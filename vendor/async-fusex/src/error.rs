@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-
 /// Get function name inside a function.
 #[macro_export]
 macro_rules! function_name {
@@ -161,7 +160,6 @@ pub enum AsyncFusexError {
         /// Context of the error
         context: Vec<String>,
     },
-
 
     /// Error caused by tokio::task::JoinError given by tokio::task::spawn*
     #[error("tokio::task::JoinError, the error is {:?}, context is {:#?}", .source, .context)]

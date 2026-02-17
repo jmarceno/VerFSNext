@@ -14,8 +14,10 @@ WHERE NOT EXPLICITLY ASKED FOR. **ALL CHANGES ARE BREAKING** AND **WE DO NOT CAR
 - Build: `cargo build --release`
 
 ## Testing Policy
-- Run full tests on big changes
-- Run focused tests on small changes
+- Prefer writing integration tests over unit tests and always use OS commands when dealing with the filesystem, never write tests that interact with the internal API of the system.
+- Run full tests on big changes.
+- Run focused tests on small changes.
+- Don't write tests for what the type system already guarantees.
 
 ## Architecture
 VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-128 hashed) in zstd-seekable packs, with a KV-only metadata layer. Chunks are deduplicated and compressed in-line, and persisted to packs.Space is reclaimed by a GC when the system is idle.

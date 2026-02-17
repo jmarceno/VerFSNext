@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use async_fusex::fs_util::{
     build_error_result_from_errno, CreateParam, FileAttr, FileLockParam, INum, RenameParam,
     SetAttrParam, StatFsParam,
 };
+use async_fusex::protocol::FUSE_WRITE_CACHE;
 use async_fusex::{DirEntry, FileType, VirtualFs};
 use async_trait::async_trait;
 use moka::sync::Cache;
@@ -1525,7 +1526,7 @@ impl VirtualFs for VerFs {
         Ok(read_len)
     }
 
-    async fn write(&self, ino: u64, offset: i64, data: &[u8], _flags: u32) -> AsyncFusexResult<()> {
+    async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
         if offset < 0 {
             return build_error_result_from_errno(
                 Errno::EINVAL,
@@ -1547,14 +1548,21 @@ impl VirtualFs for VerFs {
             data: data.to_vec(),
         };
 
-        self.batcher
-            .enqueue(op, touched_blocks)
-            .await
-            .map_err(map_anyhow_to_fuse)
+        if (flags & FUSE_WRITE_CACHE) != 0 {
+            self.batcher
+                .enqueue(op, touched_blocks)
+                .await
+                .map_err(map_anyhow_to_fuse)
+        } else {
+            self.batcher
+                .enqueue_and_wait(op, touched_blocks)
+                .await
+                .map_err(map_anyhow_to_fuse)
+        }
     }
 
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
-        Ok(())
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)
     }
 
     async fn release(
@@ -1564,10 +1572,11 @@ impl VirtualFs for VerFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> AsyncFusexResult<()> {
-        Ok(())
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)
     }
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
             .sync_cycle(!datasync)
             .await
@@ -1646,6 +1655,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn fsyncdir(&self, _ino: u64, _fh: u64, datasync: bool) -> AsyncFusexResult<()> {
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
             .sync_cycle(!datasync)
             .await
@@ -2108,17 +2118,42 @@ impl VirtualFs for VerFs {
 #[async_trait]
 impl WriteApply for FsCore {
     async fn apply_batch(&self, ops: Vec<WriteOp>) -> Vec<Result<()>> {
-        let mut out = Vec::with_capacity(ops.len());
-        for op in ops {
-            let res = self.apply_single_write(op).await;
-            out.push(res);
+        let original_len = ops.len();
+        if original_len == 0 {
+            return Vec::new();
         }
+
+        let mut groups: Vec<(WriteOp, Vec<usize>)> = Vec::new();
+        for (idx, op) in ops.into_iter().enumerate() {
+            if let Some((group_op, group_indices)) = groups.last_mut() {
+                if can_coalesce_write(group_op, &op) {
+                    merge_write_op(group_op, op);
+                    group_indices.push(idx);
+                    continue;
+                }
+            }
+            groups.push((op, vec![idx]));
+        }
+
+        let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
+        for (group_op, indices) in groups {
+            let group_result = self.apply_single_write(group_op).await;
+            for idx in indices {
+                out[idx] = Some(match &group_result {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(anyhow!(err.to_string())),
+                });
+            }
+        }
+
         debug!(
             dedup_hits = self.dedup_hits.load(Ordering::Relaxed),
             dedup_misses = self.dedup_misses.load(Ordering::Relaxed),
             "write batch applied"
         );
-        out
+        out.into_iter()
+            .map(|item| item.unwrap_or_else(|| Err(anyhow!("missing write result for queued op"))))
+            .collect()
     }
 }
 
@@ -2170,4 +2205,44 @@ fn scan_range_pairs(
         valid = iter.next()?;
     }
     Ok(out)
+}
+
+fn can_coalesce_write(existing: &WriteOp, incoming: &WriteOp) -> bool {
+    if existing.ino != incoming.ino {
+        return false;
+    }
+    let existing_end = existing.offset.saturating_add(existing.data.len() as u64);
+    let incoming_end = incoming.offset.saturating_add(incoming.data.len() as u64);
+    incoming.offset <= existing_end && incoming_end >= existing.offset
+        || incoming.offset == existing_end
+}
+
+fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
+    let existing_start = existing.offset;
+    let existing_end = existing.offset.saturating_add(existing.data.len() as u64);
+    let incoming_start = incoming.offset;
+    let incoming_end = incoming.offset.saturating_add(incoming.data.len() as u64);
+
+    let merged_start = existing_start.min(incoming_start);
+    let merged_end = existing_end.max(incoming_end);
+    let merged_len = merged_end.saturating_sub(merged_start) as usize;
+
+    if merged_start == existing_start && merged_len == existing.data.len() {
+        let dst_start = (incoming_start.saturating_sub(merged_start)) as usize;
+        let dst_end = dst_start.saturating_add(incoming.data.len());
+        existing.data[dst_start..dst_end].copy_from_slice(&incoming.data);
+        return;
+    }
+
+    let mut merged = vec![0_u8; merged_len];
+    let existing_dst_start = (existing_start.saturating_sub(merged_start)) as usize;
+    let existing_dst_end = existing_dst_start.saturating_add(existing.data.len());
+    merged[existing_dst_start..existing_dst_end].copy_from_slice(&existing.data);
+
+    let incoming_dst_start = (incoming_start.saturating_sub(merged_start)) as usize;
+    let incoming_dst_end = incoming_dst_start.saturating_add(incoming.data.len());
+    merged[incoming_dst_start..incoming_dst_end].copy_from_slice(&incoming.data);
+
+    existing.offset = merged_start;
+    existing.data = merged;
 }

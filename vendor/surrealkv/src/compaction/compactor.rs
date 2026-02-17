@@ -17,360 +17,370 @@ use crate::{Comparator, InternalKey, Options as LSMOptions};
 
 /// RAII guard to ensure tables are unhidden if compaction fails
 struct HiddenTablesGuard {
-	level_manifest: Arc<RwLock<LevelManifest>>,
-	table_ids: Vec<u64>,
-	committed: bool,
+    level_manifest: Arc<RwLock<LevelManifest>>,
+    table_ids: Vec<u64>,
+    committed: bool,
 }
 
 impl HiddenTablesGuard {
-	fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
-		Self {
-			level_manifest,
-			table_ids: table_ids.to_vec(),
-			committed: false,
-		}
-	}
+    fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
+        Self {
+            level_manifest,
+            table_ids: table_ids.to_vec(),
+            committed: false,
+        }
+    }
 
-	fn commit(&mut self) {
-		self.committed = true;
-	}
+    fn commit(&mut self) {
+        self.committed = true;
+    }
 }
 
 impl Drop for HiddenTablesGuard {
-	fn drop(&mut self) {
-		if !self.committed {
-			if let Ok(mut levels) = self.level_manifest.write() {
-				levels.unhide_tables(&self.table_ids);
-			}
-		}
-	}
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut levels) = self.level_manifest.write() {
+                levels.unhide_tables(&self.table_ids);
+            }
+        }
+    }
 }
 
 /// Compaction options
 pub(crate) struct CompactionOptions {
-	pub(crate) lopts: Arc<LSMOptions>,
-	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
-	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
-	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-	pub(crate) vlog: Option<Arc<VLog>>,
-	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
-	/// Snapshot tracker for snapshot-aware compaction.
-	///
-	/// During compaction, we query this to get the list of active snapshot
-	/// sequence numbers. Versions visible to any active snapshot must be
-	/// preserved (unless hidden by a newer version in the same visibility boundary).
-	pub(crate) snapshot_tracker: SnapshotTracker,
-	/// Versioned B+ tree index for cleanup after VLog GC
-	pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
+    pub(crate) lopts: Arc<LSMOptions>,
+    pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
+    pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
+    pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+    pub(crate) vlog: Option<Arc<VLog>>,
+    pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+    /// Snapshot tracker for snapshot-aware compaction.
+    ///
+    /// During compaction, we query this to get the list of active snapshot
+    /// sequence numbers. Versions visible to any active snapshot must be
+    /// preserved (unless hidden by a newer version in the same visibility boundary).
+    pub(crate) snapshot_tracker: SnapshotTracker,
+    /// Versioned B+ tree index for cleanup after VLog GC
+    pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
 }
 
 impl CompactionOptions {
-	pub(crate) fn from(tree: &CoreInner) -> Self {
-		Self {
-			lopts: Arc::clone(&tree.opts),
-			level_manifest: Arc::clone(&tree.level_manifest),
-			active_memtable: Arc::clone(&tree.active_memtable),
-			immutable_memtables: Arc::clone(&tree.immutable_memtables),
-			vlog: tree.vlog.clone(),
-			error_handler: Arc::clone(&tree.error_handler),
-			snapshot_tracker: tree.snapshot_tracker.clone(),
-			versioned_index: tree.versioned_index.clone(),
-		}
-	}
+    pub(crate) fn from(tree: &CoreInner) -> Self {
+        Self {
+            lopts: Arc::clone(&tree.opts),
+            level_manifest: Arc::clone(&tree.level_manifest),
+            active_memtable: Arc::clone(&tree.active_memtable),
+            immutable_memtables: Arc::clone(&tree.immutable_memtables),
+            vlog: tree.vlog.clone(),
+            error_handler: Arc::clone(&tree.error_handler),
+            snapshot_tracker: tree.snapshot_tracker.clone(),
+            versioned_index: tree.versioned_index.clone(),
+        }
+    }
 }
 
 /// Handles the compaction state and operations
 pub(crate) struct Compactor {
-	pub(crate) options: CompactionOptions,
-	pub(crate) strategy: Arc<dyn CompactionStrategy>,
+    pub(crate) options: CompactionOptions,
+    pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
 impl Compactor {
-	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
-		Self {
-			options,
-			strategy,
-		}
-	}
+    pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
+        Self { options, strategy }
+    }
 
-	pub(crate) fn compact(&self) -> Result<bool> {
-		let levels_guard = self.options.level_manifest.write()?;
-		let choice = self.strategy.pick_levels(&levels_guard)?;
+    pub(crate) fn compact(&self) -> Result<bool> {
+        let levels_guard = self.options.level_manifest.write()?;
+        let choice = self.strategy.pick_levels(&levels_guard)?;
 
-		match choice {
-			CompactionChoice::Merge(input) => {
-				self.merge_tables(levels_guard, &input)?;
-				Ok(true)
-			}
-			CompactionChoice::Skip => Ok(false),
-		}
-	}
+        match choice {
+            CompactionChoice::Merge(input) => {
+                self.merge_tables(levels_guard, &input)?;
+                Ok(true)
+            }
+            CompactionChoice::Skip => Ok(false),
+        }
+    }
 
-	fn merge_tables(
-		&self,
-		mut levels: RwLockWriteGuard<'_, LevelManifest>,
-		input: &CompactionInput,
-	) -> Result<()> {
-		// Hide tables that are being merged
-		levels.hide_tables(&input.tables_to_merge);
+    fn merge_tables(
+        &self,
+        mut levels: RwLockWriteGuard<'_, LevelManifest>,
+        input: &CompactionInput,
+    ) -> Result<()> {
+        // Hide tables that are being merged
+        levels.hide_tables(&input.tables_to_merge);
 
-		// Create guard to ensure tables are unhidden on error
-		let mut guard = HiddenTablesGuard::new(
-			Arc::clone(&self.options.level_manifest),
-			&input.tables_to_merge,
-		);
+        // Create guard to ensure tables are unhidden on error
+        let mut guard = HiddenTablesGuard::new(
+            Arc::clone(&self.options.level_manifest),
+            &input.tables_to_merge,
+        );
 
-		let tables = levels.get_all_tables();
-		let to_merge: Vec<_> =
-			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
+        let tables = levels.get_all_tables();
+        let to_merge: Vec<_> = input
+            .tables_to_merge
+            .iter()
+            .filter_map(|&id| tables.get(&id).cloned())
+            .collect();
 
-		// Keep tables alive while iterators borrow from them
-		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
-			.iter()
-			.filter_map(|table| table.iter(None).ok())
-			.map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
-			.collect();
+        // Keep tables alive while iterators borrow from them
+        let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
+            .iter()
+            .filter_map(|table| table.iter(None).ok())
+            .map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
+            .collect();
 
-		drop(levels);
+        drop(levels);
 
-		// Create new table
-		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
-		let new_table_path = self.get_table_path(new_table_id);
+        // Create new table
+        let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
+        let new_table_path = self.get_table_path(new_table_id);
 
-		// Write merged data
-		let table_created =
-			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
-				Ok(result) => result,
-				Err(e) => {
-					// Guard will unhide tables on drop
-					return Err(e);
-				}
-			};
+        // Write merged data
+        let table_created =
+            match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
+                Ok(result) => result,
+                Err(e) => {
+                    // Guard will unhide tables on drop
+                    return Err(e);
+                }
+            };
 
-		// Open table only if one was created
-		let new_table = if table_created {
-			match self.open_table(new_table_id, &new_table_path) {
-				Ok(table) => Some(table),
-				Err(e) => {
-					// Guard will unhide tables on drop
-					return Err(e);
-				}
-			}
-		} else {
-			None
-		};
+        // Open table only if one was created
+        let new_table = if table_created {
+            match self.open_table(new_table_id, &new_table_path) {
+                Ok(table) => Some(table),
+                Err(e) => {
+                    // Guard will unhide tables on drop
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
 
-		// Update manifest - this will commit the guard on success
-		self.update_manifest(input, new_table, &mut guard)?;
+        // Update manifest - this will commit the guard on success
+        self.update_manifest(input, new_table, &mut guard)?;
 
-		self.cleanup_old_tables(input);
+        self.cleanup_old_tables(input);
 
-		Ok(())
-	}
+        Ok(())
+    }
 
-	/// Returns true if a table file was created and finished, false otherwise
-	fn write_merged_table(
-		&self,
-		path: &Path,
-		table_id: u64,
-		merge_iter: Vec<BoxedLSMIterator<'_>>,
-		input: &CompactionInput,
-	) -> Result<bool> {
-		let file = SysFile::create(path)?;
-		let mut writer =
-			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
+    /// Returns true if a table file was created and finished, false otherwise
+    fn write_merged_table(
+        &self,
+        path: &Path,
+        table_id: u64,
+        merge_iter: Vec<BoxedLSMIterator<'_>>,
+        input: &CompactionInput,
+    ) -> Result<bool> {
+        let file = SysFile::create(path)?;
+        let mut writer = TableWriter::new(
+            file,
+            table_id,
+            Arc::clone(&self.options.lopts),
+            input.target_level,
+        );
 
-		let mut relocated_entries = 0u64;
-		let mut relocated_bytes = 0u64;
+        let mut relocated_entries = 0u64;
+        let mut relocated_bytes = 0u64;
 
-		// Get active snapshots for snapshot-aware compaction
-		// This is a snapshot of the snapshot list at the start of compaction.
-		// Any snapshots created during compaction will be handled by the next compaction.
-		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
+        // Get active snapshots for snapshot-aware compaction
+        // This is a snapshot of the snapshot list at the start of compaction.
+        // Any snapshots created during compaction will be handled by the next compaction.
+        let snapshots = self.options.snapshot_tracker.get_all_snapshots();
 
-		// Create a compaction iterator that filters tombstones and respects snapshots
-		let max_level = self.options.lopts.level_count - 1;
-		let is_bottom_level = input.target_level >= max_level;
-		let mut comp_iter = CompactionIterator::new(
-			merge_iter,
-			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
-			is_bottom_level,
-			self.options.lopts.enable_versioning,
-			self.options.lopts.versioned_history_retention_ns,
-			Arc::clone(&self.options.lopts.clock),
-			snapshots,
-		);
+        // Create a compaction iterator that filters tombstones and respects snapshots
+        let max_level = self.options.lopts.level_count - 1;
+        let is_bottom_level = input.target_level >= max_level;
+        let mut comp_iter = CompactionIterator::new(
+            merge_iter,
+            Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
+            is_bottom_level,
+            self.options.lopts.enable_versioning,
+            self.options.lopts.versioned_history_retention_ns,
+            Arc::clone(&self.options.lopts.clock),
+            snapshots,
+        );
 
-		let mut entries = 0;
-		for item in &mut comp_iter {
-			let (key, value) = item?;
+        let mut entries = 0;
+        for item in &mut comp_iter {
+            let (key, value) = item?;
 
-			let mut value_to_write = value.as_slice();
-			let maybe_relocated_value = self.maybe_relocate_vlog_pointer(
-				&key,
-				value_to_write,
-				&mut relocated_entries,
-				&mut relocated_bytes,
-			)?;
+            let mut value_to_write = value.as_slice();
+            let maybe_relocated_value = self.maybe_relocate_vlog_pointer(
+                &key,
+                value_to_write,
+                &mut relocated_entries,
+                &mut relocated_bytes,
+            )?;
 
-			if let Some(ref relocated_value) = maybe_relocated_value {
-				value_to_write = relocated_value;
-			}
+            if let Some(ref relocated_value) = maybe_relocated_value {
+                value_to_write = relocated_value;
+            }
 
-			writer.add(key, value_to_write)?;
-			entries += 1;
-		}
+            writer.add(key, value_to_write)?;
+            entries += 1;
+        }
 
-		if entries == 0 {
-			// No entries - drop writer and remove empty file
-			drop(writer);
-			let _ = std::fs::remove_file(path);
-			return Ok(false);
-		}
+        if entries == 0 {
+            // No entries - drop writer and remove empty file
+            drop(writer);
+            let _ = std::fs::remove_file(path);
+            return Ok(false);
+        }
 
-		writer.finish()?;
+        writer.finish()?;
 
-		if relocated_entries > 0 {
-			if let Some(ref vlog) = self.options.vlog {
-				vlog.sync()?;
-				log::debug!(
-					"Compaction relocated {} VLog entries ({} bytes)",
-					relocated_entries,
-					relocated_bytes
-				);
-			}
-		}
+        if relocated_entries > 0 {
+            if let Some(ref vlog) = self.options.vlog {
+                vlog.sync()?;
+                log::debug!(
+                    "Compaction relocated {} VLog entries ({} bytes)",
+                    relocated_entries,
+                    relocated_bytes
+                );
+            }
+        }
 
-		Ok(true)
-	}
+        Ok(true)
+    }
 
-	fn maybe_relocate_vlog_pointer(
-		&self,
-		key: &InternalKey,
-		encoded_value: &[u8],
-		relocated_entries: &mut u64,
-		relocated_bytes: &mut u64,
-	) -> Result<Option<Vec<u8>>> {
-		let Some(vlog) = self.options.vlog.as_ref() else {
-			return Ok(None);
-		};
+    fn maybe_relocate_vlog_pointer(
+        &self,
+        key: &InternalKey,
+        encoded_value: &[u8],
+        relocated_entries: &mut u64,
+        relocated_bytes: &mut u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(vlog) = self.options.vlog.as_ref() else {
+            return Ok(None);
+        };
 
-		let Ok(value_location) = ValueLocation::decode(encoded_value) else {
-			return Ok(None);
-		};
+        let Ok(value_location) = ValueLocation::decode(encoded_value) else {
+            return Ok(None);
+        };
 
-		if !value_location.is_value_pointer() {
-			return Ok(None);
-		}
+        if !value_location.is_value_pointer() {
+            return Ok(None);
+        }
 
-		let Ok(pointer) = ValuePointer::decode(&value_location.value) else {
-			return Ok(None);
-		};
+        let Ok(pointer) = ValuePointer::decode(&value_location.value) else {
+            return Ok(None);
+        };
 
-		let active_file_id = vlog.active_file_id();
-		if active_file_id == 0 || pointer.file_id >= active_file_id {
-			return Ok(None);
-		}
+        let active_file_id = vlog.active_file_id();
+        if active_file_id == 0 || pointer.file_id >= active_file_id {
+            return Ok(None);
+        }
 
-		let entry_size = pointer.total_entry_size();
+        let entry_size = pointer.total_entry_size();
 
-		let relocated_pointer = vlog.relocate_pointer(&key.encode(), &pointer)?;
-		let relocated_location = ValueLocation::with_pointer(relocated_pointer);
+        let relocated_pointer = vlog.relocate_pointer(&key.encode(), &pointer)?;
+        let relocated_location = ValueLocation::with_pointer(relocated_pointer);
 
-		*relocated_entries += 1;
-		*relocated_bytes += entry_size;
+        *relocated_entries += 1;
+        *relocated_bytes += entry_size;
 
-		Ok(Some(relocated_location.encode()))
-	}
+        Ok(Some(relocated_location.encode()))
+    }
 
-	fn update_manifest(
-		&self,
-		input: &CompactionInput,
-		new_table: Option<Arc<Table>>,
-		guard: &mut HiddenTablesGuard,
-	) -> Result<()> {
-		let mut manifest = self.options.level_manifest.write()?;
-		let _imm_guard = self.options.immutable_memtables.write();
+    fn update_manifest(
+        &self,
+        input: &CompactionInput,
+        new_table: Option<Arc<Table>>,
+        guard: &mut HiddenTablesGuard,
+    ) -> Result<()> {
+        let mut manifest = self.options.level_manifest.write()?;
+        let _imm_guard = self.options.immutable_memtables.write();
 
-		// Check for table ID collision if adding a new table
-		if let Some(ref table) = new_table {
-			if input.tables_to_merge.contains(&table.id) {
-				return Err(crate::error::Error::TableIDCollision(table.id));
-			}
-		}
+        // Check for table ID collision if adding a new table
+        if let Some(ref table) = new_table {
+            if input.tables_to_merge.contains(&table.id) {
+                return Err(crate::error::Error::TableIDCollision(table.id));
+            }
+        }
 
-		let mut changeset = ManifestChangeSet::default();
+        let mut changeset = ManifestChangeSet::default();
 
-		// Delete old tables
-		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
-			for &table_id in &input.tables_to_merge {
-				if level.tables.iter().any(|t| t.id == table_id) {
-					changeset.deleted_tables.insert((level_idx as u8, table_id));
-				}
-			}
-		}
+        // Delete old tables
+        for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
+            for &table_id in &input.tables_to_merge {
+                if level.tables.iter().any(|t| t.id == table_id) {
+                    changeset.deleted_tables.insert((level_idx as u8, table_id));
+                }
+            }
+        }
 
-		// Add new table if present
-		if let Some(table) = new_table {
-			changeset.new_tables.push((input.target_level, table));
-		}
+        // Add new table if present
+        if let Some(table) = new_table {
+            changeset.new_tables.push((input.target_level, table));
+        }
 
-		let rollback = manifest.apply_changeset(&changeset)?;
+        let rollback = manifest.apply_changeset(&changeset)?;
 
-		// Write manifest to disk - if this fails, revert in-memory state
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			manifest.revert_changeset(rollback);
-			self.options
-				.error_handler
-				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
-			return Err(e);
-		}
+        // Write manifest to disk - if this fails, revert in-memory state
+        if let Err(e) = write_manifest_to_disk(&manifest) {
+            manifest.revert_changeset(rollback);
+            self.options.error_handler.set_error(
+                e.clone(),
+                crate::error::BackgroundErrorReason::ManifestWrite,
+            );
+            return Err(e);
+        }
 
-		// Unhide tables before committing guard (they'll be removed from manifest anyway)
-		manifest.unhide_tables(&input.tables_to_merge);
+        // Unhide tables before committing guard (they'll be removed from manifest anyway)
+        manifest.unhide_tables(&input.tables_to_merge);
 
-			// Commit guard - tables are now properly handled in manifest
-			guard.commit();
+        // Commit guard - tables are now properly handled in manifest
+        guard.commit();
 
-			// After successful manifest commit, cleanup obsolete vlog files and stale index entries
-			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-			drop(_imm_guard);
-			drop(manifest);
-			let min_oldest_vlog = resolve_vlog_cleanup_floor(
-				min_oldest_vlog,
-				&self.options.active_memtable,
-				&self.options.immutable_memtables,
-				"compaction",
-			);
-			cleanup_vlog_and_index(
-				&self.options.vlog,
-				&self.options.versioned_index,
-			min_oldest_vlog,
-			"compaction",
-		);
+        // After successful manifest commit, cleanup obsolete vlog files and stale index entries
+        let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+        drop(_imm_guard);
+        drop(manifest);
+        let min_oldest_vlog = resolve_vlog_cleanup_floor(
+            min_oldest_vlog,
+            &self.options.active_memtable,
+            &self.options.immutable_memtables,
+            "compaction",
+        );
+        cleanup_vlog_and_index(
+            &self.options.vlog,
+            &self.options.versioned_index,
+            min_oldest_vlog,
+            "compaction",
+        );
 
-		Ok(())
-	}
+        Ok(())
+    }
 
-	fn get_table_path(&self, table_id: u64) -> PathBuf {
-		self.options.lopts.sstable_file_path(table_id)
-	}
+    fn get_table_path(&self, table_id: u64) -> PathBuf {
+        self.options.lopts.sstable_file_path(table_id)
+    }
 
-	fn cleanup_old_tables(&self, input: &CompactionInput) {
-		for &table_id in &input.tables_to_merge {
-			let path = self.options.lopts.sstable_file_path(table_id);
-			if let Err(e) = std::fs::remove_file(path) {
-				// Log error but continue with cleanup
-				log::warn!("Failed to remove old table file: {e}");
-			}
-		}
-	}
+    fn cleanup_old_tables(&self, input: &CompactionInput) {
+        for &table_id in &input.tables_to_merge {
+            let path = self.options.lopts.sstable_file_path(table_id);
+            if let Err(e) = std::fs::remove_file(path) {
+                // Log error but continue with cleanup
+                log::warn!("Failed to remove old table file: {e}");
+            }
+        }
+    }
 
-	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
-		let file = SysFile::open(table_path)?;
-		let file: Arc<dyn File> = Arc::new(file);
-		let file_size = file.size()?;
+    fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
+        let file = SysFile::open(table_path)?;
+        let file: Arc<dyn File> = Arc::new(file);
+        let file_size = file.size()?;
 
-		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
-	}
+        Ok(Arc::new(Table::new(
+            table_id,
+            Arc::clone(&self.options.lopts),
+            file,
+            file_size,
+        )?))
+    }
 }

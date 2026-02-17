@@ -3,12 +3,12 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+#[cfg(feature = "abi-7-21")]
+use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
-#[cfg(feature = "abi-7-21")]
-use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_request::Request;
 #[cfg(feature = "abi-7-16")]
 use super::protocol::FuseForgetOne;

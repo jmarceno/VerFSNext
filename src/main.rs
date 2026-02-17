@@ -10,7 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use async_fusex::{FuseFs, VirtualFs, session::new_session};
+use async_fusex::{
+    session::{new_session, SessionConfig},
+    FuseFs, VirtualFs,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -29,14 +32,20 @@ async fn main() -> Result<()> {
     let virtual_fs: Arc<dyn VirtualFs> = fs.clone();
     let fuse_fs = FuseFs::new(virtual_fs);
 
-    let session = new_session(&config.mount_point, fuse_fs)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to mount FUSE filesystem at {}",
-                config.mount_point.display()
-            )
-        })?;
+    let session = new_session(
+        &config.mount_point,
+        fuse_fs,
+        SessionConfig {
+            max_write_bytes: config.fuse_max_write_bytes,
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to mount FUSE filesystem at {}",
+            config.mount_point.display()
+        )
+    })?;
 
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();

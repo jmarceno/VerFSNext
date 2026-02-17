@@ -161,11 +161,7 @@ fn unique_test_root() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "verfsnext-rsync-{}-{}",
-        std::process::id(),
-        now
-    ))
+    std::env::temp_dir().join(format!("verfsnext-rsync-{}-{}", std::process::id(), now))
 }
 
 fn setup_source_tree(src: &Path) -> Result<()> {

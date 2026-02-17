@@ -1,11 +1,11 @@
 //! The `FileSystem` trait
-use std::{path::Path, time::Duration};
 use crate::error::{AsyncFusexError, AsyncFusexResult};
-use crate::fs_util::{*};
+use crate::fs_util::*;
 use async_trait::async_trait;
-use tracing::{error, warn};
-use serde::{Deserialize, Serialize};
 use nix::sys::stat::SFlag;
+use serde::{Deserialize, Serialize};
+use std::{path::Path, time::Duration};
+use tracing::{error, warn};
 /// Represents a directory entry in a filesystem.
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DirEntry {

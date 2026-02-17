@@ -1,11 +1,11 @@
 extern crate alloc;
 use alloc::string::ToString;
-use std::error::Error;
-use std::fmt::Write;
-use std::os::raw::c_int;
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::stat::SFlag;
+use std::error::Error;
+use std::fmt::Write;
+use std::os::raw::c_int;
 
 /// Format `anyhow::Error`
 #[must_use]
@@ -53,7 +53,6 @@ pub fn mode_from_kind_and_perm(kind: SFlag, perm: u16) -> u32 {
 pub const fn convert_nix_errno_to_cint(error_no: Errno) -> c_int {
     error_no as c_int
 }
-
 
 /// Round up `len` to a multiple of `align`.
 ///

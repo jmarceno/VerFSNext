@@ -10,8 +10,8 @@ use nix::sys::stat::{Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::protocol::FuseAttr;
 use crate::error::{AsyncFusexError, AsyncFusexResult};
+use crate::protocol::FuseAttr;
 use crate::util;
 
 /// Build error result from `nix` error code

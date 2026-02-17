@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::types::BLOCK_SIZE;
+
 fn default_sync_interval_ms() -> u64 {
     5_000
 }
@@ -12,7 +14,7 @@ fn default_batch_max_blocks() -> usize {
 }
 
 fn default_batch_flush_interval_ms() -> u64 {
-    500
+    1
 }
 
 fn default_metadata_cache_capacity_entries() -> u64 {
@@ -32,15 +34,19 @@ fn default_zstd_compression_level() -> i32 {
 }
 
 fn default_ultracdc_min_size_bytes() -> usize {
-    2 * 1024
+    16 * 1024
 }
 
 fn default_ultracdc_avg_size_bytes() -> usize {
-    4 * 1024
+    32 * 1024
 }
 
 fn default_ultracdc_max_size_bytes() -> usize {
-    16 * 1024
+    64 * 1024
+}
+
+fn default_fuse_max_write_bytes() -> u32 {
+    u32::try_from(BLOCK_SIZE).unwrap_or(1024 * 1024)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +73,8 @@ pub struct Config {
     pub ultracdc_avg_size_bytes: usize,
     #[serde(default = "default_ultracdc_max_size_bytes")]
     pub ultracdc_max_size_bytes: usize,
+    #[serde(default = "default_fuse_max_write_bytes")]
+    pub fuse_max_write_bytes: u32,
 }
 
 impl Config {
@@ -114,6 +122,12 @@ impl Config {
         }
         if self.ultracdc_max_size_bytes < self.ultracdc_avg_size_bytes {
             bail!("ultracdc_max_size_bytes must be >= ultracdc_avg_size_bytes");
+        }
+        if self.fuse_max_write_bytes < 4096 {
+            bail!("fuse_max_write_bytes must be >= 4096");
+        }
+        if self.fuse_max_write_bytes > 16 * 1024 * 1024 {
+            bail!("fuse_max_write_bytes must be <= 16777216");
         }
         Ok(())
     }

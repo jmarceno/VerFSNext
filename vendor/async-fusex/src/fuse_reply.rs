@@ -20,12 +20,12 @@ use nix::sys::stat::SFlag;
 use tracing::debug;
 
 use super::abi_marker;
+#[cfg(feature = "abi-7-21")]
+use super::protocol::FuseDirEntPlus;
 use super::protocol::{
     FuseAttr, FuseAttrOut, FuseBMapOut, FuseDirEnt, FuseEntryOut, FuseFileLock, FuseGetXAttrOut,
     FuseInitOut, FuseKStatFs, FuseLockOut, FuseOpenOut, FuseOutHeader, FuseStatFsOut, FuseWriteOut,
 };
-#[cfg(feature = "abi-7-21")]
-use super::protocol::FuseDirEntPlus;
 #[cfg(feature = "abi-7-18")]
 use super::protocol::{FuseNotifyCode::FUSE_NOTIFY_DELETE, FuseNotifyDeleteOut};
 

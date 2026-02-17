@@ -6,8 +6,8 @@ use nix::unistd::{getgid, getuid};
 use surrealkv::{Mode, Tree, TreeBuilder};
 
 use crate::types::{
-    INODE_KIND_DIR, InodeRecord, ROOT_INODE, decode_rkyv, encode_rkyv, inode_key, sys_key,
-    system_time_to_parts,
+    decode_rkyv, encode_rkyv, inode_key, sys_key, system_time_to_parts, InodeRecord,
+    INODE_KIND_DIR, ROOT_INODE,
 };
 
 pub struct MetaStore {

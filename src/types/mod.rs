@@ -5,7 +5,7 @@ use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const ROOT_INODE: u64 = 1;
-pub const BLOCK_SIZE: usize = 4096;
+pub const BLOCK_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
 
 pub const INODE_KIND_FILE: u8 = 1;
 pub const INODE_KIND_DIR: u8 = 2;

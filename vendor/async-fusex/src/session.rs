@@ -34,6 +34,12 @@ use super::fuse_request::{Operation, Request};
 use super::protocol::FATTR_CTIME;
 #[cfg(feature = "abi-7-9")]
 use super::protocol::FATTR_LOCKOWNER; // {FATTR_ATIME_NOW, FATTR_MTIME_NOW};
+#[cfg(feature = "abi-7-9")]
+use super::protocol::FUSE_BIG_WRITES;
+#[cfg(feature = "abi-7-28")]
+use super::protocol::FUSE_MAX_PAGES;
+#[cfg(feature = "abi-7-23")]
+use super::protocol::FUSE_WRITEBACK_CACHE;
 use super::protocol::{
     FuseInitIn, FuseInitOut, FuseSetXAttrIn, FATTR_ATIME, FATTR_FH, FATTR_GID, FATTR_MODE,
     FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
@@ -42,28 +48,67 @@ use super::protocol::{
 use super::{mount, FuseFs};
 use crate::fs_util::{CreateParam, FileLockParam, RenameParam, SetAttrParam};
 
-/// We generally support async reads
-#[cfg(target_os = "linux")]
-const INIT_FLAGS: u32 = FUSE_ASYNC_READ;
-// TODO: Add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (requires ABI 7.10)
-
-/// The max size of write requests from the kernel. The absolute minimum is 4k,
-/// FUSE recommends at least 128k, max 16M. The FUSE default is  128k on Linux.
-#[cfg(target_os = "linux")]
-const MAX_WRITE_SIZE: u32 = 128 * 1024;
-
-/// Size of the buffer for reading a request from the kernel. Since the kernel
-/// may send up to `MAX_WRITE_SIZE` bytes in a write request, we use that value
-/// plus some extra space.
-const BUFFER_SIZE: u32 = MAX_WRITE_SIZE + 512;
-
-/// We use `PAGE_SIZE` (4 KiB) as the alignment of the buffer.
-const PAGE_SIZE: usize = 4096;
+/// Per-request metadata slack above payload bytes.
+const REQUEST_FRAME_SLACK_BYTES: u32 = 512;
+/// The absolute minimum max write accepted by FUSE.
+const MIN_MAX_WRITE_BYTES: u32 = 4 * 1024;
+/// The practical Linux upper-bound for max write negotiation.
+const MAX_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+/// Default max write if caller does not provide a session config.
+const DEFAULT_MAX_WRITE_BYTES: u32 = 1024 * 1024;
 /// Max background pending requests under processing, at least to be 4,
 /// otherwise deadlock
 const MAX_BACKGROUND: u16 = 10; // TODO: set to larger value when release
 /// The max number of FUSE device reader threads.
 const MAX_FUSE_READER: usize = 2; // TODO: make it custom
+
+/// Runtime config for FUSE session negotiation.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionConfig {
+    pub max_write_bytes: u32,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            max_write_bytes: DEFAULT_MAX_WRITE_BYTES,
+        }
+    }
+}
+
+fn supported_init_flags() -> u32 {
+    let mut flags = FUSE_ASYNC_READ;
+    #[cfg(feature = "abi-7-9")]
+    {
+        flags |= FUSE_BIG_WRITES;
+    }
+    #[cfg(feature = "abi-7-23")]
+    {
+        flags |= FUSE_WRITEBACK_CACHE;
+    }
+    #[cfg(feature = "abi-7-28")]
+    {
+        flags |= FUSE_MAX_PAGES;
+    }
+    flags
+}
+
+fn system_page_size() -> usize {
+    unistd::sysconf(unistd::SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+#[cfg(feature = "abi-7-28")]
+fn compute_max_pages(max_write_bytes: u32) -> u16 {
+    let page_size = system_page_size().max(1) as u64;
+    let max_write = u64::from(max_write_bytes.max(MIN_MAX_WRITE_BYTES));
+    let pages = ((max_write.saturating_sub(1)) / page_size).saturating_add(1);
+    pages.min(u64::from(u16::MAX)) as u16
+}
 
 /// The implementation of fuse fd clone.
 /// This module is just for avoiding the `missing_docs` of `ioctl_read` macro.
@@ -250,9 +295,14 @@ pub struct Session<F: FileSystem + Send + Sync + 'static> {
     mount_path: PathBuf,
     /// The underlying FUSE file system
     filesystem: Arc<F>,
+    session_config: SessionConfig,
     // fuse_request_spawn_handle: GcHandle,
 }
-pub async fn new_session(mount_path: &Path, fs: FuseFs) -> anyhow::Result<Session<FuseFs>> {
+pub async fn new_session(
+    mount_path: &Path,
+    fs: FuseFs,
+    session_config: SessionConfig,
+) -> anyhow::Result<Session<FuseFs>> {
     let fuse_fd = mount::mount(mount_path)
         .await
         .context("Failed to mount FUSE")?;
@@ -262,6 +312,7 @@ pub async fn new_session(mount_path: &Path, fs: FuseFs) -> anyhow::Result<Sessio
         proto_version: AtomicCell::new(ProtoVersion::UNSPECIFIED),
         mount_path: mount_path.to_owned(),
         filesystem: Arc::new(fs),
+        session_config,
     })
 }
 
@@ -335,11 +386,18 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
     async fn setup_buffer_pool(
         &self,
     ) -> anyhow::Result<(Sender<(File, AlignedBytes)>, Receiver<(File, AlignedBytes)>)> {
+        let max_write = self
+            .session_config
+            .max_write_bytes
+            .clamp(MIN_MAX_WRITE_BYTES, MAX_MAX_WRITE_BYTES);
+        let buffer_size = max_write.saturating_add(REQUEST_FRAME_SLACK_BYTES);
+        let page_size = system_page_size();
+
         let (pool_sender, pool_receiver) =
             crossbeam_channel::bounded::<(File, AlignedBytes)>(MAX_BACKGROUND.into());
 
         for _ in 0..MAX_BACKGROUND {
-            let buf = AlignedBytes::new_zeroed(BUFFER_SIZE.cast(), PAGE_SIZE);
+            let buf = AlignedBytes::new_zeroed(buffer_size.cast(), page_size);
             let session_fd = self.dev_fd();
 
             let file = unsafe {
@@ -412,7 +470,11 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
             reply.error_code(Errno::ENOSYS).await?;
             return Err(anyhow!("user defined init failed, the error is: {}", err,));
         }
-        let flags = arg.flags & INIT_FLAGS; // TODO: handle init flags properly
+        let max_write = self
+            .session_config
+            .max_write_bytes
+            .clamp(MIN_MAX_WRITE_BYTES, MAX_MAX_WRITE_BYTES);
+        let flags = arg.flags & supported_init_flags();
         #[cfg(not(feature = "abi-7-13"))]
         let unused = 0_u32;
         #[cfg(feature = "abi-7-13")]
@@ -422,7 +484,7 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
         #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
         let unused = [0_u32; 9];
         #[cfg(feature = "abi-7-28")]
-        let max_pages = 0_u16; // TODO: max_pages = (max_write - 1) / getpagesize() + 1;
+        let max_pages = compute_max_pages(max_write);
         #[cfg(feature = "abi-7-28")]
         let padding = 0_u16;
         #[cfg(feature = "abi-7-28")]
@@ -436,15 +498,14 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
                 minor: FUSE_KERNEL_MINOR_VERSION, /* Do not change minor version, otherwise
                                                    * unknown panic */
                 max_readahead: arg.max_readahead, // accept FUSE kernel module max_readahead
-                flags,                            /* TODO: use features given in INIT_FLAGS and
-                                                   * reported as capable */
+                flags,                            // negotiated with kernel capabilities
                 #[cfg(not(feature = "abi-7-13"))]
                 unused,
                 #[cfg(feature = "abi-7-13")]
                 max_background: MAX_BACKGROUND,
                 #[cfg(feature = "abi-7-13")]
                 congestion_threshold,
-                max_write: MAX_WRITE_SIZE,
+                max_write,
                 #[cfg(feature = "abi-7-23")]
                 time_gran,
                 #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
@@ -459,11 +520,7 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
             .await?;
         debug!(
             "INIT response: ABI version={}.{}, flags={:#x}, max readahead={}, max write={}",
-            FUSE_KERNEL_VERSION,
-            FUSE_KERNEL_MINOR_VERSION,
-            flags,
-            arg.max_readahead,
-            MAX_WRITE_SIZE,
+            FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION, flags, arg.max_readahead, max_write,
         );
 
         // Store the kernel FUSE major and minor version

@@ -19,9 +19,7 @@ pub unsafe trait FuseAbiData {}
 pub unsafe fn as_bytes_unchecked<T: Sized>(raw: &T) -> &[u8] {
     let ty_size = mem::size_of::<T>();
     let base: *const u8 = <*const T>::cast(raw);
-    unsafe {
-        slice::from_raw_parts(base, ty_size)
-    }
+    unsafe { slice::from_raw_parts(base, ty_size) }
 }
 
 /// Transmutes `&T` to `&[u8]` where `T: FuseAbiData + Sized`

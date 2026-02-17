@@ -18,7 +18,7 @@ pub struct Deserializer<'b> {
 }
 
 /// Types which can be decoded from bytes
-#[allow(single_use_lifetimes,unused,dead_code)]
+#[allow(single_use_lifetimes, unused, dead_code)]
 pub trait Deserialize<'b>: Sized {
     /// Deserialize from bytes
     fn deserialize(
