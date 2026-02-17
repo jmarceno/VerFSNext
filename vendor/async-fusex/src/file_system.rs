@@ -1,0 +1,319 @@
+//! The `FileSystem` trait
+use std::path::Path;
+
+use async_trait::async_trait;
+
+use super::fuse_reply::{
+    ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+};
+#[cfg(feature = "abi-7-21")]
+use super::fuse_reply::ReplyDirectoryPlus;
+use super::fuse_request::Request;
+#[cfg(feature = "abi-7-16")]
+use super::protocol::FuseForgetOne;
+use crate::fs_util::{CreateParam, FileLockParam, INum, RenameParam, SetAttrParam};
+
+/// FUSE filesystem trait
+#[async_trait]
+pub trait FileSystem {
+    /// Initialize filesystem
+    async fn init(&self, req: &Request<'_>) -> nix::Result<()>;
+
+    /// Clean up filesystem
+    async fn destroy(&self, req: &Request<'_>);
+
+    /// Interrupt another FUSE request
+    async fn interrupt(&self, req: &Request<'_>, unique: u64);
+
+    /// Look up a directory entry by name and get its attributes.
+    async fn lookup(
+        &self,
+        req: &Request<'_>,
+        parent: INum,
+        name: &str,
+        reply: ReplyEntry<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Forget about an inode
+    async fn forget(&self, req: &Request<'_>, nlookup: u64);
+
+    /// Forget about multiple inodes
+    #[cfg(feature = "abi-7-16")]
+    async fn batch_forget(&self, req: &Request<'_>, nodes: &[FuseForgetOne]);
+
+    /// Get file attributes.
+    async fn getattr(&self, req: &Request<'_>, reply: ReplyAttr<'_>) -> nix::Result<usize>;
+
+    /// Set file attributes.
+    async fn setattr(
+        &self,
+        req: &Request<'_>,
+        param: SetAttrParam,
+        reply: ReplyAttr<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Read symbolic link.
+    async fn readlink(&self, req: &Request<'_>, reply: ReplyData<'_>) -> nix::Result<usize>;
+
+    /// Create file node.
+    async fn mknod(
+        &self,
+        req: &Request<'_>,
+        param: CreateParam,
+        reply: ReplyEntry<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Create a directory
+    async fn mkdir(
+        &self,
+        req: &Request<'_>,
+        parent: INum,
+        name: &str,
+        mode: u32,
+        reply: ReplyEntry<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Remove a file
+    async fn unlink(
+        &self,
+        req: &Request<'_>,
+        parent: INum,
+        name: &str,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Remove a directory
+    async fn rmdir(
+        &self,
+        req: &Request<'_>,
+        parent: INum,
+        name: &str,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Create a symbolic link
+    async fn symlink(
+        &self,
+        req: &Request<'_>,
+        parent: INum,
+        name: &str,
+        target_path: &Path,
+        reply: ReplyEntry<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Rename a file
+    async fn rename(
+        &self,
+        req: &Request<'_>,
+        param: RenameParam,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Create a hard link
+    async fn link(
+        &self,
+        _req: &Request<'_>,
+        _newparent: u64,
+        _newname: &str,
+        reply: ReplyEntry<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Open a file
+    async fn open(&self, req: &Request<'_>, flags: u32, reply: ReplyOpen<'_>)
+        -> nix::Result<usize>;
+
+    /// Read data
+    async fn read(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        reply: ReplyData<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Write data
+    async fn write(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        flags: u32,
+        reply: ReplyWrite<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Flush method
+    async fn flush(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        lock_owner: u64,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Release an open file
+    async fn release(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        flags: u32, // same as the open flags
+        lock_owner: u64,
+        flush: bool,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Synchronize file contents
+    async fn fsync(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Open a directory
+    async fn opendir(
+        &self,
+        req: &Request<'_>,
+        flags: u32,
+        reply: ReplyOpen<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Read directory
+    async fn readdir(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: i64,
+        reply: ReplyDirectory<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Read directory with attributes
+    #[cfg(feature = "abi-7-21")]
+    async fn readdirplus(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: i64,
+        reply: ReplyDirectoryPlus<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Release an open directory
+    async fn releasedir(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        flags: u32,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Synchronize directory contents
+    async fn fsyncdir(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Get file system statistics
+    async fn statfs(&self, req: &Request<'_>, reply: ReplyStatFs<'_>) -> nix::Result<usize>;
+
+    /// Set an extended attribute
+    async fn setxattr(
+        &self,
+        _req: &Request<'_>,
+        _name: &str,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Get an extended attribute
+    async fn getxattr(
+        &self,
+        _req: &Request<'_>,
+        _name: &str,
+        _size: u32,
+        reply: ReplyXAttr<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Get an extended attribute
+    async fn listxattr(
+        &self,
+        _req: &Request<'_>,
+        _size: u32,
+        reply: ReplyXAttr<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Remove an extended attribute
+    async fn removexattr(
+        &self,
+        _req: &Request<'_>,
+        _name: &str,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Check file access permissions
+    async fn access(
+        &self,
+        _req: &Request<'_>,
+        _mask: u32,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Create and open a file
+    async fn create(
+        &self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &str,
+        _mode: u32,
+        _flags: u32,
+        reply: ReplyCreate<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Copy a range of bytes between two files
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_range(
+        &self,
+        req: &Request<'_>,
+        fh_in: u64,
+        offset_in: i64,
+        nodeid_out: u64,
+        fh_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u64,
+        reply: ReplyWrite<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Test for a POSIX file lock
+    async fn getlk(
+        &self,
+        _req: &Request<'_>,
+        _lk_param: FileLockParam,
+        reply: ReplyLock<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Acquire, modify or release a POSIX file lock
+    async fn setlk(
+        &self,
+        _req: &Request<'_>,
+        _lk_param: FileLockParam,
+        _sleep: bool,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Map block index within file to block index within device
+    async fn bmap(
+        &self,
+        _req: &Request<'_>,
+        _blocksize: u32,
+        _idx: u64,
+        reply: ReplyBMap<'_>,
+    ) -> nix::Result<usize>;
+}
