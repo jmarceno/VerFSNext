@@ -3,11 +3,11 @@
 [YOU SHOULD NEVER, FOR ANY REASON ADD BACKWARD COMPATIBILITY TO ANYTHING IF YOU
 WHERE NOT EXPLICITLY ASKED FOR. **ALL CHANGES ARE BREAKING** AND **WE DO NOT CARE ABOUT THOSE LEFT BEHIND**, THEY SHOULD NOT EVEN BE MENTIONED. THIS RULE IS SACRED AND UNBREAKABLE.]
 
-
 ## Main Priorities (in order of importance)
 1. Never lose data
-2. Never stall reads
-3. Keep performance as high as possible
+2. Keep and Enhance POSIX/rsync Operational Correctness
+3. Never stall reads
+4. Keep performance as high as possible
 **Every decision must be made keeping these priorities in mind.**
 
 ## Commands

@@ -29,6 +29,18 @@ SurrealKV is now wired as a workspace member in VerFSNext and compiled from `ven
 - Added explicit dependencies required by the current source tree:
   - `guardian` for lock guard extraction patterns used by snapshot code.
   - `lz4_flex` for WAL/SST/VLog compression paths where `CompressionType::Lz4` is selected.
+- Added explicit **test-only** dependencies so the vendored crate can run
+  in-workspace test targets without external manifest patching:
+  - `test-log`, `tempdir`, `tempfile`, and `fastrand`
+  - test `tokio` feature set (`macros`, `rt-multi-thread`, `sync`, `time`)
+
+### Test-API Drift Handling
+
+- Upstream internal test call sites were aligned with current core APIs:
+  - `KMergeIterator::new_from(iter_state, range, tiered_levels)`
+  - `Strategy::select_tables_for_compaction(..., include_target_overlaps)`
+- This keeps vendored tests compiling against the current compaction and
+  snapshot iterator interfaces.
 
 This keeps the vendored engine buildable as a first-class in-repo component for VerFSNext.
 
@@ -1016,7 +1028,12 @@ Over time, old VLog files may contain only stale entries that are no longer refe
 
 ### How Garbage is Tracked
 
-The key insight is that a VLog file is safe to delete when **no live SSTable references it**. SurrealKV tracks this using the `oldest_vlog_file_id` metadata in each SSTable:
+The key insight is that a VLog file is safe to delete only when:
+- No live SSTable references it
+- No active or immutable memtable references it
+- It is not the current active writer file
+
+SurrealKV tracks the SST side using the `oldest_vlog_file_id` metadata in each SSTable:
 
 **During SSTable Creation:**
 
@@ -1036,7 +1053,7 @@ min_oldest_vlog = manifest
     .unwrap_or(0)
 ```
 
-Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTable references it.
+SurrealKV then computes an effective cleanup floor by intersecting this SST floor with in-memory references discovered from the active and immutable memtables.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1055,23 +1072,24 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    AFTER FLUSH OR COMPACTION                                │
 │                                                                             │
-│  1. Compute global minimum:                                                 │
+│  1. Compute global SST minimum:                                             │
 │     min_oldest_vlog = manifest.min_oldest_vlog_file_id()                    │
 │                                                                             │
-│  2. If min_oldest_vlog == 0: No SSTs reference VLog, skip cleanup           │
+│  2. Compute effective floor with memtable references:                       │
+│     floor = min(min_oldest_vlog, active_memtable_min, immutable_mins)       │
 │                                                                             │
-│  3. Otherwise: Delete VLog files with file_id < min_oldest_vlog             │
+│  3. If floor == 0: skip cleanup                                             │
+│                                                                             │
+│  4. Otherwise: delete VLog files with file_id < floor and != active writer  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              ITERATOR SAFETY                                │
+│                           IN-MEMORY SAFETY FLOOR                            │
 │                                                                             │
-│  Before deleting a VLog file, check iterator_count:                         │
-│    - If iterator_count > 0: Defer deletion (readers may access file)        │
-│    - If iterator_count == 0: Safe to delete immediately                     │
-│                                                                             │
-│  This prevents deleting files that in-flight reads may access.              │
+│  Cleanup never advances past the minimum file_id still visible from          │
+│  active/immutable memtables. This prevents deleting files that are not yet   │
+│  represented in SST metadata.                                                │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -1091,7 +1109,7 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 |-----------|---------|----------|
 | **oldest_vlog_file_id** | SST metadata tracking oldest VLog file referenced | SST properties |
 | **min_oldest_vlog_file_id()** | Computes global minimum across all SSTs | `LevelManifest` method |
-| **iterator_count** | Safety counter for active readers | `VLog` struct |
+| **calculate_vlog_cleanup_floor()** | Intersects SST minimum with active/immutable memtable references | `lsm.rs` |
 | **cleanup_stale_versioned_index()** | Removes stale B+tree entries | `CoreInner` method |
 
 ### GC Trigger Points
@@ -1101,7 +1119,7 @@ VLog garbage collection runs automatically at two points:
 1. **After Flush**: When a memtable is flushed to an L0 SSTable
 2. **After Compaction**: When SSTables are merged during compaction
 
-Both paths call `vlog.cleanup_obsolete_files(min_oldest_vlog)` after successfully updating the manifest.
+Both paths compute a safe floor via `resolve_vlog_cleanup_floor(...)` and then call `cleanup_vlog_and_index(...)`.
 
 ### Algorithm Details
 
@@ -1113,14 +1131,9 @@ The global minimum approach is correct because:
 - If `min_oldest_vlog = N`, then all live SSTables reference only VLog files >= N
 - Therefore, VLog files < N have no live references and can be deleted
 
-**Iterator Safety:**
+**In-Memory Safety:**
 
-VLog files cannot be deleted while readers might access them. The `iterator_count` provides a safety net:
-- Incremented when a snapshot/iterator is created
-- Decremented when the snapshot/iterator is dropped
-- If `iterator_count > 0`, deletion is deferred to startup cleanup
-
-This prevents the race condition where GC deletes a file that an in-flight read is about to access.
+SST metadata alone is insufficient during concurrent writes because recent value pointers may still live in active/immutable memtables. SurrealKV guards cleanup by scanning in-memory memtables and lowering the cleanup floor to the minimum referenced file_id found there.
 
 **Versioned Index Cleanup:**
 

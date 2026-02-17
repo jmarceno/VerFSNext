@@ -855,6 +855,7 @@ impl<'a> FuseDeleteNotification<'a> {
 #[cfg(test)]
 mod test {
     use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::io::FromRawFd;
     use std::time::Duration;
 
@@ -863,7 +864,6 @@ mod test {
     use nix::fcntl::{self, OFlag};
     use nix::sys::stat::Mode;
     use nix::unistd;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     use super::super::de::Deserializer;
     use super::super::protocol::{FuseAttr, FuseAttrOut, FuseOutHeader};
@@ -946,12 +946,9 @@ mod test {
         let reply_attr = ReplyAttr::new(unique, &mut file);
         reply_attr.attr(Duration::from_secs(1), attr).await?;
 
-        let mut file =
-            tokio::task::spawn_blocking(move || unsafe { tokio::fs::File::from_raw_fd(fd) })
-                .await?;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
+        file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await?;
+        file.read_to_end(&mut bytes)?;
 
         let mut aligned_bytes = AlignedBytes::new_zeroed(bytes.len(), 4096);
         aligned_bytes.copy_from_slice(&bytes);

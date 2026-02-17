@@ -2,10 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytecheck::CheckBytes;
-use rkyv::{
-    Archive, Deserialize, Serialize, check_archived_root,
-    de::deserializers::SharedDeserializeMap,
-};
+use rkyv::{Archive, Deserialize, Serialize};
 
 pub const ROOT_INODE: u64 = 1;
 pub const BLOCK_SIZE: usize = 4096;
@@ -18,9 +15,11 @@ pub const KEY_PREFIX_INODE: u8 = b'I';
 pub const KEY_PREFIX_DIRENT: u8 = b'D';
 pub const KEY_PREFIX_EXTENT: u8 = b'E';
 pub const KEY_PREFIX_CHUNK: u8 = b'C';
+pub const KEY_PREFIX_XATTR: u8 = b'X';
+pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[rkyv(bytecheck())]
 pub struct InodeRecord {
     pub ino: u64,
     pub parent: u64,
@@ -40,20 +39,20 @@ pub struct InodeRecord {
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[rkyv(bytecheck())]
 pub struct DirentRecord {
     pub ino: u64,
     pub kind: u8,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[rkyv(bytecheck())]
 pub struct ExtentRecord {
     pub chunk_hash: [u8; 16],
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-#[archive(check_bytes)]
+#[rkyv(bytecheck())]
 pub struct ChunkRecord {
     pub refcount: u64,
     pub pack_id: u64,
@@ -63,9 +62,16 @@ pub struct ChunkRecord {
 
 pub fn encode_rkyv<T>(value: &T) -> Result<Vec<u8>>
 where
-    T: Archive + Serialize<rkyv::ser::serializers::AllocSerializer<256>>,
+    T: Archive
+        + for<'a> Serialize<
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        >,
 {
-    rkyv::to_bytes::<_, 256>(value)
+    rkyv::to_bytes::<rkyv::rancor::Error>(value)
         .map(|bytes| bytes.to_vec())
         .context("rkyv encode failed")
 }
@@ -73,15 +79,10 @@ where
 pub fn decode_rkyv<T>(bytes: &[u8]) -> Result<T>
 where
     T: Archive,
-    T::Archived: for<'a> CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>
-        + Deserialize<T, SharedDeserializeMap>,
+    T::Archived: for<'a> CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
-    let archived = check_archived_root::<T>(bytes)
-        .map_err(|err| anyhow::anyhow!("rkyv validation failed: {err:?}"))?;
-    let mut deserializer = SharedDeserializeMap::default();
-    archived
-        .deserialize(&mut deserializer)
-        .context("rkyv decode failed")
+    rkyv::from_bytes::<T, rkyv::rancor::Error>(bytes).context("rkyv decode failed")
 }
 
 pub fn inode_key(ino: u64) -> Vec<u8> {
@@ -125,6 +126,27 @@ pub fn chunk_key(hash: &[u8; 16]) -> Vec<u8> {
     key
 }
 
+pub fn xattr_prefix(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8 + 1);
+    key.push(KEY_PREFIX_XATTR);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key.push(0);
+    key
+}
+
+pub fn xattr_key(ino: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = xattr_prefix(ino);
+    key.extend_from_slice(name);
+    key
+}
+
+pub fn symlink_target_key(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8);
+    key.push(KEY_PREFIX_SYMLINK);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
 pub fn sys_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + name.len());
     key.extend_from_slice(b"SYS:");
@@ -147,6 +169,16 @@ pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
 
 pub fn decode_dirent_name(key: &[u8]) -> Option<&[u8]> {
     if key.len() < 10 || key[0] != KEY_PREFIX_DIRENT {
+        return None;
+    }
+    if key[9] != 0 {
+        return None;
+    }
+    Some(&key[10..])
+}
+
+pub fn decode_xattr_name(key: &[u8]) -> Option<&[u8]> {
+    if key.len() < 10 || key[0] != KEY_PREFIX_XATTR {
         return None;
     }
     if key[9] != 0 {

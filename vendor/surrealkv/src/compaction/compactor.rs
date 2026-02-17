@@ -7,8 +7,8 @@ use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
-use crate::lsm::{cleanup_vlog_and_index, CoreInner};
-use crate::memtable::ImmutableMemtables;
+use crate::lsm::{cleanup_vlog_and_index, resolve_vlog_cleanup_floor, CoreInner};
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -50,6 +50,7 @@ impl Drop for HiddenTablesGuard {
 pub(crate) struct CompactionOptions {
 	pub(crate) lopts: Arc<LSMOptions>,
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
+	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
@@ -68,6 +69,7 @@ impl CompactionOptions {
 		Self {
 			lopts: Arc::clone(&tree.opts),
 			level_manifest: Arc::clone(&tree.level_manifest),
+			active_memtable: Arc::clone(&tree.active_memtable),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
@@ -327,14 +329,22 @@ impl Compactor {
 		// Unhide tables before committing guard (they'll be removed from manifest anyway)
 		manifest.unhide_tables(&input.tables_to_merge);
 
-		// Commit guard - tables are now properly handled in manifest
-		guard.commit();
+			// Commit guard - tables are now properly handled in manifest
+			guard.commit();
 
-		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(
-			&self.options.vlog,
-			&self.options.versioned_index,
+			// After successful manifest commit, cleanup obsolete vlog files and stale index entries
+			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+			drop(_imm_guard);
+			drop(manifest);
+			let min_oldest_vlog = resolve_vlog_cleanup_floor(
+				min_oldest_vlog,
+				&self.options.active_memtable,
+				&self.options.immutable_memtables,
+				"compaction",
+			);
+			cleanup_vlog_and_index(
+				&self.options.vlog,
+				&self.options.versioned_index,
 			min_oldest_vlog,
 			"compaction",
 		);

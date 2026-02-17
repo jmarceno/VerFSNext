@@ -22,15 +22,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::context::ProtoVersion;
-use super::file_system::{FileSystem};
+use super::file_system::FileSystem;
+#[cfg(feature = "abi-7-21")]
+use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyInit, ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
-#[cfg(feature = "abi-7-21")]
-use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_request::{Operation, Request};
-use super::{mount, FuseFs};
 #[cfg(feature = "abi-7-23")]
 use super::protocol::FATTR_CTIME;
 #[cfg(feature = "abi-7-9")]
@@ -40,6 +39,7 @@ use super::protocol::{
     FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_RELEASE_FLUSH,
 };
+use super::{mount, FuseFs};
 use crate::fs_util::{CreateParam, FileLockParam, RenameParam, SetAttrParam};
 
 /// We generally support async reads
@@ -89,25 +89,21 @@ mod _fuse_fd_clone {
         let cloned_fd = fcntl::open(devname, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())?;
         // use `OwnedFd` here is just to release the fd when error occurs
         // SAFETY: the `cloned_fd` is just opened
-        let cloned_fd = unsafe {
-            OwnedFd::from_raw_fd(cloned_fd)
-        };
+        let cloned_fd = unsafe { OwnedFd::from_raw_fd(cloned_fd) };
 
         fcntl::fcntl(cloned_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
 
         let mut result_fd: u32 = session_fd.cast();
         // SAFETY: `cloned_fd` is ensured to be valid, and `&mut result_fd` is a valid
         // pointer to a value on stack
-        unsafe {
-            fuse_fd_clone_impl(cloned_fd.as_raw_fd(), &mut result_fd)?
-        };
+        unsafe { fuse_fd_clone_impl(cloned_fd.as_raw_fd(), &mut result_fd)? };
         Ok(cloned_fd.into_raw_fd()) // use `into_raw_fd` to transfer the
                                     // ownership of the fd
     }
 }
 
-use _fuse_fd_clone::fuse_fd_clone;
 use crate::de::DeserializeError;
+use _fuse_fd_clone::fuse_fd_clone;
 
 /// A loop to read requests from FUSE device continuously
 #[allow(clippy::needless_pass_by_value)]
@@ -172,7 +168,7 @@ fn fuse_device_reader(
             }
         };
 
-        runtime_handle.block_on(async{
+        runtime_handle.block_on(async {
             process_fuse_request(
                 buffer,
                 size,
@@ -180,7 +176,8 @@ fn fuse_device_reader(
                 Arc::clone(&fs),
                 buffer_tx.clone(),
                 proto_version,
-            ).await
+            )
+            .await
         });
         // if spawn_result.is_err() {
         //     info!("Try to spawn task of `FuseRequest` after shutdow.");
@@ -255,10 +252,12 @@ pub struct Session<F: FileSystem + Send + Sync + 'static> {
     filesystem: Arc<F>,
     // fuse_request_spawn_handle: GcHandle,
 }
-pub async fn new_session(mount_path: &Path, fs: FuseFs)->anyhow::Result<Session<FuseFs>>{
-    let fuse_fd = mount::mount(mount_path).await.context("Failed to mount FUSE")?;
+pub async fn new_session(mount_path: &Path, fs: FuseFs) -> anyhow::Result<Session<FuseFs>> {
+    let fuse_fd = mount::mount(mount_path)
+        .await
+        .context("Failed to mount FUSE")?;
 
-    Ok(Session{
+    Ok(Session {
         fuse_fd: Arc::new(FuseFd(fuse_fd)),
         proto_version: AtomicCell::new(ProtoVersion::UNSPECIFIED),
         mount_path: mount_path.to_owned(),
@@ -657,15 +656,8 @@ async fn dispatch<'a>(
             info!("operation:write: {:?}", arg);
             assert_eq!(data.len(), arg.size.cast::<usize>());
             let reply = ReplyWrite::new(req.unique(), file);
-            fs.write(
-                req,
-                arg.fh,
-                arg.offset.cast(),
-                data,
-                arg.write_flags,
-                reply,
-            )
-            .await
+            fs.write(req, arg.fh, arg.offset.cast(), data, arg.write_flags, reply)
+                .await
         }
         Operation::Flush { arg } => {
             let reply = ReplyEmpty::new(req.unique(), file);
@@ -784,13 +776,13 @@ async fn dispatch<'a>(
 
         #[cfg(feature = "abi-7-11")]
         Operation::IoCtl { arg, data } => {
-            warn!("IoCtl not implemented, arg={:?}, data={:?}", arg, data);
-            not_implement_helper(req, file).await
+            warn!("IoCtl unsupported, arg={:?}, data={:?}", arg, data);
+            reply_errno(req, file, Errno::ENOTTY).await
         }
         #[cfg(feature = "abi-7-11")]
         Operation::Poll { arg } => {
-            error!("Poll not implemented, arg={:?}", arg);
-            not_implement_helper(req, file).await
+            error!("Poll unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
         }
         #[cfg(feature = "abi-7-15")]
         Operation::NotifyReply { data } => {
@@ -804,8 +796,8 @@ async fn dispatch<'a>(
         }
         #[cfg(feature = "abi-7-19")]
         Operation::FAllocate { arg } => {
-            error!("FAllocate not implemented, arg={:?}", arg);
-            not_implement_helper(req, file).await
+            error!("FAllocate unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
         }
         #[cfg(feature = "abi-7-21")]
         Operation::ReadDirPlus { arg } => {
@@ -830,8 +822,8 @@ async fn dispatch<'a>(
         }
         // #[cfg(feature = "abi-7-24")]
         Operation::LSeek { arg } => {
-            error!("LSeek not implemented, arg={:?}", arg);
-            not_implement_helper(req, file).await
+            error!("LSeek unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
         }
         // #[cfg(feature = "abi-7-28")]
         Operation::CopyFileRange { arg } => {
@@ -876,4 +868,9 @@ async fn dispatch<'a>(
 async fn not_implement_helper(req: &Request<'_>, file: &mut File) -> nix::Result<usize> {
     let reply = ReplyEmpty::new(req.unique(), file);
     reply.error_code(Errno::ENOSYS).await
+}
+
+async fn reply_errno(req: &Request<'_>, file: &mut File, errno: Errno) -> nix::Result<usize> {
+    let reply = ReplyEmpty::new(req.unique(), file);
+    reply.error_code(errno).await
 }

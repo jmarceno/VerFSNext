@@ -1,16 +1,16 @@
 use crate::error::AsyncFusexError;
 use crate::file_system::FileSystem;
 use crate::fs_util::*;
+#[cfg(feature = "abi-7-21")]
+use crate::fuse_reply::ReplyDirectoryPlus;
 use crate::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
-#[cfg(feature = "abi-7-21")]
-use crate::fuse_reply::ReplyDirectoryPlus;
 use crate::fuse_request::Request;
 #[cfg(feature = "abi-7-16")]
 use crate::protocol::FuseForgetOne;
-use crate::{VirtualFs, fs_util};
+use crate::{fs_util, VirtualFs};
 use async_trait::async_trait;
 use clippy_utilities::{Cast, OverflowArithmetic};
 use nix::errno::Errno;
@@ -31,7 +31,6 @@ impl FuseFs {
 
 #[async_trait]
 impl FileSystem for FuseFs {
-
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     async fn init(&self, req: &Request<'_>) -> nix::Result<()> {
@@ -542,7 +541,11 @@ impl FileSystem for FuseFs {
             }
 
             let payload = &buf[..read_size.min(buf.len())];
-            if let Err(e) = self.virtual_fs.write(nodeid_out, out_offset, payload, 0).await {
+            if let Err(e) = self
+                .virtual_fs
+                .write(nodeid_out, out_offset, payload, 0)
+                .await
+            {
                 return reply.error(e).await;
             }
 
@@ -818,12 +821,11 @@ impl FileSystem for FuseFs {
                                 dir_entry.name(),
                                 lookup_err,
                             );
-                            self.virtual_fs
-                                .getattr(dir_entry.ino())
-                                .await
-                                .map(|(ttl, file_attr)| {
+                            self.virtual_fs.getattr(dir_entry.ino()).await.map(
+                                |(ttl, file_attr)| {
                                     (ttl, fs_util::convert_to_fuse_attr(file_attr), 0)
-                                })
+                                },
+                            )
                         }
                     };
 
@@ -1340,7 +1342,9 @@ impl FileSystem for FuseFs {
                     name, parent,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.created(&ttl, fuse_attr, generation, fh, open_flags).await
+                reply
+                    .created(&ttl, fuse_attr, generation, fh, open_flags)
+                    .await
             }
             Err(AsyncFusexError::Unimplemented { context }) => {
                 debug!(
@@ -1477,9 +1481,7 @@ impl FileSystem for FuseFs {
                     "fusefilesystem call bmap() successfully mapped the block index of ino={} to block index of device",
                     ino,
                 );
-                // TODO: reply the block
-                // reply.bmap(block).await
-                reply.error_code(Errno::ENOSYS).await
+                reply.bmap(idx).await
             }
             Err(AsyncFusexError::Unimplemented { context }) => {
                 debug!(

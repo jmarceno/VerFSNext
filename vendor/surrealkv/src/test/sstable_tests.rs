@@ -73,7 +73,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(724, actual);
+	assert_eq!(602, actual);
 }
 
 #[test]
@@ -3987,6 +3987,11 @@ fn test_table_properties_persistence() {
 	let mut buffer = Vec::new();
 	let table_id = 42;
 	let opts = default_opts();
+	let expected_compression = opts
+		.compression_per_level
+		.first()
+		.copied()
+		.unwrap_or(crate::CompressionType::None);
 
 	// Step 1: Create TableWriter and add entries
 	let mut writer = TableWriter::new(&mut buffer, table_id, Arc::clone(&opts), 0);
@@ -4071,7 +4076,7 @@ fn test_table_properties_persistence() {
 	assert_eq!(meta.largest_seq_num, Some(1049), "Metadata largest seq num should match");
 
 	// Compression
-	assert_eq!(props.compression, crate::CompressionType::None, "Compression should be None");
+	assert_eq!(props.compression, expected_compression, "Compression should match table settings");
 
 	// Block properties
 	assert!(props.block_size > 0, "Block size should be tracked");

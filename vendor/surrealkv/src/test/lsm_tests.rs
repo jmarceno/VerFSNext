@@ -9,6 +9,7 @@ use crate::levels::LevelManifest;
 use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::{
+	CompressionType,
 	Error,
 	InternalKeyKind,
 	Key,
@@ -30,6 +31,7 @@ fn create_test_options(path: PathBuf, customizations: impl FnOnce(&mut Options))
 	let mut opts = Options {
 		path,
 		vlog_value_threshold: 0,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	};
 	customizations(&mut opts);

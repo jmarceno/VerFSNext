@@ -15,6 +15,7 @@ fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 
 	let mut opts = opts.unwrap_or(Options {
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	});
 
@@ -112,6 +113,7 @@ async fn test_prefill_file_handles() {
 	let opts = Options {
 		vlog_max_file_size: 1024, // Small file size to force multiple files
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	};
 	// Create initial VLog and add data to create multiple files
@@ -183,10 +185,11 @@ async fn test_prefill_file_handles() {
 	let retrieved_new = vlog2.get(&new_pointer).unwrap();
 	assert_eq!(*retrieved_new, new_value);
 
-	// Verify that the new file_id is not one of the old ones
+	// After restart, writes must continue on the most recent file (or a newer one after
+	// rotation), never on an older historical file.
 	assert!(
-		!unique_file_ids.contains(&new_pointer.file_id),
-		"New data should not be written to an old file"
+		new_pointer.file_id >= **max_file_id,
+		"New data should not be written to an older file"
 	);
 
 	// Check that file handles are properly cached
@@ -465,6 +468,7 @@ async fn test_vlog_restart_continues_last_file() {
 		path: temp_dir.path().to_path_buf(),
 		vlog_max_file_size,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	};
 
@@ -605,6 +609,7 @@ async fn test_vlog_restart_with_multiple_files() {
 		path: temp_dir.path().to_path_buf(),
 		vlog_max_file_size: 800,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	};
 
@@ -756,6 +761,7 @@ async fn test_vlog_rotation_uses_projected_append_size() {
 		path: temp_dir.path().to_path_buf(),
 		vlog_max_file_size: max_file_size,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	});
 
@@ -796,6 +802,7 @@ async fn test_vlog_single_oversized_entry_stays_atomic() {
 		path: temp_dir.path().to_path_buf(),
 		vlog_max_file_size: max_file_size,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
+		vlog_compression: CompressionType::None,
 		..Default::default()
 	});
 
