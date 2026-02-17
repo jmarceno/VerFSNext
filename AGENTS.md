@@ -5,8 +5,8 @@ WHERE NOT EXPLICITLY ASKED FOR. **ALL CHANGES ARE BREAKING** AND **WE DO NOT CAR
 
 
 ## Main Priorities (in order of importance)
-1. Never stall reads
-2. Never lose data
+1. Never lose data
+2. Never stall reads
 3. Keep performance as high as possible
 **Every decision must be made keeping these priorities in mind.**
 
@@ -23,7 +23,7 @@ VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-1
     - Deduplication - in-line
     - Compression - in-line
     - Snapshots - Snapshots can be seem and interacted through the .snapshots folder at root
-    -Encripted .vault folder at root
+    - Encrypted .vault folder at root
 ### Code Organization
 - **VENDOR**: code under `vendor/` has been hard forked and you must treat as our own code, making any needed fixes and modifications.
 

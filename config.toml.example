@@ -1,0 +1,5 @@
+mount_point = "/tmp/verfsnext-mnt"
+data_dir = "/tmp/verfsnext-data"
+sync_interval_ms = 5000
+batch_max_blocks = 3000
+batch_flush_interval_ms = 500

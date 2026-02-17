@@ -1,0 +1,5 @@
+mount_point = "/mnt/verfs/"
+data_dir = "/mnt/work/verfs/"
+sync_interval_ms = 5000
+batch_max_blocks = 3000
+batch_flush_interval_ms = 500

@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    ".",
+    "vendor/async-fusex",
+    "vendor/surrealkv",
+]
+resolver = "2"
+
+[package]
+name = "verfsnext"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.97"
+async-fusex = { path = "vendor/async-fusex" }
+async-trait = "0.1.88"
+bytecheck = "0.6.12"
+nix = { version = "0.26.4", features = ["fs", "user"] }
+parking_lot = "0.12.3"
+rkyv = { version = "0.7.45", features = ["validation"] }
+serde = { version = "1.0.219", features = ["derive"] }
+surrealkv = { path = "vendor/surrealkv" }
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.14"
+toml = "0.8.20"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

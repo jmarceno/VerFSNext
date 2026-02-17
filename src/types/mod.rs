@@ -1,0 +1,180 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use bytecheck::CheckBytes;
+use rkyv::{
+    Archive, Deserialize, Serialize, check_archived_root,
+    de::deserializers::SharedDeserializeMap,
+};
+
+pub const ROOT_INODE: u64 = 1;
+pub const BLOCK_SIZE: usize = 4096;
+
+pub const INODE_KIND_FILE: u8 = 1;
+pub const INODE_KIND_DIR: u8 = 2;
+pub const INODE_KIND_SYMLINK: u8 = 3;
+
+pub const KEY_PREFIX_INODE: u8 = b'I';
+pub const KEY_PREFIX_DIRENT: u8 = b'D';
+pub const KEY_PREFIX_EXTENT: u8 = b'E';
+pub const KEY_PREFIX_CHUNK: u8 = b'C';
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct InodeRecord {
+    pub ino: u64,
+    pub parent: u64,
+    pub kind: u8,
+    pub perm: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub size: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: u32,
+    pub mtime_sec: i64,
+    pub mtime_nsec: u32,
+    pub ctime_sec: i64,
+    pub ctime_nsec: u32,
+    pub generation: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct DirentRecord {
+    pub ino: u64,
+    pub kind: u8,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct ExtentRecord {
+    pub chunk_hash: [u8; 16],
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct ChunkRecord {
+    pub refcount: u64,
+    pub pack_id: u64,
+    pub offset: u64,
+    pub len: u32,
+}
+
+pub fn encode_rkyv<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: Archive + Serialize<rkyv::ser::serializers::AllocSerializer<256>>,
+{
+    rkyv::to_bytes::<_, 256>(value)
+        .map(|bytes| bytes.to_vec())
+        .context("rkyv encode failed")
+}
+
+pub fn decode_rkyv<T>(bytes: &[u8]) -> Result<T>
+where
+    T: Archive,
+    T::Archived: for<'a> CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>
+        + Deserialize<T, SharedDeserializeMap>,
+{
+    let archived = check_archived_root::<T>(bytes)
+        .map_err(|err| anyhow::anyhow!("rkyv validation failed: {err:?}"))?;
+    let mut deserializer = SharedDeserializeMap::default();
+    archived
+        .deserialize(&mut deserializer)
+        .context("rkyv decode failed")
+}
+
+pub fn inode_key(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8);
+    key.push(KEY_PREFIX_INODE);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+pub fn dirent_prefix(parent: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8 + 1);
+    key.push(KEY_PREFIX_DIRENT);
+    key.extend_from_slice(&parent.to_be_bytes());
+    key.push(0);
+    key
+}
+
+pub fn dirent_key(parent: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = dirent_prefix(parent);
+    key.extend_from_slice(name);
+    key
+}
+
+pub fn extent_prefix(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8);
+    key.push(KEY_PREFIX_EXTENT);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+pub fn extent_key(ino: u64, block_idx: u64) -> Vec<u8> {
+    let mut key = extent_prefix(ino);
+    key.extend_from_slice(&block_idx.to_be_bytes());
+    key
+}
+
+pub fn chunk_key(hash: &[u8; 16]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 16);
+    key.push(KEY_PREFIX_CHUNK);
+    key.extend_from_slice(hash);
+    key
+}
+
+pub fn sys_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + name.len());
+    key.extend_from_slice(b"SYS:");
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != 0xFF {
+            end[idx] = end[idx].saturating_add(1);
+            end.truncate(idx + 1);
+            return end;
+        }
+    }
+    end.push(0);
+    end
+}
+
+pub fn decode_dirent_name(key: &[u8]) -> Option<&[u8]> {
+    if key.len() < 10 || key[0] != KEY_PREFIX_DIRENT {
+        return None;
+    }
+    if key[9] != 0 {
+        return None;
+    }
+    Some(&key[10..])
+}
+
+pub fn system_time_to_parts(ts: SystemTime) -> (i64, u32) {
+    match ts.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            duration.subsec_nanos(),
+        ),
+        Err(err) => {
+            let duration = err.duration();
+            (
+                -i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                duration.subsec_nanos(),
+            )
+        }
+    }
+}
+
+pub fn parts_to_system_time(sec: i64, nsec: u32) -> SystemTime {
+    if sec >= 0 {
+        UNIX_EPOCH + Duration::new(sec as u64, nsec)
+    } else {
+        UNIX_EPOCH - Duration::new(sec.unsigned_abs(), nsec)
+    }
+}

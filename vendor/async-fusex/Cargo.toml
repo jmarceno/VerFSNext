@@ -1,0 +1,50 @@
+[package]
+name = "async-fusex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aligned-utils = "1.0.2"
+anyhow = "1.0.97"
+async-trait = "0.1.88"
+better_as = { package = "better-as", version = "0.2.0" }
+clippy-utilities = "0.1.0"
+crossbeam-channel = "0.5.15"
+crossbeam-utils = "0.8.21"
+futures = "0.3.31"
+libc = "0.2.171"
+memchr = "2.7.4"
+nix = { version = "0.26.4", features = ["fs", "ioctl", "mount", "socket", "uio", "user"] }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "1.0.69"
+tokio = { version = "1.44.1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = "0.7.14"
+tracing = "0.1.41"
+walkdir = "2.5.0"
+
+[features]
+default = ["abi-7-31"]
+abi-7-9 = []
+abi-7-10 = ["abi-7-9"]
+abi-7-11 = ["abi-7-10"]
+abi-7-12 = ["abi-7-11"]
+abi-7-13 = ["abi-7-12"]
+abi-7-14 = ["abi-7-13"]
+abi-7-15 = ["abi-7-14"]
+abi-7-16 = ["abi-7-15"]
+abi-7-17 = ["abi-7-16"]
+abi-7-18 = ["abi-7-17"]
+abi-7-19 = ["abi-7-18"]
+abi-7-20 = ["abi-7-19"]
+abi-7-21 = ["abi-7-20"]
+abi-7-22 = ["abi-7-21"]
+abi-7-23 = ["abi-7-22"]
+abi-7-24 = ["abi-7-23"]
+abi-7-25 = ["abi-7-24"]
+abi-7-26 = ["abi-7-25"]
+abi-7-27 = ["abi-7-26"]
+abi-7-28 = ["abi-7-27"]
+abi-7-29 = ["abi-7-28"]
+abi-7-30 = ["abi-7-29"]
+abi-7-31 = ["abi-7-30"]
+abi-7-32 = ["abi-7-31"]

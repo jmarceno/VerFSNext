@@ -126,7 +126,8 @@ impl FileSystem for FuseFs {
                     "fusefilesystem call open() successfully opened ino={} with flags={:?}, the fd={}",
                     ino, flags, fd,
                 );
-                reply.opened(fd, flags).await
+                // (jmarceno) No flag (0) looks like the correct behavior here - https://gemini.google.com/share/ec39ff53872f
+                reply.opened(fd, 0).await
             }
             Err(e) => {
                 debug!(
@@ -716,7 +717,7 @@ impl FileSystem for FuseFs {
                     "fusefilesystem call opendir() successfully duplicated the file handler of ino={} with flags={:?}",
                     ino, flags,
                 );
-                reply.opened(new_fd, flags).await
+                reply.opened(new_fd, 0).await
             }
             Err(e) => {
                 debug!(

@@ -15,6 +15,22 @@ This document provides a comprehensive overview of the internal design, data flo
 7. [VLog Garbage Collection](#vlog-garbage-collection)
 8. [Recovery](#recovery)
 9. [Checkpoint and Restore](#checkpoint-and-restore)
+10. [Workspace Integration](#workspace-integration)
+
+---
+
+## Workspace Integration
+
+SurrealKV is now wired as a workspace member in VerFSNext and compiled from `vendor/surrealkv` directly.
+
+### Build Manifest
+
+- Crate manifest: `vendor/surrealkv/Cargo.toml`
+- Added explicit dependencies required by the current source tree:
+  - `guardian` for lock guard extraction patterns used by snapshot code.
+  - `lz4_flex` for WAL/SST/VLog compression paths where `CompressionType::Lz4` is selected.
+
+This keeps the vendored engine buildable as a first-class in-repo component for VerFSNext.
 
 ---
 
