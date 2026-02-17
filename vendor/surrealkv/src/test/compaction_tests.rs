@@ -1018,7 +1018,7 @@ fn test_select_tables_for_compaction_bug() {
 
 	// Call select_tables_for_compaction
 	let selected_tables =
-		strategy.select_tables_for_compaction(&source_level, &next_level, 0).unwrap();
+		strategy.select_tables_for_compaction(&source_level, &next_level, 0, false).unwrap();
 
 	// Check for duplicates
 	let mut unique_ids = HashSet::new();
@@ -1114,7 +1114,7 @@ fn test_l1_to_l2_table_selection() {
 
 	// Call select_tables_for_compaction for L1 → L2 (source_level_num = 1)
 	let selected_tables =
-		strategy.select_tables_for_compaction(&source_level, &next_level, 1).unwrap();
+		strategy.select_tables_for_compaction(&source_level, &next_level, 1, false).unwrap();
 
 	// For L1+, we should select only ONE table from source level
 	let source_table_ids: HashSet<_> = source_level.tables.iter().map(|t| t.id).collect();
@@ -1230,7 +1230,7 @@ fn test_l1_compaction_bounds_correctness() {
 
 	// Call select_tables_for_compaction for L1 → L2
 	let selected_tables =
-		strategy.select_tables_for_compaction(&source_level, &next_level, 1).unwrap();
+		strategy.select_tables_for_compaction(&source_level, &next_level, 1, true).unwrap();
 
 	// Verify we selected exactly ONE L1 table
 	let source_table_ids: HashSet<_> = source_level.tables.iter().map(|t| t.id).collect();
@@ -2984,7 +2984,8 @@ fn test_clean_cut_integration_shared_boundary() {
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (largest), and should expand to include File 2
-	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+	let selected =
+		strategy.select_tables_for_compaction(source_level, next_level, 1, false).unwrap();
 
 	// Verify File 1 and File 2 are both included (shared "foo" boundary)
 	assert!(selected.contains(&1), "File 1 should be included (initially selected as largest)");
@@ -3060,7 +3061,8 @@ fn test_clean_cut_integration_chain_expansion() {
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
 	// File 2 should be selected (largest), and should expand to include Files 1 and 3
-	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+	let selected =
+		strategy.select_tables_for_compaction(source_level, next_level, 1, false).unwrap();
 
 	// Verify all three files in the chain are included
 	assert!(selected.contains(&1), "File 1 should be included (chain expansion)");
@@ -3128,7 +3130,8 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (oldest sequence), and should expand to include File 2
-	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+	let selected =
+		strategy.select_tables_for_compaction(source_level, next_level, 1, false).unwrap();
 
 	// Verify File 1 and File 2 are both included (shared "foo" boundary)
 	assert!(selected.contains(&1), "File 1 should be included (initially selected as oldest)");
@@ -3196,7 +3199,8 @@ fn test_clean_cut_integration_no_expansion() {
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (largest), but should NOT expand (no shared boundaries)
-	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+	let selected =
+		strategy.select_tables_for_compaction(source_level, next_level, 1, false).unwrap();
 
 	// Verify only File 1 is selected (no expansion needed)
 	assert_eq!(

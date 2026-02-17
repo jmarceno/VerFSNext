@@ -468,7 +468,7 @@ fn test_range_skips_non_overlapping_tables() {
 		Bound::Included("z0".as_bytes()),
 		Bound::Excluded("zz".as_bytes()),
 	);
-	let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range);
+	let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range, 1);
 
 	let items = collect_all(&mut merge_iter).unwrap();
 	assert_eq!(items.len(), 2);
@@ -827,7 +827,6 @@ fn create_iter_state_with_tables(
 	l0_tables: Vec<Arc<Table>>,
 	l1_tables: Vec<Arc<Table>>,
 	l2_tables: Vec<Arc<Table>>,
-	_opts: Arc<Options>,
 ) -> IterState {
 	let mut level0 = Level::default();
 	for table in l0_tables {
@@ -881,14 +880,14 @@ fn test_level0_tables_before_range_skipped() {
 	let table3 = create_test_table_with_range(3, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
+		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![]);
 
 	// Query range: [j-z] - all tables are before this range
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"j".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as all are before range");
@@ -909,14 +908,14 @@ fn test_level0_tables_after_range_skipped() {
 	let table3 = create_test_table_with_range(3, "s", "u", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
+		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![]);
 
 	// Query range: [a-k] - all tables are after this range
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"k".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as all are after range");
@@ -937,14 +936,14 @@ fn test_level0_overlapping_tables_included() {
 	let table3 = create_test_table_with_range(3, "f", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
+		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![]);
 
 	// Query range: [d-h] - all tables overlap with this range
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	// All 3 tables should contribute items
@@ -970,8 +969,7 @@ fn test_level0_mixed_overlap_scenarios() {
 	let iter_state = create_iter_state_with_tables(
 		vec![table1, table2, table3, table4, table5],
 		vec![],
-		vec![],
-		opts,
+		vec![]
 	);
 
 	// Query range: [f-j] - should include tables [e-g], [i-k], [d-f], [j-m]
@@ -979,7 +977,7 @@ fn test_level0_mixed_overlap_scenarios() {
 		Bound::Included(b"f".as_slice()),
 		Bound::Excluded(b"j".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	// Should have items from multiple overlapping tables
@@ -1005,8 +1003,7 @@ fn test_level1_binary_search_correct_range() {
 	let iter_state = create_iter_state_with_tables(
 		vec![],
 		vec![table1, table2, table3, table4, table5],
-		vec![],
-		opts,
+		vec![]
 	);
 
 	// Query range: [e-h] - should include tables [e-f], [g-h]
@@ -1014,7 +1011,7 @@ fn test_level1_binary_search_correct_range() {
 		Bound::Included(b"e".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from L1 tables in range");
@@ -1035,14 +1032,14 @@ fn test_level1_query_before_all_tables() {
 	let table3 = create_test_table_with_range(13, "j", "l", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
+		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![]);
 
 	// Query range: [a-c] - before all tables
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"c".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
@@ -1063,14 +1060,14 @@ fn test_level1_query_after_all_tables() {
 	let table3 = create_test_table_with_range(13, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
+		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![]);
 
 	// Query range: [m-z] - after all tables
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"m".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
@@ -1091,14 +1088,14 @@ fn test_level1_query_spans_all_tables() {
 	let table3 = create_test_table_with_range(13, "h", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
+		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![]);
 
 	// Query range: [a-z] - spans all tables
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from all L1 tables");
@@ -1116,14 +1113,14 @@ fn test_bound_included_start_and_end() {
 	// Create table with keys: "d1", "d5", "h"
 	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Query with Included bounds - should include all keys from d to h
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let items = collect_all(&mut iter).unwrap();
 	assert!(!items.is_empty(), "Should have items in inclusive range");
@@ -1141,7 +1138,7 @@ fn test_bound_excluded_start_and_end() {
 	// Create table with keys: "d1", "d5", "h"
 	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Query with Excluded bounds - "d" and "h" exact matches should be excluded
 	// But "d1", "d5" are > "d" so they should be included
@@ -1149,7 +1146,7 @@ fn test_bound_excluded_start_and_end() {
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let items = collect_all(&mut iter).unwrap();
 	// Keys "d1" and "d5" should be included (they're > "d" and < "h")
@@ -1168,12 +1165,12 @@ fn test_bound_unbounded_start() {
 
 	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Query with unbounded start
 	let internal_range =
 		crate::user_range_to_internal_range(Bound::Unbounded, Bound::Included(b"h".as_slice()));
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should iterate from beginning with unbounded start");
@@ -1190,12 +1187,12 @@ fn test_bound_unbounded_end() {
 
 	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Query with unbounded end
 	let internal_range =
 		crate::user_range_to_internal_range(Bound::Included(b"d".as_slice()), Bound::Unbounded);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should iterate to end with unbounded end");
@@ -1213,10 +1210,10 @@ fn test_fully_unbounded_range() {
 	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
 	let table2 = create_test_table_with_range(2, "n", "z", 4, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![]);
 
 	// Query with fully unbounded range
-	let iter = KMergeIterator::new_from(iter_state, (Bound::Unbounded, Bound::Unbounded));
+	let iter = KMergeIterator::new_from(iter_state, (Bound::Unbounded, Bound::Unbounded), opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should return all keys with fully unbounded range");
@@ -1232,13 +1229,13 @@ fn test_empty_levels() {
 	let opts = Arc::new(opts);
 
 	// Create IterState with no tables
-	let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![], vec![], vec![]);
 
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included("a".as_bytes()),
 		Bound::Excluded("z".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "Iterator with no tables should return no items");
@@ -1255,14 +1252,14 @@ fn test_single_key_range() {
 
 	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Query for exact single key
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included(b"a1".as_slice()),
 		Bound::Included(b"a1".as_slice()),
 	);
-	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let items = collect_all(&mut iter).unwrap();
 	// Should return at most 1 item
@@ -1282,14 +1279,14 @@ fn test_inverted_range() {
 
 	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
 
-	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
+	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![]);
 
 	// Inverted range: start > end
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included("z".as_bytes()),
 		Bound::Excluded("a".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "Inverted range should return no items");
@@ -1310,14 +1307,14 @@ fn test_mixed_level0_and_level1_tables() {
 	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
-		create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);
+		create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![]);
 
 	// Query that overlaps with both levels
 	let internal_range = crate::user_range_to_internal_range(
 		Bound::Included("e".as_bytes()),
 		Bound::Excluded("k".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range);
+	let iter = KMergeIterator::new_from(iter_state, internal_range, opts.compaction_tiered_levels);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from both L0 and L1 tables");

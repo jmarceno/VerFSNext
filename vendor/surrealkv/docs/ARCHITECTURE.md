@@ -29,6 +29,18 @@ SurrealKV is now wired as a workspace member in VerFSNext and compiled from `ven
 - Added explicit dependencies required by the current source tree:
   - `guardian` for lock guard extraction patterns used by snapshot code.
   - `lz4_flex` for WAL/SST/VLog compression paths where `CompressionType::Lz4` is selected.
+- Added explicit **test-only** dependencies so the vendored crate can run
+  in-workspace test targets without external manifest patching:
+  - `test-log`, `tempdir`, `tempfile`, and `fastrand`
+  - test `tokio` feature set (`macros`, `rt-multi-thread`, `sync`, `time`)
+
+### Test-API Drift Handling
+
+- Upstream internal test call sites were aligned with current core APIs:
+  - `KMergeIterator::new_from(iter_state, range, tiered_levels)`
+  - `Strategy::select_tables_for_compaction(..., include_target_overlaps)`
+- This keeps vendored tests compiling against the current compaction and
+  snapshot iterator interfaces.
 
 This keeps the vendored engine buildable as a first-class in-repo component for VerFSNext.
 
