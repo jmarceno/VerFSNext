@@ -103,29 +103,65 @@ The refactoring of `surrealkv` to utilize `rkyv` for zero-copy serialization is 
 
 **Verdict:** No changes recommended for VLog format.
 
-## Implementation Plan
+## Implementation Plan (Amended with Code Insertion Points)
 
-### Phase 1: WAL & Batch Refactoring (Highest Impact)
-1.  Add `rkyv` dependency.
-2.  Define `Batch` and `BatchEntry` with `#[derive(Archive, Serialize, Deserialize)]`.
-3.  Update `CommitPipeline` to use `rkyv::to_bytes::<_, 4096>(batch)` (scratch buffer size TBD).
-4.  Update `Wal::writer` to accept `AlignedVec`.
-5.  Update `Wal::reader` and recovery logic to use `rkyv::access::<Batch>` and iterate over the archived entries.
-6.  *Breaking Change:* This invalidates existing WAL files.
+### Phase 1: WAL & Batch Refactoring (Highest Impact, No New Unsafe)
+1.  Add `rkyv` dependency in `vendor/surrealkv/Cargo.toml`.
+2.  Convert `Batch` / `BatchEntry` in `vendor/surrealkv/src/batch.rs`:
+    - keep runtime-facing structs, add archive equivalents or derive where possible,
+    - replace `Batch::encode` and `Batch::decode` with `rkyv::to_bytes` + validated access.
+3.  Update commit write path in `vendor/surrealkv/src/lsm.rs` (`impl CommitEnv for LsmCommitEnv`, `write`):
+    - replace `processed_batch.encode()?` with archived bytes generation,
+    - keep sequencing, VLog ordering, and WAL-before-index ordering unchanged.
+4.  Keep WAL writer interface slice-based (`vendor/surrealkv/src/wal/writer.rs`, `Writer::add_record`) and pass archived bytes by slice (no writer-level unsafe needed).
+5.  Update WAL recovery in `vendor/surrealkv/src/wal/recovery.rs` (`replay_wal`) to decode through validated archived access instead of manual `Batch::decode`.
+6.  *Breaking Change:* invalidates existing WAL files.
 
-### Phase 2 will not be implemented as it requires unsafe 
-### Phase 2: MemTable Layout Optimization
-1.  Modify `Node` struct in `skiplist.rs`.
-2.  Update `new_node` allocator to reserve space for `trailer` and `timestamp` contiguous with `key`.
-3.  Update `SkiplistIterator` to return `InternalKeyRef` pointing directly to Arena memory.
-4.  *Internal Change:* No disk format change, but requires careful unsafe code modification.
+### Phase 2: MemTable Layout Optimization (Deferred, Unsafe-Heavy)
+This phase remains explicitly deferred.
 
-### Phase 3: SSTable Index & Meta
-1.  Define `Index` and `TableMetadata` using `rkyv`.
-2.  Update `TableWriter` to serialize these structures using `rkyv`.
-3.  Update `Table` reader to map/load these blocks and access them via `rkyv`.
-4.  *Breaking Change:* Invalidates existing SSTables.
+Planned insertion points if revisited:
+1.  `vendor/surrealkv/src/memtable/skiplist.rs` (`Node`, `new_node`, iterator key access).
+2.  `vendor/surrealkv/src/memtable/arena.rs` (allocation layout and raw byte slicing helpers).
+3.  `vendor/surrealkv/src/memtable/skiplist.rs` (`SkiplistIterator::entry`) to avoid per-entry key rebuild.
+
+This path is intentionally skipped because it requires delicate unsafe memory layout work.
+
+### Phase 3: SSTable Index & Metadata Refactoring (High Impact)
+1.  Refactor metadata codec in `vendor/surrealkv/src/sstable/meta.rs`:
+    - `Properties::{encode,decode}`,
+    - `TableMetadata::{encode,decode}`.
+2.  Refactor index materialization in `vendor/surrealkv/src/sstable/index_block.rs` (`Index::new`) to consume archived index entries directly.
+3.  Update table open/read path in `vendor/surrealkv/src/sstable/table.rs`:
+    - `read_writer_meta_properties`,
+    - `Table::new`,
+    - any metadata/index decode callsites.
+4.  *Breaking Change:* invalidates existing SSTables.
+
+## Additional Unsafe-Sensitive Areas to Keep Deferred
+
+If optimized aggressively for zero-copy, these areas are likely to require new or expanded unsafe and should remain out of scope for now:
+
+1.  `vendor/surrealkv/src/commit.rs` (`CommitQueue::{enqueue,dequeue_applied}`):
+    raw-pointer queue ownership already relies on unsafe (`Arc::into_raw`/`Arc::from_raw`).
+2.  `vendor/surrealkv/src/snapshot.rs` self-referential iterator state:
+    current iterator wiring already uses documented unsafe lifetime pinning.
+3.  `vendor/surrealkv/src/bplustree/tree.rs` and `vendor/surrealkv/src/sstable/bloom.rs`:
+    low-level byte parsing currently uses unsafe pointer reads for speed.
+
+## Additional Improvements Not to Miss (Safe/Low-Risk)
+
+1.  Add explicit archive validation/fallback errors at decode boundaries (WAL and SSTable metadata/index), so corruption reports stay actionable.
+2.  Add clear format version markers for WAL and SSTable metadata/index archives to make hard breaks deterministic during startup/recovery.
+3.  Reduce avoidable copies in hot read paths after the main refactor, notably `Table::get` in `vendor/surrealkv/src/sstable/table.rs` where values are currently copied via `to_vec()`.
+
+## VerFSNext Changes Needed to Maximize Benefit
+
+1.  Add/propagate storage format version guards in VerFSNext startup and mount flow, so WAL/SSTable format breaks fail fast with explicit operator-facing messages.
+2.  Update VerFSNext recovery and durability tests to include the new WAL archive decode path and corruption diagnostics.
+3.  Expand read-path benchmarks and telemetry around mount/recovery latency and point-lookups to confirm the expected zero-copy wins from Phase 1 and Phase 3.
+4.  Re-tune cache sizing defaults (`metadata`, `chunk`, `pack-index`) after the index/meta memory footprint changes to reclaim memory or improve hit rate.
 
 ## Risks & Mitigation
 -   **Disk Format Compatibility:** All proposed changes are breaking, which is not a problem as there are no consumers other the VerFSNext and it is still in pre-alpha. So VerFSNext will update its API.
--   **Unsafe Code:** `rkyv` guarantees are strong, but manual memory layout changes in `Skiplist` (Phase 2) involve `unsafe` Rust, this is why we are not implementing phase 2.
+-   **Unsafe Code Expansion:** `rkyv` itself does not require us to add unsafe for Phase 1/3. Keep Phase 2 and other unsafe-sensitive optimizations deferred.
