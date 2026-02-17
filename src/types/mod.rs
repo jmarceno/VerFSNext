@@ -3,8 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bytecheck::CheckBytes;
 use rkyv::{
-    Archive, Deserialize, Serialize, check_archived_root,
-    de::deserializers::SharedDeserializeMap,
+    check_archived_root, de::deserializers::SharedDeserializeMap, Archive, Deserialize, Serialize,
 };
 
 pub const ROOT_INODE: u64 = 1;
@@ -18,6 +17,8 @@ pub const KEY_PREFIX_INODE: u8 = b'I';
 pub const KEY_PREFIX_DIRENT: u8 = b'D';
 pub const KEY_PREFIX_EXTENT: u8 = b'E';
 pub const KEY_PREFIX_CHUNK: u8 = b'C';
+pub const KEY_PREFIX_XATTR: u8 = b'X';
+pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[archive(check_bytes)]
@@ -125,6 +126,27 @@ pub fn chunk_key(hash: &[u8; 16]) -> Vec<u8> {
     key
 }
 
+pub fn xattr_prefix(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8 + 1);
+    key.push(KEY_PREFIX_XATTR);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key.push(0);
+    key
+}
+
+pub fn xattr_key(ino: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = xattr_prefix(ino);
+    key.extend_from_slice(name);
+    key
+}
+
+pub fn symlink_target_key(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8);
+    key.push(KEY_PREFIX_SYMLINK);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
 pub fn sys_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + name.len());
     key.extend_from_slice(b"SYS:");
@@ -147,6 +169,16 @@ pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
 
 pub fn decode_dirent_name(key: &[u8]) -> Option<&[u8]> {
     if key.len() < 10 || key[0] != KEY_PREFIX_DIRENT {
+        return None;
+    }
+    if key[9] != 0 {
+        return None;
+    }
+    Some(&key[10..])
+}
+
+pub fn decode_xattr_name(key: &[u8]) -> Option<&[u8]> {
+    if key.len() < 10 || key[0] != KEY_PREFIX_XATTR {
         return None;
     }
     if key[9] != 0 {
