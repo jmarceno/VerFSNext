@@ -113,11 +113,11 @@ Activate full inline chunking + dedup + compression pipeline with current hash-a
 
 - UltraCDC chunking in streaming mode (no whole-file memory buffering).
 - XXH3-128 hashing with collision-ignore policy (as specified).
-- zstd compression + rayon parallel workers.
+- zstd compression + rayon parallel workers for data blocks (blocks are compressed in parallel and added to the pack as they complete).
 - Hash-only two-index design finalized:
   - Metadata `C:{chunk_hash128} -> pack_id`
   - Pack-local index `chunk_hash128 -> byte offset`
-- Moka caches for metadata/chunk/pack-index hot paths.
+- Moka caches for metadata/chunk/pack-index hot paths. (Always bounded to entry count or memory limit, no unbounded growth.)
 - Writer batching fully active (`3000` blocks or `500ms`) while preserving synchronous syscall contract.
 
 ## Output
