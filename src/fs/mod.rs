@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use async_fusex::error::{AsyncFusexError, AsyncFusexResult};
@@ -29,13 +29,15 @@ use crate::data::chunker::UltraStreamChunker;
 use crate::data::compress::{compress_parallel, PendingChunk};
 use crate::data::hash::hash128;
 use crate::data::pack::PackStore;
+use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
-    symlink_target_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord, DirentRecord,
-    ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK,
+    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
+    DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_KIND_DIR,
+    INODE_KIND_FILE, INODE_KIND_SYMLINK,
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
@@ -51,6 +53,13 @@ struct FileLockState {
     end: u64,
     typ: u32,
     pid: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ZeroRefCandidate {
+    hash: [u8; 16],
+    pack_id: u64,
+    block_size_bytes: u32,
 }
 
 pub struct VerFs {
@@ -69,7 +78,9 @@ struct FsCore {
     next_handle: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
+    last_mutation_ms: AtomicU64,
     write_lock: Mutex<()>,
+    gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
 }
 
@@ -99,7 +110,9 @@ impl VerFs {
             next_handle: AtomicU64::new(1),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
+            last_mutation_ms: AtomicU64::new(now_millis()),
             write_lock: Mutex::new(()),
+            gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
         });
 
@@ -325,12 +338,8 @@ impl FsCore {
             if let Some(raw) = txn.get(key.clone())? {
                 let mut chunk: ChunkRecord = decode_rkyv(&raw)?;
                 let next_ref = chunk.refcount as i64 + delta;
-                if next_ref <= 0 {
-                    txn.delete(key)?;
-                } else {
-                    chunk.refcount = next_ref as u64;
-                    txn.set(key, encode_rkyv(&chunk)?)?;
-                }
+                chunk.refcount = next_ref.max(0) as u64;
+                txn.set(key, encode_rkyv(&chunk)?)?;
                 continue;
             }
 
@@ -534,6 +543,7 @@ impl FsCore {
                 format!("truncate inode {} is not a regular file", ino),
             ));
         }
+        FsCore::ensure_inode_writable(&inode, "truncate")?;
 
         if new_size == inode.size {
             return Ok(inode);
@@ -622,6 +632,7 @@ impl FsCore {
                 Ok(())
             })
             .await?;
+        self.mark_mutation();
 
         Ok(inode)
     }
@@ -636,6 +647,7 @@ impl FsCore {
                 format!("write target inode {} is not a regular file", op.ino),
             ));
         }
+        FsCore::ensure_inode_writable(&inode, "write")?;
 
         let write_end = op
             .offset
@@ -731,6 +743,7 @@ impl FsCore {
                 Ok(())
             })
             .await?;
+        self.mark_mutation();
 
         self.dedup_hits.fetch_add(dedup_hits, Ordering::Relaxed);
         self.dedup_misses.fetch_add(dedup_misses, Ordering::Relaxed);
@@ -780,6 +793,28 @@ impl FsCore {
         decode_rkyv(&raw)
     }
 
+    fn ensure_parent_dir_writable_in_txn(
+        txn: &surrealkv::Transaction,
+        parent: u64,
+        context: &'static str,
+    ) -> Result<InodeRecord> {
+        let Some(parent_raw) = txn.get(inode_key(parent))? else {
+            return Err(anyhow_errno(
+                Errno::ENOENT,
+                format!("{context}: parent inode {parent} not found"),
+            ));
+        };
+        let parent_inode: InodeRecord = decode_rkyv(&parent_raw)?;
+        if parent_inode.kind != INODE_KIND_DIR {
+            return Err(anyhow_errno(
+                Errno::ENOTDIR,
+                format!("{context}: parent inode {parent} is not a directory"),
+            ));
+        }
+        FsCore::ensure_inode_writable(&parent_inode, context)?;
+        Ok(parent_inode)
+    }
+
     fn create_inode_in_txn(
         txn: &mut surrealkv::Transaction,
         parent: INum,
@@ -800,6 +835,12 @@ impl FsCore {
             return Err(anyhow_errno(
                 Errno::ENOTDIR,
                 format!("create: parent inode {} is not a directory", parent),
+            ));
+        }
+        if (parent_inode.flags & INODE_FLAG_READONLY) != 0 {
+            return Err(anyhow_errno(
+                Errno::EROFS,
+                format!("create: parent inode {} is read-only", parent),
             ));
         }
 
@@ -838,6 +879,7 @@ impl FsCore {
             ctime_sec: sec,
             ctime_nsec: nsec,
             generation: 1,
+            flags: 0,
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
@@ -860,6 +902,235 @@ impl FsCore {
         }
 
         Ok(inode)
+    }
+
+    fn ensure_inode_writable(inode: &InodeRecord, context: &'static str) -> Result<()> {
+        if (inode.flags & INODE_FLAG_READONLY) != 0 {
+            return Err(anyhow_errno(
+                Errno::EROFS,
+                format!("{context}: read-only inode {}", inode.ino),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mark_mutation(&self) {
+        self.last_mutation_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    async fn maybe_run_gc(&self) -> Result<()> {
+        let now = now_millis();
+        let last_mutation = self.last_mutation_ms.load(Ordering::Relaxed);
+        let idle_for = now.saturating_sub(last_mutation);
+        if idle_for < self.config.gc_idle_min_ms {
+            return Ok(());
+        }
+
+        let _gc_guard = self.gc_lock.lock().await;
+        self.run_gc_cycle().await
+    }
+
+    async fn run_gc_cycle(&self) -> Result<()> {
+        let discard_path = self
+            .config
+            .packs_dir()
+            .join(&self.config.gc_discard_filename);
+        let current_discard_len = ensure_file(&discard_path)?;
+        let current_checkpoint = self
+            .meta
+            .get_u64_sys("gc.discard_checkpoint")
+            .unwrap_or(current_discard_len);
+        if current_checkpoint == 0 {
+            self.meta
+                .write_txn(|txn| {
+                    txn.set(
+                        sys_key("gc.discard_checkpoint"),
+                        current_discard_len.to_le_bytes().to_vec(),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+
+        let candidates = self.collect_zero_ref_candidates()?;
+        let mut appended_checkpoint = current_checkpoint.max(current_discard_len);
+        if !candidates.is_empty() {
+            self.delete_zero_ref_candidates(&candidates).await?;
+            for candidate in candidates.iter() {
+                self.chunk_meta_cache.invalidate(&candidate.hash);
+                self.chunk_data_cache.invalidate(&candidate.hash);
+            }
+
+            let epoch = self.next_gc_epoch().await?;
+            let discard_records = candidates
+                .iter()
+                .map(|candidate| DiscardRecord {
+                    epoch_id: epoch,
+                    pack_id: candidate.pack_id,
+                    chunk_hash128: candidate.hash,
+                    block_size_bytes: candidate.block_size_bytes,
+                })
+                .collect::<Vec<_>>();
+            appended_checkpoint = append_records(&discard_path, &discard_records)?;
+            self.meta
+                .write_txn(|txn| {
+                    txn.set(
+                        sys_key("gc.discard_checkpoint"),
+                        appended_checkpoint.to_le_bytes().to_vec(),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+
+        let checkpoint = self
+            .meta
+            .get_u64_sys("gc.discard_checkpoint")
+            .unwrap_or(appended_checkpoint);
+        let parsed = read_records(&discard_path, checkpoint)?;
+        if parsed.records.is_empty() {
+            return Ok(());
+        }
+
+        let mut by_pack = HashMap::<u64, HashMap<[u8; 16], DiscardRecord>>::new();
+        for record in parsed.records {
+            by_pack
+                .entry(record.pack_id)
+                .or_default()
+                .insert(record.chunk_hash128, record);
+        }
+
+        let active_pack_id = self.packs.active_pack_id();
+        let mut rewritten_packs = HashSet::<u64>::new();
+        for (pack_id, dead_records) in by_pack.iter() {
+            if *pack_id == active_pack_id {
+                continue;
+            }
+            let reclaim_bytes = dead_records
+                .values()
+                .map(|record| record.block_size_bytes as u64)
+                .sum::<u64>();
+
+            let pack_size = self.packs.pack_size(*pack_id)?;
+            if pack_size == 0 {
+                continue;
+            }
+            let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
+            let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
+            let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
+            if !meets_bytes && !meets_percent {
+                continue;
+            }
+
+            let live_hashes = self.live_hashes_for_pack(*pack_id)?;
+            self.packs
+                .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
+            rewritten_packs.insert(*pack_id);
+        }
+
+        if rewritten_packs.is_empty() {
+            return Ok(());
+        }
+
+        let current = read_records(&discard_path, checkpoint)?;
+        let kept = current
+            .records
+            .into_iter()
+            .filter(|record| !rewritten_packs.contains(&record.pack_id))
+            .collect::<Vec<_>>();
+        let new_len = rewrite_records(&discard_path, &kept)?;
+        self.meta
+            .write_txn(|txn| {
+                txn.set(
+                    sys_key("gc.discard_checkpoint"),
+                    new_len.to_le_bytes().to_vec(),
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    fn collect_zero_ref_candidates(&self) -> Result<Vec<ZeroRefCandidate>> {
+        self.meta.read_txn(|txn| {
+            let mut out = Vec::new();
+            let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
+            let end = prefix_end(&prefix);
+            for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                if key.len() != 17 {
+                    continue;
+                }
+                let mut hash = [0_u8; 16];
+                hash.copy_from_slice(&key[1..17]);
+                let chunk: ChunkRecord = decode_rkyv(&value)?;
+                if chunk.refcount == 0 {
+                    out.push(ZeroRefCandidate {
+                        hash,
+                        pack_id: chunk.pack_id,
+                        block_size_bytes: chunk.compressed_len,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    async fn delete_zero_ref_candidates(&self, candidates: &[ZeroRefCandidate]) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let hashes = candidates
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<Vec<_>>();
+        self.meta
+            .write_txn(|txn| {
+                for hash in hashes.iter() {
+                    let key = chunk_key(hash);
+                    if let Some(raw) = txn.get(key.clone())? {
+                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                        if chunk.refcount == 0 {
+                            txn.delete(key)?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn next_gc_epoch(&self) -> Result<u64> {
+        let current = self.meta.get_u64_sys("gc.epoch").unwrap_or(0);
+        let next = current.saturating_add(1);
+        self.meta
+            .write_txn(|txn| {
+                txn.set(sys_key("gc.epoch"), next.to_le_bytes().to_vec())?;
+                Ok(())
+            })
+            .await?;
+        Ok(next)
+    }
+
+    fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {
+        self.meta.read_txn(|txn| {
+            let mut out = HashSet::new();
+            let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
+            let end = prefix_end(&prefix);
+            for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                if key.len() != 17 {
+                    continue;
+                }
+                let chunk: ChunkRecord = decode_rkyv(&value)?;
+                if chunk.pack_id != pack_id || chunk.refcount == 0 {
+                    continue;
+                }
+                let mut hash = [0_u8; 16];
+                hash.copy_from_slice(&key[1..17]);
+                out.insert(hash);
+            }
+            Ok(out)
+        })
     }
 
     fn inode_kind_to_file_type(kind: u8) -> FileType {
@@ -969,6 +1240,7 @@ impl VirtualFs for VerFs {
                 .load_inode_or_errno(ino, "setattr")
                 .map_err(map_anyhow_to_fuse)?
         };
+        FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
 
         if let Some(mode) = param.mode {
             inode.perm = (mode & 0o7777) as u16;
@@ -1003,6 +1275,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         Ok((ATTR_TTL, self.core.file_attr_from_inode(&inode)))
     }
@@ -1058,6 +1331,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created inode"))
@@ -1105,11 +1379,14 @@ impl VirtualFs for VerFs {
         self.core
             .meta
             .write_txn(|txn| {
+                let _parent_inode =
+                    FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "unlink")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, name, "unlink")?;
                 let Some(inode_raw) = txn.get(inode_key(dirent.ino))? else {
                     return Err(anyhow_errno(Errno::ENOENT, "unlink target inode not found"));
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
+                FsCore::ensure_inode_writable(&inode, "unlink")?;
 
                 if inode.kind == INODE_KIND_DIR {
                     return Err(anyhow_errno(Errno::EISDIR, "cannot unlink directory"));
@@ -1124,7 +1401,9 @@ impl VirtualFs for VerFs {
                 Ok(())
             })
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
+        Ok(())
     }
 
     async fn rmdir(
@@ -1139,11 +1418,14 @@ impl VirtualFs for VerFs {
         self.core
             .meta
             .write_txn(|txn| {
+                let _parent_inode =
+                    FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "rmdir")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, dir_name, "rmdir")?;
                 let Some(raw) = txn.get(inode_key(dirent.ino))? else {
                     return Err(anyhow_errno(Errno::ENOENT, "rmdir target inode not found"));
                 };
                 let target_inode: InodeRecord = decode_rkyv(&raw)?;
+                FsCore::ensure_inode_writable(&target_inode, "rmdir")?;
                 if target_inode.kind != INODE_KIND_DIR {
                     return Err(anyhow_errno(
                         Errno::ENOTDIR,
@@ -1175,6 +1457,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         Ok(None)
     }
@@ -1210,6 +1493,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing symlink inode"))
@@ -1254,10 +1538,15 @@ impl VirtualFs for VerFs {
                     &param.old_name,
                     "rename source",
                 )?;
+                let _old_parent =
+                    FsCore::ensure_parent_dir_writable_in_txn(txn, param.old_parent, "rename")?;
+                let _new_parent =
+                    FsCore::ensure_parent_dir_writable_in_txn(txn, param.new_parent, "rename")?;
                 let Some(source_inode_raw) = txn.get(inode_key(source.ino))? else {
                     return Err(anyhow_errno(Errno::ENOENT, "rename source inode not found"));
                 };
                 let mut source_inode: InodeRecord = decode_rkyv(&source_inode_raw)?;
+                FsCore::ensure_inode_writable(&source_inode, "rename")?;
                 let source_is_dir = source_inode.kind == INODE_KIND_DIR;
                 let target =
                     match txn.get(dirent_key(param.new_parent, param.new_name.as_bytes()))? {
@@ -1288,6 +1577,7 @@ impl VirtualFs for VerFs {
                         ));
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
+                    FsCore::ensure_inode_writable(&target_inode, "rename")?;
                     target_inode.ctime_sec = sec;
                     target_inode.ctime_nsec = nsec;
 
@@ -1336,6 +1626,7 @@ impl VirtualFs for VerFs {
                         return Err(anyhow_errno(Errno::ENOENT, "rename target inode not found"));
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
+                    FsCore::ensure_inode_writable(&target_inode, "rename")?;
                     let target_is_dir = target_inode.kind == INODE_KIND_DIR;
 
                     if source_is_dir && !target_is_dir {
@@ -1397,7 +1688,9 @@ impl VirtualFs for VerFs {
                 Ok(())
             })
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
+        Ok(())
     }
 
     async fn open(&self, _uid: u32, _gid: u32, ino: u64, flags: u32) -> AsyncFusexResult<u64> {
@@ -1740,6 +2033,7 @@ impl VirtualFs for VerFs {
                     ));
                 };
                 let mut target_inode: InodeRecord = decode_rkyv(&target_raw)?;
+                FsCore::ensure_inode_writable(&target_inode, "link")?;
                 if target_inode.kind == INODE_KIND_DIR {
                     return Err(anyhow_errno(
                         Errno::EPERM,
@@ -1760,6 +2054,7 @@ impl VirtualFs for VerFs {
                         "link parent is not a directory",
                     ));
                 }
+                FsCore::ensure_inode_writable(&parent_inode, "link")?;
                 if txn
                     .get(dirent_key(newparent, newname.as_bytes()))?
                     .is_some()
@@ -1789,6 +2084,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         let inode = linked.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing linked inode"))
@@ -1837,6 +2133,7 @@ impl VirtualFs for VerFs {
                     ));
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
+                FsCore::ensure_inode_writable(&inode, "setxattr")?;
                 let key = xattr_key(ino, name.as_bytes());
                 let exists = txn.get(key.clone())?.is_some();
                 if create && exists {
@@ -1861,7 +2158,9 @@ impl VirtualFs for VerFs {
                 Ok(())
             })
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
+        Ok(())
     }
 
     async fn getxattr(&self, ino: u64, name: &str, size: u32) -> AsyncFusexResult<Vec<u8>> {
@@ -1953,6 +2252,7 @@ impl VirtualFs for VerFs {
                     ));
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
+                FsCore::ensure_inode_writable(&inode, "removexattr")?;
                 let key = xattr_key(ino, name.as_bytes());
                 if txn.get(key.clone())?.is_none() {
                     return Err(anyhow_errno(
@@ -1969,7 +2269,9 @@ impl VirtualFs for VerFs {
                 Ok(())
             })
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
+        Ok(())
     }
 
     async fn access(&self, uid: u32, gid: u32, ino: u64, mask: u32) -> AsyncFusexResult<()> {
@@ -2166,9 +2468,17 @@ impl SyncTarget for FsCore {
         } else {
             self.packs.sync(false)?;
             self.meta.flush_wal(false)?;
+            self.maybe_run_gc().await?;
         }
         Ok(())
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn sflag_for_kind(kind: u8) -> SFlag {

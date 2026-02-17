@@ -14,7 +14,7 @@ fn default_batch_max_blocks() -> usize {
 }
 
 fn default_batch_flush_interval_ms() -> u64 {
-    1
+    500
 }
 
 fn default_metadata_cache_capacity_entries() -> u64 {
@@ -49,6 +49,22 @@ fn default_fuse_max_write_bytes() -> u32 {
     u32::try_from(BLOCK_SIZE).unwrap_or(1024 * 1024)
 }
 
+fn default_gc_idle_min_ms() -> u64 {
+    15_000
+}
+
+fn default_gc_pack_rewrite_min_reclaim_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_gc_pack_rewrite_min_reclaim_percent() -> f64 {
+    25.0
+}
+
+fn default_gc_discard_filename() -> String {
+    ".DISCARD".to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mount_point: PathBuf,
@@ -75,6 +91,14 @@ pub struct Config {
     pub ultracdc_max_size_bytes: usize,
     #[serde(default = "default_fuse_max_write_bytes")]
     pub fuse_max_write_bytes: u32,
+    #[serde(default = "default_gc_idle_min_ms")]
+    pub gc_idle_min_ms: u64,
+    #[serde(default = "default_gc_pack_rewrite_min_reclaim_bytes")]
+    pub gc_pack_rewrite_min_reclaim_bytes: u64,
+    #[serde(default = "default_gc_pack_rewrite_min_reclaim_percent")]
+    pub gc_pack_rewrite_min_reclaim_percent: f64,
+    #[serde(default = "default_gc_discard_filename")]
+    pub gc_discard_filename: String,
 }
 
 impl Config {
@@ -128,6 +152,18 @@ impl Config {
         }
         if self.fuse_max_write_bytes > 16 * 1024 * 1024 {
             bail!("fuse_max_write_bytes must be <= 16777216");
+        }
+        if self.gc_idle_min_ms == 0 {
+            bail!("gc_idle_min_ms must be > 0");
+        }
+        if self.gc_pack_rewrite_min_reclaim_bytes == 0 {
+            bail!("gc_pack_rewrite_min_reclaim_bytes must be > 0");
+        }
+        if !(0.0..=100.0).contains(&self.gc_pack_rewrite_min_reclaim_percent) {
+            bail!("gc_pack_rewrite_min_reclaim_percent must be in range 0..=100");
+        }
+        if self.gc_discard_filename.is_empty() {
+            bail!("gc_discard_filename must not be empty");
         }
         Ok(())
     }

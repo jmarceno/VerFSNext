@@ -17,6 +17,10 @@ pub const KEY_PREFIX_EXTENT: u8 = b'E';
 pub const KEY_PREFIX_CHUNK: u8 = b'C';
 pub const KEY_PREFIX_XATTR: u8 = b'X';
 pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
+pub const KEY_PREFIX_SNAPSHOT: u8 = b'S';
+
+pub const INODE_FLAG_READONLY: u32 = 1 << 0;
+pub const SNAPSHOTS_DIR_NAME: &str = ".snapshots";
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[rkyv(bytecheck())]
@@ -36,6 +40,7 @@ pub struct InodeRecord {
     pub ctime_sec: i64,
     pub ctime_nsec: u32,
     pub generation: u64,
+    pub flags: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
@@ -59,6 +64,14 @@ pub struct ChunkRecord {
     pub codec: u8,
     pub uncompressed_len: u32,
     pub compressed_len: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+pub struct SnapshotRecord {
+    pub root_ino: u64,
+    pub created_at_sec: i64,
+    pub created_at_nsec: u32,
 }
 
 pub fn encode_rkyv<T>(value: &T) -> Result<Vec<u8>>
@@ -153,6 +166,24 @@ pub fn sys_key(name: &str) -> Vec<u8> {
     key.extend_from_slice(b"SYS:");
     key.extend_from_slice(name.as_bytes());
     key
+}
+
+pub fn snapshot_prefix() -> Vec<u8> {
+    vec![KEY_PREFIX_SNAPSHOT]
+}
+
+pub fn snapshot_key(name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + name.len());
+    key.push(KEY_PREFIX_SNAPSHOT);
+    key.extend_from_slice(name);
+    key
+}
+
+pub fn decode_snapshot_name(key: &[u8]) -> Option<&[u8]> {
+    if key.is_empty() || key[0] != KEY_PREFIX_SNAPSHOT {
+        return None;
+    }
+    Some(&key[1..])
 }
 
 pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {

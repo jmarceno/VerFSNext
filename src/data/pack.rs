@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -231,6 +232,173 @@ impl PackStore {
                 .sync_data()
                 .context("failed to sync_data active pack index")
         }
+    }
+
+    pub fn active_pack_id(&self) -> u64 {
+        self.active.lock().pack_id
+    }
+
+    pub fn pack_size(&self, pack_id: u64) -> Result<u64> {
+        let path = self.pack_path(pack_id);
+        let size = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat pack {}", path.display()));
+            }
+        };
+        Ok(size)
+    }
+
+    pub fn rewrite_pack_with_live_hashes(
+        &self,
+        pack_id: u64,
+        live_hashes: &HashSet<[u8; 16]>,
+    ) -> Result<()> {
+        if pack_id == self.active_pack_id() {
+            return Ok(());
+        }
+
+        let src_pack_path = self.pack_path(pack_id);
+        if !src_pack_path.exists() {
+            return Ok(());
+        }
+        let src_idx_path = self.index_path(pack_id);
+
+        let tmp_pack_path = src_pack_path.with_extension("vpk.rewrite");
+        let tmp_idx_path = src_idx_path.with_extension("idx.rewrite");
+        let src_file = File::open(&src_pack_path)
+            .with_context(|| format!("failed to open source pack {}", src_pack_path.display()))?;
+        let mut dst_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_pack_path)
+            .with_context(|| format!("failed to open temp pack {}", tmp_pack_path.display()))?;
+        let mut dst_index = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_idx_path)
+            .with_context(|| {
+                format!("failed to open temp pack index {}", tmp_idx_path.display())
+            })?;
+
+        let mut cursor = 0_u64;
+        let mut new_offset = 0_u64;
+        let mut seen = HashSet::<[u8; 16]>::new();
+        loop {
+            let mut header = [0_u8; RECORD_HEADER_LEN as usize];
+            match src_file.read_exact_at(&mut header, cursor) {
+                Ok(()) => {
+                    if header[..4] != RECORD_MAGIC {
+                        bail!(
+                            "corrupt pack record magic at offset {} in {}",
+                            cursor,
+                            src_pack_path.display()
+                        );
+                    }
+
+                    let mut hash = [0_u8; 16];
+                    hash.copy_from_slice(&header[4..20]);
+                    let codec = header[20];
+                    let mut ulen_bytes = [0_u8; 4];
+                    ulen_bytes.copy_from_slice(&header[24..28]);
+                    let mut clen_bytes = [0_u8; 4];
+                    clen_bytes.copy_from_slice(&header[28..32]);
+                    let ulen = u32::from_le_bytes(ulen_bytes);
+                    let clen = u32::from_le_bytes(clen_bytes);
+
+                    let record_len = RECORD_HEADER_LEN
+                        .checked_add(clen as u64)
+                        .context("record length overflow while rewriting pack")?;
+
+                    if live_hashes.contains(&hash) && seen.insert(hash) {
+                        let mut payload = vec![0_u8; clen as usize];
+                        src_file
+                            .read_exact_at(&mut payload, cursor + RECORD_HEADER_LEN)
+                            .with_context(|| {
+                                format!(
+                                    "failed to read pack payload while rewriting {}",
+                                    src_pack_path.display()
+                                )
+                            })?;
+
+                        dst_file.write_all(&header).with_context(|| {
+                            format!(
+                                "failed writing pack header while rewriting {}",
+                                src_pack_path.display()
+                            )
+                        })?;
+                        dst_file.write_all(&payload).with_context(|| {
+                            format!(
+                                "failed writing pack payload while rewriting {}",
+                                src_pack_path.display()
+                            )
+                        })?;
+                        Self::append_index_record(
+                            &mut dst_index,
+                            hash,
+                            PackIndexEntry {
+                                offset: new_offset,
+                                codec,
+                                uncompressed_len: ulen,
+                                compressed_len: clen,
+                            },
+                        )?;
+                        new_offset = new_offset
+                            .checked_add(record_len)
+                            .context("destination offset overflow during pack rewrite")?;
+                    }
+
+                    cursor = cursor
+                        .checked_add(record_len)
+                        .context("source offset overflow during pack rewrite")?;
+                }
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed reading source pack while rewriting {}",
+                            src_pack_path.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        dst_file.sync_all().with_context(|| {
+            format!("failed to sync rewritten pack {}", tmp_pack_path.display())
+        })?;
+        dst_index.sync_all().with_context(|| {
+            format!(
+                "failed to sync rewritten pack index {}",
+                tmp_idx_path.display()
+            )
+        })?;
+        drop(dst_file);
+        drop(dst_index);
+
+        std::fs::rename(&tmp_pack_path, &src_pack_path).with_context(|| {
+            format!(
+                "failed to atomically replace pack {} with {}",
+                src_pack_path.display(),
+                tmp_pack_path.display()
+            )
+        })?;
+        std::fs::rename(&tmp_idx_path, &src_idx_path).with_context(|| {
+            format!(
+                "failed to atomically replace pack index {} with {}",
+                src_idx_path.display(),
+                tmp_idx_path.display()
+            )
+        })?;
+
+        let _ = self
+            .index_cache
+            .invalidate_entries_if(move |(cached_pack_id, _), _| *cached_pack_id == pack_id);
+        self.prime_index_cache(pack_id)?;
+        Ok(())
     }
 
     fn lookup_index_entry(

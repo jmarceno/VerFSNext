@@ -1,7 +1,9 @@
 mod config;
 mod data;
 mod fs;
+mod gc;
 mod meta;
+mod snapshot;
 mod sync;
 mod types;
 mod write;
@@ -9,7 +11,7 @@ mod write;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_fusex::{
     session::{new_session, SessionConfig},
     FuseFs, VirtualFs,
@@ -19,11 +21,22 @@ use tracing::{error, info};
 
 use crate::config::Config;
 use crate::fs::VerFs;
+use crate::meta::MetaStore;
+use crate::snapshot::SnapshotManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
 
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if !args.is_empty() {
+        return run_control_command(args).await;
+    }
+
+    run_mount().await
+}
+
+async fn run_mount() -> Result<()> {
     let config_path = Path::new("config.toml");
     let config = Config::load_from_file(config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
@@ -74,6 +87,61 @@ async fn main() -> Result<()> {
     }
 
     run_result.context("FUSE run loop failed")
+}
+
+async fn run_control_command(args: Vec<String>) -> Result<()> {
+    let mut idx = 0_usize;
+    let mut config_path = "config.toml".to_owned();
+    if args.len() >= 2 && args[0] == "--config" {
+        config_path = args[1].clone();
+        idx = 2;
+    }
+
+    if idx >= args.len() {
+        bail!("missing control command");
+    }
+
+    let config = Config::load_from_file(Path::new(&config_path))
+        .with_context(|| format!("failed to load {}", config_path))?;
+    config.ensure_dirs()?;
+    let meta = MetaStore::open(&config.metadata_dir()).await?;
+    let snapshots = SnapshotManager::new(&meta);
+
+    match args[idx].as_str() {
+        "snapshot" => {
+            idx += 1;
+            if idx >= args.len() {
+                bail!("missing snapshot subcommand (create|list|delete)");
+            }
+            match args[idx].as_str() {
+                "create" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        bail!("missing snapshot name");
+                    }
+                    snapshots.create(&args[idx]).await?;
+                }
+                "list" => {
+                    let names = snapshots.list()?;
+                    for name in names {
+                        println!("{name}");
+                    }
+                }
+                "delete" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        bail!("missing snapshot name");
+                    }
+                    snapshots.delete(&args[idx]).await?;
+                }
+                other => bail!("unknown snapshot subcommand '{other}'"),
+            }
+        }
+        other => bail!("unknown control command '{other}'"),
+    }
+
+    meta.close().await?;
+    Ok(())
 }
 
 fn init_logging() {

@@ -2,7 +2,7 @@
 
 ## Current State
 
-The repository now includes a Phase 3 inline data-plane implementation on top of the existing full FUSE operation surface:
+The repository now includes a Phase 4 implementation on top of the existing full FUSE surface and Phase 3 data plane:
 
 - FUSE runtime via `vendor/async-fusex`
 - Metadata runtime via `vendor/surrealkv`
@@ -14,7 +14,15 @@ The repository now includes a Phase 3 inline data-plane implementation on top of
 - Hash-only two-index lookup model:
   - Metadata chunk record stores `pack_id` and chunk properties, not physical offset
   - Pack-local index stores `chunk_hash128 -> offset`
-- Bounded moka caches for metadata/chunk/pack-index hot paths
+- Snapshot namespace and CLI control path:
+  - `verfsnext snapshot create <name>`
+  - `verfsnext snapshot list`
+  - `verfsnext snapshot delete <name>`
+- Root `/.snapshots` bootstrap directory is read-only from normal POSIX mutation paths
+- Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
+- Two-stage GC with `.DISCARD` checkpointed metadata handoff:
+  - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
+  - Pack stage: rewrites eligible non-active packs by reclaim threshold and atomically replaces pack + index files
 
 ## Runtime Layout
 
@@ -24,28 +32,29 @@ The repository now includes a Phase 3 inline data-plane implementation on top of
   - read path resolves chunk location through pack-local hash index
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
+  - read-only inode flag enforcement across mutating FUSE operations
+  - background GC trigger integrated into periodic sync cycles with idle gating
+
+- `src/snapshot/mod.rs`
+  - Snapshot create/list/delete workflows over metadata
+  - recursive tree cloning excluding `/.snapshots` subtree
+  - chunk refcount delta handling on create/delete
+
+- `src/gc/mod.rs`
+  - `.DISCARD` binary header/record encode-decode and CRC32C validation
+  - checkpoint-bounded record reads
+  - atomic discard-file rewrite/rotation primitive used by GC pack stage
 
 - `src/data/pack.rs`
   - Pack record format `VPK2`
   - Sidecar index file per pack (`.idx`) with fixed-size entries
   - Hash lookup path reads index entry first, then seeks pack payload
   - Index is rebuilt from pack data when missing
-
-- `src/data/compress.rs`
-  - Codec constants (`raw`, `zstd`)
-  - Single-chunk compression/decompression helpers
-  - Rayon-backed parallel compression fanout
-
-- `src/data/chunker.rs`
-  - Streaming wrapper over UltraCDC (`cdc-chunkers`)
-  - Incremental feed/finish API for non-whole-file chunk boundary generation
-
-- `src/data/hash.rs`
-  - XXH3-128 helper returning little-endian 128-bit hash bytes
+  - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
 
 ## Config
 
-`config.toml` fields now include Phase 3 tuning:
+`config.toml` now includes Phase 4 tuning:
 
 - `mount_point`
 - `data_dir`
@@ -59,64 +68,35 @@ The repository now includes a Phase 3 inline data-plane implementation on top of
 - `ultracdc_min_size_bytes`
 - `ultracdc_avg_size_bytes`
 - `ultracdc_max_size_bytes`
+- `fuse_max_write_bytes`
+- `gc_idle_min_ms`
+- `gc_pack_rewrite_min_reclaim_bytes`
+- `gc_pack_rewrite_min_reclaim_percent`
+- `gc_discard_filename`
 
-## Metadata and Two-Index Model
+## Metadata and Snapshot/GC Additions
 
-`ChunkRecord` (`C:<chunk_hash128>`) now stores:
+- `ChunkRecord` keeps zero-ref entries at `refcount = 0` until metadata-stage GC consumes them.
+- Snapshot metadata records are keyed under `S:<name>` and point to snapshot root inode.
+- System keys now include:
+  - `SYS:gc.discard_checkpoint`
+  - `SYS:gc.epoch`
+- Inodes now carry `flags` with a read-only bit used for snapshot immutability.
 
-- `refcount`
-- `pack_id`
-- `codec`
-- `uncompressed_len`
-- `compressed_len`
+## `.DISCARD` Flow
 
-Physical offsets are moved out of metadata and into pack-local index records.
-
-## Pack Format
-
-Each `VPK2` pack record is:
-
-- `magic` (`"VPK2"`)
-- `chunk_hash128` (16 bytes)
-- `codec` (u8)
-- reserved bytes
-- `uncompressed_len` (u32 LE)
-- `compressed_len` (u32 LE)
-- payload bytes
-
-Each index entry is fixed-size and stores:
-
-- `chunk_hash128`
-- `offset` (u64 LE)
-- `codec`
-- `uncompressed_len` (u32 LE)
-- `compressed_len` (u32 LE)
-
-## Read/Write Data Flow
-
-### Write
-
-1. FUSE write enqueues into batcher.
-2. Apply path rewrites touched logical blocks.
-3. For changed block hashes:
-   - if metadata already has hash: dedup hit
-   - else stage new chunk payload
-4. New payloads are compressed in parallel (rayon).
-5. Compressed records append to pack + pack-local index.
-6. Metadata transaction commits extents/refcounts/chunk records.
-
-### Read
-
-1. Resolve extent `E:*` to `chunk_hash128`.
-2. Resolve chunk metadata `C:*` to `pack_id` + lengths/codec.
-3. Resolve `(pack_id, chunk_hash128)` via pack-local index to offset.
-4. Read/decode payload and return bytes.
+1. Metadata-stage GC scans for zero-ref chunks.
+2. For each candidate chunk, GC emits a CRC-protected discard record (`pack_id`, `chunk_hash128`, `block_size_bytes`, `epoch_id`).
+3. `SYS:gc.discard_checkpoint` is advanced only after `.DISCARD` append + sync.
+4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, rewrites live chunks only, and atomically swaps rewritten pack/index files.
+5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
 
 ## Validation Run
 
-Executed after Phase 3 changes:
+Executed after Phase 4 changes:
 
-- `cargo test -p verfsnext`
-- `cargo build --release`
+- `cargo fmt`
+- `cargo build`
+- `cargo test`
 
-Both completed successfully.
+All completed successfully in this repository state.
