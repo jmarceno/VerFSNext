@@ -149,7 +149,12 @@ Deliver core filesystem semantics and lifecycle behavior under mutation pressure
 ## Scope (single-pass implementation)
 
 - COW versioned extent model for mutating writes.
-- Snapshot creation/listing/access via `/.snapshots` behavior.
+- Snapshot creation/listing/access via `/.snapshots` behavior + CLI.
+  - .verfsnext snapshot create "name"
+  - .verfsnext snapshot list
+  - .verfsnext snapshot delete "name"
+  - `find <mount>/.snapshots/name -type f` lists files in snapshot
+  - `cat <mount>/.snapshots/name/path/to/file` reads file from snapshot
 - Read concurrency model where reads never block on writers.
 - Two-stage GC:
   1. Metadata stage consumes SurrealKV GC output for zero-ref entries, removes refs, appends `.DISCARD` records.
