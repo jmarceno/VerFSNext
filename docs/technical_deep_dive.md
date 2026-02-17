@@ -2,213 +2,121 @@
 
 ## Current State
 
-This repository now contains a Phase 2 implementation focused on full async-fusex operation coverage and POSIX/rsync operational correctness:
+The repository now includes a Phase 3 inline data-plane implementation on top of the existing full FUSE operation surface:
 
-- FUSE runtime wired through `vendor/async-fusex`
-- Metadata runtime wired through `vendor/surrealkv`
-- Mount lifecycle + SIGINT graceful shutdown
-- Baseline metadata schema and storage
-- Baseline hash-addressed pack storage backend
-- Write batcher (`>= 3000` blocks or `500ms`)
-- Background sync service + shutdown full-sync barrier
-- Full `VirtualFs` operation implementation, including symlink/xattr/link/access/locking/bmap paths
-- rsync-oriented rename/replace/truncate correctness hardening
+- FUSE runtime via `vendor/async-fusex`
+- Metadata runtime via `vendor/surrealkv`
+- Write batching (`>= 3000` blocks or `500ms`) with synchronous syscall completion
+- Background sync + shutdown full-sync barrier
+- Streaming UltraCDC chunking telemetry in write ingress path
+- XXH3-128 hash-authoritative dedup decisions
+- zstd compression with rayon parallel compression workers
+- Hash-only two-index lookup model:
+  - Metadata chunk record stores `pack_id` and chunk properties, not physical offset
+  - Pack-local index stores `chunk_hash128 -> offset`
+- Bounded moka caches for metadata/chunk/pack-index hot paths
 
 ## Runtime Layout
 
-- `src/main.rs`
-  - Loads `config.toml`
-  - Initializes `VerFs`
-  - Mounts via `async_fusex::session::new_session`
-  - Installs SIGINT handler (`tokio::signal::ctrl_c`)
-  - Runs session until cancellation
-
 - `src/fs/mod.rs`
-  - Implements `async_fusex::VirtualFs`
-  - Owns namespace + file I/O behavior
-  - Integrates metadata (`MetaStore`), packs (`PackStore`), batching, and syncing
-  - Implements Phase 2 operation semantics:
-    - overwrite-capable rename
-    - hard links and link-count accounting
-    - symlink create/readlink
-    - xattr CRUD with proper flag/errno handling
-    - access checks and lock table behavior
-    - file truncate correctness on `setattr(size)` and `O_TRUNC`
-
-- `src/meta/mod.rs`
-  - Opens/bootstraps SurrealKV tree
-  - Provides read/write transaction wrappers
-  - Initializes root inode and system keys
-
-- `src/types/mod.rs`
-  - `rkyv` metadata records (`InodeRecord`, `DirentRecord`, `ExtentRecord`, `ChunkRecord`)
-  - Key encoding helpers for keyspace prefixes
-  - Added key helpers for xattrs and symlink targets
+  - `VirtualFs` implementation
+  - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
+  - read path resolves chunk location through pack-local hash index
+  - bounded chunk metadata and chunk payload caches
+  - dedup hit/miss counters emitted in write-path debug logs
 
 - `src/data/pack.rs`
-  - Append-only pack format
-  - Hash-addressed chunk writes/reads
-  - Per-record magic/hash/length validation
+  - Pack record format `VPK2`
+  - Sidecar index file per pack (`.idx`) with fixed-size entries
+  - Hash lookup path reads index entry first, then seeks pack payload
+  - Index is rebuilt from pack data when missing
 
-- `src/write/batcher.rs`
-  - Async worker queue with two flush triggers:
-    - block threshold (`batch_max_blocks`)
-    - time threshold (`batch_flush_interval_ms`)
-  - Synchronous caller contract via per-write ack channel
+- `src/data/compress.rs`
+  - Codec constants (`raw`, `zstd`)
+  - Single-chunk compression/decompression helpers
+  - Rayon-backed parallel compression fanout
 
-- `src/sync/mod.rs`
-  - Periodic sync task
-  - Coordinated shutdown + final full sync
+- `src/data/chunker.rs`
+  - Streaming wrapper over UltraCDC (`cdc-chunkers`)
+  - Incremental feed/finish API for non-whole-file chunk boundary generation
+
+- `src/data/hash.rs`
+  - XXH3-128 helper returning little-endian 128-bit hash bytes
 
 ## Config
 
-`config.toml` fields in current use:
+`config.toml` fields now include Phase 3 tuning:
 
 - `mount_point`
 - `data_dir`
 - `sync_interval_ms`
-- `batch_max_blocks` (default `3000`)
-- `batch_flush_interval_ms` (default `500`)
+- `batch_max_blocks`
+- `batch_flush_interval_ms`
+- `metadata_cache_capacity_entries`
+- `chunk_cache_capacity_entries`
+- `pack_index_cache_capacity_entries`
+- `zstd_compression_level`
+- `ultracdc_min_size_bytes`
+- `ultracdc_avg_size_bytes`
+- `ultracdc_max_size_bytes`
 
-Derived directories:
+## Metadata and Two-Index Model
 
-- metadata: `<data_dir>/metadata`
-- packs: `<data_dir>/packs`
+`ChunkRecord` (`C:<chunk_hash128>`) now stores:
 
-## Metadata Model
+- `refcount`
+- `pack_id`
+- `codec`
+- `uncompressed_len`
+- `compressed_len`
 
-Hot metadata is binary (`rkyv`) and prefix-keyed:
+Physical offsets are moved out of metadata and into pack-local index records.
 
-- `I:<inode_id_be>` -> inode record
-- `D:<parent_inode_be>:<name_bytes>` -> dirent record
-- `E:<inode_id_be><logical_block_be>` -> extent record
-- `C:<chunk_hash128>` -> chunk record
-- `X:<inode_id_be>:<xattr_name>` -> xattr payload
-- `Y:<inode_id_be>` -> symlink target payload
-- `SYS:*` -> system counters/config (`next_inode`, `active_pack_id`)
+## Pack Format
 
-`InodeRecord` stores inode identity, ownership, permissions, link count, file size, timestamps, and generation.
+Each `VPK2` pack record is:
 
-## Data Plane
-
-### Chunk identity
-
-- Block-sized payloads (`4096` bytes) are hashed with `XXH3-128`
-- Hash bytes are authoritative chunk identifiers
-
-### Pack format
-
-Each appended chunk record in a pack file is:
-
-- magic: `"VPK1"` (4 bytes)
-- chunk hash (16 bytes)
-- payload length (u32 little-endian)
+- `magic` (`"VPK2"`)
+- `chunk_hash128` (16 bytes)
+- `codec` (u8)
+- reserved bytes
+- `uncompressed_len` (u32 LE)
+- `compressed_len` (u32 LE)
 - payload bytes
 
-`ChunkRecord` stores `pack_id`, `offset`, `len`, and `refcount`.
+Each index entry is fixed-size and stores:
 
-### Dedup behavior
+- `chunk_hash128`
+- `offset` (u64 LE)
+- `codec`
+- `uncompressed_len` (u32 LE)
+- `compressed_len` (u32 LE)
 
-- Writes probe `C:<hash>` first
-- Existing chunk: refcount increment
-- Missing chunk: append to pack + create metadata record
+## Read/Write Data Flow
 
-## Write and Truncate Semantics
+### Write
 
-### Write path
+1. FUSE write enqueues into batcher.
+2. Apply path rewrites touched logical blocks.
+3. For changed block hashes:
+   - if metadata already has hash: dedup hit
+   - else stage new chunk payload
+4. New payloads are compressed in parallel (rayon).
+5. Compressed records append to pack + pack-local index.
+6. Metadata transaction commits extents/refcounts/chunk records.
 
-1. FUSE `write` enqueues `WriteOp` into batcher.
-2. Batcher flushes on block threshold or interval.
-3. Apply path updates extents/chunk refs/inode metadata transactionally.
+### Read
 
-### Truncate hardening
+1. Resolve extent `E:*` to `chunk_hash128`.
+2. Resolve chunk metadata `C:*` to `pack_id` + lengths/codec.
+3. Resolve `(pack_id, chunk_hash128)` via pack-local index to offset.
+4. Read/decode payload and return bytes.
 
-`setattr(size)` and `open(O_TRUNC)` now execute real truncate logic:
+## Validation Run
 
-- Shrink deletes fully truncated extents and decrements chunk refcounts.
-- Partial tail block is rewritten with zeroed bytes beyond new EOF.
-- Grow is sparse (holes read as zero).
+Executed after Phase 3 changes:
 
-This prevents stale post-truncate data visibility and keeps chunk refcounts consistent.
+- `cargo test -p verfsnext`
+- `cargo build --release`
 
-## Namespace and POSIX Semantics
-
-### Rename
-
-Rename now supports:
-
-- overwrite of existing targets
-- `RENAME_NOREPLACE`
-- `RENAME_EXCHANGE`
-- directory/non-directory compatibility checks
-- non-empty directory replacement rejection
-- parent link-count/timestamp updates where required
-
-### Link and unlink
-
-- Hard links implemented for non-directory inodes.
-- `unlink` decrements `nlink` and removes inode payload only at final unlink.
-
-### Symlinks
-
-- `symlink` creates `INODE_KIND_SYMLINK` + target payload record.
-- `readlink` returns stored target bytes.
-
-### Xattrs
-
-Implemented operations:
-
-- `setxattr` with `XATTR_CREATE` / `XATTR_REPLACE` semantics
-- `getxattr` with `ERANGE` behavior
-- `listxattr` with NUL-delimited names and `ERANGE` behavior
-- `removexattr` with `ENODATA` on missing key
-
-### Access and locking
-
-- `access` checks inode mode/uid/gid against requested mask.
-- `getlk`/`setlk` implemented with in-memory per-inode range lock tracking.
-- `setlkw` behavior is provided via retry loop in the async path.
-
-## FUSE Surface Coverage
-
-`VirtualFs` implementation now covers:
-
-- `init`, `destroy`, `lookup`, `forget`, `getattr`, `setattr`
-- `readlink`, `mknod`, `mkdir`, `unlink`, `rmdir`, `symlink`, `rename`, `link`
-- `open`, `read`, `write`, `flush`, `release`, `fsync`
-- `opendir`, `readdir`, `releasedir`, `fsyncdir`
-- `statfs`, `setxattr`, `getxattr`, `listxattr`, `removexattr`, `access`, `create`
-- `getlk`, `setlk`, `bmap`
-
-Vendor updates in `async-fusex` for this phase:
-
-- `bmap` reply now returns a real block mapping response instead of hardcoded `ENOSYS`.
-- Session fallbacks for unsupported ioctl/poll/fallocate/lseek now return deterministic non-`ENOSYS` errors.
-
-## Integration Testing
-
-Added integration test:
-
-- `tests/rsync_integration.rs`
-
-Behavior:
-
-- mounts VerFSNext
-- runs Linux `cp`, `mv`, and `rsync -a` through the mounted filesystem
-- validates integrity with Linux `sha256sum`
-- validates metadata with Linux `stat`
-- unmounts/remounts and re-validates data persistence
-- deletes copied tree, validates deletion via `ls` and `stat`
-- unmounts/remounts again and validates deletion persistence
-- runs all external commands via Linux `timeout`
-
-Execution guard:
-
-- test runs only when `VERFSNEXT_RUN_MOUNT_TESTS=1` is set
-- otherwise it exits successfully without mount execution
-
-Run example:
-
-```bash
-VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test --test rsync_integration -- --nocapture
-```
+Both completed successfully.

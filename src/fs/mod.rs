@@ -12,6 +12,7 @@ use async_fusex::fs_util::{
 };
 use async_fusex::{DirEntry, FileType, VirtualFs};
 use async_trait::async_trait;
+use moka::sync::Cache;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::libc;
@@ -20,9 +21,12 @@ use nix::sys::statvfs;
 use surrealkv::LSMIterator;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use xxhash_rust::xxh3::xxh3_128;
+use tracing::debug;
 
 use crate::config::Config;
+use crate::data::chunker::UltraStreamChunker;
+use crate::data::compress::{compress_parallel, PendingChunk};
+use crate::data::hash::hash128;
 use crate::data::pack::PackStore;
 use crate::meta::MetaStore;
 use crate::sync::{SyncService, SyncTarget};
@@ -59,7 +63,11 @@ struct FsCore {
     config: Config,
     meta: MetaStore,
     packs: PackStore,
+    chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
+    chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
     next_handle: AtomicU64,
+    dedup_hits: AtomicU64,
+    dedup_misses: AtomicU64,
     write_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
 }
@@ -70,14 +78,26 @@ impl VerFs {
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
         let active_pack_id = meta.get_u64_sys("active_pack_id")?;
-        let packs = PackStore::open(&config.packs_dir(), active_pack_id)?;
+        let packs = PackStore::open(
+            &config.packs_dir(),
+            active_pack_id,
+            config.pack_index_cache_capacity_entries,
+        )?;
         packs.verify_pack_headers(active_pack_id)?;
 
         let core = Arc::new(FsCore {
             config: config.clone(),
             meta,
             packs,
+            chunk_meta_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
+            chunk_data_cache: Cache::builder()
+                .max_capacity(config.chunk_cache_capacity_entries)
+                .build(),
             next_handle: AtomicU64::new(1),
+            dedup_hits: AtomicU64::new(0),
+            dedup_misses: AtomicU64::new(0),
             write_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
         });
@@ -156,6 +176,40 @@ impl FsCore {
         })
     }
 
+    fn ultracdc_chunk_count(&self, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let mut chunker = UltraStreamChunker::new(
+            self.config.ultracdc_min_size_bytes,
+            self.config.ultracdc_avg_size_bytes,
+            self.config.ultracdc_max_size_bytes,
+        );
+        let mut count = 0_usize;
+        for piece in data.chunks(64 * 1024) {
+            count = count.saturating_add(chunker.feed(piece).len());
+        }
+        count.saturating_add(chunker.finish().len())
+    }
+
+    fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
+        if let Some(cached) = self.chunk_meta_cache.get(&hash) {
+            return Ok(cached);
+        }
+        let chunk = self.meta.read_txn(|txn| {
+            let Some(raw) = txn.get(chunk_key(&hash))? else {
+                return Err(anyhow_errno(
+                    Errno::EIO,
+                    format!("missing chunk metadata for hash {:x?}", hash),
+                ));
+            };
+            let chunk: ChunkRecord = decode_rkyv(&raw)?;
+            Ok(chunk)
+        })?;
+        self.chunk_meta_cache.insert(hash, chunk.clone());
+        Ok(chunk)
+    }
+
     fn read_block_bytes(&self, ino: u64, block_idx: u64) -> Result<Vec<u8>> {
         let maybe_extent = self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(extent_key(ino, block_idx))? else {
@@ -169,23 +223,23 @@ impl FsCore {
             return Ok(vec![0_u8; BLOCK_SIZE]);
         };
 
-        let chunk = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(chunk_key(&extent.chunk_hash))? else {
-                return Err(anyhow_errno(
-                    Errno::EIO,
-                    format!(
-                        "missing chunk metadata for hash {:x?} while reading inode {}",
-                        extent.chunk_hash, ino
-                    ),
-                ));
-            };
-            let chunk: ChunkRecord = decode_rkyv(&raw)?;
-            Ok(chunk)
-        })?;
+        if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
+            let mut payload = cached.as_ref().clone();
+            if payload.len() < BLOCK_SIZE {
+                payload.resize(BLOCK_SIZE, 0);
+            }
+            if payload.len() > BLOCK_SIZE {
+                payload.truncate(BLOCK_SIZE);
+            }
+            return Ok(payload);
+        }
 
+        let chunk = self.load_chunk_record(extent.chunk_hash)?;
         let mut payload =
             self.packs
-                .read_chunk(chunk.pack_id, chunk.offset, extent.chunk_hash, chunk.len)?;
+                .read_chunk(chunk.pack_id, extent.chunk_hash, chunk.uncompressed_len)?;
+        self.chunk_data_cache
+            .insert(extent.chunk_hash, Arc::new(payload.clone()));
         if payload.len() < BLOCK_SIZE {
             payload.resize(BLOCK_SIZE, 0);
         }
@@ -200,30 +254,58 @@ impl FsCore {
         chunk_hash: [u8; 16],
         data: &[u8],
         checked_hashes: &mut HashSet<[u8; 16]>,
-        new_chunk_records: &mut HashMap<[u8; 16], ChunkRecord>,
-    ) -> Result<()> {
+        pending_chunks: &mut HashMap<[u8; 16], Vec<u8>>,
+    ) -> Result<bool> {
         if !checked_hashes.insert(chunk_hash) {
-            return Ok(());
+            return Ok(false);
         }
 
         let exists = self
             .meta
             .read_txn(|txn| Ok(txn.get(chunk_key(&chunk_hash))?.is_some()))?;
         if exists {
-            return Ok(());
+            return Ok(false);
         }
 
-        let (pack_id, offset, len) = self.packs.append_chunk(chunk_hash, data)?;
-        new_chunk_records.insert(
-            chunk_hash,
-            ChunkRecord {
+        pending_chunks.insert(chunk_hash, data.to_vec());
+        Ok(true)
+    }
+
+    fn materialize_pending_chunks(
+        &self,
+        pending_chunks: HashMap<[u8; 16], Vec<u8>>,
+    ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
+        if pending_chunks.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let pending = pending_chunks
+            .into_iter()
+            .map(|(hash, data)| PendingChunk { hash, data })
+            .collect::<Vec<_>>();
+        let ready = compress_parallel(pending, self.config.zstd_compression_level)?;
+
+        let mut out = HashMap::with_capacity(ready.len());
+        for ready_chunk in ready {
+            let pack_id = self.packs.append_chunk(
+                ready_chunk.hash,
+                ready_chunk.chunk.codec,
+                ready_chunk.chunk.uncompressed_len,
+                &ready_chunk.chunk.compressed,
+            )?;
+            let chunk = ChunkRecord {
                 refcount: 0,
                 pack_id,
-                offset,
-                len,
-            },
-        );
-        Ok(())
+                codec: ready_chunk.chunk.codec,
+                uncompressed_len: ready_chunk.chunk.uncompressed_len,
+                compressed_len: ready_chunk.chunk.compressed_len,
+            };
+            self.chunk_meta_cache
+                .insert(ready_chunk.hash, chunk.clone());
+            out.insert(ready_chunk.hash, chunk);
+        }
+
+        Ok(out)
     }
 
     fn apply_ref_deltas_in_txn(
@@ -460,7 +542,7 @@ impl FsCore {
         let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
         let mut extent_deletes = Vec::<Vec<u8>>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-        let mut new_chunk_records = HashMap::<[u8; 16], ChunkRecord>::new();
+        let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
 
         if new_size < old_size {
@@ -492,7 +574,7 @@ impl FsCore {
                     let mut block_data = self.read_block_bytes(ino, block_idx)?;
                     let offset_in_block = (new_size % block_size) as usize;
                     block_data[offset_in_block..].fill(0);
-                    let new_hash = xxh3_128(&block_data).to_le_bytes();
+                    let new_hash = hash128(&block_data);
                     if new_hash != chunk_hash {
                         extent_updates.push((block_idx, new_hash));
                         *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
@@ -501,7 +583,7 @@ impl FsCore {
                             new_hash,
                             &block_data,
                             &mut checked_hashes,
-                            &mut new_chunk_records,
+                            &mut pending_chunks,
                         )?;
                     }
                     continue;
@@ -513,6 +595,7 @@ impl FsCore {
                 }
             }
         }
+        let new_chunk_records = self.materialize_pending_chunks(pending_chunks)?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -562,6 +645,7 @@ impl FsCore {
             return Ok(());
         }
 
+        let cdc_chunk_count = self.ultracdc_chunk_count(&op.data);
         let start_block = op.offset / BLOCK_SIZE as u64;
         let end_block = (write_end - 1) / BLOCK_SIZE as u64;
 
@@ -577,8 +661,10 @@ impl FsCore {
 
         let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-        let mut new_chunk_records = HashMap::<[u8; 16], ChunkRecord>::new();
+        let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
+        let mut dedup_hits = 0_u64;
+        let mut dedup_misses = 0_u64;
 
         for block_idx in start_block..=end_block {
             let mut block_data = if old_extents.contains_key(&block_idx) {
@@ -596,7 +682,7 @@ impl FsCore {
             let dst_end = dst_start + (src_end - src_start);
             block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
 
-            let new_hash = xxh3_128(&block_data).to_le_bytes();
+            let new_hash = hash128(&block_data);
             let old_hash = old_extents.get(&block_idx).map(|extent| extent.chunk_hash);
 
             if old_hash == Some(new_hash) {
@@ -609,13 +695,19 @@ impl FsCore {
                 *ref_deltas.entry(old_hash).or_insert(0) -= 1;
             }
 
-            self.stage_chunk_if_missing(
+            let staged_new = self.stage_chunk_if_missing(
                 new_hash,
                 &block_data,
                 &mut checked_hashes,
-                &mut new_chunk_records,
+                &mut pending_chunks,
             )?;
+            if staged_new {
+                dedup_misses = dedup_misses.saturating_add(1);
+            } else {
+                dedup_hits = dedup_hits.saturating_add(1);
+            }
         }
+        let new_chunk_records = self.materialize_pending_chunks(pending_chunks)?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -637,27 +729,36 @@ impl FsCore {
                 txn.set(inode_key(op.ino), encode_rkyv(&inode)?)?;
                 Ok(())
             })
-            .await
+            .await?;
+
+        self.dedup_hits.fetch_add(dedup_hits, Ordering::Relaxed);
+        self.dedup_misses.fetch_add(dedup_misses, Ordering::Relaxed);
+        debug!(
+            ino = op.ino,
+            offset = op.offset,
+            bytes = op.data.len(),
+            cdc_chunks = cdc_chunk_count,
+            dedup_hits,
+            dedup_misses,
+            "write completed through streaming dedup/compress pipeline"
+        );
+        Ok(())
     }
 
     fn decrement_chunk_refcounts_in_txn(
         txn: &mut surrealkv::Transaction,
         hashes: &[[u8; 16]],
     ) -> Result<()> {
-        for hash in hashes {
-            let key = chunk_key(hash);
-            let Some(raw) = txn.get(key.clone())? else {
-                continue;
-            };
-            let mut chunk: ChunkRecord = decode_rkyv(&raw)?;
-            if chunk.refcount <= 1 {
-                txn.delete(key)?;
-            } else {
-                chunk.refcount -= 1;
-                txn.set(key, encode_rkyv(&chunk)?)?;
-            }
+        if hashes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+
+        let mut ref_deltas = HashMap::<[u8; 16], i64>::with_capacity(hashes.len());
+        for hash in hashes {
+            *ref_deltas.entry(*hash).or_insert(0) -= 1;
+        }
+
+        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &HashMap::new())
     }
 
     fn ensure_dirent_target(
@@ -1367,13 +1468,18 @@ impl VirtualFs for VerFs {
                 let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
                 for hash in hashes {
                     if let Some(raw) = txn.get(chunk_key(&hash))? {
-                        chunks.insert(hash, decode_rkyv(&raw)?);
+                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                        chunks.insert(hash, chunk);
                     }
                 }
 
                 Ok((extents, chunks))
             })
             .map_err(map_anyhow_to_fuse)?;
+
+        for (hash, chunk) in chunks.iter() {
+            self.core.chunk_meta_cache.insert(*hash, chunk.clone());
+        }
 
         let mut out = Vec::with_capacity((read_end - offset) as usize);
         for block_idx in start_block..=end_block {
@@ -1385,11 +1491,20 @@ impl VirtualFs for VerFs {
                         format!("missing chunk metadata for block {}", block_idx),
                     );
                 };
-                let mut payload = self
-                    .core
-                    .packs
-                    .read_chunk(chunk.pack_id, chunk.offset, extent.chunk_hash, chunk.len)
-                    .map_err(map_anyhow_to_fuse)?;
+                let mut payload =
+                    if let Some(cached) = self.core.chunk_data_cache.get(&extent.chunk_hash) {
+                        cached.as_ref().clone()
+                    } else {
+                        let bytes = self
+                            .core
+                            .packs
+                            .read_chunk(chunk.pack_id, extent.chunk_hash, chunk.uncompressed_len)
+                            .map_err(map_anyhow_to_fuse)?;
+                        self.core
+                            .chunk_data_cache
+                            .insert(extent.chunk_hash, Arc::new(bytes.clone()));
+                        bytes
+                    };
                 if payload.len() < BLOCK_SIZE {
                     payload.resize(BLOCK_SIZE, 0);
                 }
@@ -1998,6 +2113,11 @@ impl WriteApply for FsCore {
             let res = self.apply_single_write(op).await;
             out.push(res);
         }
+        debug!(
+            dedup_hits = self.dedup_hits.load(Ordering::Relaxed),
+            dedup_misses = self.dedup_misses.load(Ordering::Relaxed),
+            "write batch applied"
+        );
         out
     }
 }

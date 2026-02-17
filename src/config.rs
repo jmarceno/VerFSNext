@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 fn default_sync_interval_ms() -> u64 {
@@ -15,6 +15,34 @@ fn default_batch_flush_interval_ms() -> u64 {
     500
 }
 
+fn default_metadata_cache_capacity_entries() -> u64 {
+    131_072
+}
+
+fn default_chunk_cache_capacity_entries() -> u64 {
+    262_144
+}
+
+fn default_pack_index_cache_capacity_entries() -> u64 {
+    524_288
+}
+
+fn default_zstd_compression_level() -> i32 {
+    3
+}
+
+fn default_ultracdc_min_size_bytes() -> usize {
+    2 * 1024
+}
+
+fn default_ultracdc_avg_size_bytes() -> usize {
+    4 * 1024
+}
+
+fn default_ultracdc_max_size_bytes() -> usize {
+    16 * 1024
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mount_point: PathBuf,
@@ -25,6 +53,20 @@ pub struct Config {
     pub batch_max_blocks: usize,
     #[serde(default = "default_batch_flush_interval_ms")]
     pub batch_flush_interval_ms: u64,
+    #[serde(default = "default_metadata_cache_capacity_entries")]
+    pub metadata_cache_capacity_entries: u64,
+    #[serde(default = "default_chunk_cache_capacity_entries")]
+    pub chunk_cache_capacity_entries: u64,
+    #[serde(default = "default_pack_index_cache_capacity_entries")]
+    pub pack_index_cache_capacity_entries: u64,
+    #[serde(default = "default_zstd_compression_level")]
+    pub zstd_compression_level: i32,
+    #[serde(default = "default_ultracdc_min_size_bytes")]
+    pub ultracdc_min_size_bytes: usize,
+    #[serde(default = "default_ultracdc_avg_size_bytes")]
+    pub ultracdc_avg_size_bytes: usize,
+    #[serde(default = "default_ultracdc_max_size_bytes")]
+    pub ultracdc_max_size_bytes: usize,
 }
 
 impl Config {
@@ -52,6 +94,27 @@ impl Config {
         if self.batch_flush_interval_ms == 0 {
             bail!("batch_flush_interval_ms must be > 0");
         }
+        if self.metadata_cache_capacity_entries == 0 {
+            bail!("metadata_cache_capacity_entries must be > 0");
+        }
+        if self.chunk_cache_capacity_entries == 0 {
+            bail!("chunk_cache_capacity_entries must be > 0");
+        }
+        if self.pack_index_cache_capacity_entries == 0 {
+            bail!("pack_index_cache_capacity_entries must be > 0");
+        }
+        if self.zstd_compression_level < -7 || self.zstd_compression_level > 22 {
+            bail!("zstd_compression_level must be in range -7..=22");
+        }
+        if self.ultracdc_min_size_bytes == 0 {
+            bail!("ultracdc_min_size_bytes must be > 0");
+        }
+        if self.ultracdc_avg_size_bytes < self.ultracdc_min_size_bytes {
+            bail!("ultracdc_avg_size_bytes must be >= ultracdc_min_size_bytes");
+        }
+        if self.ultracdc_max_size_bytes < self.ultracdc_avg_size_bytes {
+            bail!("ultracdc_max_size_bytes must be >= ultracdc_avg_size_bytes");
+        }
         Ok(())
     }
 
@@ -72,8 +135,9 @@ impl Config {
                 self.metadata_dir().display()
             )
         })?;
-        std::fs::create_dir_all(self.packs_dir())
-            .with_context(|| format!("failed to create packs dir {}", self.packs_dir().display()))?;
+        std::fs::create_dir_all(self.packs_dir()).with_context(|| {
+            format!("failed to create packs dir {}", self.packs_dir().display())
+        })?;
         Ok(())
     }
 }

@@ -56,8 +56,9 @@ pub struct ExtentRecord {
 pub struct ChunkRecord {
     pub refcount: u64,
     pub pack_id: u64,
-    pub offset: u64,
-    pub len: u32,
+    pub codec: u8,
+    pub uncompressed_len: u32,
+    pub compressed_len: u32,
 }
 
 pub fn encode_rkyv<T>(value: &T) -> Result<Vec<u8>>
