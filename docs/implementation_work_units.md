@@ -77,6 +77,13 @@ Meet the hard requirement that every operation exposed by vendored async-fusex i
 - “No exceptions” async-fusex operation coverage.
 - Stable behavior under shell tools and rsync.
 
+## Automated Testing
+- Add an integration test covering basic rsync copy.
+    - Test must always invoke and do operations through mounted VerFSNext, using Linux commands (`cp`, `mv`, `rsync`) to interact with the filesystem.
+    - Internal commands and APIs should not be used for this test, as the goal is to validate real-world behavior and compatibility with standard tools.
+    - Test should invoke linux `rsync` binary against mounted VerFSNext and validate file integrity (`sha256sum` through linux `sha256sum` command) metadata correctness after copy, then it should unmount and remount to validate data persistence and integrity (`sha256sum` command) after remount, them it should delete the copied files and validate deletion through `ls` and `stat` commands, then it should unmount and remount to validate deletion persistence through `ls` and `stat` commands.
+    - External commands should always be run with `timeout` to prevent hanging tests in case of deadlocks or stalls, and the test should fail if any command does not complete within a reasonable time frame (e.g., 120 seconds).
+
 ## Manual Gate (10-15 minutes)
 
 1. Permission/metadata checks:
