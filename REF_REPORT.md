@@ -113,6 +113,7 @@ The refactoring of `surrealkv` to utilize `rkyv` for zero-copy serialization is 
 5.  Update `Wal::reader` and recovery logic to use `rkyv::access::<Batch>` and iterate over the archived entries.
 6.  *Breaking Change:* This invalidates existing WAL files.
 
+### Phase 2 will not be implemented as it requires unsafe 
 ### Phase 2: MemTable Layout Optimization
 1.  Modify `Node` struct in `skiplist.rs`.
 2.  Update `new_node` allocator to reserve space for `trailer` and `timestamp` contiguous with `key`.
@@ -126,5 +127,5 @@ The refactoring of `surrealkv` to utilize `rkyv` for zero-copy serialization is 
 4.  *Breaking Change:* Invalidates existing SSTables.
 
 ## Risks & Mitigation
--   **Disk Format Compatibility:** All proposed changes are breaking. As per instructions, backward compatibility is not a concern, but a clean break (e.g., version check) should be enforced to prevent corruption when opening old DBs.
--   **Unsafe Code:** `rkyv` guarantees are strong, but manual memory layout changes in `Skiplist` (Phase 2) involve `unsafe` Rust. Comprehensive testing (Miri) is required.
+-   **Disk Format Compatibility:** All proposed changes are breaking, which is not a problem as there are no consumers other the VerFSNext and it is still in pre-alpha. So VerFSNext will update its API.
+-   **Unsafe Code:** `rkyv` guarantees are strong, but manual memory layout changes in `Skiplist` (Phase 2) involve `unsafe` Rust, this is why we are not implementing phase 2.
