@@ -74,15 +74,18 @@ fn test_level_manifest_persistence() {
 	let table_id1 = 1;
 	let table1 =
 		create_test_table(table_id1, 100, Arc::clone(&opts)).expect("Failed to create table 1");
+	let expected_table1_size = table1.file_size;
 
 	let table_id2 = 2;
 	let table2 =
 		create_test_table(table_id2, 200, Arc::clone(&opts)).expect("Failed to create table 2");
+	let expected_table2_size = table2.file_size;
 
 	// Create a table for level 1
 	let table_id3 = 3;
 	let table3 =
 		create_test_table(table_id3, 300, Arc::clone(&opts)).expect("Failed to create table 3");
+	let expected_table3_size = table3.file_size;
 
 	let expected_next_id = 100;
 	manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
@@ -224,7 +227,10 @@ fn test_level_manifest_persistence() {
 
 	// Check Table1 basic properties
 	assert_eq!(table1_reloaded.id, table_id1, "Table 1 ID mismatch");
-	assert_eq!(table1_reloaded.file_size, 3838, "Table 1 file size should be 3838");
+	assert_eq!(
+		table1_reloaded.file_size, expected_table1_size,
+		"Table 1 file size should round-trip through manifest persistence"
+	);
 
 	// Check Table1 metadata properties
 	let props1 = &table1_reloaded.meta.properties;
@@ -260,7 +266,10 @@ fn test_level_manifest_persistence() {
 
 	// Check Table2 basic properties
 	assert_eq!(table2_reloaded.id, table_id2, "Table 2 ID mismatch");
-	assert_eq!(table2_reloaded.file_size, 7145, "Table 2 file size should be 7145");
+	assert_eq!(
+		table2_reloaded.file_size, expected_table2_size,
+		"Table 2 file size should round-trip through manifest persistence"
+	);
 
 	// Check Table2 metadata properties
 	let props2 = &table2_reloaded.meta.properties;
@@ -296,7 +305,10 @@ fn test_level_manifest_persistence() {
 
 	// Check Table3 basic properties
 	assert_eq!(table3_reloaded.id, table_id3, "Table 3 ID mismatch");
-	assert_eq!(table3_reloaded.file_size, 10452, "Table 3 file size should be 10452");
+	assert_eq!(
+		table3_reloaded.file_size, expected_table3_size,
+		"Table 3 file size should round-trip through manifest persistence"
+	);
 
 	// Check Table3 metadata properties
 	let props3 = &table3_reloaded.meta.properties;

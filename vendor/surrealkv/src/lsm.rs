@@ -328,9 +328,17 @@ impl CoreInner {
 			manifest.get_last_sequence()
 		);
 
-		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "flush");
+			// After successful manifest commit, cleanup obsolete vlog files and stale index entries
+			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+			drop(memtable_lock);
+			drop(manifest);
+			let min_oldest_vlog = resolve_vlog_cleanup_floor(
+				min_oldest_vlog,
+				&self.active_memtable,
+				&self.immutable_memtables,
+				"flush",
+			);
+			cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -786,8 +794,9 @@ impl CoreInner {
 			return Ok(()); // No VLog, nothing to clean up
 		}
 
-		let manifest = self.level_manifest.read()?;
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+			let manifest = self.level_manifest.read()?;
+			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+			drop(manifest);
 
 		// If no SSTs reference VLog files yet, keep all files
 		// (This handles the fresh database case)
@@ -796,10 +805,16 @@ impl CoreInner {
 			return Ok(());
 		}
 
-		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
+			log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
+			let min_oldest_vlog = resolve_vlog_cleanup_floor(
+				min_oldest_vlog,
+				&self.active_memtable,
+				&self.immutable_memtables,
+				"startup",
+			);
 
-		// Use the consolidated cleanup helper
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "startup");
+			// Use the consolidated cleanup helper
+			cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "startup");
 
 		Ok(())
 	}
@@ -1550,16 +1565,22 @@ impl Tree {
 	///
 	/// This executes a leveled compaction pass and then runs VLog/index cleanup
 	/// using the current global minimum vlog file reference.
-	pub fn force_maintenance(&self) -> Result<()> {
-		let strategy: Arc<dyn CompactionStrategy> =
-			Arc::new(Strategy::from_options(Arc::clone(&self.core.inner.opts)));
-		while self.core.inner.compact(Arc::clone(&strategy))? {}
+		pub fn force_maintenance(&self) -> Result<()> {
+			let strategy: Arc<dyn CompactionStrategy> =
+				Arc::new(Strategy::from_options(Arc::clone(&self.core.inner.opts)));
+			while self.core.inner.compact(Arc::clone(&strategy))? {}
 
-		let min_oldest_vlog = self.core.inner.level_manifest.read()?.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(
-			&self.core.inner.vlog,
-			&self.core.inner.versioned_index,
-			min_oldest_vlog,
+			let min_oldest_vlog = self.core.inner.level_manifest.read()?.min_oldest_vlog_file_id();
+			let min_oldest_vlog = resolve_vlog_cleanup_floor(
+				min_oldest_vlog,
+				&self.core.inner.active_memtable,
+				&self.core.inner.immutable_memtables,
+				"manual",
+			);
+			cleanup_vlog_and_index(
+				&self.core.inner.vlog,
+				&self.core.inner.versioned_index,
+				min_oldest_vlog,
 			"manual",
 		);
 
@@ -2117,6 +2138,80 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 }
 
 // ===== VLog and Versioned Index Cleanup Helpers =====
+
+fn min_memtable_vlog_file_id(memtable: &MemTable) -> Result<Option<u32>> {
+	let mut iter = memtable.iter();
+	iter.seek_first()?;
+
+	let mut min_file_id: Option<u32> = None;
+	while iter.valid() {
+		let encoded_value = iter.value_encoded()?;
+		if let Ok(location) = ValueLocation::decode(encoded_value) {
+			if location.is_value_pointer() {
+				if let Ok(pointer) = ValuePointer::decode(&location.value) {
+					min_file_id =
+						Some(min_file_id.map_or(pointer.file_id, |current| current.min(pointer.file_id)));
+				}
+			}
+		}
+		iter.next()?;
+	}
+
+	Ok(min_file_id)
+}
+
+pub(crate) fn calculate_vlog_cleanup_floor(
+	min_oldest_vlog: u32,
+	active_memtable: &Arc<RwLock<Arc<MemTable>>>,
+	immutable_memtables: &Arc<RwLock<ImmutableMemtables>>,
+) -> Result<u32> {
+	if min_oldest_vlog == 0 {
+		return Ok(0);
+	}
+
+	let active = {
+		let guard = active_memtable.read()?;
+		Arc::clone(&guard)
+	};
+
+	let immutable_memtables: Vec<Arc<MemTable>> = {
+		let guard = immutable_memtables.read()?;
+		guard.iter().map(|entry| Arc::clone(&entry.memtable)).collect()
+	};
+
+	let mut floor = min_oldest_vlog;
+
+	if let Some(active_min) = min_memtable_vlog_file_id(&active)? {
+		floor = floor.min(active_min);
+	}
+
+	for memtable in immutable_memtables {
+		if let Some(memtable_min) = min_memtable_vlog_file_id(&memtable)? {
+			floor = floor.min(memtable_min);
+		}
+	}
+
+	Ok(floor)
+}
+
+pub(crate) fn resolve_vlog_cleanup_floor(
+	min_oldest_vlog: u32,
+	active_memtable: &Arc<RwLock<Arc<MemTable>>>,
+	immutable_memtables: &Arc<RwLock<ImmutableMemtables>>,
+	context: &str,
+) -> u32 {
+	match calculate_vlog_cleanup_floor(min_oldest_vlog, active_memtable, immutable_memtables) {
+		Ok(floor) => floor,
+		Err(e) => {
+			log::warn!(
+				"Failed to calculate in-memory VLog cleanup floor during {}: {}. Skipping cleanup",
+				context,
+				e
+			);
+			0
+		}
+	}
+}
 
 /// Cleans up stale versioned_index entries that reference deleted VLog files.
 ///

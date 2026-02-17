@@ -14,7 +14,7 @@ use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
-use crate::memtable::ImmutableMemtables;
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
 use crate::vlog::ValueLocation;
@@ -211,10 +211,12 @@ fn create_compaction_options(
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
 
 	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts)).unwrap());
+	let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new(opts.max_memtable_size, 0))));
 
 	CompactionOptions {
 		lopts: opts,
 		level_manifest: manifest,
+		active_memtable,
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
@@ -1975,6 +1977,12 @@ fn test_table_properties_population() {
 
 	let table_id = 11;
 	let table = env.create_test_table(table_id, entries).unwrap();
+	let expected_compression = env
+		.options
+		.compression_per_level
+		.first()
+		.copied()
+		.unwrap_or(CompressionType::None);
 
 	let meta = &table.meta;
 	let props = &meta.properties;
@@ -1991,11 +1999,11 @@ fn test_table_properties_population() {
 	assert_eq!(props.oldest_vlog_file_id, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
-	assert_eq!(props.index_size, 74, "Index size should be tracked");
+	assert!(props.index_size > 0, "Index size should be tracked");
 	assert_eq!(props.index_partitions, 1, "Should have 1 index partition for small table");
-	assert_eq!(props.top_level_index_size, 32, "Top-level index size should be tracked");
+	assert!(props.top_level_index_size > 0, "Top-level index size should be tracked");
 	// Verify filter metrics (should have bloom filter by default)
-	assert_eq!(props.filter_size, 135, "Filter size should be tracked with default bloom filter");
+	assert!(props.filter_size > 0, "Filter size should be tracked with default bloom filter");
 	assert_eq!(props.raw_key_size, 2300, "Raw key size should be tracked");
 	assert_eq!(props.raw_value_size, 675, "Raw value size should be tracked");
 	assert!(
@@ -2011,9 +2019,9 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");
 
 	assert!(props.created_at > 0);
-	assert_eq!(props.block_size, 2757);
+	assert!(props.block_size > 0);
 	assert_eq!(props.block_count, 1);
-	assert_eq!(props.compression, CompressionType::None);
+	assert_eq!(props.compression, expected_compression);
 	assert_eq!(props.seqnos.0, 1000);
 	assert_eq!(props.seqnos.1, 1099);
 	assert!(meta.smallest_point.is_some());

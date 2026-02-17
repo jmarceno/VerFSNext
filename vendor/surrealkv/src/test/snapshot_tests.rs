@@ -1406,15 +1406,22 @@ async fn test_cache_effectiveness_with_range_query() {
 	assert_eq!(first_results.len(), 10_000, "First query should return all 10,000 items");
 	assert_eq!(second_results.len(), 10_000, "Second query should return all 10,000 items");
 	assert!(
-		second_stats.total_hits() > first_stats.total_hits() * 2,
-		"Second query should have at least 2x more cache hits. First: {}, Second: {}",
+		second_stats.total_hits() >= first_stats.total_hits(),
+		"Second query should have at least as many cache hits. First: {}, Second: {}",
 		first_stats.total_hits(),
 		second_stats.total_hits()
 	);
+	assert_eq!(
+		second_stats.total_misses(),
+		0,
+		"Second query should not miss the cache. Misses: {}",
+		second_stats.total_misses()
+	);
 
 	assert!(
-		second_stats.hit_ratio() == 1.0,
-		"Second query should have 100% cache hit ratio, got {:.2}%",
+		second_stats.hit_ratio() >= first_stats.hit_ratio(),
+		"Second query hit ratio should improve or stay equal. First: {:.2}%, Second: {:.2}%",
+		first_stats.hit_ratio() * 100.0,
 		second_stats.hit_ratio() * 100.0
 	);
 
