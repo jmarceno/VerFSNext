@@ -1,4 +1,5 @@
-use integer_encoding::{VarInt, VarIntWriter};
+use integer_encoding::VarInt;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
@@ -6,6 +7,25 @@ use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 pub(crate) const BATCH_VERSION: u8 = 1;
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct BatchEntryArchive {
+    kind: u8,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    timestamp: u64,
+    valueptr: Option<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct BatchArchive {
+    version: u8,
+    starting_seq_num: u64,
+    entries: Vec<BatchEntryArchive>,
+}
+
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -54,51 +74,28 @@ impl Batch {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let mut encoded = Vec::new();
+        let entries = self
+            .entries
+            .iter()
+            .zip(self.valueptrs.iter())
+            .map(|(entry, valueptr)| BatchEntryArchive {
+                kind: entry.kind as u8,
+                key: entry.key.clone(),
+                value: entry.value.clone().filter(|value| !value.is_empty()),
+                timestamp: entry.timestamp,
+                valueptr: valueptr.as_ref().map(|ptr| ptr.encode().to_vec()),
+            })
+            .collect::<Vec<_>>();
 
-        // Write version (1 byte)
-        encoded.push(self.version);
+        let archived = BatchArchive {
+            version: self.version,
+            starting_seq_num: self.starting_seq_num,
+            entries,
+        };
 
-        // Write sequence number (8 bytes)
-        encoded.write_varint(self.starting_seq_num)?;
-
-        // Write count (4 bytes)
-        encoded.write_varint(self.entries.len() as u32)?;
-
-        // Write entries
-        for entry in &self.entries {
-            // Write kind (1 byte)
-            encoded.push(entry.kind as u8);
-
-            // Write key length and key
-            encoded.write_varint(entry.key.len() as u64)?;
-            encoded.extend_from_slice(&entry.key);
-
-            // Write value length and value
-            let value_len = entry.value.as_ref().map_or(0, |v| v.len());
-            encoded.write_varint(value_len as u64)?;
-            if let Some(value) = &entry.value {
-                encoded.extend_from_slice(value);
-            }
-
-            // Write timestamp (8 bytes)
-            encoded.write_varint(entry.timestamp)?;
-        }
-
-        // Write value pointers
-        for valueptr in &self.valueptrs {
-            match valueptr {
-                Some(ptr) => {
-                    encoded.push(1); // Has pointer
-                    encoded.extend_from_slice(&ptr.encode());
-                }
-                None => {
-                    encoded.push(0); // No pointer (inline value)
-                }
-            }
-        }
-
-        Ok(encoded)
+        rkyv::to_bytes::<rkyv::rancor::Error>(&archived)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| Error::Corruption(format!("failed to encode WAL batch archive: {e}")))
     }
 
     #[cfg(test)]
@@ -208,91 +205,51 @@ impl Batch {
 
     /// Decode a batch from encoded data
     pub(crate) fn decode(data: &[u8]) -> Result<Self> {
-        if data.is_empty() {
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
+        aligned.extend_from_slice(data);
+        let archived = rkyv::from_bytes::<BatchArchive, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Corruption(format!("invalid WAL batch archive: {e}")))?;
+
+        if archived.version != BATCH_VERSION {
             return Err(Error::InvalidBatchRecord);
         }
 
-        let mut pos = 0;
-
-        // Read version
-        let version = data[pos];
-        pos += 1;
-        if version != BATCH_VERSION {
-            return Err(Error::InvalidBatchRecord);
-        }
-
-        // Read sequence number
-        let (seq_num, bytes_read) =
-            u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-        pos += bytes_read;
-
-        // Read count
-        let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-        pos += bytes_read;
-
-        // Read entries
-        let mut entries = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            // Read kind
-            let kind_byte = data[pos];
-            pos += 1;
-            let kind = InternalKeyKind::from(kind_byte);
+        let mut entries = Vec::with_capacity(archived.entries.len());
+        let mut valueptrs = Vec::with_capacity(archived.entries.len());
+        for archived_entry in archived.entries {
+            let kind = InternalKeyKind::from(archived_entry.kind);
             if kind == InternalKeyKind::Invalid {
                 return Err(Error::InvalidBatchRecord);
             }
 
-            // Read key
-            let (key_len, bytes_read) =
-                u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-            pos += bytes_read;
-            let key = data[pos..pos + key_len as usize].to_vec();
-            pos += key_len as usize;
-
-            // Read value
-            let (value_len, bytes_read) =
-                u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-            pos += bytes_read;
-            let value = if value_len > 0 {
-                let value_data = data[pos..pos + value_len as usize].to_vec();
-                pos += value_len as usize;
-                Some(value_data)
-            } else {
-                None
+            let valueptr = match archived_entry.valueptr {
+                Some(ptr) => {
+                    if ptr.len() != VALUE_POINTER_SIZE {
+                        return Err(Error::Corruption(format!(
+                            "invalid WAL batch value pointer size: got {}, expected {}",
+                            ptr.len(),
+                            VALUE_POINTER_SIZE
+                        )));
+                    }
+                    Some(ValuePointer::decode(&ptr)?)
+                }
+                None => None,
             };
-
-            // Read timestamp
-            let (timestamp, bytes_read) =
-                u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-            pos += bytes_read;
 
             entries.push(BatchEntry {
                 kind,
-                key,
-                value,
-                timestamp,
+                key: archived_entry.key,
+                value: archived_entry.value,
+                timestamp: archived_entry.timestamp,
             });
-        }
-
-        // Read value pointers
-        let mut valueptrs = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let has_pointer = data[pos];
-            pos += 1;
-            let valueptr = if has_pointer == 1 {
-                let ptr_data = &data[pos..pos + VALUE_POINTER_SIZE];
-                pos += VALUE_POINTER_SIZE;
-                Some(ValuePointer::decode(ptr_data)?)
-            } else {
-                None
-            };
             valueptrs.push(valueptr);
         }
 
         Ok(Self {
-            version,
+            version: archived.version,
             entries,
             valueptrs,
-            starting_seq_num: seq_num,
+            starting_seq_num: archived.starting_seq_num,
             size: 0, // Decoded batches don't track size
         })
     }

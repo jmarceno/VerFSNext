@@ -83,6 +83,8 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
+use rkyv::{Archive, Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
@@ -124,6 +126,20 @@ impl BlockHandleWithKey {
     pub(crate) fn offset(&self) -> u64 {
         self.handle.offset as u64
     }
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct TopLevelIndexArchiveEntry {
+    separator_key: Vec<u8>,
+    offset: u64,
+    size: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct TopLevelIndexArchive {
+    entries: Vec<TopLevelIndexArchiveEntry>,
 }
 
 // =============================================================================
@@ -293,6 +309,7 @@ impl IndexWriter {
             self.opts.block_restart_interval,
             Arc::clone(&self.opts.internal_comparator),
         );
+        let mut top_level_entries = Vec::new();
 
         self.num_partitions = self.index_blocks.len() as u64;
 
@@ -313,9 +330,31 @@ impl IndexWriter {
                 Self::write_compressed_block(writer, block_data, compression_type, offset)?;
             offset = new_offset;
 
-            // Add to top-level: separator_key → partition_handle
-            top_level_index.add(&separator_key, &block_handle.encode())?;
+            top_level_entries.push(TopLevelIndexArchiveEntry {
+                separator_key,
+                offset: block_handle.offset() as u64,
+                size: block_handle.size() as u64,
+            });
         }
+
+        if top_level_entries.is_empty() {
+            let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex { table_id: 0 });
+            log::error!("[INDEX] {}", err);
+            return Err(err);
+        }
+
+        let archived_index = TopLevelIndexArchive {
+            entries: top_level_entries,
+        };
+        let archived_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archived_index)
+            .map_err(|e| Error::Corruption(format!("failed to encode SSTable top-level index archive: {e}")))?;
+
+        let top_level_key = archived_index
+            .entries
+            .last()
+            .map(|entry| entry.separator_key.as_slice())
+            .unwrap();
+        top_level_index.add(top_level_key, archived_bytes.as_ref())?;
 
         // Write top-level index block
         let top_level_data = top_level_index.finish()?;
@@ -383,20 +422,37 @@ impl Index {
         )?;
 
         let mut iter = block.iter()?;
-        let mut blocks = Vec::new();
-
-        // Extract all partition entries
         iter.seek_to_first()?;
-        while iter.is_valid() {
-            let key = iter.key_bytes().to_vec();
-            let handle_bytes = iter.value_bytes();
-            let (handle, _) = BlockHandle::decode(handle_bytes)?;
+        if !iter.is_valid() {
+            let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex { table_id: id });
+            log::error!("[INDEX] {}", err);
+            return Err(err);
+        }
 
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(iter.value_bytes().len());
+        aligned.extend_from_slice(iter.value_bytes());
+        let archived_index = rkyv::from_bytes::<TopLevelIndexArchive, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Corruption(format!("invalid SSTable top-level index archive: {e}")))?;
+        let mut blocks = Vec::with_capacity(archived_index.entries.len());
+        for entry in archived_index.entries {
+            let handle = BlockHandle::new(
+                usize::try_from(entry.offset).map_err(|_| {
+                    Error::Corruption(format!(
+                        "SSTable top-level index offset {} does not fit usize",
+                        entry.offset
+                    ))
+                })?,
+                usize::try_from(entry.size).map_err(|_| {
+                    Error::Corruption(format!(
+                        "SSTable top-level index size {} does not fit usize",
+                        entry.size
+                    ))
+                })?,
+            );
             blocks.push(BlockHandleWithKey {
-                separator_key: key,
+                separator_key: entry.separator_key,
                 handle,
             });
-            iter.advance()?;
         }
 
         Ok(Index {

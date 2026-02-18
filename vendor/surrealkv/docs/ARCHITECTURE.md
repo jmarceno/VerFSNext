@@ -46,6 +46,15 @@ This keeps the vendored engine buildable as a first-class in-repo component for 
 
 ---
 
+## On-Disk Serialization Boundaries
+
+- WAL commit batches are serialized with `rkyv` archives and validated during replay.
+- SSTable `TableMetadata` payloads are serialized with `rkyv` archives and validated on table open.
+- Partitioned index top-level entries are persisted as a `rkyv` archive payload, then materialized directly into `Index::blocks` during open.
+- These format updates are intentionally breaking and no compatibility path is maintained.
+
+---
+
 ## Overall Architecture
 
 SurrealKV is organized into four main layers: the Client API, Core Components, Storage Layer, and Background Tasks.

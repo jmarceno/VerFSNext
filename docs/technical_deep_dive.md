@@ -6,6 +6,7 @@ The repository now includes a Phase 4 implementation on top of the existing full
 
 - FUSE runtime via `vendor/async-fusex`
 - Metadata runtime via `vendor/surrealkv`
+  - WAL batches, SSTable table metadata, and partitioned top-level index payloads are archived with `rkyv` and validated at decode boundaries
 - Write batching (`>= 3000` blocks or `500ms`) with synchronous syscall completion
 - Background sync + shutdown full-sync barrier
 - Streaming UltraCDC chunking telemetry in write ingress path
