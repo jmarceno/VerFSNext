@@ -3,6 +3,8 @@
 [YOU SHOULD NEVER, FOR ANY REASON ADD BACKWARD COMPATIBILITY TO ANYTHING IF YOU
 WHERE NOT EXPLICITLY ASKED FOR. **ALL CHANGES ARE BREAKING** AND **WE DO NOT CARE ABOUT THOSE LEFT BEHIND**, THEY SHOULD NOT EVEN BE MENTIONED. THIS RULE IS SACRED AND UNBREAKABLE.]
 
+This is an unreleased, all the code need to be cannonical.
+
 ## Main Priorities (in order of importance)
 1. Never lose data
 2. Keep and Enhance POSIX/rsync Operational Correctness
