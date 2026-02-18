@@ -51,14 +51,17 @@ Read live runtime/internal statistics from the mounted daemon through the contro
 ```
 
 The report includes:
-- Total logical size
-- Unique compressed/uncompressed chunk sizes and compression rate
+- Live logical size scoped to mounted namespace (explicitly excluding `/.snapshots`)
+- Snapshot logical size and all-namespace logical size
+- Live referenced/unique compressed and uncompressed chunk sizes
+- Stored unique chunk sizes across all chunk records
+- Compression and dedup savings computed from live data scope
 - Metadata size
-- Deduplication savings
 - Cache hit rate
-- Used memory (RSS)
+- Process memory (private + RSS) and cache-memory approximation
 - Read/write throughput and totals
-- Full `data_dir` disk size and disk-usage delta computed as `data_dir_size - logical_size`
+- Full `data_dir` disk size and disk-usage delta computed as `data_dir_size - live_logical_size`
+- Output is rendered in an aligned table
 
 ## Encryption (`.vault`)
 

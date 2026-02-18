@@ -1,18 +1,65 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use moka::sync::Cache;
 use parking_lot::Mutex;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::data::compress::decompress_chunk;
 
 const RECORD_MAGIC: [u8; 4] = *b"VPK2";
-const RECORD_HEADER_LEN: u64 = 32;
-const INDEX_ENTRY_LEN: usize = 36;
+const RECORD_RESERVED: [u8; 3] = [0_u8; 3];
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+#[rkyv(bytecheck())]
+struct PackRecordHeader {
+    magic: [u8; 4],
+    hash: [u8; 16],
+    codec: u8,
+    reserved: [u8; 3],
+    uncompressed_len: u32,
+    compressed_len: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+#[rkyv(bytecheck())]
+struct PackIndexRecord {
+    hash: [u8; 16],
+    offset: u64,
+    codec: u8,
+    reserved: [u8; 3],
+    uncompressed_len: u32,
+    compressed_len: u32,
+}
+
+const RECORD_HEADER_LEN: usize = size_of::<ArchivedPackRecordHeader>();
+const RECORD_HEADER_LEN_U64: u64 = RECORD_HEADER_LEN as u64;
+const INDEX_ENTRY_LEN: usize = size_of::<ArchivedPackIndexRecord>();
+const INDEX_ENTRY_LEN_U64: u64 = INDEX_ENTRY_LEN as u64;
+
+#[repr(C, align(16))]
+struct AlignedBytes<const N: usize> {
+    data: [u8; N],
+}
+
+impl<const N: usize> AlignedBytes<N> {
+    fn zeroed() -> Self {
+        Self { data: [0_u8; N] }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackIndexEntry {
@@ -109,7 +156,7 @@ impl PackStore {
         if compressed_data.len() > u32::MAX as usize {
             bail!("compressed chunk too large: {}", compressed_data.len());
         }
-        let record_len = RECORD_HEADER_LEN
+        let record_len = RECORD_HEADER_LEN_U64
             .checked_add(compressed_data.len() as u64)
             .context("pack record length overflow")?;
         let mut active = self.active.lock();
@@ -133,19 +180,18 @@ impl PackStore {
             .seek(SeekFrom::End(0))
             .context("failed to seek to pack end")?;
         let compressed_len = compressed_data.len() as u32;
+        let header = PackRecordHeader {
+            magic: RECORD_MAGIC,
+            hash: chunk_hash,
+            codec,
+            reserved: RECORD_RESERVED,
+            uncompressed_len,
+            compressed_len,
+        };
+        let header_bytes = Self::encode_pack_header(&header)?;
 
-        file.write_all(&RECORD_MAGIC)
-            .context("failed to write pack record magic")?;
-        file.write_all(&chunk_hash)
-            .context("failed to write pack record hash")?;
-        file.write_all(&[codec])
-            .context("failed to write pack record codec")?;
-        file.write_all(&[0_u8; 3])
-            .context("failed to write pack record reserved bytes")?;
-        file.write_all(&uncompressed_len.to_le_bytes())
-            .context("failed to write pack record uncompressed len")?;
-        file.write_all(&compressed_len.to_le_bytes())
-            .context("failed to write pack record compressed len")?;
+        file.write_all(&header_bytes)
+            .context("failed to write pack record header")?;
         file.write_all(compressed_data)
             .context("failed to write pack record payload")?;
 
@@ -231,61 +277,53 @@ impl PackStore {
         let file = File::open(&path)
             .with_context(|| format!("failed to open pack file {}", path.display()))?;
 
-        let mut header = [0_u8; RECORD_HEADER_LEN as usize];
-        file.read_exact_at(&mut header, index.offset)
+        let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
+        file.read_exact_at(raw_header.as_mut_slice(), index.offset)
             .with_context(|| {
                 format!("failed to read pack record header from {}", path.display())
             })?;
+        let header = Self::decode_pack_header(raw_header.as_slice())?;
 
-        if header[..4] != RECORD_MAGIC {
+        if header.magic != RECORD_MAGIC {
             bail!("pack record magic mismatch for {}", path.display());
         }
 
-        let mut stored_hash = [0_u8; 16];
-        stored_hash.copy_from_slice(&header[4..20]);
-        if stored_hash != expected_hash {
+        if header.hash != expected_hash {
             bail!("pack record hash mismatch for {}", path.display());
         }
 
-        let stored_codec = header[20];
-        if stored_codec != index.codec {
+        if header.codec != index.codec {
             bail!(
                 "pack record codec mismatch for {}: index {}, header {}",
                 path.display(),
                 index.codec,
-                stored_codec
+                header.codec
             );
         }
 
-        let mut ulen_bytes = [0_u8; 4];
-        ulen_bytes.copy_from_slice(&header[24..28]);
-        let stored_ulen = u32::from_le_bytes(ulen_bytes);
-        if stored_ulen != expected_uncompressed_len {
+        if header.uncompressed_len != expected_uncompressed_len {
             bail!(
                 "pack record uncompressed length mismatch for {}: expected {}, got {}",
                 path.display(),
                 expected_uncompressed_len,
-                stored_ulen
+                header.uncompressed_len
             );
         }
 
-        let mut clen_bytes = [0_u8; 4];
-        clen_bytes.copy_from_slice(&header[28..32]);
-        let stored_clen = u32::from_le_bytes(clen_bytes);
-        if stored_clen != index.compressed_len {
+        if header.compressed_len != index.compressed_len {
             bail!(
                 "pack record compressed length mismatch for {}: index {}, header {}",
                 path.display(),
                 index.compressed_len,
-                stored_clen
+                header.compressed_len
             );
         }
 
         let payload_offset = index
             .offset
-            .checked_add(RECORD_HEADER_LEN)
+            .checked_add(RECORD_HEADER_LEN_U64)
             .context("pack record offset overflow while reading payload")?;
-        let mut payload = vec![0_u8; stored_clen as usize];
+        let mut payload = vec![0_u8; header.compressed_len as usize];
         file.read_exact_at(&mut payload, payload_offset)
             .with_context(|| format!("failed to read pack payload from {}", path.display()))?;
 
@@ -455,10 +493,11 @@ impl PackStore {
         let mut new_offset = 0_u64;
         let mut seen = HashSet::<[u8; 16]>::new();
         loop {
-            let mut header = [0_u8; RECORD_HEADER_LEN as usize];
-            match src_file.read_exact_at(&mut header, cursor) {
+            let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
+            match src_file.read_exact_at(raw_header.as_mut_slice(), cursor) {
                 Ok(()) => {
-                    if header[..4] != RECORD_MAGIC {
+                    let header = Self::decode_pack_header(raw_header.as_slice())?;
+                    if header.magic != RECORD_MAGIC {
                         bail!(
                             "corrupt pack record magic at offset {} in {}",
                             cursor,
@@ -466,24 +505,19 @@ impl PackStore {
                         );
                     }
 
-                    let mut hash = [0_u8; 16];
-                    hash.copy_from_slice(&header[4..20]);
-                    let codec = header[20];
-                    let mut ulen_bytes = [0_u8; 4];
-                    ulen_bytes.copy_from_slice(&header[24..28]);
-                    let mut clen_bytes = [0_u8; 4];
-                    clen_bytes.copy_from_slice(&header[28..32]);
-                    let ulen = u32::from_le_bytes(ulen_bytes);
-                    let clen = u32::from_le_bytes(clen_bytes);
+                    let hash = header.hash;
+                    let codec = header.codec;
+                    let ulen = header.uncompressed_len;
+                    let clen = header.compressed_len;
 
-                    let record_len = RECORD_HEADER_LEN
+                    let record_len = RECORD_HEADER_LEN_U64
                         .checked_add(clen as u64)
                         .context("record length overflow while rewriting pack")?;
 
                     if live_hashes.contains(&hash) && seen.insert(hash) {
                         let mut payload = vec![0_u8; clen as usize];
                         src_file
-                            .read_exact_at(&mut payload, cursor + RECORD_HEADER_LEN)
+                            .read_exact_at(&mut payload, cursor + RECORD_HEADER_LEN_U64)
                             .with_context(|| {
                                 format!(
                                     "failed to read pack payload while rewriting {}",
@@ -491,7 +525,7 @@ impl PackStore {
                                 )
                             })?;
 
-                        dst_file.write_all(&header).with_context(|| {
+                        dst_file.write_all(raw_header.as_slice()).with_context(|| {
                             format!(
                                 "failed writing pack header while rewriting {}",
                                 src_pack_path.display()
@@ -587,15 +621,15 @@ impl PackStore {
         let mut cursor = 0_u64;
         let mut found = None;
         loop {
-            let mut raw = [0_u8; INDEX_ENTRY_LEN];
-            match file.read_exact_at(&mut raw, cursor) {
+            let mut raw = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
+            match file.read_exact_at(raw.as_mut_slice(), cursor) {
                 Ok(()) => {
-                    let (hash, entry) = Self::decode_index_record(&raw)?;
+                    let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
                     if hash == expected_hash {
                         found = Some(entry);
                     }
                     cursor = cursor
-                        .checked_add(INDEX_ENTRY_LEN as u64)
+                        .checked_add(INDEX_ENTRY_LEN_U64)
                         .context("pack index cursor overflow")?;
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
@@ -640,21 +674,20 @@ impl PackStore {
         let mut cursor = 0_u64;
 
         loop {
-            let mut header = [0_u8; RECORD_HEADER_LEN as usize];
-            match file.read_exact_at(&mut header, cursor) {
+            let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
+            match file.read_exact_at(raw_header.as_mut_slice(), cursor) {
                 Ok(()) => {
-                    if header[..4] != RECORD_MAGIC {
+                    let header = Self::decode_pack_header(raw_header.as_slice())?;
+                    if header.magic != RECORD_MAGIC {
                         bail!(
                             "corrupt pack record magic at offset {} in {}",
                             cursor,
                             path.display()
                         );
                     }
-                    let mut clen_bytes = [0_u8; 4];
-                    clen_bytes.copy_from_slice(&header[28..32]);
-                    let compressed_len = u32::from_le_bytes(clen_bytes) as u64;
+                    let compressed_len = header.compressed_len as u64;
                     cursor = cursor
-                        .checked_add(RECORD_HEADER_LEN)
+                        .checked_add(RECORD_HEADER_LEN_U64)
                         .and_then(|v| v.checked_add(compressed_len))
                         .context("pack offset overflow while validating")?;
                 }
@@ -700,10 +733,11 @@ impl PackStore {
 
         let mut cursor = 0_u64;
         loop {
-            let mut header = [0_u8; RECORD_HEADER_LEN as usize];
-            match pack.read_exact_at(&mut header, cursor) {
+            let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
+            match pack.read_exact_at(raw_header.as_mut_slice(), cursor) {
                 Ok(()) => {
-                    if header[..4] != RECORD_MAGIC {
+                    let header = Self::decode_pack_header(raw_header.as_slice())?;
+                    if header.magic != RECORD_MAGIC {
                         bail!(
                             "corrupt pack record magic while rebuilding index at offset {} in {}",
                             cursor,
@@ -711,24 +745,16 @@ impl PackStore {
                         );
                     }
 
-                    let mut hash = [0_u8; 16];
-                    hash.copy_from_slice(&header[4..20]);
-                    let codec = header[20];
-                    let mut ulen_bytes = [0_u8; 4];
-                    ulen_bytes.copy_from_slice(&header[24..28]);
-                    let mut clen_bytes = [0_u8; 4];
-                    clen_bytes.copy_from_slice(&header[28..32]);
-
                     let entry = PackIndexEntry {
                         offset: cursor,
-                        codec,
-                        uncompressed_len: u32::from_le_bytes(ulen_bytes),
-                        compressed_len: u32::from_le_bytes(clen_bytes),
+                        codec: header.codec,
+                        uncompressed_len: header.uncompressed_len,
+                        compressed_len: header.compressed_len,
                     };
-                    Self::append_index_record(&mut index, hash, entry)?;
+                    Self::append_index_record(&mut index, header.hash, entry)?;
 
                     cursor = cursor
-                        .checked_add(RECORD_HEADER_LEN)
+                        .checked_add(RECORD_HEADER_LEN_U64)
                         .and_then(|v| v.checked_add(entry.compressed_len as u64))
                         .context("pack offset overflow while rebuilding index")?;
                 }
@@ -760,13 +786,13 @@ impl PackStore {
             .with_context(|| format!("failed to open pack index file {}", index_path.display()))?;
         let mut cursor = 0_u64;
         loop {
-            let mut raw = [0_u8; INDEX_ENTRY_LEN];
-            match file.read_exact_at(&mut raw, cursor) {
+            let mut raw = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
+            match file.read_exact_at(raw.as_mut_slice(), cursor) {
                 Ok(()) => {
-                    let (hash, entry) = Self::decode_index_record(&raw)?;
+                    let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
                     self.index_cache.insert((pack_id, hash), entry);
                     cursor = cursor
-                        .checked_add(INDEX_ENTRY_LEN as u64)
+                        .checked_add(INDEX_ENTRY_LEN_U64)
                         .context("pack index cursor overflow while priming cache")?;
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
@@ -785,38 +811,172 @@ impl PackStore {
         hash: [u8; 16],
         entry: PackIndexEntry,
     ) -> Result<()> {
-        let mut raw = [0_u8; INDEX_ENTRY_LEN];
-        raw[..16].copy_from_slice(&hash);
-        raw[16..24].copy_from_slice(&entry.offset.to_le_bytes());
-        raw[24] = entry.codec;
-        raw[28..32].copy_from_slice(&entry.uncompressed_len.to_le_bytes());
-        raw[32..36].copy_from_slice(&entry.compressed_len.to_le_bytes());
+        let record = PackIndexRecord {
+            hash,
+            offset: entry.offset,
+            codec: entry.codec,
+            reserved: RECORD_RESERVED,
+            uncompressed_len: entry.uncompressed_len,
+            compressed_len: entry.compressed_len,
+        };
+        let raw = Self::encode_index_record(&record)?;
         index_file
             .write_all(&raw)
             .context("failed to append pack index record")
     }
 
-    fn decode_index_record(raw: &[u8; INDEX_ENTRY_LEN]) -> Result<([u8; 16], PackIndexEntry)> {
-        let mut hash = [0_u8; 16];
-        hash.copy_from_slice(&raw[..16]);
-
-        let mut offset_bytes = [0_u8; 8];
-        offset_bytes.copy_from_slice(&raw[16..24]);
-
-        let codec = raw[24];
-        let mut ulen_bytes = [0_u8; 4];
-        ulen_bytes.copy_from_slice(&raw[28..32]);
-        let mut clen_bytes = [0_u8; 4];
-        clen_bytes.copy_from_slice(&raw[32..36]);
-
+    fn decode_index_record(raw: &[u8]) -> Result<([u8; 16], PackIndexEntry)> {
+        let archived = rkyv::access::<ArchivedPackIndexRecord, rkyv::rancor::Error>(raw)
+            .context("failed to decode pack index record")?;
+        if archived.reserved != RECORD_RESERVED {
+            bail!("pack index record reserved bytes are non-zero");
+        }
         Ok((
-            hash,
+            archived.hash,
             PackIndexEntry {
-                offset: u64::from_le_bytes(offset_bytes),
-                codec,
-                uncompressed_len: u32::from_le_bytes(ulen_bytes),
-                compressed_len: u32::from_le_bytes(clen_bytes),
+                offset: archived.offset.to_native(),
+                codec: archived.codec,
+                uncompressed_len: archived.uncompressed_len.to_native(),
+                compressed_len: archived.compressed_len.to_native(),
             },
         ))
+    }
+
+    fn decode_pack_header(raw: &[u8]) -> Result<PackRecordHeader> {
+        let archived = rkyv::access::<ArchivedPackRecordHeader, rkyv::rancor::Error>(raw)
+            .context("failed to decode pack record header")?;
+        if archived.reserved != RECORD_RESERVED {
+            bail!("pack record header reserved bytes are non-zero");
+        }
+        Ok(PackRecordHeader {
+            magic: archived.magic,
+            hash: archived.hash,
+            codec: archived.codec,
+            reserved: archived.reserved,
+            uncompressed_len: archived.uncompressed_len.to_native(),
+            compressed_len: archived.compressed_len.to_native(),
+        })
+    }
+
+    fn encode_pack_header(header: &PackRecordHeader) -> Result<rkyv::util::AlignedVec> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(header)
+            .context("failed to encode pack record header")?;
+        if bytes.len() != RECORD_HEADER_LEN {
+            bail!(
+                "invalid pack record header size: expected {}, got {}",
+                RECORD_HEADER_LEN,
+                bytes.len()
+            );
+        }
+        Ok(bytes)
+    }
+
+    fn encode_index_record(record: &PackIndexRecord) -> Result<rkyv::util::AlignedVec> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(record)
+            .context("failed to encode pack index record")?;
+        if bytes.len() != INDEX_ENTRY_LEN {
+            bail!(
+                "invalid pack index record size: expected {}, got {}",
+                INDEX_ENTRY_LEN,
+                bytes.len()
+            );
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::data::compress::CODEC_RAW;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(suffix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "verfsnext-pack-{suffix}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("failed to create temporary directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn archived_pack_record_sizes_are_stable() {
+        let header = PackRecordHeader {
+            magic: RECORD_MAGIC,
+            hash: [1_u8; 16],
+            codec: CODEC_RAW,
+            reserved: RECORD_RESERVED,
+            uncompressed_len: 1024,
+            compressed_len: 1000,
+        };
+        let index = PackIndexRecord {
+            hash: [2_u8; 16],
+            offset: 1234,
+            codec: CODEC_RAW,
+            reserved: RECORD_RESERVED,
+            uncompressed_len: 2048,
+            compressed_len: 1200,
+        };
+
+        let header_bytes =
+            PackStore::encode_pack_header(&header).expect("header should encode with rkyv");
+        let index_bytes =
+            PackStore::encode_index_record(&index).expect("index should encode with rkyv");
+
+        assert_eq!(header_bytes.len(), RECORD_HEADER_LEN);
+        assert_eq!(index_bytes.len(), INDEX_ENTRY_LEN);
+    }
+
+    #[test]
+    fn pack_store_roundtrips_payload_and_writes_rkyv_index_records() {
+        let tmp = TempDir::new("roundtrip");
+        let store =
+            PackStore::open(&tmp.path, 0, 1024, 64 * 1024 * 1024).expect("pack store should open");
+
+        let hash = [7_u8; 16];
+        let payload = b"verfs-pack-payload".to_vec();
+        let pack_id = store
+            .append_chunk(hash, CODEC_RAW, payload.len() as u32, &payload)
+            .expect("chunk append should succeed");
+
+        let read_back = store
+            .read_chunk_payload(
+                pack_id,
+                hash,
+                CODEC_RAW,
+                payload.len() as u32,
+                payload.len() as u32,
+            )
+            .expect("chunk read should succeed");
+        assert_eq!(read_back, payload);
+
+        store
+            .verify_pack_headers(pack_id)
+            .expect("pack header verification should succeed");
+
+        let index_path = PackStore::index_path_impl(&tmp.path, pack_id);
+        let index_len = std::fs::metadata(index_path)
+            .expect("index metadata should be readable")
+            .len();
+        assert_eq!(index_len, INDEX_ENTRY_LEN_U64);
     }
 }

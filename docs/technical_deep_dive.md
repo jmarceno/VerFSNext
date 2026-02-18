@@ -43,8 +43,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
-  - `collect_stats` computes logical/chunk/dedup/cache/memory/throughput metrics
-  - stats output includes full `data_dir` size and disk delta `data_dir_size - logical_size`
+  - `collect_stats` computes live-scope logical/chunk/dedup/cache/memory/throughput metrics
+  - live scope is traversed from root while excluding `/.snapshots`; snapshot and all-namespace logical totals are also exposed separately
+  - stats output includes full `data_dir` size and disk delta `data_dir_size - live_logical_size`
+  - stats are rendered as an aligned table for terminal readability
   - read-only inode flag enforcement across mutating FUSE operations
   - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - enforces `.vault` lock-state visibility and access policy
@@ -71,8 +73,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - atomic discard-file rewrite/rotation primitive used by GC pack stage
 
 - `src/data/pack.rs`
-  - Pack record format `VPK2`
-  - Sidecar index file per pack (`.idx`) with fixed-size entries
+  - Pack record format `VPK2` archived with `rkyv`
+  - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records
+  - Pack header and index record decode paths use checked `rkyv::access` for zero-copy validation
   - Automatic active-pack rollover on append when configured pack size target is reached
   - Existing packs are discovered on startup; highest pack id becomes active if metadata lags
   - Hash lookup path reads index entry first, then seeks pack payload

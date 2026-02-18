@@ -41,7 +41,7 @@ use crate::types::{
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_EXTENT, KEY_PREFIX_INODE, ROOT_INODE, VAULT_DIR_NAME,
+    KEY_PREFIX_INODE, ROOT_INODE, SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -74,18 +74,23 @@ struct ZeroRefCandidate {
 
 #[derive(Debug, Clone)]
 pub struct VerFsStats {
-    pub logical_size_bytes: u64,
-    pub referenced_uncompressed_bytes: u64,
-    pub unique_uncompressed_bytes: u64,
-    pub referenced_compressed_bytes: u64,
-    pub unique_compressed_bytes: u64,
+    pub live_logical_size_bytes: u64,
+    pub snapshots_logical_size_bytes: u64,
+    pub all_logical_size_bytes: u64,
+    pub live_referenced_uncompressed_bytes: u64,
+    pub live_referenced_compressed_bytes: u64,
+    pub live_unique_uncompressed_bytes: u64,
+    pub live_unique_compressed_bytes: u64,
+    pub stored_unique_uncompressed_bytes: u64,
+    pub stored_unique_compressed_bytes: u64,
     pub metadata_size_bytes: u64,
     pub data_dir_size_bytes: u64,
-    pub dedup_savings_bytes: u64,
+    pub live_dedup_savings_bytes: u64,
     pub cache_hits: u64,
     pub cache_requests: u64,
     pub cache_hit_rate: f64,
-    pub used_memory_bytes: u64,
+    pub process_private_memory_bytes: u64,
+    pub process_rss_bytes: u64,
     pub read_bytes_total: u64,
     pub write_bytes_total: u64,
     pub uptime_secs: f64,
@@ -1306,64 +1311,127 @@ impl FsCore {
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
 
-        let (logical_size_bytes, unique_uncompressed_bytes, unique_compressed_bytes, referenced_uncompressed_bytes, referenced_compressed_bytes) =
-            self.meta.read_txn(|txn| {
-                let mut logical_size_bytes = 0_u64;
-                let mut unique_uncompressed_bytes = 0_u64;
-                let mut unique_compressed_bytes = 0_u64;
-                let mut referenced_uncompressed_bytes = 0_u64;
-                let mut referenced_compressed_bytes = 0_u64;
-
-                let inode_prefix = vec![KEY_PREFIX_INODE];
-                let inode_end = prefix_end(&inode_prefix);
-                for (_, value) in scan_range_pairs(txn, inode_prefix, inode_end)? {
-                    let inode: InodeRecord = decode_rkyv(&value)?;
-                    if inode.kind == INODE_KIND_FILE {
-                        logical_size_bytes = logical_size_bytes.saturating_add(inode.size);
-                    }
+        let (
+            all_logical_size_bytes,
+            live_logical_size_bytes,
+            stored_unique_uncompressed_bytes,
+            stored_unique_compressed_bytes,
+            live_unique_uncompressed_bytes,
+            live_unique_compressed_bytes,
+            live_referenced_uncompressed_bytes,
+            live_referenced_compressed_bytes,
+        ) = self.meta.read_txn(|txn| {
+            let mut all_logical_size_bytes = 0_u64;
+            let inode_prefix = vec![KEY_PREFIX_INODE];
+            let inode_end = prefix_end(&inode_prefix);
+            for (_, value) in scan_range_pairs(txn, inode_prefix, inode_end)? {
+                let inode: InodeRecord = decode_rkyv(&value)?;
+                if inode.kind == INODE_KIND_FILE {
+                    all_logical_size_bytes = all_logical_size_bytes.saturating_add(inode.size);
                 }
+            }
 
-                let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
-                let chunk_prefix = vec![KEY_PREFIX_CHUNK];
-                let chunk_end = prefix_end(&chunk_prefix);
-                for (key, value) in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
-                    if key.len() != 17 {
+            let mut live_logical_size_bytes = 0_u64;
+            let mut live_seen_inodes = HashSet::<u64>::new();
+            let mut live_dir_stack = vec![ROOT_INODE];
+            let mut live_extent_refcounts = HashMap::<[u8; 16], u64>::new();
+            live_seen_inodes.insert(ROOT_INODE);
+
+            while let Some(dir_ino) = live_dir_stack.pop() {
+                let prefix = dirent_prefix(dir_ino);
+                let end = prefix_end(&prefix);
+                for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                    let Some(name) = decode_dirent_name(&key) else {
+                        continue;
+                    };
+                    if dir_ino == ROOT_INODE && name == SNAPSHOTS_DIR_NAME.as_bytes() {
                         continue;
                     }
-                    let mut hash = [0_u8; 16];
-                    hash.copy_from_slice(&key[1..17]);
-                    let chunk: ChunkRecord = decode_rkyv(&value)?;
-                    unique_uncompressed_bytes =
-                        unique_uncompressed_bytes.saturating_add(chunk.uncompressed_len as u64);
-                    unique_compressed_bytes =
-                        unique_compressed_bytes.saturating_add(chunk.compressed_len as u64);
-                    chunks.insert(hash, chunk);
-                }
 
-                let extent_prefix = vec![KEY_PREFIX_EXTENT];
-                let extent_end = prefix_end(&extent_prefix);
-                for (_, value) in scan_range_pairs(txn, extent_prefix, extent_end)? {
-                    let extent: ExtentRecord = decode_rkyv(&value)?;
-                    if let Some(chunk) = chunks.get(&extent.chunk_hash) {
-                        referenced_uncompressed_bytes = referenced_uncompressed_bytes
-                            .saturating_add(chunk.uncompressed_len as u64);
-                        referenced_compressed_bytes = referenced_compressed_bytes
-                            .saturating_add(chunk.compressed_len as u64);
+                    let dirent: DirentRecord = decode_rkyv(&value)?;
+                    if !live_seen_inodes.insert(dirent.ino) {
+                        continue;
+                    }
+                    let Some(child_raw) = txn.get(inode_key(dirent.ino))? else {
+                        continue;
+                    };
+                    let child: InodeRecord = decode_rkyv(&child_raw)?;
+
+                    match child.kind {
+                        INODE_KIND_FILE => {
+                            live_logical_size_bytes =
+                                live_logical_size_bytes.saturating_add(child.size);
+                            let ext_prefix = extent_prefix(child.ino);
+                            let ext_end = prefix_end(&ext_prefix);
+                            for (_, ext_value) in scan_range_pairs(txn, ext_prefix, ext_end)? {
+                                let extent: ExtentRecord = decode_rkyv(&ext_value)?;
+                                let counter =
+                                    live_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
+                                *counter = counter.saturating_add(1);
+                            }
+                        }
+                        INODE_KIND_DIR => {
+                            live_dir_stack.push(child.ino);
+                        }
+                        _ => {}
                     }
                 }
+            }
 
-                Ok((
-                    logical_size_bytes,
-                    unique_uncompressed_bytes,
-                    unique_compressed_bytes,
-                    referenced_uncompressed_bytes,
-                    referenced_compressed_bytes,
-                ))
-            })?;
+            let mut stored_unique_uncompressed_bytes = 0_u64;
+            let mut stored_unique_compressed_bytes = 0_u64;
+            let mut live_unique_uncompressed_bytes = 0_u64;
+            let mut live_unique_compressed_bytes = 0_u64;
+            let mut live_referenced_uncompressed_bytes = 0_u64;
+            let mut live_referenced_compressed_bytes = 0_u64;
+
+            let chunk_prefix = vec![KEY_PREFIX_CHUNK];
+            let chunk_end = prefix_end(&chunk_prefix);
+            for (key, value) in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
+                if key.len() != 17 {
+                    continue;
+                }
+                let mut hash = [0_u8; 16];
+                hash.copy_from_slice(&key[1..17]);
+                let chunk: ChunkRecord = decode_rkyv(&value)?;
+
+                let chunk_uncompressed = chunk.uncompressed_len as u64;
+                let chunk_compressed = chunk.compressed_len as u64;
+                stored_unique_uncompressed_bytes =
+                    stored_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
+                stored_unique_compressed_bytes =
+                    stored_unique_compressed_bytes.saturating_add(chunk_compressed);
+
+                if let Some(reference_count) = live_extent_refcounts.get(&hash) {
+                    live_unique_uncompressed_bytes =
+                        live_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
+                    live_unique_compressed_bytes =
+                        live_unique_compressed_bytes.saturating_add(chunk_compressed);
+                    live_referenced_uncompressed_bytes = live_referenced_uncompressed_bytes
+                        .saturating_add(chunk_uncompressed.saturating_mul(*reference_count));
+                    live_referenced_compressed_bytes = live_referenced_compressed_bytes
+                        .saturating_add(chunk_compressed.saturating_mul(*reference_count));
+                }
+            }
+
+            Ok((
+                all_logical_size_bytes,
+                live_logical_size_bytes,
+                stored_unique_uncompressed_bytes,
+                stored_unique_compressed_bytes,
+                live_unique_uncompressed_bytes,
+                live_unique_compressed_bytes,
+                live_referenced_uncompressed_bytes,
+                live_referenced_compressed_bytes,
+            ))
+        })?;
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
-        let dedup_savings_bytes = referenced_compressed_bytes.saturating_sub(unique_compressed_bytes);
+        let snapshots_logical_size_bytes =
+            all_logical_size_bytes.saturating_sub(live_logical_size_bytes);
+        let live_dedup_savings_bytes =
+            live_referenced_compressed_bytes.saturating_sub(live_unique_compressed_bytes);
 
         let cache_hits = self
             .chunk_meta_cache_hits
@@ -1388,7 +1456,9 @@ impl FsCore {
                 ),
             );
 
-        let used_memory_bytes = read_process_rss_bytes().unwrap_or(0);
+        let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
+        let process_private_memory_bytes =
+            read_process_private_memory_bytes().unwrap_or(process_rss_bytes);
         let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
         let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
         let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
@@ -1397,18 +1467,23 @@ impl FsCore {
         let write_throughput_bps = write_bytes_total as f64 / uptime_secs;
 
         Ok(VerFsStats {
-            logical_size_bytes,
-            referenced_uncompressed_bytes,
-            unique_uncompressed_bytes,
-            referenced_compressed_bytes,
-            unique_compressed_bytes,
+            live_logical_size_bytes,
+            snapshots_logical_size_bytes,
+            all_logical_size_bytes,
+            live_referenced_uncompressed_bytes,
+            live_referenced_compressed_bytes,
+            live_unique_uncompressed_bytes,
+            live_unique_compressed_bytes,
+            stored_unique_uncompressed_bytes,
+            stored_unique_compressed_bytes,
             metadata_size_bytes,
             data_dir_size_bytes,
-            dedup_savings_bytes,
+            live_dedup_savings_bytes,
             cache_hits,
             cache_requests,
             cache_hit_rate,
-            used_memory_bytes,
+            process_private_memory_bytes,
+            process_rss_bytes,
             read_bytes_total,
             write_bytes_total,
             uptime_secs,
@@ -3338,16 +3413,47 @@ fn dir_size_recursive(path: &Path) -> Result<u64> {
 fn read_process_rss_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| anyhow!("malformed VmRSS line"))?
-                .parse::<u64>()?;
-            return Ok(kb.saturating_mul(1024));
+        if let Some(bytes) = parse_proc_kib_line(line, "VmRSS:") {
+            return Ok(bytes?);
         }
     }
     Ok(0)
+}
+
+fn read_process_private_memory_bytes() -> Result<u64> {
+    let smaps_rollup = std::fs::read_to_string("/proc/self/smaps_rollup")?;
+    let mut private_clean = 0_u64;
+    let mut private_dirty = 0_u64;
+
+    for line in smaps_rollup.lines() {
+        if let Some(bytes) = parse_proc_kib_line(line, "Private_Clean:") {
+            private_clean = bytes?;
+            continue;
+        }
+        if let Some(bytes) = parse_proc_kib_line(line, "Private_Dirty:") {
+            private_dirty = bytes?;
+        }
+    }
+
+    Ok(private_clean.saturating_add(private_dirty))
+}
+
+fn parse_proc_kib_line(line: &str, key: &str) -> Option<Result<u64>> {
+    if !line.starts_with(key) {
+        return None;
+    }
+    Some(
+        line.strip_prefix(key)
+            .ok_or_else(|| anyhow!("malformed proc line for {key}"))
+            .and_then(|rest| {
+                let kb = rest
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {key}"))?
+                    .parse::<u64>()?;
+                Ok(kb.saturating_mul(1024))
+            }),
+    )
 }
 
 fn can_coalesce_write(existing: &WriteOp, incoming: &WriteOp) -> bool {

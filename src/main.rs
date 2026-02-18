@@ -642,99 +642,217 @@ async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
 }
 
 fn format_stats_report(stats: &VerFsStats) -> String {
-    let compression_rate = percent(stats.unique_compressed_bytes, stats.unique_uncompressed_bytes);
-    let dedup_ratio = if stats.referenced_compressed_bytes == 0 {
-        0.0
+    let compression_ratio = ratio(
+        stats.live_unique_compressed_bytes,
+        stats.live_unique_uncompressed_bytes,
+    );
+    let compression_savings_ratio = (1.0 - compression_ratio).max(0.0);
+    let dedup_ratio = ratio(
+        stats.live_dedup_savings_bytes,
+        stats.live_referenced_compressed_bytes,
+    );
+    let disk_vs_live_logical =
+        stats.data_dir_size_bytes as i128 - stats.live_logical_size_bytes as i128;
+    let disk_delta_note = if disk_vs_live_logical < 0 {
+        format!(
+            "saving {} vs live logical",
+            human_bytes(u64::try_from((-disk_vs_live_logical) as u128).unwrap_or(u64::MAX))
+        )
+    } else if disk_vs_live_logical > 0 {
+        format!(
+            "overhead {} vs live logical",
+            human_bytes(u64::try_from(disk_vs_live_logical as u128).unwrap_or(u64::MAX))
+        )
     } else {
-        stats.dedup_savings_bytes as f64 / stats.referenced_compressed_bytes as f64
+        "exactly equal to live logical".to_owned()
     };
-    let disk_vs_logical = stats.data_dir_size_bytes as i128 - stats.logical_size_bytes as i128;
 
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "total logical size: {} ({})",
-        stats.logical_size_bytes,
-        human_bytes(stats.logical_size_bytes)
-    ));
-    lines.push(format!(
-        "compressed unique chunk size: {} ({})",
-        stats.unique_compressed_bytes,
-        human_bytes(stats.unique_compressed_bytes)
-    ));
-    lines.push(format!(
-        "uncompressed unique chunk size: {} ({})",
-        stats.unique_uncompressed_bytes,
-        human_bytes(stats.unique_uncompressed_bytes)
-    ));
-    lines.push(format!(
-        "uncompressed referenced chunk size: {} ({})",
-        stats.referenced_uncompressed_bytes,
-        human_bytes(stats.referenced_uncompressed_bytes)
-    ));
-    lines.push(format!("compression rate: {:.2}%", compression_rate * 100.0));
-    lines.push(format!(
-        "metadata size: {} ({})",
-        stats.metadata_size_bytes,
-        human_bytes(stats.metadata_size_bytes)
-    ));
-    lines.push(format!(
-        "deduplication savings: {} ({}, {:.2}% of referenced compressed)",
-        stats.dedup_savings_bytes,
-        human_bytes(stats.dedup_savings_bytes),
-        dedup_ratio * 100.0
-    ));
-    lines.push(format!(
-        "cache hit rate: {:.2}% ({}/{})",
-        stats.cache_hit_rate * 100.0,
-        stats.cache_hits,
-        stats.cache_requests
-    ));
-    lines.push(format!(
-        "used memory (RSS): {} ({})",
-        stats.used_memory_bytes,
-        human_bytes(stats.used_memory_bytes)
-    ));
-    lines.push(format!(
-        "throughput: read {}/s, write {}/s, uptime {:.1}s",
-        human_bytes(stats.read_throughput_bps as u64),
-        human_bytes(stats.write_throughput_bps as u64),
-        stats.uptime_secs
-    ));
-    lines.push(format!(
-        "io totals: read {} ({}), write {} ({})",
-        stats.read_bytes_total,
-        human_bytes(stats.read_bytes_total),
-        stats.write_bytes_total,
-        human_bytes(stats.write_bytes_total)
-    ));
-    lines.push(format!(
-        "full data dir size: {} ({})",
-        stats.data_dir_size_bytes,
-        human_bytes(stats.data_dir_size_bytes)
-    ));
-    lines.push(format!(
-        "disk usage delta (data dir - logical): {} ({})",
-        disk_vs_logical,
-        human_bytes_signed(disk_vs_logical)
-    ));
-    lines.push(format!(
-        "cache entries: metadata {}, chunk-data {}",
-        stats.metadata_cache_entries, stats.chunk_cache_entries
-    ));
-    lines.push(format!(
-        "approx cache memory: {} ({})",
-        stats.approx_cache_memory_bytes,
-        human_bytes(stats.approx_cache_memory_bytes)
-    ));
-    lines.join("\n")
+    let rows = vec![
+        (
+            "Live Logical Size (/.snapshots excluded)".to_owned(),
+            human_bytes(stats.live_logical_size_bytes),
+            format!("{} bytes", stats.live_logical_size_bytes),
+        ),
+        (
+            "Logical Size in Snapshots".to_owned(),
+            human_bytes(stats.snapshots_logical_size_bytes),
+            format!("{} bytes", stats.snapshots_logical_size_bytes),
+        ),
+        (
+            "Logical Size (All Namespaces)".to_owned(),
+            human_bytes(stats.all_logical_size_bytes),
+            format!("{} bytes", stats.all_logical_size_bytes),
+        ),
+        (
+            "Live Referenced Uncompressed".to_owned(),
+            human_bytes(stats.live_referenced_uncompressed_bytes),
+            format!("{} bytes", stats.live_referenced_uncompressed_bytes),
+        ),
+        (
+            "Live Referenced Compressed".to_owned(),
+            human_bytes(stats.live_referenced_compressed_bytes),
+            format!("{} bytes", stats.live_referenced_compressed_bytes),
+        ),
+        (
+            "Live Unique Uncompressed".to_owned(),
+            human_bytes(stats.live_unique_uncompressed_bytes),
+            format!("{} bytes", stats.live_unique_uncompressed_bytes),
+        ),
+        (
+            "Live Unique Compressed".to_owned(),
+            human_bytes(stats.live_unique_compressed_bytes),
+            format!("{} bytes", stats.live_unique_compressed_bytes),
+        ),
+        (
+            "Compression (Live Unique)".to_owned(),
+            format!("{:.2}% smaller", compression_savings_ratio * 100.0),
+            format!("compressed/original: {:.2}%", compression_ratio * 100.0),
+        ),
+        (
+            "Dedup Savings (Live)".to_owned(),
+            human_bytes(stats.live_dedup_savings_bytes),
+            format!("{:.2}% of non-dedup compressed", dedup_ratio * 100.0),
+        ),
+        (
+            "Stored Unique Uncompressed (All Chunks)".to_owned(),
+            human_bytes(stats.stored_unique_uncompressed_bytes),
+            format!("{} bytes", stats.stored_unique_uncompressed_bytes),
+        ),
+        (
+            "Stored Unique Compressed (All Chunks)".to_owned(),
+            human_bytes(stats.stored_unique_compressed_bytes),
+            format!("{} bytes", stats.stored_unique_compressed_bytes),
+        ),
+        (
+            "Metadata Size".to_owned(),
+            human_bytes(stats.metadata_size_bytes),
+            format!("{} bytes", stats.metadata_size_bytes),
+        ),
+        (
+            "Data Dir Size (On Disk)".to_owned(),
+            human_bytes(stats.data_dir_size_bytes),
+            format!("{} bytes", stats.data_dir_size_bytes),
+        ),
+        (
+            "Disk Delta (data_dir - live_logical)".to_owned(),
+            human_bytes_signed(disk_vs_live_logical),
+            disk_delta_note,
+        ),
+        (
+            "Cache Hit Rate".to_owned(),
+            format!("{:.2}%", stats.cache_hit_rate * 100.0),
+            format!("{} hits / {} requests", stats.cache_hits, stats.cache_requests),
+        ),
+        (
+            "Process Private Memory".to_owned(),
+            human_bytes(stats.process_private_memory_bytes),
+            format!("{} bytes", stats.process_private_memory_bytes),
+        ),
+        (
+            "Process RSS".to_owned(),
+            human_bytes(stats.process_rss_bytes),
+            format!("{} bytes", stats.process_rss_bytes),
+        ),
+        (
+            "Approx Cache Memory".to_owned(),
+            human_bytes(stats.approx_cache_memory_bytes),
+            format!("{} bytes", stats.approx_cache_memory_bytes),
+        ),
+        (
+            "Cache Entries".to_owned(),
+            format!(
+                "metadata {}, chunk-data {}",
+                stats.metadata_cache_entries, stats.chunk_cache_entries
+            ),
+            "active cache keys".to_owned(),
+        ),
+        (
+            "Average Throughput".to_owned(),
+            format!(
+                "read {}/s | write {}/s",
+                human_bytes(stats.read_throughput_bps as u64),
+                human_bytes(stats.write_throughput_bps as u64)
+            ),
+            format!("uptime {:.1}s", stats.uptime_secs),
+        ),
+        (
+            "I/O Totals".to_owned(),
+            format!(
+                "read {} | write {}",
+                human_bytes(stats.read_bytes_total),
+                human_bytes(stats.write_bytes_total)
+            ),
+            format!("{} / {} bytes", stats.read_bytes_total, stats.write_bytes_total),
+        ),
+    ];
+
+    let table = render_stats_table(&rows);
+    format!(
+        "VerFSNext Stats\n(scoped to live tree unless explicitly marked otherwise)\n{}",
+        table
+    )
 }
 
-fn percent(numerator: u64, denominator: u64) -> f64 {
+fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
     } else {
         numerator as f64 / denominator as f64
     }
+}
+
+fn render_stats_table(rows: &[(String, String, String)]) -> String {
+    let metric_header = "Metric";
+    let value_header = "Value";
+    let details_header = "Details";
+
+    let metric_width = rows
+        .iter()
+        .map(|(metric, _, _)| metric.len())
+        .max()
+        .unwrap_or(metric_header.len())
+        .max(metric_header.len());
+    let value_width = rows
+        .iter()
+        .map(|(_, value, _)| value.len())
+        .max()
+        .unwrap_or(value_header.len())
+        .max(value_header.len());
+    let details_width = rows
+        .iter()
+        .map(|(_, _, details)| details.len())
+        .max()
+        .unwrap_or(details_header.len())
+        .max(details_header.len());
+
+    let sep = format!(
+        "+-{:-<metric_width$}-+-{:-<value_width$}-+-{:-<details_width$}-+",
+        "",
+        "",
+        ""
+    );
+
+    let mut out = String::new();
+    out.push_str(&sep);
+    out.push('\n');
+    out.push_str(&format!(
+        "| {:<metric_width$} | {:<value_width$} | {:<details_width$} |",
+        metric_header, value_header, details_header
+    ));
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
+
+    for (metric, value, details) in rows {
+        out.push_str(&format!(
+            "| {:<metric_width$} | {:<value_width$} | {:<details_width$} |",
+            metric, value, details
+        ));
+        out.push('\n');
+    }
+
+    out.push_str(&sep);
+    out
 }
 
 fn human_bytes(bytes: u64) -> String {
