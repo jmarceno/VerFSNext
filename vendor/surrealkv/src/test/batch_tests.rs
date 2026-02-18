@@ -1,6 +1,7 @@
 use test_log::test;
 
 use crate::batch::{Batch, BATCH_VERSION, MAX_BATCH_SIZE};
+use crate::error::Error;
 use crate::vlog::ValuePointer;
 use crate::InternalKeyKind;
 
@@ -174,6 +175,18 @@ fn test_batch_iteration() {
 fn test_batch_invalid_data() {
     let invalid_data = vec![0];
     assert!(Batch::decode(&invalid_data).is_err());
+}
+
+#[test]
+fn test_batch_decode_reports_archive_corruption() {
+    let mut batch = Batch::new(1);
+    batch.set(b"key".to_vec(), b"value".to_vec(), 10).unwrap();
+    let mut encoded = batch.encode().unwrap();
+    encoded.pop();
+
+    let err = Batch::decode(&encoded).unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)));
+    assert!(err.to_string().contains("invalid WAL batch archive"));
 }
 
 #[test]

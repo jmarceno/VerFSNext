@@ -796,7 +796,10 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
         let k = metaindexiter.key();
         assert_eq!(k.user_key(), b"meta");
         let buf_bytes = metaindexiter.value_encoded()?;
-        return Ok(Some(TableMetadata::decode(buf_bytes)?));
+        let metadata = TableMetadata::decode(buf_bytes).map_err(|e| {
+            Error::Corruption(format!("failed to decode SSTable metadata archive: {e}"))
+        })?;
+        return Ok(Some(metadata));
     }
     Ok(None)
 }
