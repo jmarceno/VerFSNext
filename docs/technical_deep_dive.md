@@ -23,9 +23,12 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext crypt -c -p <password> [-path <directory_or_file_path>]`
   - `verfsnext crypt -u -p <password> -k <key_file_path>`
   - `verfsnext crypt -l`
-- Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot commands from CLI control mode.
+- Runtime stats control path:
+  - `verfsnext stats`
+- Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
 - Snapshot CLI first tries socket RPC; if no socket listener is available, it falls back to offline metadata mode.
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
+- Stats CLI uses socket RPC and requires a mounted daemon.
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
@@ -39,6 +42,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - read path resolves chunk location through pack-local hash index
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
+  - runtime counters for chunk cache hit/miss and read/write byte totals
+  - `collect_stats` computes logical/chunk/dedup/cache/memory/throughput metrics
+  - stats output includes full `data_dir` size and disk delta `data_dir_size - logical_size`
   - read-only inode flag enforcement across mutating FUSE operations
   - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - enforces `.vault` lock-state visibility and access policy

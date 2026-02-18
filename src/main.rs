@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::fs::VerFs;
+use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::snapshot::SnapshotManager;
 
@@ -128,6 +128,14 @@ async fn run_control_command(args: Vec<String>) -> Result<()> {
             let cmd = parse_snapshot_cmd(&args[(idx + 1)..])?;
             if !try_run_snapshot_via_socket(&config, &cmd).await? {
                 run_snapshot_via_metadata(&config, &cmd).await?;
+            }
+        }
+        "stats" => {
+            if !args[(idx + 1)..].is_empty() {
+                bail!("stats does not take arguments");
+            }
+            if !try_run_stats_via_socket(&config).await? {
+                bail!("stats requires a mounted daemon (control socket unavailable)");
             }
         }
         "crypt" => {
@@ -264,6 +272,7 @@ enum ControlRequest {
         key_file: String,
     },
     VaultLock,
+    Stats,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -435,6 +444,20 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
                 error: err.to_string(),
             },
         },
+        ControlRequest::Stats => match fs.collect_stats() {
+            Ok(stats) => ControlResponse {
+                ok: true,
+                names: Vec::new(),
+                message: format_stats_report(&stats),
+                error: String::new(),
+            },
+            Err(err) => ControlResponse {
+                ok: false,
+                names: Vec::new(),
+                message: String::new(),
+                error: err.to_string(),
+            },
+        },
     };
 
     let payload = serde_json::to_vec(&resp).context("failed to encode control response")?;
@@ -569,6 +592,169 @@ async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result
         println!("{}", resp.message);
     }
     Ok(true)
+}
+
+async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
+    let socket_path = config.control_socket_path();
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(stream) => stream,
+        Err(err) if socket_unavailable(&err) => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to connect control socket {}", socket_path.display())
+            });
+        }
+    };
+
+    let payload =
+        serde_json::to_vec(&ControlRequest::Stats).context("failed to encode control request")?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("failed writing control request")?;
+    stream
+        .write_all(b"\n")
+        .await
+        .context("failed writing control request terminator")?;
+    stream
+        .flush()
+        .await
+        .context("failed flushing control request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .context("failed reading control response")?;
+    if read == 0 {
+        bail!("empty control response");
+    }
+    let resp: ControlResponse =
+        serde_json::from_str(line.trim_end()).context("invalid control response payload")?;
+    if !resp.ok {
+        bail!(resp.error);
+    }
+    if !resp.message.is_empty() {
+        println!("{}", resp.message);
+    }
+    Ok(true)
+}
+
+fn format_stats_report(stats: &VerFsStats) -> String {
+    let compression_rate = percent(stats.unique_compressed_bytes, stats.unique_uncompressed_bytes);
+    let dedup_ratio = if stats.referenced_compressed_bytes == 0 {
+        0.0
+    } else {
+        stats.dedup_savings_bytes as f64 / stats.referenced_compressed_bytes as f64
+    };
+    let disk_vs_logical = stats.data_dir_size_bytes as i128 - stats.logical_size_bytes as i128;
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "total logical size: {} ({})",
+        stats.logical_size_bytes,
+        human_bytes(stats.logical_size_bytes)
+    ));
+    lines.push(format!(
+        "compressed unique chunk size: {} ({})",
+        stats.unique_compressed_bytes,
+        human_bytes(stats.unique_compressed_bytes)
+    ));
+    lines.push(format!(
+        "uncompressed unique chunk size: {} ({})",
+        stats.unique_uncompressed_bytes,
+        human_bytes(stats.unique_uncompressed_bytes)
+    ));
+    lines.push(format!(
+        "uncompressed referenced chunk size: {} ({})",
+        stats.referenced_uncompressed_bytes,
+        human_bytes(stats.referenced_uncompressed_bytes)
+    ));
+    lines.push(format!("compression rate: {:.2}%", compression_rate * 100.0));
+    lines.push(format!(
+        "metadata size: {} ({})",
+        stats.metadata_size_bytes,
+        human_bytes(stats.metadata_size_bytes)
+    ));
+    lines.push(format!(
+        "deduplication savings: {} ({}, {:.2}% of referenced compressed)",
+        stats.dedup_savings_bytes,
+        human_bytes(stats.dedup_savings_bytes),
+        dedup_ratio * 100.0
+    ));
+    lines.push(format!(
+        "cache hit rate: {:.2}% ({}/{})",
+        stats.cache_hit_rate * 100.0,
+        stats.cache_hits,
+        stats.cache_requests
+    ));
+    lines.push(format!(
+        "used memory (RSS): {} ({})",
+        stats.used_memory_bytes,
+        human_bytes(stats.used_memory_bytes)
+    ));
+    lines.push(format!(
+        "throughput: read {}/s, write {}/s, uptime {:.1}s",
+        human_bytes(stats.read_throughput_bps as u64),
+        human_bytes(stats.write_throughput_bps as u64),
+        stats.uptime_secs
+    ));
+    lines.push(format!(
+        "io totals: read {} ({}), write {} ({})",
+        stats.read_bytes_total,
+        human_bytes(stats.read_bytes_total),
+        stats.write_bytes_total,
+        human_bytes(stats.write_bytes_total)
+    ));
+    lines.push(format!(
+        "full data dir size: {} ({})",
+        stats.data_dir_size_bytes,
+        human_bytes(stats.data_dir_size_bytes)
+    ));
+    lines.push(format!(
+        "disk usage delta (data dir - logical): {} ({})",
+        disk_vs_logical,
+        human_bytes_signed(disk_vs_logical)
+    ));
+    lines.push(format!(
+        "cache entries: metadata {}, chunk-data {}",
+        stats.metadata_cache_entries, stats.chunk_cache_entries
+    ));
+    lines.push(format!(
+        "approx cache memory: {} ({})",
+        stats.approx_cache_memory_bytes,
+        human_bytes(stats.approx_cache_memory_bytes)
+    ));
+    lines.join("\n")
+}
+
+fn percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+fn human_bytes_signed(bytes: i128) -> String {
+    if bytes < 0 {
+        let abs = u64::try_from(bytes.unsigned_abs()).unwrap_or(u64::MAX);
+        format!("-{}", human_bytes(abs))
+    } else {
+        human_bytes(u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
 }
 
 fn socket_unavailable(err: &std::io::Error) -> bool {

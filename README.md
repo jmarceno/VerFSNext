@@ -42,6 +42,23 @@ Use snapshots through the control CLI:
 Mounted snapshot view:
 - Snapshot roots appear under `/.snapshots` and can be accessed like normal directories.
 
+## Stats
+
+Read live runtime/internal statistics from the mounted daemon through the control socket:
+
+```bash
+./target/release/verfsnext stats
+```
+
+The report includes:
+- Total logical size
+- Unique compressed/uncompressed chunk sizes and compression rate
+- Metadata size
+- Deduplication savings
+- Cache hit rate
+- Used memory (RSS)
+- Read/write throughput and totals
+- Full `data_dir` disk size and disk-usage delta computed as `data_dir_size - logical_size`
 
 ## Encryption (`.vault`)
 

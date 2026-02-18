@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,8 +40,8 @@ use crate::types::{
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
-    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE,
-    VAULT_DIR_NAME,
+    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
+    KEY_PREFIX_EXTENT, KEY_PREFIX_INODE, ROOT_INODE, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -71,6 +72,30 @@ struct ZeroRefCandidate {
     block_size_bytes: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerFsStats {
+    pub logical_size_bytes: u64,
+    pub referenced_uncompressed_bytes: u64,
+    pub unique_uncompressed_bytes: u64,
+    pub referenced_compressed_bytes: u64,
+    pub unique_compressed_bytes: u64,
+    pub metadata_size_bytes: u64,
+    pub data_dir_size_bytes: u64,
+    pub dedup_savings_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_requests: u64,
+    pub cache_hit_rate: f64,
+    pub used_memory_bytes: u64,
+    pub read_bytes_total: u64,
+    pub write_bytes_total: u64,
+    pub uptime_secs: f64,
+    pub read_throughput_bps: f64,
+    pub write_throughput_bps: f64,
+    pub metadata_cache_entries: u64,
+    pub chunk_cache_entries: u64,
+    pub approx_cache_memory_bytes: u64,
+}
+
 pub struct VerFs {
     core: Arc<FsCore>,
     batcher: WriteBatcher,
@@ -88,6 +113,13 @@ struct FsCore {
     last_persisted_active_pack_id: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
+    chunk_meta_cache_hits: AtomicU64,
+    chunk_meta_cache_misses: AtomicU64,
+    chunk_data_cache_hits: AtomicU64,
+    chunk_data_cache_misses: AtomicU64,
+    read_bytes_total: AtomicU64,
+    write_bytes_total: AtomicU64,
+    stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     write_lock: Mutex<()>,
     gc_lock: Mutex<()>,
@@ -134,6 +166,13 @@ impl VerFs {
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
+            chunk_meta_cache_hits: AtomicU64::new(0),
+            chunk_meta_cache_misses: AtomicU64::new(0),
+            chunk_data_cache_hits: AtomicU64::new(0),
+            chunk_data_cache_misses: AtomicU64::new(0),
+            read_bytes_total: AtomicU64::new(0),
+            write_bytes_total: AtomicU64::new(0),
+            stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             write_lock: Mutex::new(()),
             gc_lock: Mutex::new(()),
@@ -207,6 +246,10 @@ impl VerFs {
 
     pub async fn lock_vault(&self) -> Result<()> {
         self.core.lock_vault().await
+    }
+
+    pub fn collect_stats(&self) -> Result<VerFsStats> {
+        self.core.collect_stats()
     }
 }
 
@@ -483,8 +526,10 @@ impl FsCore {
 
     fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
         if let Some(cached) = self.chunk_meta_cache.get(&hash) {
+            self.chunk_meta_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
+        self.chunk_meta_cache_misses.fetch_add(1, Ordering::Relaxed);
         let chunk = self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(chunk_key(&hash))? else {
                 return Err(anyhow_errno(
@@ -513,6 +558,7 @@ impl FsCore {
         };
 
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
+            self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut payload = cached.as_ref().clone();
             if payload.len() < BLOCK_SIZE {
                 payload.resize(BLOCK_SIZE, 0);
@@ -522,6 +568,7 @@ impl FsCore {
             }
             return Ok(payload);
         }
+        self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let chunk = self.load_chunk_record(extent.chunk_hash)?;
         let mut payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
@@ -1071,6 +1118,8 @@ impl FsCore {
 
         self.dedup_hits.fetch_add(dedup_hits, Ordering::Relaxed);
         self.dedup_misses.fetch_add(dedup_misses, Ordering::Relaxed);
+        self.write_bytes_total
+            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
         debug!(
             ino = op.ino,
             offset = op.offset,
@@ -1251,6 +1300,124 @@ impl FsCore {
 
     fn mark_mutation(&self) {
         self.last_mutation_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn collect_stats(&self) -> Result<VerFsStats> {
+        self.chunk_meta_cache.run_pending_tasks();
+        self.chunk_data_cache.run_pending_tasks();
+
+        let (logical_size_bytes, unique_uncompressed_bytes, unique_compressed_bytes, referenced_uncompressed_bytes, referenced_compressed_bytes) =
+            self.meta.read_txn(|txn| {
+                let mut logical_size_bytes = 0_u64;
+                let mut unique_uncompressed_bytes = 0_u64;
+                let mut unique_compressed_bytes = 0_u64;
+                let mut referenced_uncompressed_bytes = 0_u64;
+                let mut referenced_compressed_bytes = 0_u64;
+
+                let inode_prefix = vec![KEY_PREFIX_INODE];
+                let inode_end = prefix_end(&inode_prefix);
+                for (_, value) in scan_range_pairs(txn, inode_prefix, inode_end)? {
+                    let inode: InodeRecord = decode_rkyv(&value)?;
+                    if inode.kind == INODE_KIND_FILE {
+                        logical_size_bytes = logical_size_bytes.saturating_add(inode.size);
+                    }
+                }
+
+                let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
+                let chunk_prefix = vec![KEY_PREFIX_CHUNK];
+                let chunk_end = prefix_end(&chunk_prefix);
+                for (key, value) in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
+                    if key.len() != 17 {
+                        continue;
+                    }
+                    let mut hash = [0_u8; 16];
+                    hash.copy_from_slice(&key[1..17]);
+                    let chunk: ChunkRecord = decode_rkyv(&value)?;
+                    unique_uncompressed_bytes =
+                        unique_uncompressed_bytes.saturating_add(chunk.uncompressed_len as u64);
+                    unique_compressed_bytes =
+                        unique_compressed_bytes.saturating_add(chunk.compressed_len as u64);
+                    chunks.insert(hash, chunk);
+                }
+
+                let extent_prefix = vec![KEY_PREFIX_EXTENT];
+                let extent_end = prefix_end(&extent_prefix);
+                for (_, value) in scan_range_pairs(txn, extent_prefix, extent_end)? {
+                    let extent: ExtentRecord = decode_rkyv(&value)?;
+                    if let Some(chunk) = chunks.get(&extent.chunk_hash) {
+                        referenced_uncompressed_bytes = referenced_uncompressed_bytes
+                            .saturating_add(chunk.uncompressed_len as u64);
+                        referenced_compressed_bytes = referenced_compressed_bytes
+                            .saturating_add(chunk.compressed_len as u64);
+                    }
+                }
+
+                Ok((
+                    logical_size_bytes,
+                    unique_uncompressed_bytes,
+                    unique_compressed_bytes,
+                    referenced_uncompressed_bytes,
+                    referenced_compressed_bytes,
+                ))
+            })?;
+
+        let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
+        let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
+        let dedup_savings_bytes = referenced_compressed_bytes.saturating_sub(unique_compressed_bytes);
+
+        let cache_hits = self
+            .chunk_meta_cache_hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.chunk_data_cache_hits.load(Ordering::Relaxed));
+        let cache_requests = cache_hits
+            .saturating_add(self.chunk_meta_cache_misses.load(Ordering::Relaxed))
+            .saturating_add(self.chunk_data_cache_misses.load(Ordering::Relaxed));
+        let cache_hit_rate = if cache_requests == 0 {
+            0.0
+        } else {
+            cache_hits as f64 / cache_requests as f64
+        };
+
+        let metadata_cache_entries = self.chunk_meta_cache.entry_count();
+        let chunk_cache_entries = self.chunk_data_cache.entry_count();
+        let approx_cache_memory_bytes = metadata_cache_entries
+            .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
+            .saturating_add(
+                chunk_cache_entries.saturating_mul(
+                    (size_of::<([u8; 16], Arc<Vec<u8>>)>() + BLOCK_SIZE) as u64,
+                ),
+            );
+
+        let used_memory_bytes = read_process_rss_bytes().unwrap_or(0);
+        let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
+        let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
+        let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
+        let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
+        let read_throughput_bps = read_bytes_total as f64 / uptime_secs;
+        let write_throughput_bps = write_bytes_total as f64 / uptime_secs;
+
+        Ok(VerFsStats {
+            logical_size_bytes,
+            referenced_uncompressed_bytes,
+            unique_uncompressed_bytes,
+            referenced_compressed_bytes,
+            unique_compressed_bytes,
+            metadata_size_bytes,
+            data_dir_size_bytes,
+            dedup_savings_bytes,
+            cache_hits,
+            cache_requests,
+            cache_hit_rate,
+            used_memory_bytes,
+            read_bytes_total,
+            write_bytes_total,
+            uptime_secs,
+            read_throughput_bps,
+            write_throughput_bps,
+            metadata_cache_entries,
+            chunk_cache_entries,
+            approx_cache_memory_bytes,
+        })
     }
 
     async fn maybe_run_gc(&self) -> Result<()> {
@@ -2249,8 +2416,14 @@ impl VirtualFs for VerFs {
                 };
                 let mut payload =
                     if let Some(cached) = self.core.chunk_data_cache.get(&extent.chunk_hash) {
+                        self.core
+                            .chunk_data_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
                         cached.as_ref().clone()
                     } else {
+                        self.core
+                            .chunk_data_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
                         let bytes = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
                             if !FsCore::inode_is_vault(&inode) {
                                 return build_error_result_from_errno(
@@ -2314,6 +2487,9 @@ impl VirtualFs for VerFs {
 
         let read_len = out.len();
         buf.extend_from_slice(&out);
+        self.core
+            .read_bytes_total
+            .fetch_add(read_len as u64, Ordering::Relaxed);
         Ok(read_len)
     }
 
@@ -3134,6 +3310,44 @@ fn scan_range_pairs(
         valid = iter.next()?;
     }
     Ok(out)
+}
+
+fn dir_size_recursive(path: &Path) -> Result<u64> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(anyhow::Error::new(err)),
+    };
+
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(metadata.len());
+    }
+
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(dir_size_recursive(&entry.path())?);
+    }
+    Ok(total)
+}
+
+fn read_process_rss_bytes() -> Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| anyhow!("malformed VmRSS line"))?
+                .parse::<u64>()?;
+            return Ok(kb.saturating_mul(1024));
+        }
+    }
+    Ok(0)
 }
 
 fn can_coalesce_write(existing: &WriteOp, incoming: &WriteOp) -> bool {
