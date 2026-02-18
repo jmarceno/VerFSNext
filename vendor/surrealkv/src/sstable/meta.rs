@@ -1,9 +1,49 @@
-use bytes::{Buf, BufMut, BytesMut};
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::sstable::error::SSTableError;
 use crate::sstable::table::TableFormat;
 use crate::{CompressionType, InternalKey, Result};
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct PropertiesArchive {
+    id: u64,
+    table_format: u8,
+    num_entries: u64,
+    num_deletions: u64,
+    data_size: u64,
+    oldest_vlog_file_id: u64,
+    num_data_blocks: u64,
+    index_size: u64,
+    index_partitions: u64,
+    top_level_index_size: u64,
+    filter_size: u64,
+    raw_key_size: u64,
+    raw_value_size: u64,
+    created_at: u128,
+    item_count: u64,
+    key_count: u64,
+    tombstone_count: u64,
+    num_soft_deletes: u64,
+    num_range_deletions: u64,
+    block_size: u32,
+    block_count: u32,
+    compression: u8,
+    seqnos: (u64, u64),
+    oldest_key_time: Option<u64>,
+    newest_key_time: Option<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(bytecheck())]
+struct TableMetadataArchive {
+    has_point_keys: Option<bool>,
+    smallest_seq_num: Option<u64>,
+    largest_seq_num: Option<u64>,
+    properties: PropertiesArchive,
+    smallest_point: Option<Vec<u8>>,
+    largest_point: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
@@ -78,91 +118,70 @@ impl Properties {
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut buf = BytesMut::with_capacity(256);
-        buf.put_u64(self.id);
-        buf.put_u8(self.table_format as u8);
-        buf.put_u64(self.num_entries);
-        buf.put_u64(self.num_deletions);
-        buf.put_u64(self.data_size);
-        buf.put_u64(self.oldest_vlog_file_id);
-        buf.put_u64(self.num_data_blocks);
-        buf.put_u64(self.index_size);
-        buf.put_u64(self.index_partitions);
-        buf.put_u64(self.top_level_index_size);
-        buf.put_u64(self.filter_size);
-        buf.put_u64(self.raw_key_size);
-        buf.put_u64(self.raw_value_size);
-        buf.put_u128(self.created_at);
-        buf.put_u64(self.item_count);
-        buf.put_u64(self.key_count);
-        buf.put_u64(self.tombstone_count);
-        buf.put_u64(self.num_soft_deletes);
-        buf.put_u64(self.num_range_deletions);
-        buf.put_u32(self.block_size);
-        buf.put_u32(self.block_count);
-        buf.put_u8(self.compression as u8);
-        buf.put_u64(self.seqnos.0);
-        buf.put_u64(self.seqnos.1);
-        buf.put_u64(self.oldest_key_time.unwrap_or(0));
-        buf.put_u64(self.newest_key_time.unwrap_or(0));
-        buf.to_vec()
+        let archived = PropertiesArchive {
+            id: self.id,
+            table_format: self.table_format as u8,
+            num_entries: self.num_entries,
+            num_deletions: self.num_deletions,
+            data_size: self.data_size,
+            oldest_vlog_file_id: self.oldest_vlog_file_id,
+            num_data_blocks: self.num_data_blocks,
+            index_size: self.index_size,
+            index_partitions: self.index_partitions,
+            top_level_index_size: self.top_level_index_size,
+            filter_size: self.filter_size,
+            raw_key_size: self.raw_key_size,
+            raw_value_size: self.raw_value_size,
+            created_at: self.created_at,
+            item_count: self.item_count,
+            key_count: self.key_count,
+            tombstone_count: self.tombstone_count,
+            num_soft_deletes: self.num_soft_deletes,
+            num_range_deletions: self.num_range_deletions,
+            block_size: self.block_size,
+            block_count: self.block_count,
+            compression: self.compression as u8,
+            seqnos: self.seqnos,
+            oldest_key_time: self.oldest_key_time,
+            newest_key_time: self.newest_key_time,
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&archived)
+            .map(|bytes| bytes.to_vec())
+            .expect("rkyv failed to encode SSTable properties")
     }
 
     pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
-        let mut buf = &buf[..];
-        let id = buf.get_u64();
-        let table_format = buf.get_u8();
-        let num_entries = buf.get_u64();
-        let num_deletions = buf.get_u64();
-        let data_size = buf.get_u64();
-        let oldest_vlog_file_id = buf.get_u64();
-        let num_data_blocks = buf.get_u64();
-        let index_size = buf.get_u64();
-        let index_partitions = buf.get_u64();
-        let top_level_index_size = buf.get_u64();
-        let filter_size = buf.get_u64();
-        let raw_key_size = buf.get_u64();
-        let raw_value_size = buf.get_u64();
-        let created_at = buf.get_u128();
-        let item_count = buf.get_u64();
-        let key_count = buf.get_u64();
-        let tombstone_count = buf.get_u64();
-        let num_soft_deletes = buf.get_u64();
-        let num_range_deletions = buf.get_u64();
-        let block_size = buf.get_u32();
-        let block_count = buf.get_u32();
-        let compression = buf.get_u8();
-        let seqno_start = buf.get_u64();
-        let seqno_end = buf.get_u64();
-        let oldest_key_time = Some(buf.get_u64());
-        let newest_key_time = Some(buf.get_u64());
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(buf.len());
+        aligned.extend_from_slice(&buf);
+        let archived = rkyv::from_bytes::<PropertiesArchive, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Corruption(format!("invalid SSTable properties archive: {e}")))?;
 
         Ok(Self {
-            id,
-            table_format: TableFormat::from_u8(table_format)?,
-            num_entries,
-            num_deletions,
-            data_size,
-            oldest_vlog_file_id,
-            num_data_blocks,
-            index_size,
-            index_partitions,
-            top_level_index_size,
-            filter_size,
-            raw_key_size,
-            raw_value_size,
-            created_at,
-            item_count,
-            key_count,
-            tombstone_count,
-            num_soft_deletes,
-            num_range_deletions,
-            block_size,
-            block_count,
-            compression: CompressionType::try_from(compression)?,
-            seqnos: (seqno_start, seqno_end),
-            oldest_key_time,
-            newest_key_time,
+            id: archived.id,
+            table_format: TableFormat::from_u8(archived.table_format)?,
+            num_entries: archived.num_entries,
+            num_deletions: archived.num_deletions,
+            data_size: archived.data_size,
+            oldest_vlog_file_id: archived.oldest_vlog_file_id,
+            num_data_blocks: archived.num_data_blocks,
+            index_size: archived.index_size,
+            index_partitions: archived.index_partitions,
+            top_level_index_size: archived.top_level_index_size,
+            filter_size: archived.filter_size,
+            raw_key_size: archived.raw_key_size,
+            raw_value_size: archived.raw_value_size,
+            created_at: archived.created_at,
+            item_count: archived.item_count,
+            key_count: archived.key_count,
+            tombstone_count: archived.tombstone_count,
+            num_soft_deletes: archived.num_soft_deletes,
+            num_range_deletions: archived.num_range_deletions,
+            block_size: archived.block_size,
+            block_count: archived.block_count,
+            compression: CompressionType::try_from(archived.compression)?,
+            seqnos: archived.seqnos,
+            oldest_key_time: archived.oldest_key_time,
+            newest_key_time: archived.newest_key_time,
         })
     }
 }
@@ -205,114 +224,86 @@ impl TableMetadata {
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut buf = BytesMut::new();
-
-        // Encode has_point_keys as 0 for None, 1 for Some(true), and 2 for Some(false)
-        match self.has_point_keys {
-            None => buf.put_u8(0),
-            Some(true) => buf.put_u8(1),
-            Some(false) => buf.put_u8(2),
-        }
-
-        // Encode smallest_seq_num and largest_seq_num as u64
-        // Write 0 if not set (only happens for empty tables which aren't persisted)
-        buf.put_u64(self.smallest_seq_num.unwrap_or(0));
-        buf.put_u64(self.largest_seq_num.unwrap_or(0));
-
-        let properties_encoded = self.properties.encode();
-        let properties_encoded_len = properties_encoded.len() as u64;
-        buf.put_u64(properties_encoded_len);
-        buf.extend_from_slice(&properties_encoded);
-
-        // Encode smallest_point and largest_point
-        match &self.smallest_point {
-            None => buf.put_u8(0),
-            Some(key) => {
-                buf.put_u8(1);
-                let key_encoded = key.encode();
-                buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-                buf.extend_from_slice(&key_encoded); // Write the encoded key itself
-            }
-        }
-
-        match &self.largest_point {
-            None => buf.put_u8(0),
-            Some(key) => {
-                buf.put_u8(1);
-                let key_encoded = key.encode();
-                buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-                buf.extend_from_slice(&key_encoded); // Write the encoded key itself
-            }
-        }
-
-        buf.to_vec()
+        let archived = TableMetadataArchive {
+            has_point_keys: self.has_point_keys,
+            smallest_seq_num: self.smallest_seq_num,
+            largest_seq_num: self.largest_seq_num,
+            properties: PropertiesArchive {
+                id: self.properties.id,
+                table_format: self.properties.table_format as u8,
+                num_entries: self.properties.num_entries,
+                num_deletions: self.properties.num_deletions,
+                data_size: self.properties.data_size,
+                oldest_vlog_file_id: self.properties.oldest_vlog_file_id,
+                num_data_blocks: self.properties.num_data_blocks,
+                index_size: self.properties.index_size,
+                index_partitions: self.properties.index_partitions,
+                top_level_index_size: self.properties.top_level_index_size,
+                filter_size: self.properties.filter_size,
+                raw_key_size: self.properties.raw_key_size,
+                raw_value_size: self.properties.raw_value_size,
+                created_at: self.properties.created_at,
+                item_count: self.properties.item_count,
+                key_count: self.properties.key_count,
+                tombstone_count: self.properties.tombstone_count,
+                num_soft_deletes: self.properties.num_soft_deletes,
+                num_range_deletions: self.properties.num_range_deletions,
+                block_size: self.properties.block_size,
+                block_count: self.properties.block_count,
+                compression: self.properties.compression as u8,
+                seqnos: self.properties.seqnos,
+                oldest_key_time: self.properties.oldest_key_time,
+                newest_key_time: self.properties.newest_key_time,
+            },
+            smallest_point: self.smallest_point.as_ref().map(InternalKey::encode),
+            largest_point: self.largest_point.as_ref().map(InternalKey::encode),
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&archived)
+            .map(|bytes| bytes.to_vec())
+            .expect("rkyv failed to encode table metadata")
     }
 
     pub(crate) fn decode(src: &[u8]) -> Result<TableMetadata> {
-        let mut cursor = std::io::Cursor::new(src);
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(src.len());
+        aligned.extend_from_slice(src);
+        let archived = rkyv::from_bytes::<TableMetadataArchive, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Corruption(format!("invalid SSTable metadata archive: {e}")))?;
 
-        // Decode has_point_keys
-        let has_point_keys = match cursor.get_u8() {
-            0 => None,
-            1 => Some(true),
-            2 => Some(false),
-            value => {
-                return Err(Error::from(SSTableError::InvalidHasPointKeysValue {
-                    value,
-                }))
-            }
-        };
-
-        // Decode smallest_seq_num and largest_seq_num
-        // Always Some since persisted tables have entries
-        let smallest_seq_num = Some(cursor.get_u64());
-        let largest_seq_num = Some(cursor.get_u64());
-
-        // Decode properties
-        let properties_len = cursor.get_u64() as usize;
-        let mut properties_bytes = vec![0u8; properties_len];
-        cursor.copy_to_slice(&mut properties_bytes);
-        let properties = Properties::decode(properties_bytes)?;
-
-        // Decode smallest_point
-        let smallest_point = match cursor.get_u8() {
-            0 => None,
-            1 => {
-                let key_len: usize = cursor.get_u64() as usize;
-                let mut key_bytes = vec![0u8; key_len];
-                cursor.copy_to_slice(&mut key_bytes);
-                Some(InternalKey::decode(&key_bytes))
-            }
-            value => {
-                return Err(Error::from(SSTableError::InvalidSmallestPointValue {
-                    value,
-                }))
-            }
-        };
-
-        // Decode largest_point
-        let largest_point = match cursor.get_u8() {
-            0 => None,
-            1 => {
-                let key_len = cursor.get_u64() as usize;
-                let mut key_bytes = vec![0u8; key_len];
-                cursor.copy_to_slice(&mut key_bytes);
-                Some(InternalKey::decode(&key_bytes))
-            }
-            value => {
-                return Err(Error::from(SSTableError::InvalidLargestPointValue {
-                    value,
-                }))
-            }
+        let properties = Properties {
+            id: archived.properties.id,
+            table_format: TableFormat::from_u8(archived.properties.table_format)?,
+            num_entries: archived.properties.num_entries,
+            num_deletions: archived.properties.num_deletions,
+            data_size: archived.properties.data_size,
+            oldest_vlog_file_id: archived.properties.oldest_vlog_file_id,
+            num_data_blocks: archived.properties.num_data_blocks,
+            index_size: archived.properties.index_size,
+            index_partitions: archived.properties.index_partitions,
+            top_level_index_size: archived.properties.top_level_index_size,
+            filter_size: archived.properties.filter_size,
+            raw_key_size: archived.properties.raw_key_size,
+            raw_value_size: archived.properties.raw_value_size,
+            created_at: archived.properties.created_at,
+            item_count: archived.properties.item_count,
+            key_count: archived.properties.key_count,
+            tombstone_count: archived.properties.tombstone_count,
+            num_soft_deletes: archived.properties.num_soft_deletes,
+            num_range_deletions: archived.properties.num_range_deletions,
+            block_size: archived.properties.block_size,
+            block_count: archived.properties.block_count,
+            compression: CompressionType::try_from(archived.properties.compression)?,
+            seqnos: archived.properties.seqnos,
+            oldest_key_time: archived.properties.oldest_key_time,
+            newest_key_time: archived.properties.newest_key_time,
         };
 
         Ok(TableMetadata {
-            has_point_keys,
-            smallest_seq_num,
-            largest_seq_num,
+            has_point_keys: archived.has_point_keys,
+            smallest_seq_num: archived.smallest_seq_num,
+            largest_seq_num: archived.largest_seq_num,
             properties,
-            smallest_point,
-            largest_point,
+            smallest_point: archived.smallest_point.as_ref().map(|k| InternalKey::decode(k)),
+            largest_point: archived.largest_point.as_ref().map(|k| InternalKey::decode(k)),
         })
     }
 }

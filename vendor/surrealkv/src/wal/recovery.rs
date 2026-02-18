@@ -175,7 +175,13 @@ pub(crate) fn replay_wal(
             match reader.read() {
                 Ok((record_data, offset)) => {
                     last_valid_offset = offset as usize;
-                    let batch = Batch::decode(record_data)?;
+                    let batch = Batch::decode(record_data).map_err(|e| {
+                        Error::wal_corruption(
+                            segment_id as usize,
+                            last_valid_offset,
+                            format!("failed to decode WAL batch archive: {e}"),
+                        )
+                    })?;
                     let batch_highest_seq_num = batch.get_highest_seq_num();
 
                     if batch_highest_seq_num > max_seq_num {

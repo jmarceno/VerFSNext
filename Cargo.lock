@@ -1305,6 +1305,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bytecheck",
  "byteorder",
  "bytes",
  "crc32fast",
@@ -1318,6 +1319,7 @@ dependencies = [
  "parking_lot",
  "quick_cache",
  "rand 0.9.2",
+ "rkyv",
  "snap",
  "tempdir",
  "tempfile",

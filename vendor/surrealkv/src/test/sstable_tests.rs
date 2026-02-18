@@ -5396,6 +5396,22 @@ fn test_metadata_roundtrip_with_edge_values() {
     }
 }
 
+#[test]
+fn test_metadata_decode_reports_archive_corruption() {
+    use crate::error::Error;
+    use crate::sstable::meta::TableMetadata;
+
+    let mut meta = TableMetadata::new();
+    meta.update_seq_num(1);
+    meta.update_seq_num(2);
+    let mut encoded = meta.encode();
+    encoded.pop();
+
+    let err = TableMetadata::decode(&encoded).unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)));
+    assert!(err.to_string().contains("invalid SSTable metadata archive"));
+}
+
 /// Tests that all entries having seq_num=0 works correctly.
 #[test]
 fn test_all_zero_seq_nums() {
