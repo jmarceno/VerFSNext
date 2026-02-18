@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,8 +40,8 @@ use crate::types::{
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
-    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE,
-    VAULT_DIR_NAME,
+    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
+    KEY_PREFIX_INODE, ROOT_INODE, SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -71,6 +72,35 @@ struct ZeroRefCandidate {
     block_size_bytes: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerFsStats {
+    pub live_logical_size_bytes: u64,
+    pub snapshots_logical_size_bytes: u64,
+    pub all_logical_size_bytes: u64,
+    pub live_referenced_uncompressed_bytes: u64,
+    pub live_referenced_compressed_bytes: u64,
+    pub live_unique_uncompressed_bytes: u64,
+    pub live_unique_compressed_bytes: u64,
+    pub stored_unique_uncompressed_bytes: u64,
+    pub stored_unique_compressed_bytes: u64,
+    pub metadata_size_bytes: u64,
+    pub data_dir_size_bytes: u64,
+    pub live_dedup_savings_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_requests: u64,
+    pub cache_hit_rate: f64,
+    pub process_private_memory_bytes: u64,
+    pub process_rss_bytes: u64,
+    pub read_bytes_total: u64,
+    pub write_bytes_total: u64,
+    pub uptime_secs: f64,
+    pub read_throughput_bps: f64,
+    pub write_throughput_bps: f64,
+    pub metadata_cache_entries: u64,
+    pub chunk_cache_entries: u64,
+    pub approx_cache_memory_bytes: u64,
+}
+
 pub struct VerFs {
     core: Arc<FsCore>,
     batcher: WriteBatcher,
@@ -88,6 +118,13 @@ struct FsCore {
     last_persisted_active_pack_id: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
+    chunk_meta_cache_hits: AtomicU64,
+    chunk_meta_cache_misses: AtomicU64,
+    chunk_data_cache_hits: AtomicU64,
+    chunk_data_cache_misses: AtomicU64,
+    read_bytes_total: AtomicU64,
+    write_bytes_total: AtomicU64,
+    stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     write_lock: Mutex<()>,
     gc_lock: Mutex<()>,
@@ -134,6 +171,13 @@ impl VerFs {
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
+            chunk_meta_cache_hits: AtomicU64::new(0),
+            chunk_meta_cache_misses: AtomicU64::new(0),
+            chunk_data_cache_hits: AtomicU64::new(0),
+            chunk_data_cache_misses: AtomicU64::new(0),
+            read_bytes_total: AtomicU64::new(0),
+            write_bytes_total: AtomicU64::new(0),
+            stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             write_lock: Mutex::new(()),
             gc_lock: Mutex::new(()),
@@ -207,6 +251,10 @@ impl VerFs {
 
     pub async fn lock_vault(&self) -> Result<()> {
         self.core.lock_vault().await
+    }
+
+    pub fn collect_stats(&self) -> Result<VerFsStats> {
+        self.core.collect_stats()
     }
 }
 
@@ -483,8 +531,10 @@ impl FsCore {
 
     fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
         if let Some(cached) = self.chunk_meta_cache.get(&hash) {
+            self.chunk_meta_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
+        self.chunk_meta_cache_misses.fetch_add(1, Ordering::Relaxed);
         let chunk = self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(chunk_key(&hash))? else {
                 return Err(anyhow_errno(
@@ -513,6 +563,7 @@ impl FsCore {
         };
 
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
+            self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut payload = cached.as_ref().clone();
             if payload.len() < BLOCK_SIZE {
                 payload.resize(BLOCK_SIZE, 0);
@@ -522,6 +573,7 @@ impl FsCore {
             }
             return Ok(payload);
         }
+        self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let chunk = self.load_chunk_record(extent.chunk_hash)?;
         let mut payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
@@ -1071,6 +1123,8 @@ impl FsCore {
 
         self.dedup_hits.fetch_add(dedup_hits, Ordering::Relaxed);
         self.dedup_misses.fetch_add(dedup_misses, Ordering::Relaxed);
+        self.write_bytes_total
+            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
         debug!(
             ino = op.ino,
             offset = op.offset,
@@ -1251,6 +1305,194 @@ impl FsCore {
 
     fn mark_mutation(&self) {
         self.last_mutation_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn collect_stats(&self) -> Result<VerFsStats> {
+        self.chunk_meta_cache.run_pending_tasks();
+        self.chunk_data_cache.run_pending_tasks();
+
+        let (
+            all_logical_size_bytes,
+            live_logical_size_bytes,
+            stored_unique_uncompressed_bytes,
+            stored_unique_compressed_bytes,
+            live_unique_uncompressed_bytes,
+            live_unique_compressed_bytes,
+            live_referenced_uncompressed_bytes,
+            live_referenced_compressed_bytes,
+        ) = self.meta.read_txn(|txn| {
+            let mut all_logical_size_bytes = 0_u64;
+            let inode_prefix = vec![KEY_PREFIX_INODE];
+            let inode_end = prefix_end(&inode_prefix);
+            for (_, value) in scan_range_pairs(txn, inode_prefix, inode_end)? {
+                let inode: InodeRecord = decode_rkyv(&value)?;
+                if inode.kind == INODE_KIND_FILE {
+                    all_logical_size_bytes = all_logical_size_bytes.saturating_add(inode.size);
+                }
+            }
+
+            let mut live_logical_size_bytes = 0_u64;
+            let mut live_seen_inodes = HashSet::<u64>::new();
+            let mut live_dir_stack = vec![ROOT_INODE];
+            let mut live_extent_refcounts = HashMap::<[u8; 16], u64>::new();
+            live_seen_inodes.insert(ROOT_INODE);
+
+            while let Some(dir_ino) = live_dir_stack.pop() {
+                let prefix = dirent_prefix(dir_ino);
+                let end = prefix_end(&prefix);
+                for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                    let Some(name) = decode_dirent_name(&key) else {
+                        continue;
+                    };
+                    if dir_ino == ROOT_INODE && name == SNAPSHOTS_DIR_NAME.as_bytes() {
+                        continue;
+                    }
+
+                    let dirent: DirentRecord = decode_rkyv(&value)?;
+                    if !live_seen_inodes.insert(dirent.ino) {
+                        continue;
+                    }
+                    let Some(child_raw) = txn.get(inode_key(dirent.ino))? else {
+                        continue;
+                    };
+                    let child: InodeRecord = decode_rkyv(&child_raw)?;
+
+                    match child.kind {
+                        INODE_KIND_FILE => {
+                            live_logical_size_bytes =
+                                live_logical_size_bytes.saturating_add(child.size);
+                            let ext_prefix = extent_prefix(child.ino);
+                            let ext_end = prefix_end(&ext_prefix);
+                            for (_, ext_value) in scan_range_pairs(txn, ext_prefix, ext_end)? {
+                                let extent: ExtentRecord = decode_rkyv(&ext_value)?;
+                                let counter =
+                                    live_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
+                                *counter = counter.saturating_add(1);
+                            }
+                        }
+                        INODE_KIND_DIR => {
+                            live_dir_stack.push(child.ino);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut stored_unique_uncompressed_bytes = 0_u64;
+            let mut stored_unique_compressed_bytes = 0_u64;
+            let mut live_unique_uncompressed_bytes = 0_u64;
+            let mut live_unique_compressed_bytes = 0_u64;
+            let mut live_referenced_uncompressed_bytes = 0_u64;
+            let mut live_referenced_compressed_bytes = 0_u64;
+
+            let chunk_prefix = vec![KEY_PREFIX_CHUNK];
+            let chunk_end = prefix_end(&chunk_prefix);
+            for (key, value) in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
+                if key.len() != 17 {
+                    continue;
+                }
+                let mut hash = [0_u8; 16];
+                hash.copy_from_slice(&key[1..17]);
+                let chunk: ChunkRecord = decode_rkyv(&value)?;
+
+                let chunk_uncompressed = chunk.uncompressed_len as u64;
+                let chunk_compressed = chunk.compressed_len as u64;
+                stored_unique_uncompressed_bytes =
+                    stored_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
+                stored_unique_compressed_bytes =
+                    stored_unique_compressed_bytes.saturating_add(chunk_compressed);
+
+                if let Some(reference_count) = live_extent_refcounts.get(&hash) {
+                    live_unique_uncompressed_bytes =
+                        live_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
+                    live_unique_compressed_bytes =
+                        live_unique_compressed_bytes.saturating_add(chunk_compressed);
+                    live_referenced_uncompressed_bytes = live_referenced_uncompressed_bytes
+                        .saturating_add(chunk_uncompressed.saturating_mul(*reference_count));
+                    live_referenced_compressed_bytes = live_referenced_compressed_bytes
+                        .saturating_add(chunk_compressed.saturating_mul(*reference_count));
+                }
+            }
+
+            Ok((
+                all_logical_size_bytes,
+                live_logical_size_bytes,
+                stored_unique_uncompressed_bytes,
+                stored_unique_compressed_bytes,
+                live_unique_uncompressed_bytes,
+                live_unique_compressed_bytes,
+                live_referenced_uncompressed_bytes,
+                live_referenced_compressed_bytes,
+            ))
+        })?;
+
+        let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
+        let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
+        let snapshots_logical_size_bytes =
+            all_logical_size_bytes.saturating_sub(live_logical_size_bytes);
+        let live_dedup_savings_bytes =
+            live_referenced_compressed_bytes.saturating_sub(live_unique_compressed_bytes);
+
+        let cache_hits = self
+            .chunk_meta_cache_hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.chunk_data_cache_hits.load(Ordering::Relaxed));
+        let cache_requests = cache_hits
+            .saturating_add(self.chunk_meta_cache_misses.load(Ordering::Relaxed))
+            .saturating_add(self.chunk_data_cache_misses.load(Ordering::Relaxed));
+        let cache_hit_rate = if cache_requests == 0 {
+            0.0
+        } else {
+            cache_hits as f64 / cache_requests as f64
+        };
+
+        let metadata_cache_entries = self.chunk_meta_cache.entry_count();
+        let chunk_cache_entries = self.chunk_data_cache.entry_count();
+        let approx_cache_memory_bytes = metadata_cache_entries
+            .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
+            .saturating_add(
+                chunk_cache_entries.saturating_mul(
+                    (size_of::<([u8; 16], Arc<Vec<u8>>)>() + BLOCK_SIZE) as u64,
+                ),
+            );
+
+        let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
+        let process_private_memory_bytes =
+            read_process_private_memory_bytes().unwrap_or(process_rss_bytes);
+        let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
+        let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
+        let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
+        let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
+        let read_throughput_bps = read_bytes_total as f64 / uptime_secs;
+        let write_throughput_bps = write_bytes_total as f64 / uptime_secs;
+
+        Ok(VerFsStats {
+            live_logical_size_bytes,
+            snapshots_logical_size_bytes,
+            all_logical_size_bytes,
+            live_referenced_uncompressed_bytes,
+            live_referenced_compressed_bytes,
+            live_unique_uncompressed_bytes,
+            live_unique_compressed_bytes,
+            stored_unique_uncompressed_bytes,
+            stored_unique_compressed_bytes,
+            metadata_size_bytes,
+            data_dir_size_bytes,
+            live_dedup_savings_bytes,
+            cache_hits,
+            cache_requests,
+            cache_hit_rate,
+            process_private_memory_bytes,
+            process_rss_bytes,
+            read_bytes_total,
+            write_bytes_total,
+            uptime_secs,
+            read_throughput_bps,
+            write_throughput_bps,
+            metadata_cache_entries,
+            chunk_cache_entries,
+            approx_cache_memory_bytes,
+        })
     }
 
     async fn maybe_run_gc(&self) -> Result<()> {
@@ -2249,8 +2491,14 @@ impl VirtualFs for VerFs {
                 };
                 let mut payload =
                     if let Some(cached) = self.core.chunk_data_cache.get(&extent.chunk_hash) {
+                        self.core
+                            .chunk_data_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
                         cached.as_ref().clone()
                     } else {
+                        self.core
+                            .chunk_data_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
                         let bytes = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
                             if !FsCore::inode_is_vault(&inode) {
                                 return build_error_result_from_errno(
@@ -2314,6 +2562,9 @@ impl VirtualFs for VerFs {
 
         let read_len = out.len();
         buf.extend_from_slice(&out);
+        self.core
+            .read_bytes_total
+            .fetch_add(read_len as u64, Ordering::Relaxed);
         Ok(read_len)
     }
 
@@ -3134,6 +3385,75 @@ fn scan_range_pairs(
         valid = iter.next()?;
     }
     Ok(out)
+}
+
+fn dir_size_recursive(path: &Path) -> Result<u64> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(anyhow::Error::new(err)),
+    };
+
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(metadata.len());
+    }
+
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(dir_size_recursive(&entry.path())?);
+    }
+    Ok(total)
+}
+
+fn read_process_rss_bytes() -> Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    for line in status.lines() {
+        if let Some(bytes) = parse_proc_kib_line(line, "VmRSS:") {
+            return Ok(bytes?);
+        }
+    }
+    Ok(0)
+}
+
+fn read_process_private_memory_bytes() -> Result<u64> {
+    let smaps_rollup = std::fs::read_to_string("/proc/self/smaps_rollup")?;
+    let mut private_clean = 0_u64;
+    let mut private_dirty = 0_u64;
+
+    for line in smaps_rollup.lines() {
+        if let Some(bytes) = parse_proc_kib_line(line, "Private_Clean:") {
+            private_clean = bytes?;
+            continue;
+        }
+        if let Some(bytes) = parse_proc_kib_line(line, "Private_Dirty:") {
+            private_dirty = bytes?;
+        }
+    }
+
+    Ok(private_clean.saturating_add(private_dirty))
+}
+
+fn parse_proc_kib_line(line: &str, key: &str) -> Option<Result<u64>> {
+    if !line.starts_with(key) {
+        return None;
+    }
+    Some(
+        line.strip_prefix(key)
+            .ok_or_else(|| anyhow!("malformed proc line for {key}"))
+            .and_then(|rest| {
+                let kb = rest
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {key}"))?
+                    .parse::<u64>()?;
+                Ok(kb.saturating_mul(1024))
+            }),
+    )
 }
 
 fn can_coalesce_write(existing: &WriteOp, incoming: &WriteOp) -> bool {

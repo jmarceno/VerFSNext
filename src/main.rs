@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::fs::VerFs;
+use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::snapshot::SnapshotManager;
 
@@ -128,6 +128,14 @@ async fn run_control_command(args: Vec<String>) -> Result<()> {
             let cmd = parse_snapshot_cmd(&args[(idx + 1)..])?;
             if !try_run_snapshot_via_socket(&config, &cmd).await? {
                 run_snapshot_via_metadata(&config, &cmd).await?;
+            }
+        }
+        "stats" => {
+            if !args[(idx + 1)..].is_empty() {
+                bail!("stats does not take arguments");
+            }
+            if !try_run_stats_via_socket(&config).await? {
+                bail!("stats requires a mounted daemon (control socket unavailable)");
             }
         }
         "crypt" => {
@@ -264,6 +272,7 @@ enum ControlRequest {
         key_file: String,
     },
     VaultLock,
+    Stats,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -435,6 +444,20 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
                 error: err.to_string(),
             },
         },
+        ControlRequest::Stats => match fs.collect_stats() {
+            Ok(stats) => ControlResponse {
+                ok: true,
+                names: Vec::new(),
+                message: format_stats_report(&stats),
+                error: String::new(),
+            },
+            Err(err) => ControlResponse {
+                ok: false,
+                names: Vec::new(),
+                message: String::new(),
+                error: err.to_string(),
+            },
+        },
     };
 
     let payload = serde_json::to_vec(&resp).context("failed to encode control response")?;
@@ -569,6 +592,287 @@ async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result
         println!("{}", resp.message);
     }
     Ok(true)
+}
+
+async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
+    let socket_path = config.control_socket_path();
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(stream) => stream,
+        Err(err) if socket_unavailable(&err) => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to connect control socket {}", socket_path.display())
+            });
+        }
+    };
+
+    let payload =
+        serde_json::to_vec(&ControlRequest::Stats).context("failed to encode control request")?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("failed writing control request")?;
+    stream
+        .write_all(b"\n")
+        .await
+        .context("failed writing control request terminator")?;
+    stream
+        .flush()
+        .await
+        .context("failed flushing control request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .context("failed reading control response")?;
+    if read == 0 {
+        bail!("empty control response");
+    }
+    let resp: ControlResponse =
+        serde_json::from_str(line.trim_end()).context("invalid control response payload")?;
+    if !resp.ok {
+        bail!(resp.error);
+    }
+    if !resp.message.is_empty() {
+        println!("{}", resp.message);
+    }
+    Ok(true)
+}
+
+fn format_stats_report(stats: &VerFsStats) -> String {
+    let compression_ratio = ratio(
+        stats.live_unique_compressed_bytes,
+        stats.live_unique_uncompressed_bytes,
+    );
+    let compression_savings_ratio = (1.0 - compression_ratio).max(0.0);
+    let dedup_ratio = ratio(
+        stats.live_dedup_savings_bytes,
+        stats.live_referenced_compressed_bytes,
+    );
+    let disk_vs_live_logical =
+        stats.data_dir_size_bytes as i128 - stats.live_logical_size_bytes as i128;
+    let disk_delta_note = if disk_vs_live_logical < 0 {
+        format!(
+            "saving {} vs live logical",
+            human_bytes(u64::try_from((-disk_vs_live_logical) as u128).unwrap_or(u64::MAX))
+        )
+    } else if disk_vs_live_logical > 0 {
+        format!(
+            "overhead {} vs live logical",
+            human_bytes(u64::try_from(disk_vs_live_logical as u128).unwrap_or(u64::MAX))
+        )
+    } else {
+        "exactly equal to live logical".to_owned()
+    };
+
+    let rows = vec![
+        (
+            "Live Logical Size (/.snapshots excluded)".to_owned(),
+            human_bytes(stats.live_logical_size_bytes),
+            format!("{} bytes", stats.live_logical_size_bytes),
+        ),
+        (
+            "Logical Size in Snapshots".to_owned(),
+            human_bytes(stats.snapshots_logical_size_bytes),
+            format!("{} bytes", stats.snapshots_logical_size_bytes),
+        ),
+        (
+            "Logical Size (All Namespaces)".to_owned(),
+            human_bytes(stats.all_logical_size_bytes),
+            format!("{} bytes", stats.all_logical_size_bytes),
+        ),
+        (
+            "Live Referenced Uncompressed".to_owned(),
+            human_bytes(stats.live_referenced_uncompressed_bytes),
+            format!("{} bytes", stats.live_referenced_uncompressed_bytes),
+        ),
+        (
+            "Live Referenced Compressed".to_owned(),
+            human_bytes(stats.live_referenced_compressed_bytes),
+            format!("{} bytes", stats.live_referenced_compressed_bytes),
+        ),
+        (
+            "Live Unique Uncompressed".to_owned(),
+            human_bytes(stats.live_unique_uncompressed_bytes),
+            format!("{} bytes", stats.live_unique_uncompressed_bytes),
+        ),
+        (
+            "Live Unique Compressed".to_owned(),
+            human_bytes(stats.live_unique_compressed_bytes),
+            format!("{} bytes", stats.live_unique_compressed_bytes),
+        ),
+        (
+            "Compression (Live Unique)".to_owned(),
+            format!("{:.2}% smaller", compression_savings_ratio * 100.0),
+            format!("compressed/original: {:.2}%", compression_ratio * 100.0),
+        ),
+        (
+            "Dedup Savings (Live)".to_owned(),
+            human_bytes(stats.live_dedup_savings_bytes),
+            format!("{:.2}% of non-dedup compressed", dedup_ratio * 100.0),
+        ),
+        (
+            "Stored Unique Uncompressed (All Chunks)".to_owned(),
+            human_bytes(stats.stored_unique_uncompressed_bytes),
+            format!("{} bytes", stats.stored_unique_uncompressed_bytes),
+        ),
+        (
+            "Stored Unique Compressed (All Chunks)".to_owned(),
+            human_bytes(stats.stored_unique_compressed_bytes),
+            format!("{} bytes", stats.stored_unique_compressed_bytes),
+        ),
+        (
+            "Metadata Size".to_owned(),
+            human_bytes(stats.metadata_size_bytes),
+            format!("{} bytes", stats.metadata_size_bytes),
+        ),
+        (
+            "Data Dir Size (On Disk)".to_owned(),
+            human_bytes(stats.data_dir_size_bytes),
+            format!("{} bytes", stats.data_dir_size_bytes),
+        ),
+        (
+            "Disk Delta (data_dir - live_logical)".to_owned(),
+            human_bytes_signed(disk_vs_live_logical),
+            disk_delta_note,
+        ),
+        (
+            "Cache Hit Rate".to_owned(),
+            format!("{:.2}%", stats.cache_hit_rate * 100.0),
+            format!("{} hits / {} requests", stats.cache_hits, stats.cache_requests),
+        ),
+        (
+            "Process Private Memory".to_owned(),
+            human_bytes(stats.process_private_memory_bytes),
+            format!("{} bytes", stats.process_private_memory_bytes),
+        ),
+        (
+            "Process RSS".to_owned(),
+            human_bytes(stats.process_rss_bytes),
+            format!("{} bytes", stats.process_rss_bytes),
+        ),
+        (
+            "Approx Cache Memory".to_owned(),
+            human_bytes(stats.approx_cache_memory_bytes),
+            format!("{} bytes", stats.approx_cache_memory_bytes),
+        ),
+        (
+            "Cache Entries".to_owned(),
+            format!(
+                "metadata {}, chunk-data {}",
+                stats.metadata_cache_entries, stats.chunk_cache_entries
+            ),
+            "active cache keys".to_owned(),
+        ),
+        (
+            "Average Throughput".to_owned(),
+            format!(
+                "read {}/s | write {}/s",
+                human_bytes(stats.read_throughput_bps as u64),
+                human_bytes(stats.write_throughput_bps as u64)
+            ),
+            format!("uptime {:.1}s", stats.uptime_secs),
+        ),
+        (
+            "I/O Totals".to_owned(),
+            format!(
+                "read {} | write {}",
+                human_bytes(stats.read_bytes_total),
+                human_bytes(stats.write_bytes_total)
+            ),
+            format!("{} / {} bytes", stats.read_bytes_total, stats.write_bytes_total),
+        ),
+    ];
+
+    let table = render_stats_table(&rows);
+    format!(
+        "VerFSNext Stats\n(scoped to live tree unless explicitly marked otherwise)\n{}",
+        table
+    )
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn render_stats_table(rows: &[(String, String, String)]) -> String {
+    let metric_header = "Metric";
+    let value_header = "Value";
+    let details_header = "Details";
+
+    let metric_width = rows
+        .iter()
+        .map(|(metric, _, _)| metric.len())
+        .max()
+        .unwrap_or(metric_header.len())
+        .max(metric_header.len());
+    let value_width = rows
+        .iter()
+        .map(|(_, value, _)| value.len())
+        .max()
+        .unwrap_or(value_header.len())
+        .max(value_header.len());
+    let details_width = rows
+        .iter()
+        .map(|(_, _, details)| details.len())
+        .max()
+        .unwrap_or(details_header.len())
+        .max(details_header.len());
+
+    let sep = format!(
+        "+-{:-<metric_width$}-+-{:-<value_width$}-+-{:-<details_width$}-+",
+        "",
+        "",
+        ""
+    );
+
+    let mut out = String::new();
+    out.push_str(&sep);
+    out.push('\n');
+    out.push_str(&format!(
+        "| {:<metric_width$} | {:<value_width$} | {:<details_width$} |",
+        metric_header, value_header, details_header
+    ));
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
+
+    for (metric, value, details) in rows {
+        out.push_str(&format!(
+            "| {:<metric_width$} | {:<value_width$} | {:<details_width$} |",
+            metric, value, details
+        ));
+        out.push('\n');
+    }
+
+    out.push_str(&sep);
+    out
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+fn human_bytes_signed(bytes: i128) -> String {
+    if bytes < 0 {
+        let abs = u64::try_from(bytes.unsigned_abs()).unwrap_or(u64::MAX);
+        format!("-{}", human_bytes(abs))
+    } else {
+        human_bytes(u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
 }
 
 fn socket_unavailable(err: &std::io::Error) -> bool {
