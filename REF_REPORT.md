@@ -152,16 +152,9 @@ If optimized aggressively for zero-copy, these areas are likely to require new o
 ## Additional Improvements Not to Miss (Safe/Low-Risk)
 
 1.  Add explicit archive validation/fallback errors at decode boundaries (WAL and SSTable metadata/index), so corruption reports stay actionable.
-2.  Add clear format version markers for WAL and SSTable metadata/index archives to make hard breaks deterministic during startup/recovery.
-3.  Reduce avoidable copies in hot read paths after the main refactor, notably `Table::get` in `vendor/surrealkv/src/sstable/table.rs` where values are currently copied via `to_vec()`.
+2.  Reduce avoidable copies in hot read paths after the main refactor, notably `Table::get` in `vendor/surrealkv/src/sstable/table.rs` where values are currently copied via `to_vec()`.
 
-## VerFSNext Changes Needed to Maximize Benefit
-
-1.  Add/propagate storage format version guards in VerFSNext startup and mount flow, so WAL/SSTable format breaks fail fast with explicit operator-facing messages.
-2.  Update VerFSNext recovery and durability tests to include the new WAL archive decode path and corruption diagnostics.
-3.  Expand read-path benchmarks and telemetry around mount/recovery latency and point-lookups to confirm the expected zero-copy wins from Phase 1 and Phase 3.
-4.  Re-tune cache sizing defaults (`metadata`, `chunk`, `pack-index`) after the index/meta memory footprint changes to reclaim memory or improve hit rate.
 
 ## Risks & Mitigation
--   **Disk Format Compatibility:** All proposed changes are breaking, which is not a problem as there are no consumers other the VerFSNext and it is still in pre-alpha. So VerFSNext will update its API.
+-   **Disk Format Compatibility:** All proposed changes are breaking, which is not a problem as there are no consumers other the VerFSNext and it is still in pre-alpha. So VerFSNext will update its API. Because of the very early development phase, no change will trigger a new revision or version number, neither on surrealkv nor on VerFSNext.
 -   **Unsafe Code Expansion:** `rkyv` itself does not require us to add unsafe for Phase 1/3. Keep Phase 2 and other unsafe-sensitive optimizations deferred.
