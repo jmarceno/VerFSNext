@@ -195,9 +195,9 @@ Ship complete encrypted folder behavior with strict operational semantics.
 ## Scope (single-pass implementation)
 
 - `verfs crypt` CLI:
-  - `-c` create
-  - `-u` unlock
-  - `-l` lock
+  - `-c` create - takes a password and a path where the key will be saved once it is created, no path creates the key at working directory. Key is always named `verfsnext.vault.key`.
+  - `-u` unlock - takes a password and a path to the key file created with `-c` to unlock the vault.
+  - `-l` lock - takes no arguments, locks the vault, and invalidates all active vault handles.
 - `.vault` root-only behavior:
   - not auto-created
   - invisible/inaccessible when locked
@@ -208,6 +208,7 @@ Ship complete encrypted folder behavior with strict operational semantics.
   - Argon2id KEK derivation
   - wrapped key stored in metadata system config
   - data-only chunk encryption via XChaCha20-Poly1305 (192-bit nonce)
+  - metadata stays unencrypted for indexing, performance and simplicity reasons
 - `ChunkBackend` interception for `/.vault` paths.
 - Lock transition hard invalidation:
   - clear vault-related caches
