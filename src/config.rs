@@ -172,6 +172,10 @@ impl Config {
         self.data_dir.join("metadata")
     }
 
+    pub fn control_socket_path(&self) -> PathBuf {
+        self.data_dir.join("verfsnext.sock")
+    }
+
     pub fn packs_dir(&self) -> PathBuf {
         self.data_dir.join("packs")
     }

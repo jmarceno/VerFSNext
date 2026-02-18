@@ -169,21 +169,21 @@ pub fn sys_key(name: &str) -> Vec<u8> {
 }
 
 pub fn snapshot_prefix() -> Vec<u8> {
-    vec![KEY_PREFIX_SNAPSHOT]
+    b"S:".to_vec()
 }
 
 pub fn snapshot_key(name: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + name.len());
-    key.push(KEY_PREFIX_SNAPSHOT);
+    let mut key = Vec::with_capacity(2 + name.len());
+    key.extend_from_slice(b"S:");
     key.extend_from_slice(name);
     key
 }
 
 pub fn decode_snapshot_name(key: &[u8]) -> Option<&[u8]> {
-    if key.is_empty() || key[0] != KEY_PREFIX_SNAPSHOT {
+    if key.len() < 2 || key[0] != KEY_PREFIX_SNAPSHOT || key[1] != b':' {
         return None;
     }
-    Some(&key[1..])
+    Some(&key[2..])
 }
 
 pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
@@ -240,5 +240,21 @@ pub fn parts_to_system_time(sec: i64, nsec: u32) -> SystemTime {
         UNIX_EPOCH + Duration::new(sec as u64, nsec)
     } else {
         UNIX_EPOCH - Duration::new(sec.unsigned_abs(), nsec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_snapshot_name, snapshot_key, sys_key};
+
+    #[test]
+    fn snapshot_decode_rejects_sys_keys() {
+        assert!(decode_snapshot_name(&sys_key("next_inode")).is_none());
+    }
+
+    #[test]
+    fn snapshot_encode_decode_roundtrip() {
+        let key = snapshot_key(b"snap01");
+        assert_eq!(decode_snapshot_name(&key), Some(&b"snap01"[..]));
     }
 }

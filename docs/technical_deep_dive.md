@@ -19,7 +19,8 @@ The repository now includes a Phase 4 implementation on top of the existing full
   - `verfsnext snapshot create <name>`
   - `verfsnext snapshot list`
   - `verfsnext snapshot delete <name>`
-- Root `/.snapshots` bootstrap directory is read-only from normal POSIX mutation paths
+- Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot commands from CLI control mode.
+- Snapshot CLI first tries socket RPC; if no socket listener is available, it falls back to offline metadata mode.
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
@@ -34,6 +35,7 @@ The repository now includes a Phase 4 implementation on top of the existing full
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
   - read-only inode flag enforcement across mutating FUSE operations
+  - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - background GC trigger integrated into periodic sync cycles with idle gating
 
 - `src/snapshot/mod.rs`

@@ -31,6 +31,7 @@ use crate::data::hash::hash128;
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
+use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
@@ -144,6 +145,27 @@ impl VerFs {
         self.batcher.shutdown().await?;
         self.sync_service.shutdown_with_full_sync().await?;
         self.core.meta.close().await?;
+        Ok(())
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<String>> {
+        let snapshots = SnapshotManager::new(&self.core.meta);
+        snapshots.list()
+    }
+
+    pub async fn create_snapshot(&self, name: &str) -> Result<()> {
+        let _guard = self.core.write_lock.lock().await;
+        let snapshots = SnapshotManager::new(&self.core.meta);
+        snapshots.create(name).await?;
+        self.core.mark_mutation();
+        Ok(())
+    }
+
+    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        let _guard = self.core.write_lock.lock().await;
+        let snapshots = SnapshotManager::new(&self.core.meta);
+        snapshots.delete(name).await?;
+        self.core.mark_mutation();
         Ok(())
     }
 }
