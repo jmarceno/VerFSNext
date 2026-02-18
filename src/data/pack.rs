@@ -125,7 +125,27 @@ impl PackStore {
         &self,
         pack_id: u64,
         expected_hash: [u8; 16],
+        expected_codec: u8,
         expected_uncompressed_len: u32,
+        expected_compressed_len: u32,
+    ) -> Result<Vec<u8>> {
+        let payload = self.read_chunk_payload(
+            pack_id,
+            expected_hash,
+            expected_codec,
+            expected_uncompressed_len,
+            expected_compressed_len,
+        )?;
+        decompress_chunk(expected_codec, &payload, expected_uncompressed_len)
+    }
+
+    pub fn read_chunk_payload(
+        &self,
+        pack_id: u64,
+        expected_hash: [u8; 16],
+        expected_codec: u8,
+        expected_uncompressed_len: u32,
+        expected_compressed_len: u32,
     ) -> Result<Vec<u8>> {
         let index = self
             .lookup_index_entry(pack_id, expected_hash)?
@@ -136,6 +156,16 @@ impl PackStore {
                 )
             })?;
 
+        if index.codec != expected_codec {
+            bail!(
+                "pack index codec mismatch for pack {} hash {:x?}: expected {}, got {}",
+                pack_id,
+                expected_hash,
+                expected_codec,
+                index.codec
+            );
+        }
+
         if index.uncompressed_len != expected_uncompressed_len {
             bail!(
                 "pack index uncompressed length mismatch for pack {} hash {:x?}: expected {}, got {}",
@@ -143,6 +173,15 @@ impl PackStore {
                 expected_hash,
                 expected_uncompressed_len,
                 index.uncompressed_len
+            );
+        }
+        if index.compressed_len != expected_compressed_len {
+            bail!(
+                "pack index compressed length mismatch for pack {} hash {:x?}: expected {}, got {}",
+                pack_id,
+                expected_hash,
+                expected_compressed_len,
+                index.compressed_len
             );
         }
 
@@ -208,7 +247,7 @@ impl PackStore {
         file.read_exact_at(&mut payload, payload_offset)
             .with_context(|| format!("failed to read pack payload from {}", path.display()))?;
 
-        decompress_chunk(index.codec, &payload, expected_uncompressed_len)
+        Ok(payload)
     }
 
     pub fn sync(&self, full: bool) -> Result<()> {

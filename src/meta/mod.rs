@@ -9,6 +9,7 @@ use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
     InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, ROOT_INODE, SNAPSHOTS_DIR_NAME,
 };
+use crate::vault::{SYS_VAULT_POLICY, SYS_VAULT_STATE, VAULT_STATE_LOCKED};
 
 pub struct MetaStore {
     tree: Tree,
@@ -67,6 +68,12 @@ impl MetaStore {
             }
             if txn.get(sys_key("gc.epoch"))?.is_none() {
                 txn.set(sys_key("gc.epoch"), 0_u64.to_le_bytes().to_vec())?;
+            }
+            if txn.get(sys_key(SYS_VAULT_STATE))?.is_none() {
+                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+            }
+            if txn.get(sys_key(SYS_VAULT_POLICY))?.is_none() {
+                txn.set(sys_key(SYS_VAULT_POLICY), vec![0_u8])?;
             }
 
             let snapshots_name = SNAPSHOTS_DIR_NAME.as_bytes();
@@ -187,6 +194,10 @@ impl MetaStore {
             bytes.copy_from_slice(&raw);
             Ok(u64::from_le_bytes(bytes))
         })
+    }
+
+    pub fn get_sys(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.read_txn(|txn| txn.get(sys_key(name)).context("failed reading SYS key"))
     }
 
     pub fn flush_wal(&self, sync: bool) -> Result<()> {

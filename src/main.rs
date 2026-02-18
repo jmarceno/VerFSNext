@@ -6,6 +6,7 @@ mod meta;
 mod snapshot;
 mod sync;
 mod types;
+mod vault;
 mod write;
 
 use std::io::ErrorKind;
@@ -129,6 +130,12 @@ async fn run_control_command(args: Vec<String>) -> Result<()> {
                 run_snapshot_via_metadata(&config, &cmd).await?;
             }
         }
+        "crypt" => {
+            let cmd = parse_crypt_cmd(&args[(idx + 1)..])?;
+            if !try_run_crypt_via_socket(&config, &cmd).await? {
+                run_crypt_via_metadata(&config, &cmd).await?;
+            }
+        }
         other => bail!("unknown control command '{other}'"),
     }
 
@@ -139,6 +146,18 @@ enum SnapshotCommand {
     Create(String),
     List,
     Delete(String),
+}
+
+enum CryptCommand {
+    Create {
+        password: String,
+        key_path: Option<PathBuf>,
+    },
+    Unlock {
+        password: String,
+        key_file: PathBuf,
+    },
+    Lock,
 }
 
 fn parse_snapshot_cmd(args: &[String]) -> Result<SnapshotCommand> {
@@ -163,18 +182,95 @@ fn parse_snapshot_cmd(args: &[String]) -> Result<SnapshotCommand> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum SnapshotControlRequest {
-    Create { name: String },
-    List,
-    Delete { name: String },
+fn parse_crypt_cmd(args: &[String]) -> Result<CryptCommand> {
+    if args.is_empty() {
+        bail!("missing crypt arguments");
+    }
+    let mut create = false;
+    let mut unlock = false;
+    let mut lock = false;
+    let mut password: Option<String> = None;
+    let mut key_path: Option<PathBuf> = None;
+    let mut unlock_key: Option<PathBuf> = None;
+
+    let mut idx = 0_usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-c" => create = true,
+            "-u" => unlock = true,
+            "-l" => lock = true,
+            "-p" => {
+                idx = idx.saturating_add(1);
+                let Some(value) = args.get(idx) else {
+                    bail!("missing value for -p");
+                };
+                password = Some(value.clone());
+            }
+            "-path" => {
+                idx = idx.saturating_add(1);
+                let Some(value) = args.get(idx) else {
+                    bail!("missing value for -path");
+                };
+                key_path = Some(PathBuf::from(value));
+            }
+            "-k" => {
+                idx = idx.saturating_add(1);
+                let Some(value) = args.get(idx) else {
+                    bail!("missing value for -k");
+                };
+                unlock_key = Some(PathBuf::from(value));
+            }
+            other => bail!("unknown crypt argument '{other}'"),
+        }
+        idx = idx.saturating_add(1);
+    }
+
+    let selected = [create, unlock, lock].into_iter().filter(|v| *v).count();
+    if selected != 1 {
+        bail!("exactly one of -c, -u, -l is required");
+    }
+
+    if create {
+        let password = password.context("missing -p password for -c")?;
+        return Ok(CryptCommand::Create { password, key_path });
+    }
+    if unlock {
+        let password = password.context("missing -p password for -u")?;
+        let key_file = unlock_key.context("missing -k key file for -u")?;
+        return Ok(CryptCommand::Unlock { password, key_file });
+    }
+    if password.is_some() || key_path.is_some() || unlock_key.is_some() {
+        bail!("-l does not take -p, -path, or -k");
+    }
+    Ok(CryptCommand::Lock)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SnapshotControlResponse {
+#[serde(tag = "op", rename_all = "snake_case")]
+enum ControlRequest {
+    SnapshotCreate {
+        name: String,
+    },
+    SnapshotList,
+    SnapshotDelete {
+        name: String,
+    },
+    VaultCreate {
+        password: String,
+        key_path: Option<String>,
+    },
+    VaultUnlock {
+        password: String,
+        key_file: String,
+    },
+    VaultLock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlResponse {
     ok: bool,
     names: Vec<String>,
+    message: String,
     error: String,
 }
 
@@ -246,43 +342,96 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
         return Ok(());
     }
 
-    let req: SnapshotControlRequest =
+    let req: ControlRequest =
         serde_json::from_str(line.trim_end()).context("invalid control request payload")?;
 
     let resp = match req {
-        SnapshotControlRequest::Create { name } => match fs.create_snapshot(&name).await {
-            Ok(()) => SnapshotControlResponse {
+        ControlRequest::SnapshotCreate { name } => match fs.create_snapshot(&name).await {
+            Ok(()) => ControlResponse {
                 ok: true,
                 names: Vec::new(),
+                message: String::new(),
                 error: String::new(),
             },
-            Err(err) => SnapshotControlResponse {
+            Err(err) => ControlResponse {
                 ok: false,
                 names: Vec::new(),
+                message: String::new(),
                 error: err.to_string(),
             },
         },
-        SnapshotControlRequest::List => match fs.list_snapshots() {
-            Ok(names) => SnapshotControlResponse {
+        ControlRequest::SnapshotList => match fs.list_snapshots() {
+            Ok(names) => ControlResponse {
                 ok: true,
                 names,
+                message: String::new(),
                 error: String::new(),
             },
-            Err(err) => SnapshotControlResponse {
+            Err(err) => ControlResponse {
                 ok: false,
                 names: Vec::new(),
+                message: String::new(),
                 error: err.to_string(),
             },
         },
-        SnapshotControlRequest::Delete { name } => match fs.delete_snapshot(&name).await {
-            Ok(()) => SnapshotControlResponse {
+        ControlRequest::SnapshotDelete { name } => match fs.delete_snapshot(&name).await {
+            Ok(()) => ControlResponse {
                 ok: true,
                 names: Vec::new(),
+                message: String::new(),
                 error: String::new(),
             },
-            Err(err) => SnapshotControlResponse {
+            Err(err) => ControlResponse {
                 ok: false,
                 names: Vec::new(),
+                message: String::new(),
+                error: err.to_string(),
+            },
+        },
+        ControlRequest::VaultCreate { password, key_path } => {
+            let path = key_path.map(PathBuf::from);
+            match fs.create_vault(&password, path.as_deref()).await {
+                Ok(written_path) => ControlResponse {
+                    ok: true,
+                    names: Vec::new(),
+                    message: written_path.display().to_string(),
+                    error: String::new(),
+                },
+                Err(err) => ControlResponse {
+                    ok: false,
+                    names: Vec::new(),
+                    message: String::new(),
+                    error: err.to_string(),
+                },
+            }
+        }
+        ControlRequest::VaultUnlock { password, key_file } => {
+            match fs.unlock_vault(&password, Path::new(&key_file)).await {
+                Ok(()) => ControlResponse {
+                    ok: true,
+                    names: Vec::new(),
+                    message: String::new(),
+                    error: String::new(),
+                },
+                Err(err) => ControlResponse {
+                    ok: false,
+                    names: Vec::new(),
+                    message: String::new(),
+                    error: err.to_string(),
+                },
+            }
+        }
+        ControlRequest::VaultLock => match fs.lock_vault().await {
+            Ok(()) => ControlResponse {
+                ok: true,
+                names: Vec::new(),
+                message: String::new(),
+                error: String::new(),
+            },
+            Err(err) => ControlResponse {
+                ok: false,
+                names: Vec::new(),
+                message: String::new(),
                 error: err.to_string(),
             },
         },
@@ -317,9 +466,9 @@ async fn try_run_snapshot_via_socket(config: &Config, cmd: &SnapshotCommand) -> 
     };
 
     let req = match cmd {
-        SnapshotCommand::Create(name) => SnapshotControlRequest::Create { name: name.clone() },
-        SnapshotCommand::List => SnapshotControlRequest::List,
-        SnapshotCommand::Delete(name) => SnapshotControlRequest::Delete { name: name.clone() },
+        SnapshotCommand::Create(name) => ControlRequest::SnapshotCreate { name: name.clone() },
+        SnapshotCommand::List => ControlRequest::SnapshotList,
+        SnapshotCommand::Delete(name) => ControlRequest::SnapshotDelete { name: name.clone() },
     };
 
     let payload = serde_json::to_vec(&req).context("failed to encode control request")?;
@@ -345,7 +494,7 @@ async fn try_run_snapshot_via_socket(config: &Config, cmd: &SnapshotCommand) -> 
     if read == 0 {
         bail!("empty control response");
     }
-    let resp: SnapshotControlResponse =
+    let resp: ControlResponse =
         serde_json::from_str(line.trim_end()).context("invalid control response payload")?;
     if !resp.ok {
         bail!(resp.error);
@@ -354,6 +503,70 @@ async fn try_run_snapshot_via_socket(config: &Config, cmd: &SnapshotCommand) -> 
         for name in resp.names {
             println!("{name}");
         }
+    }
+    Ok(true)
+}
+
+async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result<bool> {
+    let socket_path = config.control_socket_path();
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(stream) => stream,
+        Err(err) if socket_unavailable(&err) => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to connect control socket {}", socket_path.display())
+            });
+        }
+    };
+
+    let req = match cmd {
+        CryptCommand::Create { password, key_path } => ControlRequest::VaultCreate {
+            password: password.clone(),
+            key_path: key_path
+                .as_ref()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                .map(|p| p.to_string_lossy().to_string()),
+        },
+        CryptCommand::Unlock { password, key_file } => ControlRequest::VaultUnlock {
+            password: password.clone(),
+            key_file: std::fs::canonicalize(key_file)
+                .unwrap_or_else(|_| key_file.clone())
+                .to_string_lossy()
+                .to_string(),
+        },
+        CryptCommand::Lock => ControlRequest::VaultLock,
+    };
+
+    let payload = serde_json::to_vec(&req).context("failed to encode control request")?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("failed writing control request")?;
+    stream
+        .write_all(b"\n")
+        .await
+        .context("failed writing control request terminator")?;
+    stream
+        .flush()
+        .await
+        .context("failed flushing control request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .context("failed reading control response")?;
+    if read == 0 {
+        bail!("empty control response");
+    }
+    let resp: ControlResponse =
+        serde_json::from_str(line.trim_end()).context("invalid control response payload")?;
+    if !resp.ok {
+        bail!(resp.error);
+    }
+    if !resp.message.is_empty() {
+        println!("{}", resp.message);
     }
     Ok(true)
 }
@@ -384,6 +597,27 @@ async fn run_snapshot_via_metadata(config: &Config, cmd: &SnapshotCommand) -> Re
     action_result?;
     close_result?;
     Ok(())
+}
+
+async fn run_crypt_via_metadata(config: &Config, cmd: &CryptCommand) -> Result<()> {
+    let fs = VerFs::new(config.clone()).await?;
+    match cmd {
+        CryptCommand::Create { password, key_path } => {
+            let path = fs.create_vault(password, key_path.as_deref()).await?;
+            println!("{}", path.display());
+            fs.graceful_shutdown().await?;
+            Ok(())
+        }
+        CryptCommand::Unlock { .. } => {
+            fs.graceful_shutdown().await?;
+            bail!("unlock requires a mounted daemon (control socket unavailable)")
+        }
+        CryptCommand::Lock => {
+            let result = fs.lock_vault().await;
+            fs.graceful_shutdown().await?;
+            result
+        }
+    }
 }
 
 fn init_logging() {

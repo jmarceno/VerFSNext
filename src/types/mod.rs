@@ -20,7 +20,10 @@ pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
 pub const KEY_PREFIX_SNAPSHOT: u8 = b'S';
 
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
+pub const INODE_FLAG_VAULT: u32 = 1 << 1;
+pub const INODE_FLAG_VAULT_ROOT: u32 = 1 << 2;
 pub const SNAPSHOTS_DIR_NAME: &str = ".snapshots";
+pub const VAULT_DIR_NAME: &str = ".vault";
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[rkyv(bytecheck())]
@@ -62,6 +65,8 @@ pub struct ChunkRecord {
     pub refcount: u64,
     pub pack_id: u64,
     pub codec: u8,
+    pub flags: u8,
+    pub nonce: [u8; 24],
     pub uncompressed_len: u32,
     pub compressed_len: u32,
 }

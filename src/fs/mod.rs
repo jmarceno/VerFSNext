@@ -19,6 +19,7 @@ use nix::fcntl::OFlag;
 use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
+use parking_lot::RwLock;
 use surrealkv::LSMIterator;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -27,7 +28,7 @@ use tracing::debug;
 use crate::config::Config;
 use crate::data::chunker::UltraStreamChunker;
 use crate::data::compress::{compress_parallel, PendingChunk};
-use crate::data::hash::hash128;
+use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
@@ -37,8 +38,15 @@ use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_KIND_DIR,
-    INODE_KIND_FILE, INODE_KIND_SYMLINK,
+    DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
+    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE,
+    VAULT_DIR_NAME,
+};
+use crate::vault::{
+    build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
+    generate_key_file_material, read_key_file, resolve_create_key_path, unwrap_folder_key,
+    write_key_file, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_ENCRYPTED,
+    SYS_VAULT_STATE, SYS_VAULT_WRAP, VAULT_STATE_LOCKED, VAULT_STATE_UNLOCKED,
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
@@ -83,6 +91,7 @@ struct FsCore {
     write_lock: Mutex<()>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
+    vault: RwLock<VaultRuntime>,
 }
 
 impl VerFs {
@@ -97,6 +106,17 @@ impl VerFs {
             config.pack_index_cache_capacity_entries,
         )?;
         packs.verify_pack_headers(active_pack_id)?;
+        let vault_initialized = meta
+            .get_sys(SYS_VAULT_WRAP)?
+            .map(|raw| !raw.is_empty())
+            .unwrap_or(false);
+        if meta.get_sys(SYS_VAULT_STATE)?.is_none() {
+            meta.write_txn(|txn| {
+                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+                Ok(())
+            })
+            .await?;
+        }
 
         let core = Arc::new(FsCore {
             config: config.clone(),
@@ -115,6 +135,7 @@ impl VerFs {
             write_lock: Mutex::new(()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
+            vault: RwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
         let write_sink: Arc<dyn WriteApply> = core.clone();
@@ -168,11 +189,240 @@ impl VerFs {
         self.core.mark_mutation();
         Ok(())
     }
+
+    pub async fn create_vault(
+        &self,
+        password: &str,
+        key_path: Option<&Path>,
+    ) -> Result<std::path::PathBuf> {
+        self.core.create_vault(password, key_path).await
+    }
+
+    pub async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
+        self.core.unlock_vault(password, key_file).await
+    }
+
+    pub async fn lock_vault(&self) -> Result<()> {
+        self.core.lock_vault().await
+    }
 }
 
 impl FsCore {
     fn new_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn vault_locked(&self) -> bool {
+        !self.vault.read().unlocked()
+    }
+
+    fn inode_is_vault(inode: &InodeRecord) -> bool {
+        (inode.flags & INODE_FLAG_VAULT) != 0
+    }
+
+    fn hash_for_inode(inode: &InodeRecord, data: &[u8]) -> [u8; 16] {
+        if FsCore::inode_is_vault(inode) {
+            hash128_with_domain(0xA7, data)
+        } else {
+            hash128(data)
+        }
+    }
+
+    fn check_vault_parent_name_gate(&self, parent: u64, name: &str) -> Result<()> {
+        if self.vault_locked() && parent == ROOT_INODE && name == VAULT_DIR_NAME {
+            return Err(anyhow_errno(Errno::ENOENT, "vault is locked"));
+        }
+        Ok(())
+    }
+
+    fn ensure_inode_vault_access(&self, inode: &InodeRecord, context: &'static str) -> Result<()> {
+        if self.vault_locked() && FsCore::inode_is_vault(inode) {
+            return Err(anyhow_errno(
+                Errno::ENOENT,
+                format!("{context}: vault is locked"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_vault_key(&self) -> Result<[u8; 32]> {
+        let vault = self.vault.read();
+        if !vault.unlocked() {
+            return Err(anyhow_errno(Errno::EACCES, "vault is locked"));
+        }
+        vault
+            .key()
+            .ok_or_else(|| anyhow_errno(Errno::EIO, "vault key is unavailable"))
+    }
+
+    async fn create_vault(
+        &self,
+        password: &str,
+        key_path: Option<&Path>,
+    ) -> Result<std::path::PathBuf> {
+        if !self.config.vault_enabled {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                "vault is disabled by configuration",
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+
+        if self.meta.get_sys(SYS_VAULT_WRAP)?.is_some() {
+            return Err(anyhow_errno(Errno::EEXIST, "vault is already initialized"));
+        }
+
+        let key_material = generate_key_file_material();
+        let folder_key = generate_folder_key();
+        let wrap = build_wrap_record(
+            password,
+            &key_material,
+            &folder_key,
+            VaultArgon2Params {
+                mem_kib: self.config.vault_argon2_mem_kib,
+                iters: self.config.vault_argon2_iters,
+                parallelism: self.config.vault_argon2_parallelism,
+            },
+        )?;
+        let out_key_path = resolve_create_key_path(key_path)?;
+        write_key_file(&out_key_path, &key_material)?;
+
+        let now = SystemTime::now();
+        let (sec, nsec) = system_time_to_parts(now);
+
+        self.meta
+            .write_txn(|txn| {
+                if txn
+                    .get(dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()))?
+                    .is_some()
+                {
+                    return Err(anyhow_errno(
+                        Errno::EEXIST,
+                        "vault namespace already exists",
+                    ));
+                }
+
+                let Some(next_inode_raw) = txn.get(sys_key("next_inode"))? else {
+                    return Err(anyhow_errno(Errno::EIO, "missing SYS:next_inode"));
+                };
+                if next_inode_raw.len() != 8 {
+                    return Err(anyhow_errno(Errno::EIO, "invalid SYS:next_inode encoding"));
+                }
+                let mut next_inode_bytes = [0_u8; 8];
+                next_inode_bytes.copy_from_slice(&next_inode_raw);
+                let vault_ino = u64::from_le_bytes(next_inode_bytes);
+
+                let Some(root_raw) = txn.get(inode_key(ROOT_INODE))? else {
+                    return Err(anyhow_errno(Errno::EIO, "missing root inode"));
+                };
+                let mut root_inode: InodeRecord = decode_rkyv(&root_raw)?;
+                root_inode.nlink = root_inode.nlink.saturating_add(1);
+                root_inode.mtime_sec = sec;
+                root_inode.mtime_nsec = nsec;
+                root_inode.ctime_sec = sec;
+                root_inode.ctime_nsec = nsec;
+                txn.set(inode_key(ROOT_INODE), encode_rkyv(&root_inode)?)?;
+
+                let vault_inode = InodeRecord {
+                    ino: vault_ino,
+                    parent: ROOT_INODE,
+                    kind: INODE_KIND_DIR,
+                    perm: 0o700,
+                    uid: root_inode.uid,
+                    gid: root_inode.gid,
+                    nlink: 2,
+                    size: 0,
+                    atime_sec: sec,
+                    atime_nsec: nsec,
+                    mtime_sec: sec,
+                    mtime_nsec: nsec,
+                    ctime_sec: sec,
+                    ctime_nsec: nsec,
+                    generation: 1,
+                    flags: INODE_FLAG_VAULT | INODE_FLAG_VAULT_ROOT,
+                };
+                txn.set(inode_key(vault_ino), encode_rkyv(&vault_inode)?)?;
+                txn.set(
+                    dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()),
+                    encode_rkyv(&DirentRecord {
+                        ino: vault_ino,
+                        kind: INODE_KIND_DIR,
+                    })?,
+                )?;
+                txn.set(
+                    sys_key("next_inode"),
+                    (vault_ino + 1).to_le_bytes().to_vec(),
+                )?;
+                txn.set(sys_key(SYS_VAULT_WRAP), encode_rkyv(&wrap)?)?;
+                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+                Ok(())
+            })
+            .await?;
+
+        {
+            let mut vault = self.vault.write();
+            vault.set_initialized(true);
+            vault.lock();
+        }
+        self.chunk_meta_cache.invalidate_all();
+        self.chunk_data_cache.invalidate_all();
+        self.mark_mutation();
+        Ok(out_key_path)
+    }
+
+    async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
+        if !self.config.vault_enabled {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                "vault is disabled by configuration",
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+
+        let wrap_raw = self
+            .meta
+            .get_sys(SYS_VAULT_WRAP)?
+            .ok_or_else(|| anyhow_errno(Errno::ENOENT, "vault is not initialized"))?;
+        let wrap: VaultWrapRecord = decode_rkyv(&wrap_raw)?;
+        let key_material = read_key_file(key_file)?;
+        let folder_key = unwrap_folder_key(password, &key_material, &wrap)?;
+        {
+            let mut vault = self.vault.write();
+            if vault.unlocked() {
+                return Err(anyhow_errno(Errno::EALREADY, "vault is already unlocked"));
+            }
+            vault.unlock_with(folder_key);
+            vault.set_initialized(true);
+        }
+        self.meta
+            .write_txn(|txn| {
+                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_UNLOCKED])?;
+                Ok(())
+            })
+            .await?;
+        self.chunk_meta_cache.invalidate_all();
+        self.chunk_data_cache.invalidate_all();
+        Ok(())
+    }
+
+    async fn lock_vault(&self) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        {
+            let mut vault = self.vault.write();
+            if !vault.unlocked() {
+                return Err(anyhow_errno(Errno::EALREADY, "vault is already locked"));
+            }
+            vault.lock();
+        }
+        self.meta
+            .write_txn(|txn| {
+                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+                Ok(())
+            })
+            .await?;
+        self.chunk_meta_cache.invalidate_all();
+        self.chunk_data_cache.invalidate_all();
+        Ok(())
     }
 
     fn file_attr_from_inode(&self, inode: &InodeRecord) -> FileAttr {
@@ -246,7 +496,7 @@ impl FsCore {
         Ok(chunk)
     }
 
-    fn read_block_bytes(&self, ino: u64, block_idx: u64) -> Result<Vec<u8>> {
+    fn read_block_bytes(&self, ino: u64, block_idx: u64, vault_encrypted: bool) -> Result<Vec<u8>> {
         let maybe_extent = self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(extent_key(ino, block_idx))? else {
                 return Ok(None);
@@ -271,9 +521,36 @@ impl FsCore {
         }
 
         let chunk = self.load_chunk_record(extent.chunk_hash)?;
-        let mut payload =
-            self.packs
-                .read_chunk(chunk.pack_id, extent.chunk_hash, chunk.uncompressed_len)?;
+        let mut payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+            if !vault_encrypted {
+                return Err(anyhow_errno(
+                    Errno::EIO,
+                    "encrypted chunk referenced by non-vault inode",
+                ));
+            }
+            let encrypted = self.packs.read_chunk_payload(
+                chunk.pack_id,
+                extent.chunk_hash,
+                chunk.codec,
+                chunk.uncompressed_len,
+                chunk.compressed_len,
+            )?;
+            let folder_key = self.current_vault_key()?;
+            let compressed = decrypt_chunk_payload(&folder_key, &chunk.nonce, &encrypted)?;
+            crate::data::compress::decompress_chunk(
+                chunk.codec,
+                &compressed,
+                chunk.uncompressed_len,
+            )?
+        } else {
+            self.packs.read_chunk(
+                chunk.pack_id,
+                extent.chunk_hash,
+                chunk.codec,
+                chunk.uncompressed_len,
+                chunk.compressed_len,
+            )?
+        };
         self.chunk_data_cache
             .insert(extent.chunk_hash, Arc::new(payload.clone()));
         if payload.len() < BLOCK_SIZE {
@@ -310,6 +587,7 @@ impl FsCore {
     fn materialize_pending_chunks(
         &self,
         pending_chunks: HashMap<[u8; 16], Vec<u8>>,
+        encrypt_for_vault: bool,
     ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
         if pending_chunks.is_empty() {
             return Ok(HashMap::new());
@@ -323,18 +601,34 @@ impl FsCore {
 
         let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
+            let (payload, disk_compressed_len, nonce, flags) = if encrypt_for_vault {
+                let folder_key = self.current_vault_key()?;
+                let (ciphertext, nonce) =
+                    encrypt_chunk_payload(&folder_key, &ready_chunk.chunk.compressed)?;
+                let clen = ciphertext.len() as u32;
+                (ciphertext, clen, nonce, CHUNK_FLAG_ENCRYPTED)
+            } else {
+                (
+                    ready_chunk.chunk.compressed.clone(),
+                    ready_chunk.chunk.compressed_len,
+                    [0_u8; 24],
+                    0,
+                )
+            };
             let pack_id = self.packs.append_chunk(
                 ready_chunk.hash,
                 ready_chunk.chunk.codec,
                 ready_chunk.chunk.uncompressed_len,
-                &ready_chunk.chunk.compressed,
+                &payload,
             )?;
             let chunk = ChunkRecord {
                 refcount: 0,
                 pack_id,
                 codec: ready_chunk.chunk.codec,
+                flags,
+                nonce,
                 uncompressed_len: ready_chunk.chunk.uncompressed_len,
-                compressed_len: ready_chunk.chunk.compressed_len,
+                compressed_len: disk_compressed_len,
             };
             self.chunk_meta_cache
                 .insert(ready_chunk.hash, chunk.clone());
@@ -559,6 +853,7 @@ impl FsCore {
 
     async fn truncate_file_locked(&self, ino: u64, new_size: u64) -> Result<InodeRecord> {
         let mut inode = self.load_inode_or_errno(ino, "truncate")?;
+        self.ensure_inode_vault_access(&inode, "truncate")?;
         if inode.kind != INODE_KIND_FILE {
             return Err(anyhow_errno(
                 Errno::EISDIR,
@@ -604,10 +899,11 @@ impl FsCore {
 
             for (block_idx, chunk_hash, key) in extents {
                 if has_boundary && block_idx == boundary_block {
-                    let mut block_data = self.read_block_bytes(ino, block_idx)?;
+                    let mut block_data =
+                        self.read_block_bytes(ino, block_idx, FsCore::inode_is_vault(&inode))?;
                     let offset_in_block = (new_size % block_size) as usize;
                     block_data[offset_in_block..].fill(0);
-                    let new_hash = hash128(&block_data);
+                    let new_hash = FsCore::hash_for_inode(&inode, &block_data);
                     if new_hash != chunk_hash {
                         extent_updates.push((block_idx, new_hash));
                         *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
@@ -628,7 +924,8 @@ impl FsCore {
                 }
             }
         }
-        let new_chunk_records = self.materialize_pending_chunks(pending_chunks)?;
+        let new_chunk_records =
+            self.materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -663,6 +960,7 @@ impl FsCore {
         let _guard = self.write_lock.lock().await;
 
         let mut inode = self.load_inode_or_errno(op.ino, "write")?;
+        self.ensure_inode_vault_access(&inode, "write")?;
         if inode.kind != INODE_KIND_FILE {
             return Err(anyhow_errno(
                 Errno::EISDIR,
@@ -703,7 +1001,7 @@ impl FsCore {
 
         for block_idx in start_block..=end_block {
             let mut block_data = if old_extents.contains_key(&block_idx) {
-                self.read_block_bytes(op.ino, block_idx)?
+                self.read_block_bytes(op.ino, block_idx, FsCore::inode_is_vault(&inode))?
             } else {
                 vec![0_u8; BLOCK_SIZE]
             };
@@ -717,7 +1015,7 @@ impl FsCore {
             let dst_end = dst_start + (src_end - src_start);
             block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
 
-            let new_hash = hash128(&block_data);
+            let new_hash = FsCore::hash_for_inode(&inode, &block_data);
             let old_hash = old_extents.get(&block_idx).map(|extent| extent.chunk_hash);
 
             if old_hash == Some(new_hash) {
@@ -742,7 +1040,8 @@ impl FsCore {
                 dedup_hits = dedup_hits.saturating_add(1);
             }
         }
-        let new_chunk_records = self.materialize_pending_chunks(pending_chunks)?;
+        let new_chunk_records =
+            self.materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -865,6 +1164,12 @@ impl FsCore {
                 format!("create: parent inode {} is read-only", parent),
             ));
         }
+        if parent == ROOT_INODE && name == VAULT_DIR_NAME {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                "top-level .vault is managed only by crypt control commands",
+            ));
+        }
 
         if txn.get(dirent_key(parent, name.as_bytes()))?.is_some() {
             return Err(anyhow_errno(
@@ -885,6 +1190,11 @@ impl FsCore {
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
+        let inherited_flags = if (parent_inode.flags & INODE_FLAG_VAULT) != 0 {
+            INODE_FLAG_VAULT
+        } else {
+            0
+        };
         let inode = InodeRecord {
             ino,
             parent,
@@ -901,7 +1211,7 @@ impl FsCore {
             ctime_sec: sec,
             ctime_nsec: nsec,
             generation: 1,
-            flags: 0,
+            flags: inherited_flags,
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
@@ -1184,20 +1494,27 @@ impl VirtualFs for VerFs {
         parent: INum,
         name: &str,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+        let parent_inode = self
+            .core
+            .meta
+            .get_inode(parent)
+            .map_err(map_anyhow_to_fuse)?
+            .ok_or_else(|| {
+                AsyncFusexError::from(anyhow_errno(
+                    Errno::ENOENT,
+                    format!("lookup: inode {} not found", parent),
+                ))
+            })?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "lookup")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .check_vault_parent_name_gate(parent, name)
+            .map_err(map_anyhow_to_fuse)?;
+
         let ino = if name == "." {
             parent
         } else if name == ".." {
-            let parent_inode = self
-                .core
-                .meta
-                .get_inode(parent)
-                .map_err(map_anyhow_to_fuse)?
-                .ok_or_else(|| {
-                    AsyncFusexError::from(anyhow_errno(
-                        Errno::ENOENT,
-                        format!("lookup: inode {} not found", parent),
-                    ))
-                })?;
             parent_inode.parent
         } else {
             let Some(dirent) = self
@@ -1224,6 +1541,9 @@ impl VirtualFs for VerFs {
                     format!("lookup: inode {} not found", ino),
                 ))
             })?;
+        self.core
+            .ensure_inode_vault_access(&inode, "lookup")
+            .map_err(map_anyhow_to_fuse)?;
 
         let attr = self.core.file_attr_from_inode(&inode);
         Ok((ATTR_TTL, attr, inode.generation))
@@ -1240,6 +1560,9 @@ impl VirtualFs for VerFs {
             .ok_or_else(|| {
                 AsyncFusexError::from(anyhow_errno(Errno::ENOENT, "getattr: inode not found"))
             })?;
+        self.core
+            .ensure_inode_vault_access(&inode, "getattr")
+            .map_err(map_anyhow_to_fuse)?;
 
         Ok((ATTR_TTL, self.core.file_attr_from_inode(&inode)))
     }
@@ -1262,6 +1585,9 @@ impl VirtualFs for VerFs {
                 .load_inode_or_errno(ino, "setattr")
                 .map_err(map_anyhow_to_fuse)?
         };
+        self.core
+            .ensure_inode_vault_access(&inode, "setattr")
+            .map_err(map_anyhow_to_fuse)?;
         FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
 
         if let Some(mode) = param.mode {
@@ -1307,6 +1633,9 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_or_errno(ino, "readlink")
             .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "readlink")
+            .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_SYMLINK {
             return build_error_result_from_errno(
                 Errno::EINVAL,
@@ -1329,6 +1658,16 @@ impl VirtualFs for VerFs {
     }
 
     async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(param.parent, "mknod")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "mknod")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .check_vault_parent_name_gate(param.parent, &param.name)
+            .map_err(map_anyhow_to_fuse)?;
         let create_kind = if param.node_type == SFlag::S_IFDIR {
             INODE_KIND_DIR
         } else {
@@ -1366,6 +1705,16 @@ impl VirtualFs for VerFs {
     }
 
     async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(param.parent, "mkdir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "mkdir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .check_vault_parent_name_gate(param.parent, &param.name)
+            .map_err(map_anyhow_to_fuse)?;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -1396,6 +1745,16 @@ impl VirtualFs for VerFs {
     }
 
     async fn unlink(&self, _uid: u32, _gid: u32, parent: INum, name: &str) -> AsyncFusexResult<()> {
+        self.core
+            .check_vault_parent_name_gate(parent, name)
+            .map_err(map_anyhow_to_fuse)?;
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(parent, "unlink")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "unlink")
+            .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
 
         self.core
@@ -1435,6 +1794,16 @@ impl VirtualFs for VerFs {
         parent: INum,
         dir_name: &str,
     ) -> AsyncFusexResult<Option<INum>> {
+        self.core
+            .check_vault_parent_name_gate(parent, dir_name)
+            .map_err(map_anyhow_to_fuse)?;
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(parent, "rmdir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "rmdir")
+            .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
 
         self.core
@@ -1492,6 +1861,16 @@ impl VirtualFs for VerFs {
         name: &str,
         target_path: &Path,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(parent, "symlink")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "symlink")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .check_vault_parent_name_gate(parent, name)
+            .map_err(map_anyhow_to_fuse)?;
         let target_bytes = target_path.as_os_str().as_encoded_bytes().to_vec();
 
         let mut created: Option<InodeRecord> = None;
@@ -1528,6 +1907,38 @@ impl VirtualFs for VerFs {
     }
 
     async fn rename(&self, _uid: u32, _gid: u32, param: RenameParam) -> AsyncFusexResult<()> {
+        if (param.old_parent == ROOT_INODE
+            && param.old_name == VAULT_DIR_NAME
+            && !(param.new_parent == ROOT_INODE && param.new_name == VAULT_DIR_NAME))
+            || (param.new_parent == ROOT_INODE
+                && param.new_name == VAULT_DIR_NAME
+                && !(param.old_parent == ROOT_INODE && param.old_name == VAULT_DIR_NAME))
+        {
+            return build_error_result_from_errno(
+                Errno::EPERM,
+                "top-level .vault cannot be renamed".to_owned(),
+            );
+        }
+        let old_parent_inode = self
+            .core
+            .load_inode_or_errno(param.old_parent, "rename")
+            .map_err(map_anyhow_to_fuse)?;
+        let new_parent_inode = self
+            .core
+            .load_inode_or_errno(param.new_parent, "rename")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&old_parent_inode, "rename")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&new_parent_inode, "rename")
+            .map_err(map_anyhow_to_fuse)?;
+        if FsCore::inode_is_vault(&old_parent_inode) != FsCore::inode_is_vault(&new_parent_inode) {
+            return build_error_result_from_errno(
+                Errno::EXDEV,
+                "cannot rename across vault boundary".to_owned(),
+            );
+        }
         let _guard = self.core.write_lock.lock().await;
 
         self.core
@@ -1720,6 +2131,9 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_or_errno(ino, "open")
             .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "open")
+            .map_err(map_anyhow_to_fuse)?;
         if inode.kind == INODE_KIND_DIR {
             return build_error_result_from_errno(
                 Errno::EISDIR,
@@ -1749,6 +2163,9 @@ impl VirtualFs for VerFs {
         let inode = self
             .core
             .load_inode_or_errno(ino, "read")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "read")
             .map_err(map_anyhow_to_fuse)?;
 
         if inode.kind != INODE_KIND_FILE {
@@ -1811,11 +2228,47 @@ impl VirtualFs for VerFs {
                     if let Some(cached) = self.core.chunk_data_cache.get(&extent.chunk_hash) {
                         cached.as_ref().clone()
                     } else {
-                        let bytes = self
-                            .core
-                            .packs
-                            .read_chunk(chunk.pack_id, extent.chunk_hash, chunk.uncompressed_len)
-                            .map_err(map_anyhow_to_fuse)?;
+                        let bytes = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+                            if !FsCore::inode_is_vault(&inode) {
+                                return build_error_result_from_errno(
+                                    Errno::EIO,
+                                    "encrypted chunk mapped outside vault inode".to_owned(),
+                                );
+                            }
+                            let encrypted = self
+                                .core
+                                .packs
+                                .read_chunk_payload(
+                                    chunk.pack_id,
+                                    extent.chunk_hash,
+                                    chunk.codec,
+                                    chunk.uncompressed_len,
+                                    chunk.compressed_len,
+                                )
+                                .map_err(map_anyhow_to_fuse)?;
+                            let folder_key =
+                                self.core.current_vault_key().map_err(map_anyhow_to_fuse)?;
+                            let compressed =
+                                decrypt_chunk_payload(&folder_key, &chunk.nonce, &encrypted)
+                                    .map_err(map_anyhow_to_fuse)?;
+                            crate::data::compress::decompress_chunk(
+                                chunk.codec,
+                                &compressed,
+                                chunk.uncompressed_len,
+                            )
+                            .map_err(map_anyhow_to_fuse)?
+                        } else {
+                            self.core
+                                .packs
+                                .read_chunk(
+                                    chunk.pack_id,
+                                    extent.chunk_hash,
+                                    chunk.codec,
+                                    chunk.uncompressed_len,
+                                    chunk.compressed_len,
+                                )
+                                .map_err(map_anyhow_to_fuse)?
+                        };
                         self.core
                             .chunk_data_cache
                             .insert(extent.chunk_hash, Arc::new(bytes.clone()));
@@ -1842,6 +2295,13 @@ impl VirtualFs for VerFs {
     }
 
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
+        let inode = self
+            .core
+            .load_inode_or_errno(ino, "write")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "write")
+            .map_err(map_anyhow_to_fuse)?;
         if offset < 0 {
             return build_error_result_from_errno(
                 Errno::EINVAL,
@@ -1877,6 +2337,11 @@ impl VirtualFs for VerFs {
     }
 
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
+        if let Ok(inode) = self.core.load_inode_or_errno(_ino, "flush") {
+            self.core
+                .ensure_inode_vault_access(&inode, "flush")
+                .map_err(map_anyhow_to_fuse)?;
+        }
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)
     }
 
@@ -1887,10 +2352,22 @@ impl VirtualFs for VerFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> AsyncFusexResult<()> {
+        if let Ok(inode) = self.core.load_inode_or_errno(_ino, "release") {
+            self.core
+                .ensure_inode_vault_access(&inode, "release")
+                .map_err(map_anyhow_to_fuse)?;
+        }
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)
     }
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
+        let inode = self
+            .core
+            .load_inode_or_errno(_ino, "fsync")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "fsync")
+            .map_err(map_anyhow_to_fuse)?;
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
             .sync_cycle(!datasync)
@@ -1902,6 +2379,9 @@ impl VirtualFs for VerFs {
         let inode = self
             .core
             .load_inode_or_errno(ino, "opendir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "opendir")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_DIR {
             return build_error_result_from_errno(
@@ -1923,6 +2403,9 @@ impl VirtualFs for VerFs {
         let inode = self
             .core
             .load_inode_or_errno(ino, "readdir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "readdir")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_DIR {
             return build_error_result_from_errno(
@@ -1948,6 +2431,9 @@ impl VirtualFs for VerFs {
                     };
                     let name = String::from_utf8_lossy(name_bytes).to_string();
                     let dirent: DirentRecord = decode_rkyv(&value)?;
+                    if self.core.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
+                        continue;
+                    }
                     out.push((name, dirent.ino, dirent.kind));
                 }
                 Ok(out)
@@ -1970,6 +2456,13 @@ impl VirtualFs for VerFs {
     }
 
     async fn fsyncdir(&self, _ino: u64, _fh: u64, datasync: bool) -> AsyncFusexResult<()> {
+        let inode = self
+            .core
+            .load_inode_or_errno(_ino, "fsyncdir")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "fsyncdir")
+            .map_err(map_anyhow_to_fuse)?;
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
             .sync_cycle(!datasync)
@@ -2004,6 +2497,16 @@ impl VirtualFs for VerFs {
         mode: u32,
         _flags: u32,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64, u64, u32)> {
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(parent, "create")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "create")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .check_vault_parent_name_gate(parent, name)
+            .map_err(map_anyhow_to_fuse)?;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -2042,6 +2545,29 @@ impl VirtualFs for VerFs {
         newparent: u64,
         newname: &str,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+        self.core
+            .check_vault_parent_name_gate(newparent, newname)
+            .map_err(map_anyhow_to_fuse)?;
+        let target_inode = self
+            .core
+            .load_inode_or_errno(ino, "link")
+            .map_err(map_anyhow_to_fuse)?;
+        let parent_inode = self
+            .core
+            .load_inode_or_errno(newparent, "link")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&target_inode, "link")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&parent_inode, "link")
+            .map_err(map_anyhow_to_fuse)?;
+        if FsCore::inode_is_vault(&target_inode) != FsCore::inode_is_vault(&parent_inode) {
+            return build_error_result_from_errno(
+                Errno::EXDEV,
+                "cannot hard-link across vault boundary".to_owned(),
+            );
+        }
         let _guard = self.core.write_lock.lock().await;
         let mut linked: Option<InodeRecord> = None;
 
@@ -2126,6 +2652,13 @@ impl VirtualFs for VerFs {
         flags: u32,
         position: u32,
     ) -> AsyncFusexResult<()> {
+        let inode = self
+            .core
+            .load_inode_or_errno(ino, "setxattr")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "setxattr")
+            .map_err(map_anyhow_to_fuse)?;
         if position != 0 {
             return build_error_result_from_errno(
                 Errno::EINVAL,
@@ -2186,6 +2719,13 @@ impl VirtualFs for VerFs {
     }
 
     async fn getxattr(&self, ino: u64, name: &str, size: u32) -> AsyncFusexResult<Vec<u8>> {
+        let inode = self
+            .core
+            .load_inode_or_errno(ino, "getxattr")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "getxattr")
+            .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
         let value = self
             .core
@@ -2217,6 +2757,13 @@ impl VirtualFs for VerFs {
     }
 
     async fn listxattr(&self, ino: u64, size: u32) -> AsyncFusexResult<Vec<u8>> {
+        let inode = self
+            .core
+            .load_inode_or_errno(ino, "listxattr")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "listxattr")
+            .map_err(map_anyhow_to_fuse)?;
         let mut buffer = self
             .core
             .meta
@@ -2262,6 +2809,13 @@ impl VirtualFs for VerFs {
     }
 
     async fn removexattr(&self, ino: u64, name: &str) -> AsyncFusexResult<()> {
+        let inode = self
+            .core
+            .load_inode_or_errno(ino, "removexattr")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "removexattr")
+            .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
         self.core
@@ -2301,6 +2855,9 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_or_errno(ino, "access")
             .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "access")
+            .map_err(map_anyhow_to_fuse)?;
         if mask == libc::F_OK as u32 {
             return Ok(());
         }
@@ -2317,9 +2874,12 @@ impl VirtualFs for VerFs {
         if !FsCore::lock_type_valid(lk_param.typ) {
             return build_error_result_from_errno(Errno::EINVAL, "invalid lock type".to_owned());
         }
-        let _inode = self
+        let inode = self
             .core
             .load_inode_or_errno(ino, "getlk")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "getlk")
             .map_err(map_anyhow_to_fuse)?;
 
         let request = FileLockState {
@@ -2367,9 +2927,12 @@ impl VirtualFs for VerFs {
         if !FsCore::lock_type_valid(lk_param.typ) {
             return build_error_result_from_errno(Errno::EINVAL, "invalid lock type".to_owned());
         }
-        let _inode = self
+        let inode = self
             .core
             .load_inode_or_errno(ino, "setlk")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "setlk")
             .map_err(map_anyhow_to_fuse)?;
 
         let request = FileLockState {
@@ -2428,6 +2991,9 @@ impl VirtualFs for VerFs {
         let inode = self
             .core
             .load_inode_or_errno(ino, "bmap")
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .ensure_inode_vault_access(&inode, "bmap")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_FILE {
             return build_error_result_from_errno(

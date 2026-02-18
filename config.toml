@@ -15,3 +15,7 @@ gc_idle_min_ms = 15000
 gc_pack_rewrite_min_reclaim_bytes = 67108864
 gc_pack_rewrite_min_reclaim_percent = 25.0
 gc_discard_filename = ".DISCARD"
+vault_enabled = true
+vault_argon2_mem_kib = 131072
+vault_argon2_iters = 3
+vault_argon2_parallelism = 1

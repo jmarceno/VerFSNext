@@ -65,6 +65,22 @@ fn default_gc_discard_filename() -> String {
     ".DISCARD".to_owned()
 }
 
+fn default_vault_enabled() -> bool {
+    true
+}
+
+fn default_vault_argon2_mem_kib() -> u32 {
+    131_072
+}
+
+fn default_vault_argon2_iters() -> u32 {
+    3
+}
+
+fn default_vault_argon2_parallelism() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mount_point: PathBuf,
@@ -99,6 +115,14 @@ pub struct Config {
     pub gc_pack_rewrite_min_reclaim_percent: f64,
     #[serde(default = "default_gc_discard_filename")]
     pub gc_discard_filename: String,
+    #[serde(default = "default_vault_enabled")]
+    pub vault_enabled: bool,
+    #[serde(default = "default_vault_argon2_mem_kib")]
+    pub vault_argon2_mem_kib: u32,
+    #[serde(default = "default_vault_argon2_iters")]
+    pub vault_argon2_iters: u32,
+    #[serde(default = "default_vault_argon2_parallelism")]
+    pub vault_argon2_parallelism: u32,
 }
 
 impl Config {
@@ -164,6 +188,15 @@ impl Config {
         }
         if self.gc_discard_filename.is_empty() {
             bail!("gc_discard_filename must not be empty");
+        }
+        if self.vault_argon2_mem_kib < 8 * 1024 {
+            bail!("vault_argon2_mem_kib must be >= 8192");
+        }
+        if self.vault_argon2_iters == 0 {
+            bail!("vault_argon2_iters must be > 0");
+        }
+        if self.vault_argon2_parallelism == 0 {
+            bail!("vault_argon2_parallelism must be > 0");
         }
         Ok(())
     }
