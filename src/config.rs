@@ -29,6 +29,10 @@ fn default_pack_index_cache_capacity_entries() -> u64 {
     524_288
 }
 
+fn default_pack_max_size_mb() -> u64 {
+    10 * 1024
+}
+
 fn default_zstd_compression_level() -> i32 {
     3
 }
@@ -97,6 +101,8 @@ pub struct Config {
     pub chunk_cache_capacity_entries: u64,
     #[serde(default = "default_pack_index_cache_capacity_entries")]
     pub pack_index_cache_capacity_entries: u64,
+    #[serde(default = "default_pack_max_size_mb")]
+    pub pack_max_size_mb: u64,
     #[serde(default = "default_zstd_compression_level")]
     pub zstd_compression_level: i32,
     #[serde(default = "default_ultracdc_min_size_bytes")]
@@ -158,6 +164,9 @@ impl Config {
         }
         if self.pack_index_cache_capacity_entries == 0 {
             bail!("pack_index_cache_capacity_entries must be > 0");
+        }
+        if self.pack_max_size_mb == 0 {
+            bail!("pack_max_size_mb must be > 0");
         }
         if self.zstd_compression_level < -7 || self.zstd_compression_level > 22 {
             bail!("zstd_compression_level must be in range -7..=22");

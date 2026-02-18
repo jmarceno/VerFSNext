@@ -104,6 +104,7 @@ impl VerFs {
             &config.packs_dir(),
             active_pack_id,
             config.pack_index_cache_capacity_entries,
+            config.pack_max_size_mb.saturating_mul(1024 * 1024),
         )?;
         packs.verify_pack_headers(active_pack_id)?;
         let vault_initialized = meta

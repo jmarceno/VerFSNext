@@ -26,16 +26,23 @@ struct ActivePack {
     pack_id: u64,
     file: File,
     index_file: File,
+    size_bytes: u64,
 }
 
 pub struct PackStore {
     packs_dir: PathBuf,
     active: Mutex<ActivePack>,
     index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
+    max_pack_size_bytes: u64,
 }
 
 impl PackStore {
-    pub fn open(packs_dir: &Path, active_pack_id: u64, index_cache_capacity: u64) -> Result<Self> {
+    pub fn open(
+        packs_dir: &Path,
+        active_pack_id: u64,
+        index_cache_capacity: u64,
+        max_pack_size_bytes: u64,
+    ) -> Result<Self> {
         std::fs::create_dir_all(packs_dir).with_context(|| {
             format!(
                 "failed to create packs directory {}",
@@ -57,6 +64,10 @@ impl PackStore {
             .append(true)
             .open(&index_path)
             .with_context(|| format!("failed to open pack index file {}", index_path.display()))?;
+        let size_bytes = file
+            .metadata()
+            .with_context(|| format!("failed to stat active pack file {}", path.display()))?
+            .len();
 
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
@@ -64,8 +75,10 @@ impl PackStore {
                 pack_id: active_pack_id,
                 file,
                 index_file,
+                size_bytes,
             }),
             index_cache: Cache::builder().max_capacity(index_cache_capacity).build(),
+            max_pack_size_bytes,
         };
 
         store.rebuild_index_if_missing(active_pack_id)?;
@@ -84,8 +97,30 @@ impl PackStore {
         if compressed_data.len() > u32::MAX as usize {
             bail!("compressed chunk too large: {}", compressed_data.len());
         }
+        let record_len = RECORD_HEADER_LEN
+            .checked_add(compressed_data.len() as u64)
+            .context("pack record length overflow")?;
+        if record_len > self.max_pack_size_bytes {
+            bail!(
+                "chunk record size {} exceeds pack_max_size_mb limit {} bytes",
+                record_len,
+                self.max_pack_size_bytes
+            );
+        }
 
         let mut active = self.active.lock();
+        let next_size = active
+            .size_bytes
+            .checked_add(record_len)
+            .context("active pack size overflow")?;
+        if next_size > self.max_pack_size_bytes {
+            bail!(
+                "active pack {} would exceed pack_max_size_mb limit: {} > {} bytes",
+                active.pack_id,
+                next_size,
+                self.max_pack_size_bytes
+            );
+        }
         let file = &mut active.file;
 
         let record_offset = file
@@ -117,6 +152,7 @@ impl PackStore {
         Self::append_index_record(&mut active.index_file, chunk_hash, index)?;
 
         self.index_cache.insert((active.pack_id, chunk_hash), index);
+        active.size_bytes = next_size;
 
         Ok(active.pack_id)
     }
