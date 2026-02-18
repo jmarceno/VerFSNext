@@ -67,9 +67,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `src/data/pack.rs`
   - Pack record format `VPK2`
   - Sidecar index file per pack (`.idx`) with fixed-size entries
+  - Automatic active-pack rollover on append when configured pack size target is reached
+  - Existing packs are discovered on startup; highest pack id becomes active if metadata lags
   - Hash lookup path reads index entry first, then seeks pack payload
   - Supports encrypted-payload reads (`read_chunk_payload`) for vault decrypt-then-decompress flow
-  - Index is rebuilt from pack data when missing
+  - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
   - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
 
 ## Config
@@ -84,6 +86,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `metadata_cache_capacity_entries`
 - `chunk_cache_capacity_entries`
 - `pack_index_cache_capacity_entries`
+- `pack_max_size_mb`
 - `zstd_compression_level`
 - `ultracdc_min_size_bytes`
 - `ultracdc_avg_size_bytes`
@@ -104,6 +107,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `ChunkRecord` now also stores vault encryption state (`flags`, `nonce`) for encrypted chunks.
 - Snapshot metadata records are keyed under `S:<name>` and point to snapshot root inode.
 - System keys now include:
+  - `SYS:active_pack_id`
   - `SYS:gc.discard_checkpoint`
   - `SYS:gc.epoch`
   - `SYS:vault.state`

@@ -302,8 +302,14 @@ impl TableMetadata {
             smallest_seq_num: archived.smallest_seq_num,
             largest_seq_num: archived.largest_seq_num,
             properties,
-            smallest_point: archived.smallest_point.as_ref().map(|k| InternalKey::decode(k)),
-            largest_point: archived.largest_point.as_ref().map(|k| InternalKey::decode(k)),
+            smallest_point: archived
+                .smallest_point
+                .as_ref()
+                .map(|k| InternalKey::decode(k)),
+            largest_point: archived
+                .largest_point
+                .as_ref()
+                .map(|k| InternalKey::decode(k)),
         })
     }
 }

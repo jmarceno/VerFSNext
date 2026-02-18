@@ -183,6 +183,21 @@ fn setup_source_tree(src: &Path) -> Result<()> {
     Ok(())
 }
 
+fn setup_large_source_file(src: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(src).context("failed to create large source dir")?;
+    let large = src.join("large.bin");
+    let mut file = File::create(&large).context("failed to create large.bin")?;
+    let mut block = vec![0_u8; 1024 * 1024];
+    for (idx, byte) in block.iter_mut().enumerate() {
+        *byte = (idx % 251) as u8;
+    }
+    for _ in 0..4 {
+        file.write_all(&block)
+            .context("failed to write large.bin block")?;
+    }
+    Ok(large)
+}
+
 #[test]
 fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
     if std::env::consts::OS != "linux" {
@@ -309,5 +324,91 @@ fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);
 
+    Ok(())
+}
+
+#[test]
+fn rsync_large_file_rollover_multpack_persists() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "rsync",
+        "sha256sum",
+        "mountpoint",
+        "fusermount",
+        "ls",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let src_dir = root.join("src");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&src_dir).context("failed to create source dir")?;
+    let src_large = setup_large_source_file(&src_dir)?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 500\npack_max_size_mb = 1\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let src_rsync = format!("{}/", src_dir.display());
+    let dst_rsync = format!("{}/", mount_point.join("roll").display());
+    run_cmd(240, None, "rsync", &["-a", &src_rsync, &dst_rsync])?;
+
+    let dst_large = mount_point.join("roll/large.bin");
+    let src_hash = sha256(&src_large)?;
+    let dst_hash = sha256(&dst_large)?;
+    if src_hash != dst_hash {
+        bail!("large file checksum mismatch after rsync")
+    }
+
+    daemon.stop_graceful()?;
+
+    let packs_dir = data_dir.join("packs");
+    let pack_files = fs::read_dir(&packs_dir)
+        .with_context(|| format!("failed to list packs dir {}", packs_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "vpk")
+                .unwrap_or(false)
+        })
+        .count();
+    if pack_files < 2 {
+        bail!(
+            "expected rollover to create multiple packs, found {}",
+            pack_files
+        );
+    }
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    let remount_hash = sha256(&dst_large)?;
+    if remount_hash != src_hash {
+        bail!("large file checksum mismatch after remount")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
     Ok(())
 }

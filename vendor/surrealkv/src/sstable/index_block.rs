@@ -346,8 +346,12 @@ impl IndexWriter {
         let archived_index = TopLevelIndexArchive {
             entries: top_level_entries,
         };
-        let archived_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archived_index)
-            .map_err(|e| Error::Corruption(format!("failed to encode SSTable top-level index archive: {e}")))?;
+        let archived_bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&archived_index).map_err(|e| {
+                Error::Corruption(format!(
+                    "failed to encode SSTable top-level index archive: {e}"
+                ))
+            })?;
 
         let top_level_key = archived_index
             .entries
@@ -431,8 +435,10 @@ impl Index {
 
         let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(iter.value_bytes().len());
         aligned.extend_from_slice(iter.value_bytes());
-        let archived_index = rkyv::from_bytes::<TopLevelIndexArchive, rkyv::rancor::Error>(&aligned)
-            .map_err(|e| Error::Corruption(format!("invalid SSTable top-level index archive: {e}")))?;
+        let archived_index = rkyv::from_bytes::<TopLevelIndexArchive, rkyv::rancor::Error>(
+            &aligned,
+        )
+        .map_err(|e| Error::Corruption(format!("invalid SSTable top-level index archive: {e}")))?;
         let mut blocks = Vec::with_capacity(archived_index.entries.len());
         for entry in archived_index.entries {
             let handle = BlockHandle::new(

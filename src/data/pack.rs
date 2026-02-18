@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -50,8 +50,16 @@ impl PackStore {
             )
         })?;
 
-        let path = Self::pack_path_impl(packs_dir, active_pack_id);
-        let index_path = Self::index_path_impl(packs_dir, active_pack_id);
+        let existing_pack_ids = Self::list_existing_pack_ids(packs_dir)?;
+        let resolved_active_pack_id = existing_pack_ids
+            .iter()
+            .copied()
+            .max()
+            .map(|existing_max| existing_max.max(active_pack_id))
+            .unwrap_or(active_pack_id);
+
+        let path = Self::pack_path_impl(packs_dir, resolved_active_pack_id);
+        let index_path = Self::index_path_impl(packs_dir, resolved_active_pack_id);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -72,7 +80,7 @@ impl PackStore {
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
             active: Mutex::new(ActivePack {
-                pack_id: active_pack_id,
+                pack_id: resolved_active_pack_id,
                 file,
                 index_file,
                 size_bytes,
@@ -81,8 +89,12 @@ impl PackStore {
             max_pack_size_bytes,
         };
 
-        store.rebuild_index_if_missing(active_pack_id)?;
-        store.prime_index_cache(active_pack_id)?;
+        let mut all_pack_ids = existing_pack_ids;
+        all_pack_ids.insert(resolved_active_pack_id);
+        for pack_id in all_pack_ids {
+            store.rebuild_index_if_missing(pack_id)?;
+            store.prime_index_cache(pack_id)?;
+        }
 
         Ok(store)
     }
@@ -100,27 +112,21 @@ impl PackStore {
         let record_len = RECORD_HEADER_LEN
             .checked_add(compressed_data.len() as u64)
             .context("pack record length overflow")?;
-        if record_len > self.max_pack_size_bytes {
-            bail!(
-                "chunk record size {} exceeds pack_max_size_mb limit {} bytes",
-                record_len,
-                self.max_pack_size_bytes
-            );
-        }
-
         let mut active = self.active.lock();
+        while active.size_bytes > 0 {
+            let next_size = active
+                .size_bytes
+                .checked_add(record_len)
+                .context("active pack size overflow")?;
+            if next_size <= self.max_pack_size_bytes {
+                break;
+            }
+            self.rotate_active_pack(&mut active)?;
+        }
         let next_size = active
             .size_bytes
             .checked_add(record_len)
             .context("active pack size overflow")?;
-        if next_size > self.max_pack_size_bytes {
-            bail!(
-                "active pack {} would exceed pack_max_size_mb limit: {} > {} bytes",
-                active.pack_id,
-                next_size,
-                self.max_pack_size_bytes
-            );
-        }
         let file = &mut active.file;
 
         let record_offset = file
@@ -311,6 +317,92 @@ impl PackStore {
 
     pub fn active_pack_id(&self) -> u64 {
         self.active.lock().pack_id
+    }
+
+    fn list_existing_pack_ids(packs_dir: &Path) -> Result<BTreeSet<u64>> {
+        let mut out = BTreeSet::new();
+        for entry in std::fs::read_dir(packs_dir).with_context(|| {
+            format!(
+                "failed to read packs directory while listing pack ids {}",
+                packs_dir.display()
+            )
+        })? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("pack-") || !name.ends_with(".vpk") {
+                continue;
+            }
+            let number = &name[5..name.len().saturating_sub(4)];
+            if let Ok(pack_id) = number.parse::<u64>() {
+                out.insert(pack_id);
+            }
+        }
+        Ok(out)
+    }
+
+    fn rotate_active_pack(&self, active: &mut ActivePack) -> Result<()> {
+        active
+            .file
+            .sync_data()
+            .context("failed to sync current active pack before rotation")?;
+        active
+            .index_file
+            .sync_data()
+            .context("failed to sync current active pack index before rotation")?;
+
+        let mut next_pack_id = active
+            .pack_id
+            .checked_add(1)
+            .context("active pack id overflow during rotation")?;
+        loop {
+            let next_path = self.pack_path(next_pack_id);
+            let next_index_path = self.index_path(next_pack_id);
+            let next_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&next_path)
+                .with_context(|| {
+                    format!("failed to open next pack file {}", next_path.display())
+                })?;
+            let next_index_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&next_index_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open next pack index file {}",
+                        next_index_path.display()
+                    )
+                })?;
+            let next_size = next_file
+                .metadata()
+                .with_context(|| format!("failed to stat next pack file {}", next_path.display()))?
+                .len();
+
+            self.rebuild_index_if_missing(next_pack_id)?;
+            self.prime_index_cache(next_pack_id)?;
+
+            if next_size >= self.max_pack_size_bytes && next_size > 0 {
+                next_pack_id = next_pack_id
+                    .checked_add(1)
+                    .context("active pack id overflow while skipping full packs")?;
+                continue;
+            }
+
+            active.pack_id = next_pack_id;
+            active.file = next_file;
+            active.index_file = next_index_file;
+            active.size_bytes = next_size;
+            return Ok(());
+        }
     }
 
     pub fn pack_size(&self, pack_id: u64) -> Result<u64> {

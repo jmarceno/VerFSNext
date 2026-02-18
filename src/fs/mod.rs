@@ -85,6 +85,7 @@ struct FsCore {
     chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
     chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
     next_handle: AtomicU64,
+    last_persisted_active_pack_id: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
     last_mutation_ms: AtomicU64,
@@ -99,14 +100,14 @@ impl VerFs {
         config.ensure_dirs()?;
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
-        let active_pack_id = meta.get_u64_sys("active_pack_id")?;
+        let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
         let packs = PackStore::open(
             &config.packs_dir(),
-            active_pack_id,
+            configured_active_pack_id,
             config.pack_index_cache_capacity_entries,
             config.pack_max_size_mb.saturating_mul(1024 * 1024),
         )?;
-        packs.verify_pack_headers(active_pack_id)?;
+        packs.verify_pack_headers(packs.active_pack_id())?;
         let vault_initialized = meta
             .get_sys(SYS_VAULT_WRAP)?
             .map(|raw| !raw.is_empty())
@@ -130,6 +131,7 @@ impl VerFs {
                 .max_capacity(config.chunk_cache_capacity_entries)
                 .build(),
             next_handle: AtomicU64::new(1),
+            last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
             last_mutation_ms: AtomicU64::new(now_millis()),
@@ -1443,6 +1445,26 @@ impl FsCore {
             })
             .await?;
         Ok(next)
+    }
+
+    async fn persist_active_pack_id_if_needed(&self) -> Result<()> {
+        let active_pack_id = self.packs.active_pack_id();
+        let last_persisted = self.last_persisted_active_pack_id.load(Ordering::Relaxed);
+        if active_pack_id == last_persisted {
+            return Ok(());
+        }
+        self.meta
+            .write_txn(|txn| {
+                txn.set(
+                    sys_key("active_pack_id"),
+                    active_pack_id.to_le_bytes().to_vec(),
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.last_persisted_active_pack_id
+            .store(active_pack_id, Ordering::Relaxed);
+        Ok(())
     }
 
     fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {
@@ -3051,6 +3073,7 @@ impl WriteApply for FsCore {
 #[async_trait]
 impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
+        self.persist_active_pack_id_if_needed().await?;
         if full {
             self.packs.sync(true)?;
             self.meta.flush_wal(true)?;
@@ -3082,6 +3105,13 @@ fn sflag_for_kind(kind: u8) -> SFlag {
 fn map_anyhow_to_fuse(err: anyhow::Error) -> AsyncFusexError {
     if err.root_cause().downcast_ref::<nix::Error>().is_some() {
         AsyncFusexError::from(err)
+    } else if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
+        match io_err.raw_os_error() {
+            Some(raw_errno) => {
+                AsyncFusexError::from(anyhow_errno(Errno::from_i32(raw_errno), err.to_string()))
+            }
+            None => AsyncFusexError::from(anyhow_errno(Errno::EIO, err.to_string())),
+        }
     } else {
         AsyncFusexError::from(anyhow_errno(Errno::EIO, err.to_string()))
     }
