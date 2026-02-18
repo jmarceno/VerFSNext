@@ -26,3 +26,54 @@
    ```bash
    fusermount -uz /mnt/verfs
    ```
+
+## Snapshots
+
+Use snapshots through the control CLI:
+
+```bash
+# Create
+./target/release/verfsnext snapshot create snap1
+# List
+./target/release/verfsnext snapshot list
+# Delete
+./target/release/verfsnext snapshot delete snap1
+```
+Mounted snapshot view:
+- Snapshot roots appear under `/.snapshots` and can be accessed like normal directories.
+
+
+## Encryption (`.vault`)
+
+`/.vault` is a reserved encrypted namespace at filesystem root.
+
+- Not created automatically
+- Hidden/inaccessible while locked
+- Visible and usable only when unlocked
+
+### Initialize vault (one-time)
+
+```bash
+./target/release/verfsnext crypt -c -p "your-password" -path /secure/key/dir
+```
+- Creates `verfsnext.vault.key` in the provided directory
+- Creates `/.vault` metadata in the filesystem
+
+If `-path` is omitted, the key is created in the current working directory.
+
+### Unlock vault
+
+```bash
+./target/release/verfsnext crypt -u -p "your-password" -k /secure/key/dir/verfsnext.vault.key
+```
+After unlock `.vault` becomes visible and accessible for normal file operations. The vault remains unlocked and usable until a lock command is issued or the daemon is restarted.
+
+### Lock vault
+
+```bash
+./target/release/verfsnext crypt -l
+```
+
+After lock:
+- `/.vault` disappears from directory listings
+- Direct access to `/.vault/*` fails until next unlock
