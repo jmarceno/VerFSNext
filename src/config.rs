@@ -9,8 +9,8 @@ fn default_sync_interval_ms() -> u64 {
     5_000
 }
 
-fn default_batch_max_blocks() -> usize {
-    3_000
+fn default_batch_max_size_mb() -> usize {
+    512
 }
 
 fn default_batch_flush_interval_ms() -> u64 {
@@ -21,8 +21,8 @@ fn default_metadata_cache_capacity_entries() -> u64 {
     131_072
 }
 
-fn default_chunk_cache_capacity_entries() -> u64 {
-    262_144
+fn default_chunk_cache_capacity_mb() -> u64 {
+    1024
 }
 
 fn default_pack_index_cache_capacity_entries() -> u64 {
@@ -103,14 +103,14 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default = "default_sync_interval_ms")]
     pub sync_interval_ms: u64,
-    #[serde(default = "default_batch_max_blocks")]
-    pub batch_max_blocks: usize,
+    #[serde(default = "default_batch_max_size_mb")]
+    pub batch_max_size_mb: usize,
     #[serde(default = "default_batch_flush_interval_ms")]
     pub batch_flush_interval_ms: u64,
     #[serde(default = "default_metadata_cache_capacity_entries")]
     pub metadata_cache_capacity_entries: u64,
-    #[serde(default = "default_chunk_cache_capacity_entries")]
-    pub chunk_cache_capacity_entries: u64,
+    #[serde(default = "default_chunk_cache_capacity_mb")]
+    pub chunk_cache_capacity_mb: u64,
     #[serde(default = "default_pack_index_cache_capacity_entries")]
     pub pack_index_cache_capacity_entries: u64,
     #[serde(default = "default_pack_max_size_mb")]
@@ -168,8 +168,8 @@ impl Config {
         if self.sync_interval_ms == 0 {
             bail!("sync_interval_ms must be > 0");
         }
-        if self.batch_max_blocks == 0 {
-            bail!("batch_max_blocks must be > 0");
+        if self.batch_max_size_mb == 0 {
+            bail!("batch_max_size_mb must be > 0");
         }
         if self.batch_flush_interval_ms == 0 {
             bail!("batch_flush_interval_ms must be > 0");
@@ -177,8 +177,8 @@ impl Config {
         if self.metadata_cache_capacity_entries == 0 {
             bail!("metadata_cache_capacity_entries must be > 0");
         }
-        if self.chunk_cache_capacity_entries == 0 {
-            bail!("chunk_cache_capacity_entries must be > 0");
+        if self.chunk_cache_capacity_mb == 0 {
+            bail!("chunk_cache_capacity_mb must be > 0");
         }
         if self.pack_index_cache_capacity_entries == 0 {
             bail!("pack_index_cache_capacity_entries must be > 0");

@@ -166,7 +166,8 @@ impl VerFs {
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
             chunk_data_cache: Cache::builder()
-                .max_capacity(config.chunk_cache_capacity_entries)
+                .max_capacity(config.chunk_cache_capacity_mb.saturating_mul(1024 * 1024))
+                .weigher(|_k, v: &Arc<Vec<u8>>| v.capacity() as u32)
                 .build(),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
@@ -192,9 +193,9 @@ impl VerFs {
 
         let batcher = WriteBatcher::new(
             write_sink,
-            config.batch_max_blocks,
+            config.batch_max_size_mb.saturating_mul(1024 * 1024),
             Duration::from_millis(config.batch_flush_interval_ms),
-            config.batch_max_blocks.saturating_mul(2).max(64),
+            2048,
         );
         let sync_service =
             SyncService::start(sync_target, Duration::from_millis(config.sync_interval_ms));
@@ -2619,13 +2620,7 @@ impl VirtualFs for VerFs {
             );
         }
 
-        let touched_blocks = if data.is_empty() {
-            1
-        } else {
-            let start = (offset as u64) / BLOCK_SIZE as u64;
-            let end = ((offset as u64) + (data.len() as u64) - 1) / BLOCK_SIZE as u64;
-            (end - start + 1) as usize
-        };
+        let write_bytes = data.len().max(1);
 
         let op = WriteOp {
             ino,
@@ -2635,12 +2630,12 @@ impl VirtualFs for VerFs {
 
         if (flags & FUSE_WRITE_CACHE) != 0 {
             self.batcher
-                .enqueue(op, touched_blocks)
+                .enqueue(op, write_bytes)
                 .await
                 .map_err(map_anyhow_to_fuse)
         } else {
             self.batcher
-                .enqueue_and_wait(op, touched_blocks)
+                .enqueue_and_wait(op, write_bytes)
                 .await
                 .map_err(map_anyhow_to_fuse)
         }

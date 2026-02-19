@@ -1,10 +1,10 @@
 mount_point = "/tmp/verfsnext-mnt" # FUSE mount point path.
 data_dir = "/tmp/verfsnext-data" # Root data directory for metadata and packs.
 sync_interval_ms = 5000 # Background sync interval in milliseconds.
-batch_max_blocks = 3000 # Maximum dirty blocks per write batch.
+batch_max_size_mb = 512 # Maximum unwritten block data per write batch in megabytes.
 batch_flush_interval_ms = 500 # Maximum write batching delay in milliseconds.
 metadata_cache_capacity_entries = 131072 # Metadata cache capacity (entry count).
-chunk_cache_capacity_entries = 262144 # Chunk metadata cache capacity (entry count).
+chunk_cache_capacity_mb = 1024 # Chunk metadata cache capacity in megabytes.
 pack_index_cache_capacity_entries = 524288 # Pack index cache capacity (entry count).
 pack_max_size_mb = 10240 # Maximum size for a pack file in megabytes.
 zstd_compression_level = 3 # Zstd compression level (-7..22).

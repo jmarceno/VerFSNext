@@ -21,7 +21,7 @@ pub trait WriteApply: Send + Sync {
 
 struct QueuedWrite {
     op: WriteOp,
-    blocks: usize,
+    bytes: usize,
     done: Option<oneshot::Sender<Result<()>>>,
 }
 
@@ -39,7 +39,7 @@ pub struct WriteBatcher {
 impl WriteBatcher {
     pub fn new(
         sink: Arc<dyn WriteApply>,
-        max_blocks: usize,
+        max_size_bytes: usize,
         flush_interval: Duration,
         queue_capacity: usize,
     ) -> Self {
@@ -47,7 +47,7 @@ impl WriteBatcher {
 
         let handle = tokio::spawn(async move {
             let mut pending = Vec::<QueuedWrite>::new();
-            let mut pending_blocks = 0_usize;
+            let mut pending_bytes = 0_usize;
             let mut ticker = tokio::time::interval(flush_interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             let mut pending_error: Option<anyhow::Error> = None;
@@ -57,21 +57,21 @@ impl WriteBatcher {
                     maybe_msg = rx.recv() => {
                         match maybe_msg {
                             Some(QueueMessage::Write(msg)) => {
-                                pending_blocks = pending_blocks.saturating_add(msg.blocks.max(1));
+                                pending_bytes = pending_bytes.saturating_add(msg.bytes);
                                 pending.push(msg);
-                                if pending_blocks >= max_blocks.max(1) {
-                                    flush_pending(&sink, &mut pending, &mut pending_blocks, &mut pending_error).await;
+                                if pending_bytes >= max_size_bytes {
+                                    flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
                                 }
                             }
                             Some(QueueMessage::Drain(done_tx)) => {
-                                flush_pending(&sink, &mut pending, &mut pending_blocks, &mut pending_error).await;
+                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
                                 let _ = done_tx.send(match pending_error.take() {
                                     Some(err) => Err(err),
                                     None => Ok(()),
                                 });
                             }
                             Some(QueueMessage::Shutdown(done_tx)) => {
-                                flush_pending(&sink, &mut pending, &mut pending_blocks, &mut pending_error).await;
+                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
                                 let _ = done_tx.send(match pending_error.take() {
                                     Some(err) => Err(err),
                                     None => Ok(()),
@@ -79,13 +79,13 @@ impl WriteBatcher {
                                 break;
                             }
                             None => {
-                                flush_pending(&sink, &mut pending, &mut pending_blocks, &mut pending_error).await;
+                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
                                 break;
                             }
                         }
                     }
                     _ = ticker.tick() => {
-                        flush_pending(&sink, &mut pending, &mut pending_blocks, &mut pending_error).await;
+                        flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
                     }
                 }
             }
@@ -97,23 +97,23 @@ impl WriteBatcher {
         }
     }
 
-    pub async fn enqueue(&self, op: WriteOp, touched_blocks: usize) -> Result<()> {
+    pub async fn enqueue(&self, op: WriteOp, bytes: usize) -> Result<()> {
         self.tx
             .send(QueueMessage::Write(QueuedWrite {
                 op,
-                blocks: touched_blocks.max(1),
+                bytes,
                 done: None,
             }))
             .await
             .map_err(|_| anyhow!("write batcher is closed"))
     }
 
-    pub async fn enqueue_and_wait(&self, op: WriteOp, touched_blocks: usize) -> Result<()> {
+    pub async fn enqueue_and_wait(&self, op: WriteOp, bytes: usize) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(QueueMessage::Write(QueuedWrite {
                 op,
-                blocks: touched_blocks.max(1),
+                bytes,
                 done: Some(done_tx),
             }))
             .await
@@ -154,7 +154,7 @@ impl WriteBatcher {
 async fn flush_pending(
     sink: &Arc<dyn WriteApply>,
     pending: &mut Vec<QueuedWrite>,
-    pending_blocks: &mut usize,
+    pending_bytes: &mut usize,
     pending_error: &mut Option<anyhow::Error>,
 ) {
     if pending.is_empty() {
@@ -181,7 +181,7 @@ async fn flush_pending(
         if pending_error.is_none() {
             *pending_error = Some(err);
         }
-        *pending_blocks = 0;
+        *pending_bytes = 0;
         return;
     }
 
@@ -202,5 +202,5 @@ async fn flush_pending(
             }
         }
     }
-    *pending_blocks = 0;
+    *pending_bytes = 0;
 }
