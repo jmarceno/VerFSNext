@@ -50,7 +50,7 @@ async fn run_mount() -> Result<()> {
 
     let fs = Arc::new(VerFs::new(config.clone()).await?);
     let virtual_fs: Arc<dyn VirtualFs> = fs.clone();
-    let fuse_fs = FuseFs::new(virtual_fs);
+    let fuse_fs = FuseFs::new(virtual_fs).with_direct_io(config.fuse_direct_io);
 
     let session = new_session(
         &config.mount_point,

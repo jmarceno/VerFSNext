@@ -21,11 +21,17 @@ use tracing::{debug, instrument};
 
 pub struct FuseFs {
     virtual_fs: Arc<dyn VirtualFs>,
+    direct_io: bool,
 }
 
 impl FuseFs {
     pub fn new(virtual_fs: Arc<dyn VirtualFs>) -> Self {
-        Self { virtual_fs }
+        Self { virtual_fs, direct_io: false }
+    }
+
+    pub fn with_direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
+        self
     }
 }
 
@@ -125,8 +131,11 @@ impl FileSystem for FuseFs {
                     "fusefilesystem call open() successfully opened ino={} with flags={:?}, the fd={}",
                     ino, flags, fd,
                 );
-                // (jmarceno) No flag (0) looks like the correct behavior here - https://gemini.google.com/share/ec39ff53872f
-                reply.opened(fd, 0).await
+                let mut reply_flags = 0;
+                if self.direct_io {
+                    reply_flags |= crate::protocol::FOPEN_DIRECT_IO;
+                }
+                reply.opened(fd, reply_flags).await
             }
             Err(e) => {
                 debug!(
@@ -1342,8 +1351,12 @@ impl FileSystem for FuseFs {
                     name, parent,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
+                let mut reply_flags = open_flags;
+                if self.direct_io {
+                    reply_flags |= crate::protocol::FOPEN_DIRECT_IO;
+                }
                 reply
-                    .created(&ttl, fuse_attr, generation, fh, open_flags)
+                    .created(&ttl, fuse_attr, generation, fh, reply_flags)
                     .await
             }
             Err(AsyncFusexError::Unimplemented { context }) => {

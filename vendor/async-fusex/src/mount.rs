@@ -27,7 +27,7 @@ impl Default for MountConfig {
 }
 
 fn build_fusermount_options(config: &MountConfig) -> String {
-    let mut options = vec![
+    let options = vec![
         "nosuid".to_owned(),
         "nodev".to_owned(),
         "allow_other".to_owned(),
@@ -35,9 +35,6 @@ fn build_fusermount_options(config: &MountConfig) -> String {
         format!("fsname={}", config.fs_name),
         format!("subtype={}", config.subtype),
     ];
-    if config.direct_io {
-        options.push("direct_io".to_owned());
-    }
     options.join(",")
 }
 
@@ -201,7 +198,6 @@ async fn direct_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Resul
     let target_path = full_path.clone();
     let fstype = direct_mount_fstype(config);
     let fsname = config.fs_name.clone();
-    let direct_io = config.direct_io;
 
     let mnt_sb = tokio::task::spawn_blocking(move || stat::stat(&full_path))
         .await?
@@ -215,11 +211,6 @@ async fn direct_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Resul
         unistd::getuid().as_raw(),
         unistd::getgid().as_raw(),
     );
-    let opts = if direct_io {
-        format!("{opts},direct_io")
-    } else {
-        opts
-    };
 
     debug!("direct mount opts={:?}", &opts);
     tokio::task::spawn_blocking(move || {
