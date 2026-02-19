@@ -31,19 +31,21 @@ use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::snapshot::SnapshotManager;
 
+type LogHandle = tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logging();
+    let log_handle = init_logging();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if !args.is_empty() {
         return run_control_command(args).await;
     }
 
-    run_mount().await
+    run_mount(log_handle).await
 }
 
-async fn run_mount() -> Result<()> {
+async fn run_mount(log_handle: LogHandle) -> Result<()> {
     let config_path = Path::new("config.toml");
     let config = Config::load_from_file(config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
@@ -82,11 +84,17 @@ async fn run_mount() -> Result<()> {
         control_listener,
         control_socket_path.clone(),
         cancel.clone(),
+        Some(log_handle.clone()),
     ));
+    let log_handle_for_signal = log_handle.clone();
 
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = log_handle_for_signal.modify(|filter| *filter = tracing_subscriber::EnvFilter::new("info"));
             info!("SIGINT received, starting graceful shutdown");
+            if fs_for_signal.is_gc_in_progress() {
+                info!("Garbage collection is currently in progress, shutdown might take a while");
+            }
             if let Err(err) = fs_for_signal.graceful_shutdown().await {
                 error!(error = %err, "graceful shutdown failed during SIGINT handling");
             }
@@ -294,8 +302,13 @@ async fn run_control_socket_server(
     listener: UnixListener,
     socket_path: PathBuf,
     cancel: CancellationToken,
+    log_handle: Option<LogHandle>,
 ) -> Result<()> {
     info!(path = %socket_path.display(), "control socket listening");
+
+    if let Some(handle) = log_handle {
+        let _ = handle.modify(|filter| *filter = tracing_subscriber::EnvFilter::new("error"));
+    }
 
     loop {
         tokio::select! {
@@ -934,12 +947,14 @@ async fn run_crypt_via_metadata(config: &Config, cmd: &CryptCommand) -> Result<(
     }
 }
 
-fn init_logging() {
+fn init_logging() -> LogHandle {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .compact()
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().compact().with_target(true))
         .init();
+    reload_handle
 }

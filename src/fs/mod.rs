@@ -259,6 +259,10 @@ impl VerFs {
     pub fn collect_stats(&self) -> Result<VerFsStats> {
         self.core.collect_stats()
     }
+
+    pub fn is_gc_in_progress(&self) -> bool {
+        self.core.gc_lock.try_lock().is_err()
+    }
 }
 
 impl FsCore {
