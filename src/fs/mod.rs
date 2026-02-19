@@ -1558,43 +1558,64 @@ impl FsCore {
                 .await?;
         }
 
-        let candidates = self.collect_zero_ref_candidates()?;
-        let mut appended_checkpoint = current_checkpoint.max(current_discard_len);
-        if !candidates.is_empty() {
-            self.delete_zero_ref_candidates(&candidates).await?;
-            for candidate in candidates.iter() {
-                self.chunk_meta_cache.invalidate(&candidate.hash);
-                self.chunk_data_cache.invalidate(&candidate.hash);
+        let phase = self.meta.get_u64_sys("gc.phase").unwrap_or(0);
+
+        if phase == 0 {
+            // == SCAN PHASE ==
+            let (candidates, next_cursor) = self.collect_zero_ref_candidates()?;
+
+            if !candidates.is_empty() {
+                self.delete_zero_ref_candidates(&candidates).await?;
+                for candidate in candidates.iter() {
+                    self.chunk_meta_cache.invalidate(&candidate.hash);
+                    self.chunk_data_cache.invalidate(&candidate.hash);
+                }
+
+                let epoch = self.next_gc_epoch().await?;
+                let discard_records = candidates
+                    .iter()
+                    .map(|candidate| DiscardRecord {
+                        epoch_id: epoch,
+                        pack_id: candidate.pack_id,
+                        chunk_hash128: candidate.hash,
+                        block_size_bytes: candidate.block_size_bytes,
+                    })
+                    .collect::<Vec<_>>();
+                let appended_checkpoint = append_records(&discard_path, &discard_records)?;
+                self.meta
+                    .write_txn(|txn| {
+                        txn.set(
+                            sys_key("gc.discard_checkpoint"),
+                            appended_checkpoint.to_le_bytes().to_vec(),
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
             }
 
-            let epoch = self.next_gc_epoch().await?;
-            let discard_records = candidates
-                .iter()
-                .map(|candidate| DiscardRecord {
-                    epoch_id: epoch,
-                    pack_id: candidate.pack_id,
-                    chunk_hash128: candidate.hash,
-                    block_size_bytes: candidate.block_size_bytes,
-                })
-                .collect::<Vec<_>>();
-            appended_checkpoint = append_records(&discard_path, &discard_records)?;
             self.meta
                 .write_txn(|txn| {
-                    txn.set(
-                        sys_key("gc.discard_checkpoint"),
-                        appended_checkpoint.to_le_bytes().to_vec(),
-                    )?;
+                    if let Some(cursor) = next_cursor {
+                        txn.set(sys_key("gc.scan_cursor"), cursor)?;
+                    } else {
+                        txn.delete(sys_key("gc.scan_cursor"))?;
+                        txn.set(sys_key("gc.phase"), 1_u64.to_le_bytes().to_vec())?;
+                    }
                     Ok(())
                 })
                 .await?;
+
+            return Ok(());
         }
 
+        // == REWRITE PHASE ==
         let checkpoint = self
             .meta
             .get_u64_sys("gc.discard_checkpoint")
-            .unwrap_or(appended_checkpoint);
+            .unwrap_or(current_checkpoint.max(current_discard_len));
         let parsed = read_records(&discard_path, checkpoint)?;
         if parsed.records.is_empty() {
+            self.switch_to_scan_phase().await?;
             return Ok(());
         }
 
@@ -1607,11 +1628,9 @@ impl FsCore {
         }
 
         let active_pack_id = self.packs.active_pack_id();
-        let mut rewritten_packs = HashSet::<u64>::new();
+        let mut rewritten_pack: Option<u64> = None;
+
         for (pack_id, dead_records) in by_pack.iter() {
-            if !self.gc_idle_window_open() {
-                break;
-            }
             if *pack_id == active_pack_id {
                 continue;
             }
@@ -1627,52 +1646,74 @@ impl FsCore {
             let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
             let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
             let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
-            if !meets_bytes && !meets_percent {
-                continue;
-            }
-
-            if !self.gc_idle_window_open() {
+            if meets_bytes || meets_percent {
+                let live_hashes = self.live_hashes_for_pack(*pack_id)?;
+                if !self.gc_idle_window_open() {
+                    return Ok(());
+                }
+                self.packs
+                    .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
+                rewritten_pack = Some(*pack_id);
                 break;
             }
-            let live_hashes = self.live_hashes_for_pack(*pack_id)?;
-            if !self.gc_idle_window_open() {
-                break;
-            }
-            self.packs
-                .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
-            rewritten_packs.insert(*pack_id);
         }
 
-        if rewritten_packs.is_empty() {
-            return Ok(());
+        if let Some(rewritten_pack_id) = rewritten_pack {
+            let current = read_records(&discard_path, checkpoint)?;
+            let kept = current
+                .records
+                .into_iter()
+                .filter(|record| record.pack_id != rewritten_pack_id)
+                .collect::<Vec<_>>();
+            let new_len = rewrite_records(&discard_path, &kept)?;
+            self.meta
+                .write_txn(|txn| {
+                    txn.set(
+                        sys_key("gc.discard_checkpoint"),
+                        new_len.to_le_bytes().to_vec(),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        } else {
+            self.switch_to_scan_phase().await?;
         }
-
-        let current = read_records(&discard_path, checkpoint)?;
-        let kept = current
-            .records
-            .into_iter()
-            .filter(|record| !rewritten_packs.contains(&record.pack_id))
-            .collect::<Vec<_>>();
-        let new_len = rewrite_records(&discard_path, &kept)?;
-        self.meta
-            .write_txn(|txn| {
-                txn.set(
-                    sys_key("gc.discard_checkpoint"),
-                    new_len.to_le_bytes().to_vec(),
-                )?;
-                Ok(())
-            })
-            .await?;
 
         Ok(())
     }
 
-    fn collect_zero_ref_candidates(&self) -> Result<Vec<ZeroRefCandidate>> {
+    async fn switch_to_scan_phase(&self) -> Result<()> {
+        self.meta
+            .write_txn(|txn| {
+                txn.set(sys_key("gc.phase"), 0_u64.to_le_bytes().to_vec())?;
+                Ok(())
+            })
+            .await
+    }
+
+    fn collect_zero_ref_candidates(&self) -> Result<(Vec<ZeroRefCandidate>, Option<Vec<u8>>)> {
         self.meta.read_txn(|txn| {
             let mut out = Vec::new();
             let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
             let end = prefix_end(&prefix);
-            for (key, value) in scan_range_pairs(txn, prefix, end)? {
+
+            let mut start = prefix.clone();
+            if let Ok(Some(cursor)) = txn.get(sys_key("gc.scan_cursor")) {
+                if !cursor.is_empty() {
+                    start = cursor;
+                }
+            }
+
+            let mut next_cursor = None;
+            let (pairs, has_more) = scan_range_pairs_limited(txn, start, end, 50_000)?;
+
+            for (key, value) in pairs {
+                if has_more {
+                    let mut next = key.clone();
+                    next.push(0);
+                    next_cursor = Some(next);
+                }
+
                 if key.len() != 17 {
                     continue;
                 }
@@ -1687,7 +1728,7 @@ impl FsCore {
                     });
                 }
             }
-            Ok(out)
+            Ok((out, next_cursor))
         })
     }
 
@@ -3425,6 +3466,25 @@ fn scan_range_pairs(
         valid = iter.next()?;
     }
     Ok(out)
+}
+
+fn scan_range_pairs_limited(
+    txn: &surrealkv::Transaction,
+    start: Vec<u8>,
+    end: Vec<u8>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    let mut out = Vec::new();
+    let mut iter = txn.range(start, end)?;
+    let mut valid = iter.seek_first()?;
+    while valid {
+        out.push((iter.key().user_key().to_vec(), iter.value()?));
+        if out.len() >= limit {
+            return Ok((out, true));
+        }
+        valid = iter.next()?;
+    }
+    Ok((out, false))
 }
 
 fn dir_size_recursive(path: &Path) -> Result<u64> {
