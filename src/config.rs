@@ -53,6 +53,18 @@ fn default_fuse_max_write_bytes() -> u32 {
     u32::try_from(BLOCK_SIZE).unwrap_or(1024 * 1024)
 }
 
+fn default_fuse_direct_io() -> bool {
+    false
+}
+
+fn default_fuse_fsname() -> String {
+    "verfsnext".to_owned()
+}
+
+fn default_fuse_subtype() -> String {
+    "verfsnext".to_owned()
+}
+
 fn default_gc_idle_min_ms() -> u64 {
     15_000
 }
@@ -113,6 +125,12 @@ pub struct Config {
     pub ultracdc_max_size_bytes: usize,
     #[serde(default = "default_fuse_max_write_bytes")]
     pub fuse_max_write_bytes: u32,
+    #[serde(default = "default_fuse_direct_io")]
+    pub fuse_direct_io: bool,
+    #[serde(default = "default_fuse_fsname")]
+    pub fuse_fsname: String,
+    #[serde(default = "default_fuse_subtype")]
+    pub fuse_subtype: String,
     #[serde(default = "default_gc_idle_min_ms")]
     pub gc_idle_min_ms: u64,
     #[serde(default = "default_gc_pack_rewrite_min_reclaim_bytes")]
@@ -185,6 +203,12 @@ impl Config {
         }
         if self.fuse_max_write_bytes > 16 * 1024 * 1024 {
             bail!("fuse_max_write_bytes must be <= 16777216");
+        }
+        if self.fuse_fsname.trim().is_empty() {
+            bail!("fuse_fsname must not be empty");
+        }
+        if self.fuse_subtype.trim().is_empty() {
+            bail!("fuse_subtype must not be empty");
         }
         if self.gc_idle_min_ms == 0 {
             bail!("gc_idle_min_ms must be > 0");

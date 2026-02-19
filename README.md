@@ -27,6 +27,9 @@ And as obviuous, I'm not responsible for any data loss!
 1. Set your paths in `config.toml`:
    - `mount_point`: existing mount directory (for example `/mnt/verfs`)
    - `data_dir`: existing data directory (for example `/mnt/work/verfs`)
+   - Optional mount behavior:
+     - `fuse_direct_io = true` to bypass kernel page cache
+     - `fuse_fsname`, `fuse_subtype` for filesystem labeling/identity
 
 2. Start the filesystem daemon from the repo root:
    ```bash

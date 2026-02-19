@@ -9,6 +9,42 @@ use nix::fcntl::{self, OFlag};
 use nix::sys::stat::{self, Mode};
 use tracing::{debug, info};
 
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    pub direct_io: bool,
+    pub fs_name: String,
+    pub subtype: String,
+}
+
+impl Default for MountConfig {
+    fn default() -> Self {
+        Self {
+            direct_io: false,
+            fs_name: "verfsnext".to_owned(),
+            subtype: "verfsnext".to_owned(),
+        }
+    }
+}
+
+fn build_fusermount_options(config: &MountConfig) -> String {
+    let mut options = vec![
+        "nosuid".to_owned(),
+        "nodev".to_owned(),
+        "allow_other".to_owned(),
+        "default_permissions".to_owned(),
+        format!("fsname={}", config.fs_name),
+        format!("subtype={}", config.subtype),
+    ];
+    if config.direct_io {
+        options.push("direct_io".to_owned());
+    }
+    options.join(",")
+}
+
+fn direct_mount_fstype(config: &MountConfig) -> String {
+    format!("fuse.{}", config.subtype)
+}
+
 // Linux mount flags, check the following link for details
 // <https://github.com/torvalds/linux/blob/master/include/uapi/linux/mount.h#L11>
 
@@ -56,21 +92,21 @@ pub async fn umount(short_path: &Path) -> anyhow::Result<()> {
 
 /// Linux mount
 #[cfg(target_os = "linux")]
-pub async fn mount(mount_point: &Path) -> anyhow::Result<RawFd> {
+pub async fn mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
     use nix::unistd;
 
     if unistd::geteuid().is_root() {
-        // Direct umount
-        direct_mount(mount_point).await
+        // Direct mount
+        direct_mount(mount_point, config).await
     } else {
         // Use fusermount to mount
-        fuser_mount(mount_point).await
+        fuser_mount(mount_point, config).await
     }
 }
 
 /// Linux fusermount
 #[cfg(target_os = "linux")]
-async fn fuser_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
+async fn fuser_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
     use std::io::IoSliceMut;
     use std::os::fd::AsRawFd;
     use std::process::Command;
@@ -81,6 +117,7 @@ async fn fuser_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
     };
 
     let mount_path = mount_point.to_path_buf();
+    let mount_opts = build_fusermount_options(config);
 
     let (local, remote) = tokio::task::spawn_blocking(|| {
         socket::socketpair(
@@ -96,9 +133,8 @@ async fn fuser_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
     let mount_handle = tokio::task::spawn_blocking(move || {
         Command::new("fusermount")
             .arg("-o")
-            // fusermount option allow_other only allowed if user_allow_other is set in
-            // /etc/fuse.conf
-            .arg("nosuid,nodev,allow_other,default_permissions") // rw,async,noatime,noexec,auto_unmount,allow_other
+            // `allow_other` requires `user_allow_other` in /etc/fuse.conf.
+            .arg(mount_opts)
             .arg(mount_path.as_os_str())
             .env("_FUSE_COMMFD", remote.as_raw_fd().to_string())
             .output()
@@ -149,7 +185,7 @@ async fn fuser_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
 
 /// Linux directly mount
 #[cfg(target_os = "linux")]
-async fn direct_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
+async fn direct_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
     use nix::mount::MsFlags;
     use nix::sys::stat::SFlag;
     use nix::unistd;
@@ -163,8 +199,9 @@ async fn direct_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
     let mount_path = mount_point.to_path_buf();
     let full_path = tokio::task::spawn_blocking(move || fs::canonicalize(mount_path)).await??;
     let target_path = full_path.clone();
-    let fstype = "fuse";
-    let fsname = "/dev/fuse";
+    let fstype = direct_mount_fstype(config);
+    let fsname = config.fs_name.clone();
+    let direct_io = config.direct_io;
 
     let mnt_sb = tokio::task::spawn_blocking(move || stat::stat(&full_path))
         .await?
@@ -178,13 +215,18 @@ async fn direct_mount(mount_point: &Path) -> anyhow::Result<RawFd> {
         unistd::getuid().as_raw(),
         unistd::getgid().as_raw(),
     );
+    let opts = if direct_io {
+        format!("{opts},direct_io")
+    } else {
+        opts
+    };
 
     debug!("direct mount opts={:?}", &opts);
     tokio::task::spawn_blocking(move || {
         nix::mount::mount(
-            Some(fsname),
+            Some(fsname.as_str()),
             &target_path,
-            Some(fstype),
+            Some(fstype.as_str()),
             MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
             Some(opts.as_str()),
         )

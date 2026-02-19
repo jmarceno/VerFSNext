@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_fusex::{
+    mount::MountConfig,
     session::{new_session, SessionConfig},
     FuseFs, VirtualFs,
 };
@@ -56,6 +57,11 @@ async fn run_mount() -> Result<()> {
         fuse_fs,
         SessionConfig {
             max_write_bytes: config.fuse_max_write_bytes,
+            mount_config: MountConfig {
+                direct_io: config.fuse_direct_io,
+                fs_name: config.fuse_fsname.clone(),
+                subtype: config.fuse_subtype.clone(),
+            },
         },
     )
     .await
@@ -741,7 +747,10 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         (
             "Cache Hit Rate".to_owned(),
             format!("{:.2}%", stats.cache_hit_rate * 100.0),
-            format!("{} hits / {} requests", stats.cache_hits, stats.cache_requests),
+            format!(
+                "{} hits / {} requests",
+                stats.cache_hits, stats.cache_requests
+            ),
         ),
         (
             "Process Private Memory".to_owned(),
@@ -782,7 +791,10 @@ fn format_stats_report(stats: &VerFsStats) -> String {
                 human_bytes(stats.read_bytes_total),
                 human_bytes(stats.write_bytes_total)
             ),
-            format!("{} / {} bytes", stats.read_bytes_total, stats.write_bytes_total),
+            format!(
+                "{} / {} bytes",
+                stats.read_bytes_total, stats.write_bytes_total
+            ),
         ),
     ];
 
@@ -827,9 +839,7 @@ fn render_stats_table(rows: &[(String, String, String)]) -> String {
 
     let sep = format!(
         "+-{:-<metric_width$}-+-{:-<value_width$}-+-{:-<details_width$}-+",
-        "",
-        "",
-        ""
+        "", "", ""
     );
 
     let mut out = String::new();

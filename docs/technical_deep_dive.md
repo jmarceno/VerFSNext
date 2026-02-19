@@ -101,6 +101,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `ultracdc_avg_size_bytes`
 - `ultracdc_max_size_bytes`
 - `fuse_max_write_bytes`
+- `fuse_direct_io`
+- `fuse_fsname`
+- `fuse_subtype`
 - `gc_idle_min_ms`
 - `gc_pack_rewrite_min_reclaim_bytes`
 - `gc_pack_rewrite_min_reclaim_percent`

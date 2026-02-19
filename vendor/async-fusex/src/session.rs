@@ -63,15 +63,17 @@ const MAX_BACKGROUND: u16 = 10; // TODO: set to larger value when release
 const MAX_FUSE_READER: usize = 2; // TODO: make it custom
 
 /// Runtime config for FUSE session negotiation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub max_write_bytes: u32,
+    pub mount_config: crate::mount::MountConfig,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_write_bytes: DEFAULT_MAX_WRITE_BYTES,
+            mount_config: crate::mount::MountConfig::default(),
         }
     }
 }
@@ -303,7 +305,7 @@ pub async fn new_session(
     fs: FuseFs,
     session_config: SessionConfig,
 ) -> anyhow::Result<Session<FuseFs>> {
-    let fuse_fd = mount::mount(mount_path)
+    let fuse_fd = mount::mount(mount_path, &session_config.mount_config)
         .await
         .context("Failed to mount FUSE")?;
 
