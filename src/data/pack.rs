@@ -97,6 +97,16 @@ impl PackStore {
             )
         })?;
 
+        for subdir in ["A", "B", "C", "D", "E", "F"] {
+            let subdir_path = packs_dir.join(subdir);
+            std::fs::create_dir_all(&subdir_path).with_context(|| {
+                format!(
+                    "failed to create packs subdirectory {}",
+                    subdir_path.display()
+                )
+            })?;
+        }
+
         let existing_pack_ids = Self::list_existing_pack_ids(packs_dir)?;
         let resolved_active_pack_id = existing_pack_ids
             .iter()
@@ -359,26 +369,36 @@ impl PackStore {
 
     fn list_existing_pack_ids(packs_dir: &Path) -> Result<BTreeSet<u64>> {
         let mut out = BTreeSet::new();
-        for entry in std::fs::read_dir(packs_dir).with_context(|| {
-            format!(
-                "failed to read packs directory while listing pack ids {}",
-                packs_dir.display()
-            )
-        })? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
+        for subdir in ["A", "B", "C", "D", "E", "F"] {
+            let subdir_path = packs_dir.join(subdir);
+            let entries = match std::fs::read_dir(&subdir_path) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read packs subdirectory while listing pack ids {}",
+                            subdir_path.display()
+                        )
+                    });
+                }
             };
-            if !name.starts_with("pack-") || !name.ends_with(".vpk") {
-                continue;
-            }
-            let number = &name[5..name.len().saturating_sub(4)];
-            if let Ok(pack_id) = number.parse::<u64>() {
-                out.insert(pack_id);
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("pack-") || !name.ends_with(".vpk") {
+                    continue;
+                }
+                let number = &name[5..name.len().saturating_sub(4)];
+                if let Ok(pack_id) = number.parse::<u64>() {
+                    out.insert(pack_id);
+                }
             }
         }
         Ok(out)
@@ -656,11 +676,29 @@ impl PackStore {
     }
 
     fn pack_path_impl(base: &Path, pack_id: u64) -> PathBuf {
-        base.join(format!("pack-{pack_id:020}.vpk"))
+        let subdir = match pack_id % 6 {
+            0 => "A",
+            1 => "B",
+            2 => "C",
+            3 => "D",
+            4 => "E",
+            5 => "F",
+            _ => unreachable!(),
+        };
+        base.join(subdir).join(format!("pack-{pack_id:020}.vpk"))
     }
 
     fn index_path_impl(base: &Path, pack_id: u64) -> PathBuf {
-        base.join(format!("pack-{pack_id:020}.idx"))
+        let subdir = match pack_id % 6 {
+            0 => "A",
+            1 => "B",
+            2 => "C",
+            3 => "D",
+            4 => "E",
+            5 => "F",
+            _ => unreachable!(),
+        };
+        base.join(subdir).join(format!("pack-{pack_id:020}.idx"))
     }
 
     pub fn verify_pack_headers(&self, pack_id: u64) -> Result<()> {
