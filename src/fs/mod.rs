@@ -126,6 +126,7 @@ struct FsCore {
     write_bytes_total: AtomicU64,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
+    last_activity_ms: AtomicU64,
     write_lock: Mutex<()>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
@@ -179,6 +180,7 @@ impl VerFs {
             write_bytes_total: AtomicU64::new(0),
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
+            last_activity_ms: AtomicU64::new(now_millis()),
             write_lock: Mutex::new(()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
@@ -1303,8 +1305,31 @@ impl FsCore {
         Ok(())
     }
 
+    fn mark_activity(&self) {
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
     fn mark_mutation(&self) {
-        self.last_mutation_ms.store(now_millis(), Ordering::Relaxed);
+        let now = now_millis();
+        self.last_mutation_ms.store(now, Ordering::Relaxed);
+        self.last_activity_ms.store(now, Ordering::Relaxed);
+    }
+
+    fn gc_idle_window_open(&self) -> bool {
+        let now = now_millis();
+        let last_mutation = self.last_mutation_ms.load(Ordering::Relaxed);
+        let last_activity = self.last_activity_ms.load(Ordering::Relaxed);
+        let last_event = last_mutation.max(last_activity);
+        if now.saturating_sub(last_event) < self.config.gc_idle_min_ms {
+            return false;
+        }
+
+        if let Ok(guard) = self.write_lock.try_lock() {
+            drop(guard);
+            return true;
+        }
+
+        false
     }
 
     fn collect_stats(&self) -> Result<VerFsStats> {
@@ -1451,9 +1476,8 @@ impl FsCore {
         let approx_cache_memory_bytes = metadata_cache_entries
             .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
             .saturating_add(
-                chunk_cache_entries.saturating_mul(
-                    (size_of::<([u8; 16], Arc<Vec<u8>>)>() + BLOCK_SIZE) as u64,
-                ),
+                chunk_cache_entries
+                    .saturating_mul((size_of::<([u8; 16], Arc<Vec<u8>>)>() + BLOCK_SIZE) as u64),
             );
 
         let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
@@ -1496,14 +1520,14 @@ impl FsCore {
     }
 
     async fn maybe_run_gc(&self) -> Result<()> {
-        let now = now_millis();
-        let last_mutation = self.last_mutation_ms.load(Ordering::Relaxed);
-        let idle_for = now.saturating_sub(last_mutation);
-        if idle_for < self.config.gc_idle_min_ms {
+        if !self.gc_idle_window_open() {
             return Ok(());
         }
 
         let _gc_guard = self.gc_lock.lock().await;
+        if !self.gc_idle_window_open() {
+            return Ok(());
+        }
         self.run_gc_cycle().await
     }
 
@@ -1580,6 +1604,9 @@ impl FsCore {
         let active_pack_id = self.packs.active_pack_id();
         let mut rewritten_packs = HashSet::<u64>::new();
         for (pack_id, dead_records) in by_pack.iter() {
+            if !self.gc_idle_window_open() {
+                break;
+            }
             if *pack_id == active_pack_id {
                 continue;
             }
@@ -1599,7 +1626,13 @@ impl FsCore {
                 continue;
             }
 
+            if !self.gc_idle_window_open() {
+                break;
+            }
             let live_hashes = self.live_hashes_for_pack(*pack_id)?;
+            if !self.gc_idle_window_open() {
+                break;
+            }
             self.packs
                 .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
             rewritten_packs.insert(*pack_id);
@@ -1998,6 +2031,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created directory"))
@@ -2425,6 +2459,7 @@ impl VirtualFs for VerFs {
         size: u32,
         buf: &mut Vec<u8>,
     ) -> AsyncFusexResult<usize> {
+        self.core.mark_activity();
         let inode = self
             .core
             .load_inode_or_errno(ino, "read")
@@ -2569,6 +2604,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
         let inode = self
             .core
             .load_inode_or_errno(ino, "write")
@@ -2611,6 +2647,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
         if let Ok(inode) = self.core.load_inode_or_errno(_ino, "flush") {
             self.core
                 .ensure_inode_vault_access(&inode, "flush")
@@ -2626,6 +2663,7 @@ impl VirtualFs for VerFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
         if let Ok(inode) = self.core.load_inode_or_errno(_ino, "release") {
             self.core
                 .ensure_inode_vault_access(&inode, "release")
@@ -2635,6 +2673,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
         let inode = self
             .core
             .load_inode_or_errno(_ino, "fsync")
@@ -2730,6 +2769,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn fsyncdir(&self, _ino: u64, _fh: u64, datasync: bool) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
         let inode = self
             .core
             .load_inode_or_errno(_ino, "fsyncdir")
@@ -2799,6 +2839,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created file inode"))

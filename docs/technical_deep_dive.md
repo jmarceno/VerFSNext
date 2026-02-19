@@ -53,7 +53,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - blocks rename of top-level `/.vault` and blocks cross-boundary rename/link between vault and non-vault trees
   - marks vault inodes using inode flags and applies data encryption/decryption only for those inodes
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
-  - background GC trigger integrated into periodic sync cycles with idle gating
+  - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
 
 - `src/vault/mod.rs`
   - Envelope wrapping metadata type (`VaultWrapRecord`) encoded with `rkyv`
