@@ -53,6 +53,12 @@ This keeps the vendored engine buildable as a first-class in-repo component for 
 - Partitioned index top-level entries are persisted as a `rkyv` archive payload, then materialized directly into `Index::blocks` during open.
 - These format updates are intentionally breaking and no compatibility path is maintained.
 
+## WAL Directory Permission Behavior
+
+- WAL initialization (`src/wal/manager.rs`) attempts to normalize directory mode based on WAL options.
+- Permission normalization is best-effort: if `set_permissions` fails with `PermissionDenied`, WAL startup continues using the existing directory mode.
+- Rationale: deployments where data directories are writable but not owned by the service user must remain operational.
+
 ---
 
 ## Overall Architecture

@@ -162,24 +162,37 @@ ensure_service_user() {
       "$SERVICE_USER"
   fi
 
-  run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
+  run_cmd "${SUDO[@]}" install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
 }
 
 install_config() {
   echo "Preparing config at $CONFIG_FILE..."
-  run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_DIR"
+  run_cmd "${SUDO[@]}" install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_DIR"
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    run_cmd "${SUDO[@]}" install -m640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_SRC" "$CONFIG_FILE"
+    run_cmd "${SUDO[@]}" install -m0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_SRC" "$CONFIG_FILE"
     echo "Installed config template from $CONFIG_SRC"
   else
     run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
+    run_cmd "${SUDO[@]}" chmod 0640 "$CONFIG_FILE"
+  fi
+}
+
+ensure_owned_by_service() {
+  local path=$1
+  local recursive=${2:-0}
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  if [[ "$recursive" -eq 1 ]]; then
+    run_cmd "${SUDO[@]}" chown -R "$SERVICE_USER:$SERVICE_GROUP" "$path"
+  else
+    run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$path"
   fi
 }
 
 validate_config_paths() {
   local mount_point data_dir
   local check_write_perms=1
-  local caller_user="${SUDO_USER:-${USER:-root}}"
   mount_point="$(toml_path_value mount_point "$VALIDATION_CONFIG_FILE" || true)"
   data_dir="$(toml_path_value data_dir "$VALIDATION_CONFIG_FILE" || true)"
 
@@ -190,14 +203,17 @@ validate_config_paths() {
 
   if [[ ! -d "$mount_point" ]]; then
     echo "Creating mount_point: $mount_point"
-    run_cmd "${SUDO[@]}" install -d -m 0777 -o "$caller_user" "$mount_point"
+    run_cmd "${SUDO[@]}" install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$mount_point"
   fi
 
   if [[ ! -d "$data_dir" ]]; then
     echo "Creating data_dir: $data_dir"
-    run_cmd "${SUDO[@]}" install -d -m 0777 -o "$caller_user" "$data_dir"
+    run_cmd "${SUDO[@]}" install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$data_dir"
   fi
 
+  # WAL startup updates directory mode; service user must own data tree.
+  ensure_owned_by_service "$mount_point" 0
+  ensure_owned_by_service "$data_dir" 0
   ensure_subdir_owned "$data_dir/metadata"
   ensure_subdir_owned "$data_dir/packs"
 
@@ -225,19 +241,38 @@ ensure_subdir_owned() {
   local dir_path=$1
   if [[ ! -d "$dir_path" ]]; then
     echo "Creating directory: $dir_path"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$dir_path"
+    run_cmd "${SUDO[@]}" install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$dir_path"
     return 0
   fi
+
+  ensure_owned_by_service "$dir_path" 1
 
   local check_write_perms=1
   if [[ $DRY_RUN -eq 1 ]] && ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     check_write_perms=0
   fi
 
-  if [[ $check_write_perms -eq 1 ]] && [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$dir_path"; then
-    echo "config validation failed: $SERVICE_USER cannot write to $dir_path" >&2
-    echo "Please fix the permissions for $dir_path so that it is writable." >&2
-    exit 1
+  if [[ $check_write_perms -eq 1 ]] && [[ $DRY_RUN -eq 0 ]]; then
+    if ! can_user_write_dir "$dir_path"; then
+      echo "config validation failed: $SERVICE_USER cannot write to $dir_path" >&2
+      echo "Please fix the permissions for $dir_path so that it is writable." >&2
+      exit 1
+    fi
+
+    local unreadable
+    if command -v runuser >/dev/null 2>&1; then
+      unreadable="$("${SUDO[@]}" runuser -u "$SERVICE_USER" -- find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    elif command -v sudo >/dev/null 2>&1; then
+      unreadable="$(sudo -u "$SERVICE_USER" find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    else
+      unreadable="$("${SUDO[@]}" -u "$SERVICE_USER" find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$unreadable" ]]; then
+       echo "config validation failed: $SERVICE_USER cannot write to inner files, e.g. $unreadable" >&2
+       echo "Please fix the permissions for $dir_path (e.g. by running: sudo chmod -R a+rw $dir_path) so that all inner files are writable by the service." >&2
+       exit 1
+    fi
   fi
 }
 

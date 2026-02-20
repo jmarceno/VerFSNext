@@ -220,7 +220,10 @@ impl Wal {
 
     fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
         // Directory should already be created by Tree::new()
-        // Just set permissions if needed
+        // Just set permissions if needed.
+        // If mode adjustment is not permitted (e.g. service user does not own
+        // pre-existing directory), continue as long as directory access itself
+        // is otherwise valid.
         if let Ok(metadata) = fs::metadata(dir) {
             let mut permissions = metadata.permissions();
 
@@ -235,7 +238,17 @@ impl Wal {
                 permissions.set_readonly(false);
             }
 
-            fs::set_permissions(dir, permissions)?;
+            if let Err(err) = fs::set_permissions(dir, permissions) {
+                if err.kind() == io::ErrorKind::PermissionDenied {
+                    log::warn!(
+                        "WAL: unable to adjust directory permissions for {}: {}. continuing with existing mode",
+                        dir.display(),
+                        err
+                    );
+                } else {
+                    return Err(Error::IO(IOError::new(err.kind(), &err.to_string())));
+                }
+            }
         }
 
         Ok(())
