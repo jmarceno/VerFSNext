@@ -1,6 +1,8 @@
 use super::*;
 use crate::fs::FsCore;
 
+const VAULT_HASH_DOMAIN: u8 = 0xA7;
+
 impl FsCore {
     pub(crate) fn vault_locked(&self) -> bool {
         !self.vault.read().unlocked()
@@ -10,7 +12,7 @@ impl FsCore {
     }
     pub(crate) fn hash_for_inode(inode: &InodeRecord, data: &[u8]) -> [u8; 16] {
         if FsCore::inode_is_vault(inode) {
-            hash128_with_domain(0xA7, data)
+            hash128_with_domain(VAULT_HASH_DOMAIN, data)
         } else {
             hash128(data)
         }
