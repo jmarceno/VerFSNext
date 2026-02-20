@@ -10,6 +10,7 @@ pub struct UltraStreamChunker {
     sizes: SizeParams,
     carry: Vec<u8>,
     consumed_prefix: usize,
+    scanned_len: usize,
 }
 
 impl UltraStreamChunker {
@@ -18,6 +19,7 @@ impl UltraStreamChunker {
             sizes: SizeParams::new(min, avg, max),
             carry: Vec::new(),
             consumed_prefix: 0,
+            scanned_len: 0,
         }
     }
 
@@ -34,40 +36,37 @@ impl UltraStreamChunker {
     }
 
     fn emit_ready(&mut self, finalize: bool) -> Vec<ChunkSpan> {
-        if self.carry.is_empty() {
-            return Vec::new();
-        }
+        let mut out = Vec::new();
 
-        let mut chunker = ultra::Chunker::new(&self.carry, self.sizes);
-        let chunks = chunker.generate_chunks();
-        if chunks.is_empty() {
-            return Vec::new();
-        }
+        while !self.carry.is_empty() {
+            let skip_len = self.scanned_len.max(self.sizes.min);
+            
+            let mut sizes = self.sizes;
+            sizes.min = skip_len;
 
-        let emit_count = if finalize {
-            chunks.len()
-        } else {
-            chunks.len().saturating_sub(1)
-        };
+            let mut chunker = ultra::Chunker::new(&self.carry, sizes);
+            let Some(chunk) = chunker.next() else {
+                break; 
+            };
 
-        let mut out = Vec::with_capacity(emit_count);
-        for chunk in chunks.iter().take(emit_count) {
+            if chunk.pos + chunk.len == self.carry.len() && !finalize {
+                self.scanned_len = self.carry.len().saturating_sub(8); 
+                break;
+            }
+
             out.push(ChunkSpan {
                 offset: self.consumed_prefix + chunk.pos,
                 len: chunk.len,
             });
-        }
 
-        if emit_count == 0 {
-            return out;
+            self.carry.drain(..chunk.len);
+            self.consumed_prefix += chunk.len;
+            self.scanned_len = 0; 
         }
-
-        let consumed = chunks[emit_count - 1].pos + chunks[emit_count - 1].len;
-        self.carry.drain(..consumed);
-        self.consumed_prefix += consumed;
 
         if finalize {
             self.carry.clear();
+            self.scanned_len = 0;
         }
 
         out
@@ -90,5 +89,32 @@ mod tests {
 
         let covered = spans.iter().map(|span| span.len).sum::<usize>();
         assert_eq!(covered, data.len());
+    }
+
+    #[test]
+    fn benchmark_streaming_chunker_baseline() {
+        use std::time::Instant;
+        let mut streaming = UltraStreamChunker::new(1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024);
+        
+        let chunk_size = 4096; // Feed 4KB at a time (like a slow disk or stream)
+        let total_size = 64 * 1024 * 1024; // 64 MB total
+        
+        // Generate pseudo-random data to prevent extreme early match patterns
+        // but keep it fast to generate.
+        let mut data = vec![0_u8; total_size];
+        for i in 0..total_size {
+            data[i] = (i % 251) as u8;
+        }
+
+        let start = Instant::now();
+        let mut spans = Vec::new();
+        for part in data.chunks(chunk_size) {
+            spans.extend(streaming.feed(part));
+        }
+        spans.extend(streaming.finish());
+        
+        let duration = start.elapsed();
+        println!("baseline_benchmark: Chunking 64MB (4KB feeds, 4MB avg chunks) took: {:?}", duration);
+        assert!(!spans.is_empty());
     }
 }
