@@ -22,6 +22,12 @@ pub const KEY_PREFIX_SNAPSHOT: u8 = b'S';
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
 pub const INODE_FLAG_VAULT_ROOT: u32 = 1 << 2;
+
+pub const PERM_DIRECTORY_DEFAULT: u16 = 0o755;
+pub const PERM_VAULT_DIRECTORY: u16 = 0o700;
+pub const PERM_SYMLINK_DEFAULT: u16 = 0o777;
+pub const PERM_KEY_FILE: u32 = 0o600;
+
 pub const SNAPSHOTS_DIR_NAME: &str = ".snapshots";
 pub const VAULT_DIR_NAME: &str = ".vault";
 

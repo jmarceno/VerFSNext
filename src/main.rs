@@ -31,7 +31,8 @@ use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::snapshot::SnapshotManager;
 
-type LogHandle = tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+type LogHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -90,7 +91,8 @@ async fn run_mount(log_handle: LogHandle) -> Result<()> {
 
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = log_handle_for_signal.modify(|filter| *filter = tracing_subscriber::EnvFilter::new("info"));
+            let _ = log_handle_for_signal
+                .modify(|filter| *filter = tracing_subscriber::EnvFilter::new("info"));
             info!("SIGINT received, starting graceful shutdown");
             if fs_for_signal.is_gc_in_progress() {
                 info!("Garbage collection is currently in progress, shutdown might take a while");
