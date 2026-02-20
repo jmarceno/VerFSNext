@@ -557,19 +557,7 @@ impl FsCore {
         Ok(chunk)
     }
 
-    fn read_block_bytes(&self, ino: u64, block_idx: u64, vault_encrypted: bool) -> Result<Vec<u8>> {
-        let maybe_extent = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(extent_key(ino, block_idx))? else {
-                return Ok(None);
-            };
-            let extent: ExtentRecord = decode_rkyv(&raw)?;
-            Ok(Some(extent))
-        })?;
-
-        let Some(extent) = maybe_extent else {
-            return Ok(vec![0_u8; BLOCK_SIZE]);
-        };
-
+    fn read_extent_bytes(&self, extent: ExtentRecord, vault_encrypted: bool) -> Result<Vec<u8>> {
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut payload = cached.as_ref().clone();
@@ -624,6 +612,7 @@ impl FsCore {
         }
         Ok(payload)
     }
+
 
     fn stage_chunk_if_missing(
         &self,
@@ -963,10 +952,36 @@ impl FsCore {
                 Ok(out)
             })?;
 
+            let missing_hashes = extents
+                .iter()
+                .map(|(_, hash, _)| *hash)
+                .filter(|h| !self.chunk_meta_cache.contains_key(h))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            if !missing_hashes.is_empty() {
+                let chunks = self.meta.read_txn(|txn| {
+                    let mut chunks = Vec::new();
+                    for hash in &missing_hashes {
+                        if let Some(raw) = txn.get(chunk_key(hash))? {
+                            let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                            chunks.push((*hash, chunk));
+                        }
+                    }
+                    Ok(chunks)
+                })?;
+                for (hash, chunk) in chunks {
+                    self.chunk_meta_cache.insert(hash, chunk);
+                }
+            }
+
             for (block_idx, chunk_hash, key) in extents {
                 if has_boundary && block_idx == boundary_block {
-                    let mut block_data =
-                        self.read_block_bytes(ino, block_idx, FsCore::inode_is_vault(&inode))?;
+                    let mut block_data = self.read_extent_bytes(
+                        ExtentRecord { chunk_hash },
+                        FsCore::inode_is_vault(&inode),
+                    )?;
                     let offset_in_block = (new_size % block_size) as usize;
                     block_data[offset_in_block..].fill(0);
                     let new_hash = FsCore::hash_for_inode(&inode, &block_data);
@@ -1073,6 +1088,30 @@ impl FsCore {
             Ok(map)
         })?;
 
+        let missing_hashes = old_extents
+            .values()
+            .map(|e| e.chunk_hash)
+            .filter(|h| !self.chunk_meta_cache.contains_key(h))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        if !missing_hashes.is_empty() {
+            let chunks = self.meta.read_txn(|txn| {
+                let mut chunks = Vec::new();
+                for hash in &missing_hashes {
+                    if let Some(raw) = txn.get(chunk_key(hash))? {
+                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                        chunks.push((*hash, chunk));
+                    }
+                }
+                Ok(chunks)
+            })?;
+            for (hash, chunk) in chunks {
+                self.chunk_meta_cache.insert(hash, chunk);
+            }
+        }
+
         let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
         let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
@@ -1081,8 +1120,8 @@ impl FsCore {
         let mut dedup_misses = 0_u64;
 
         for block_idx in start_block..=end_block {
-            let mut block_data = if old_extents.contains_key(&block_idx) {
-                self.read_block_bytes(op.ino, block_idx, FsCore::inode_is_vault(&inode))?
+            let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
+                self.read_extent_bytes(extent.clone(), FsCore::inode_is_vault(&inode))?
             } else {
                 vec![0_u8; BLOCK_SIZE]
             };
