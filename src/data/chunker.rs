@@ -120,4 +120,61 @@ mod tests {
         );
         assert!(!spans.is_empty());
     }
+
+    #[test]
+    fn finish_without_data_emits_nothing() {
+        let mut streaming = UltraStreamChunker::new(2048, 4096, 16384);
+        assert!(streaming.feed(&[]).is_empty());
+        assert!(streaming.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_spans_are_contiguous_and_cover_all_bytes() {
+        let mut streaming = UltraStreamChunker::new(1024, 2048, 8192);
+        let total_size = 128 * 1024;
+        let mut data = vec![0_u8; total_size];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+
+        let mut spans = Vec::new();
+        for part in data.chunks(333) {
+            spans.extend(streaming.feed(part));
+        }
+        spans.extend(streaming.finish());
+        assert!(!spans.is_empty());
+
+        let mut expected_offset = 0_usize;
+        for span in spans {
+            assert_eq!(span.offset, expected_offset);
+            assert!(span.len > 0);
+            expected_offset += span.len;
+        }
+        assert_eq!(expected_offset, data.len());
+    }
+
+    #[test]
+    fn chunking_is_deterministic_for_same_feed_pattern() {
+        let total_size = 64 * 1024;
+        let mut data = vec![0_u8; total_size];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 233) as u8;
+        }
+
+        let mut first = UltraStreamChunker::new(1024, 4096, 16384);
+        let mut first_spans = Vec::new();
+        for part in data.chunks(17) {
+            first_spans.extend(first.feed(part));
+        }
+        first_spans.extend(first.finish());
+
+        let mut second = UltraStreamChunker::new(1024, 4096, 16384);
+        let mut second_spans = Vec::new();
+        for part in data.chunks(17) {
+            second_spans.extend(second.feed(part));
+        }
+        second_spans.extend(second.finish());
+
+        assert_eq!(first_spans, second_spans);
+    }
 }

@@ -252,3 +252,77 @@ fn derive_kek(
     input.zeroize();
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, unwrap_folder_key,
+        VaultArgon2Params,
+    };
+
+    fn test_params() -> VaultArgon2Params {
+        VaultArgon2Params {
+            mem_kib: 8192,
+            iters: 1,
+            parallelism: 1,
+        }
+    }
+
+    #[test]
+    fn key_wrap_roundtrip_succeeds() {
+        let password = "correct horse battery staple";
+        let key_material = [7_u8; 32];
+        let folder_key = [9_u8; 32];
+        let wrap = build_wrap_record(password, &key_material, &folder_key, test_params())
+            .expect("build wrap");
+
+        let unwrapped =
+            unwrap_folder_key(password, &key_material, &wrap).expect("unwrap should succeed");
+        assert_eq!(unwrapped, folder_key);
+    }
+
+    #[test]
+    fn key_wrap_rejects_wrong_password_and_key_material() {
+        let key_material = [11_u8; 32];
+        let folder_key = [13_u8; 32];
+        let wrap = build_wrap_record("password-a", &key_material, &folder_key, test_params())
+            .expect("build wrap");
+
+        let err = unwrap_folder_key("password-b", &key_material, &wrap)
+            .expect_err("wrong password must fail");
+        assert!(
+            err.to_string()
+                .contains("invalid vault password or key file"),
+            "unexpected error: {err}"
+        );
+
+        let err = unwrap_folder_key("password-a", &[99_u8; 32], &wrap)
+            .expect_err("wrong key file material must fail");
+        assert!(
+            err.to_string()
+                .contains("invalid vault password or key file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_encryption_roundtrip_and_integrity() {
+        let key = [3_u8; 32];
+        let plain = b"vault payload data block".to_vec();
+
+        let (encrypted, nonce) = encrypt_chunk_payload(&key, &plain).expect("encrypt");
+        assert_ne!(encrypted, plain);
+
+        let decrypted = decrypt_chunk_payload(&key, &nonce, &encrypted).expect("decrypt");
+        assert_eq!(decrypted, plain);
+
+        let mut tampered = encrypted.clone();
+        tampered[0] ^= 0x01;
+        let err =
+            decrypt_chunk_payload(&key, &nonce, &tampered).expect_err("tamper must be rejected");
+        assert!(
+            err.to_string().contains("failed to decrypt vault chunk"),
+            "unexpected error: {err}"
+        );
+    }
+}

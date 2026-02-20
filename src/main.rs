@@ -960,3 +960,79 @@ fn init_logging() -> LogHandle {
         .init();
     reload_handle
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{format_stats_report, human_bytes_signed, render_stats_table};
+    use crate::fs::VerFsStats;
+
+    fn sample_stats() -> VerFsStats {
+        VerFsStats {
+            live_logical_size_bytes: 10_000,
+            snapshots_logical_size_bytes: 2_000,
+            all_logical_size_bytes: 12_000,
+            live_referenced_uncompressed_bytes: 9_000,
+            live_referenced_compressed_bytes: 4_000,
+            live_unique_uncompressed_bytes: 8_000,
+            live_unique_compressed_bytes: 3_000,
+            stored_unique_uncompressed_bytes: 11_000,
+            stored_unique_compressed_bytes: 5_000,
+            metadata_size_bytes: 1_000,
+            data_dir_size_bytes: 7_500,
+            live_dedup_savings_bytes: 1_000,
+            cache_hits: 9,
+            cache_requests: 10,
+            cache_hit_rate: 0.9,
+            process_private_memory_bytes: 2_048,
+            process_rss_bytes: 4_096,
+            read_bytes_total: 100_000,
+            write_bytes_total: 50_000,
+            uptime_secs: 10.0,
+            read_throughput_bps: 10_000.0,
+            write_throughput_bps: 5_000.0,
+            metadata_cache_entries: 123,
+            chunk_cache_entries: 456,
+            approx_cache_memory_bytes: 8_192,
+        }
+    }
+
+    #[test]
+    fn stats_report_contains_expected_sections_and_rows() {
+        let report = format_stats_report(&sample_stats());
+        assert!(report.contains("VerFSNext Stats"));
+        assert!(report.contains("Metric"));
+        assert!(report.contains("Live Logical Size (/.snapshots excluded)"));
+        assert!(report.contains("Compression (Live Unique)"));
+        assert!(report.contains("Average Throughput"));
+        assert!(report.contains("I/O Totals"));
+    }
+
+    #[test]
+    fn stats_report_formats_negative_disk_delta() {
+        let mut stats = sample_stats();
+        stats.data_dir_size_bytes = 1_000;
+        stats.live_logical_size_bytes = 10_000;
+        let report = format_stats_report(&stats);
+        assert!(report.contains("Disk Delta (data_dir - live_logical)"));
+        assert!(report.contains("saving"));
+    }
+
+    #[test]
+    fn stats_table_renders_headers_and_borders() {
+        let rows = vec![
+            ("A".to_owned(), "1".to_owned(), "x".to_owned()),
+            ("Long Metric".to_owned(), "2".to_owned(), "y".to_owned()),
+        ];
+        let table = render_stats_table(&rows);
+        assert!(table.contains("| Metric"));
+        assert!(table.contains("| Value"));
+        assert!(table.contains("| Details"));
+        assert!(table.lines().next().unwrap_or_default().starts_with("+-"));
+    }
+
+    #[test]
+    fn signed_human_bytes_has_minus_prefix_for_negative() {
+        assert!(human_bytes_signed(-1024).starts_with('-'));
+        assert!(!human_bytes_signed(1024).starts_with('-'));
+    }
+}

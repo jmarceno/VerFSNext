@@ -417,3 +417,35 @@ fn scan_range_pairs<'a>(
 fn anyhow_errno(message_errno: Errno, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(message_errno).context(message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_snapshot_name;
+
+    #[test]
+    fn validate_snapshot_name_accepts_regular_names() {
+        for name in ["snap-01", "daily_2026_02_20", "prod.backup"] {
+            validate_snapshot_name(name).expect("valid snapshot name");
+        }
+    }
+
+    #[test]
+    fn validate_snapshot_name_rejects_empty_and_special_names() {
+        for name in ["", ".", ".."] {
+            let err = validate_snapshot_name(name).expect_err("name must be rejected");
+            assert!(
+                err.to_string().contains("snapshot name"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_snapshot_name_rejects_path_separators() {
+        let err = validate_snapshot_name("team/snap").expect_err("slash must be rejected");
+        assert!(
+            err.to_string().contains("cannot include '/'"),
+            "unexpected error: {err}"
+        );
+    }
+}

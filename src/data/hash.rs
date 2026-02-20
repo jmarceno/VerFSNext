@@ -98,4 +98,11 @@ mod tests {
             elapsed, iters, black_box_sum
         );
     }
+
+    #[test]
+    fn test_hash128_changes_when_input_changes() {
+        let h1 = hash128(b"alpha");
+        let h2 = hash128(b"beta");
+        assert_ne!(h1, h2, "Distinct inputs should not map to the same hash");
+    }
 }

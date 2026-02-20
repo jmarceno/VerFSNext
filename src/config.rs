@@ -261,3 +261,119 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Config;
+
+    fn valid_config() -> Config {
+        Config {
+            mount_point: PathBuf::from("/tmp/verfsnext-mnt"),
+            data_dir: PathBuf::from("/tmp/verfsnext-data"),
+            sync_interval_ms: 1,
+            batch_max_size_mb: 1,
+            batch_flush_interval_ms: 1,
+            metadata_cache_capacity_entries: 1,
+            chunk_cache_capacity_mb: 1,
+            pack_index_cache_capacity_entries: 1,
+            pack_max_size_mb: 1,
+            zstd_compression_level: 3,
+            ultracdc_min_size_bytes: 1024,
+            ultracdc_avg_size_bytes: 2048,
+            ultracdc_max_size_bytes: 4096,
+            fuse_max_write_bytes: 4096,
+            fuse_direct_io: false,
+            fuse_fsname: "verfsnext".to_owned(),
+            fuse_subtype: "verfsnext".to_owned(),
+            gc_idle_min_ms: 1,
+            gc_pack_rewrite_min_reclaim_bytes: 1,
+            gc_pack_rewrite_min_reclaim_percent: 25.0,
+            gc_discard_filename: ".DISCARD".to_owned(),
+            vault_enabled: true,
+            vault_argon2_mem_kib: 8192,
+            vault_argon2_iters: 1,
+            vault_argon2_parallelism: 1,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_boundary_values() {
+        let mut cfg = valid_config();
+        cfg.zstd_compression_level = -7;
+        cfg.validate().expect("zstd lower bound must be valid");
+
+        cfg.zstd_compression_level = 22;
+        cfg.validate().expect("zstd upper bound must be valid");
+
+        cfg.gc_pack_rewrite_min_reclaim_percent = 0.0;
+        cfg.validate().expect("gc lower bound must be valid");
+
+        cfg.gc_pack_rewrite_min_reclaim_percent = 100.0;
+        cfg.validate().expect("gc upper bound must be valid");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_size_relationships() {
+        let mut cfg = valid_config();
+        cfg.ultracdc_avg_size_bytes = cfg.ultracdc_min_size_bytes - 1;
+        let err = cfg.validate().expect_err("avg < min must fail");
+        assert!(
+            err.to_string()
+                .contains("ultracdc_avg_size_bytes must be >= ultracdc_min_size_bytes"),
+            "unexpected error: {err}"
+        );
+
+        let mut cfg = valid_config();
+        cfg.ultracdc_max_size_bytes = cfg.ultracdc_avg_size_bytes - 1;
+        let err = cfg.validate().expect_err("max < avg must fail");
+        assert!(
+            err.to_string()
+                .contains("ultracdc_max_size_bytes must be >= ultracdc_avg_size_bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fuse_write_out_of_range() {
+        let mut cfg = valid_config();
+        cfg.fuse_max_write_bytes = 4095;
+        let err = cfg.validate().expect_err("small fuse write must fail");
+        assert!(
+            err.to_string()
+                .contains("fuse_max_write_bytes must be >= 4096"),
+            "unexpected error: {err}"
+        );
+
+        let mut cfg = valid_config();
+        cfg.fuse_max_write_bytes = 16 * 1024 * 1024 + 1;
+        let err = cfg.validate().expect_err("large fuse write must fail");
+        assert!(
+            err.to_string()
+                .contains("fuse_max_write_bytes must be <= 16777216"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_gc_percent_and_vault_argon2_values() {
+        let mut cfg = valid_config();
+        cfg.gc_pack_rewrite_min_reclaim_percent = 100.1;
+        let err = cfg.validate().expect_err("gc percent must fail");
+        assert!(
+            err.to_string()
+                .contains("gc_pack_rewrite_min_reclaim_percent must be in range 0..=100"),
+            "unexpected error: {err}"
+        );
+
+        let mut cfg = valid_config();
+        cfg.vault_argon2_mem_kib = 8191;
+        let err = cfg.validate().expect_err("vault memory must fail");
+        assert!(
+            err.to_string()
+                .contains("vault_argon2_mem_kib must be >= 8192"),
+            "unexpected error: {err}"
+        );
+    }
+}
