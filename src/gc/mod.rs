@@ -24,14 +24,7 @@ pub struct DiscardReadResult {
 }
 
 pub fn append_records(path: &Path, records: &[DiscardRecord]) -> Result<u64> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open discard file {}", path.display()))?;
-
-    ensure_header(&mut file, path)?;
+    let mut file = open_for_append(path)?;
 
     for record in records {
         let encoded = encode_record(record)?;
@@ -131,17 +124,23 @@ pub fn rewrite_records(path: &Path, records: &[DiscardRecord]) -> Result<u64> {
 }
 
 pub fn ensure_file(path: &Path) -> Result<u64> {
+    let mut file = open_for_append(path)?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .with_context(|| format!("failed to stat discard file {}", path.display()))?;
+    Ok(len)
+}
+
+fn open_for_append(path: &Path) -> Result<std::fs::File> {
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open discard file {}", path.display()))?;
+
     ensure_header(&mut file, path)?;
-    let len = file
-        .seek(SeekFrom::End(0))
-        .with_context(|| format!("failed to stat discard file {}", path.display()))?;
-    Ok(len)
+    Ok(file)
 }
 
 fn ensure_header(file: &mut std::fs::File, path: &Path) -> Result<()> {
