@@ -57,13 +57,13 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE as u32;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE as u32;
 
-pub mod fuse;
-pub mod vault;
-pub mod inode;
 pub mod chunk;
-pub mod write;
+pub mod fuse;
 pub mod gc;
+pub mod inode;
 pub mod utils;
+pub mod vault;
+pub mod write;
 
 pub(crate) use utils::*;
 
@@ -281,46 +281,6 @@ impl FsCore {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fn collect_stats(&self) -> Result<VerFsStats> {
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
@@ -507,15 +467,6 @@ impl FsCore {
             approx_cache_memory_bytes,
         })
     }
-
-
-
-
-
-
-
-
-
 }
 
 #[async_trait]
@@ -534,33 +485,22 @@ impl SyncTarget for FsCore {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::types::ROOT_INODE;
+    use anyhow::anyhow;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
-    use anyhow::anyhow;
-    use crate::config::Config;
-    use crate::types::ROOT_INODE;
 
     fn temp_dir_manual() -> PathBuf {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let pid = std::process::id();
         let mut path = std::env::temp_dir();
         path.push(format!("verfs_bench_{}_{}", pid, t));
@@ -607,7 +547,10 @@ mod tests {
 
         let fs = VerFs::new(config).await?;
 
-        let (_ttl, attr, _gen, _fh, _) = fs.create(1000, 1000, ROOT_INODE, ROOT_INODE, "bench_file", 0o644, 0).await.map_err(|e| anyhow!("create failed: {:?}", e))?;
+        let (_ttl, attr, _gen, _fh, _) = fs
+            .create(1000, 1000, ROOT_INODE, ROOT_INODE, "bench_file", 0o644, 0)
+            .await
+            .map_err(|e| anyhow!("create failed: {:?}", e))?;
         let ino = attr.ino;
 
         let size = 50 * 1024 * 1024;
@@ -616,10 +559,15 @@ mod tests {
         let chunk_size = 1024 * 1024;
         for offset in (0..size).step_by(chunk_size) {
             let len = std::cmp::min(chunk_size, size - offset);
-            fs.write(ino, offset as i64, &data[offset..offset+len], 0).await.map_err(|e| anyhow!("write failed: {:?}", e))?;
+            fs.write(ino, offset as i64, &data[offset..offset + len], 0)
+                .await
+                .map_err(|e| anyhow!("write failed: {:?}", e))?;
         }
 
-        fs.batcher.drain().await.map_err(|e| anyhow!("drain failed: {:?}", e))?;
+        fs.batcher
+            .drain()
+            .await
+            .map_err(|e| anyhow!("drain failed: {:?}", e))?;
         fs.core.sync_cycle(true).await?;
 
         fs.core.chunk_meta_cache.invalidate_all();
@@ -630,9 +578,14 @@ mod tests {
 
         for offset in (0..size).step_by(chunk_size) {
             let len = std::cmp::min(chunk_size, size - offset);
-            fs.write(ino, offset as i64, &data[offset..offset+len], 0).await.map_err(|e| anyhow!("overwrite failed: {:?}", e))?;
+            fs.write(ino, offset as i64, &data[offset..offset + len], 0)
+                .await
+                .map_err(|e| anyhow!("overwrite failed: {:?}", e))?;
         }
-        fs.batcher.drain().await.map_err(|e| anyhow!("drain overwrite failed: {:?}", e))?;
+        fs.batcher
+            .drain()
+            .await
+            .map_err(|e| anyhow!("drain overwrite failed: {:?}", e))?;
 
         let duration = start.elapsed();
         println!("Overwrite took: {:?}", duration);

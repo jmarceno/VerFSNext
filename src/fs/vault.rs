@@ -21,7 +21,11 @@ impl FsCore {
         }
         Ok(())
     }
-    pub(crate) fn ensure_inode_vault_access(&self, inode: &InodeRecord, context: &'static str) -> Result<()> {
+    pub(crate) fn ensure_inode_vault_access(
+        &self,
+        inode: &InodeRecord,
+        context: &'static str,
+    ) -> Result<()> {
         if self.vault_locked() && FsCore::inode_is_vault(inode) {
             return Err(anyhow_errno(
                 Errno::ENOENT,
@@ -206,5 +210,4 @@ impl FsCore {
         self.chunk_data_cache.invalidate_all();
         Ok(())
     }
-
 }

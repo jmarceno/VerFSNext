@@ -144,7 +144,11 @@ impl FsCore {
         );
         Ok(())
     }
-    pub(crate) async fn truncate_file_locked(&self, ino: u64, new_size: u64) -> Result<InodeRecord> {
+    pub(crate) async fn truncate_file_locked(
+        &self,
+        ino: u64,
+        new_size: u64,
+    ) -> Result<InodeRecord> {
         let mut inode = self.load_inode_or_errno(ino, "truncate")?;
         self.ensure_inode_vault_access(&inode, "truncate")?;
         if inode.kind != INODE_KIND_FILE {
@@ -270,7 +274,6 @@ impl FsCore {
         }
         request.typ == libc::F_WRLCK as u32 || existing.typ == libc::F_WRLCK as u32
     }
-
 }
 
 #[async_trait]

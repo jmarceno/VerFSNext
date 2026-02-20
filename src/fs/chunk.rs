@@ -36,7 +36,10 @@ impl FsCore {
         self.chunk_meta_cache.insert(hash, chunk.clone());
         Ok(chunk)
     }
-    pub(crate) fn prefetch_chunk_meta(&self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Result<()> {
+    pub(crate) fn prefetch_chunk_meta(
+        &self,
+        hashes: impl IntoIterator<Item = [u8; 16]>,
+    ) -> Result<()> {
         let missing_hashes = hashes
             .into_iter()
             .filter(|h| !self.chunk_meta_cache.contains_key(h))
@@ -61,7 +64,11 @@ impl FsCore {
         }
         Ok(())
     }
-    pub(crate) fn read_extent_bytes(&self, extent: ExtentRecord, vault_encrypted: bool) -> Result<Vec<u8>> {
+    pub(crate) fn read_extent_bytes(
+        &self,
+        extent: ExtentRecord,
+        vault_encrypted: bool,
+    ) -> Result<Vec<u8>> {
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut payload = cached.as_ref().clone();
@@ -251,5 +258,4 @@ impl FsCore {
 
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &HashMap::new())
     }
-
 }

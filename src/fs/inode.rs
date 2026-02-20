@@ -19,7 +19,11 @@ impl FsCore {
             version: inode.generation,
         }
     }
-    pub(crate) fn load_inode_or_errno(&self, ino: u64, context: &'static str) -> Result<InodeRecord> {
+    pub(crate) fn load_inode_or_errno(
+        &self,
+        ino: u64,
+        context: &'static str,
+    ) -> Result<InodeRecord> {
         self.meta.get_inode(ino)?.ok_or_else(|| {
             anyhow_errno(
                 Errno::ENOENT,
@@ -272,7 +276,12 @@ impl FsCore {
         txn.set(inode_key(parent_ino), encode_rkyv(&inode)?)?;
         Ok(())
     }
-    pub(crate) fn check_access_for_mask(inode: &InodeRecord, uid: u32, gid: u32, mask: u32) -> Result<()> {
+    pub(crate) fn check_access_for_mask(
+        inode: &InodeRecord,
+        uid: u32,
+        gid: u32,
+        mask: u32,
+    ) -> Result<()> {
         let mode_bits = inode.perm as u32;
         let access_mask = mask & ((libc::R_OK | libc::W_OK | libc::X_OK) as u32);
         if access_mask == 0 {
@@ -331,5 +340,4 @@ impl FsCore {
             _ => FileType::File,
         }
     }
-
 }

@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(sflag_for_kind(INODE_KIND_DIR), SFlag::S_IFDIR);
         assert_eq!(sflag_for_kind(INODE_KIND_FILE), SFlag::S_IFREG);
         assert_eq!(sflag_for_kind(INODE_KIND_SYMLINK), SFlag::S_IFLNK);
-        
+
         // Fallback for unknown kind
         assert_eq!(sflag_for_kind(255), SFlag::S_IFREG);
     }

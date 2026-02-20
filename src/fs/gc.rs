@@ -190,7 +190,9 @@ impl FsCore {
             })
             .await
     }
-    pub(crate) fn collect_zero_ref_candidates(&self) -> Result<(Vec<ZeroRefCandidate>, Option<Vec<u8>>)> {
+    pub(crate) fn collect_zero_ref_candidates(
+        &self,
+    ) -> Result<(Vec<ZeroRefCandidate>, Option<Vec<u8>>)> {
         self.meta.read_txn(|txn| {
             let mut out = Vec::new();
             let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
@@ -230,7 +232,10 @@ impl FsCore {
             Ok((out, next_cursor))
         })
     }
-    pub(crate) async fn delete_zero_ref_candidates(&self, candidates: &[ZeroRefCandidate]) -> Result<()> {
+    pub(crate) async fn delete_zero_ref_candidates(
+        &self,
+        candidates: &[ZeroRefCandidate],
+    ) -> Result<()> {
         if candidates.is_empty() {
             return Ok(());
         }
@@ -303,5 +308,4 @@ impl FsCore {
             Ok(out)
         })
     }
-
 }
