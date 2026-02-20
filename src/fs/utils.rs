@@ -166,3 +166,18 @@ pub(crate) fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
     existing.offset = merged_start;
     existing.data = merged;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sflag_for_kind() {
+        assert_eq!(sflag_for_kind(INODE_KIND_DIR), SFlag::S_IFDIR);
+        assert_eq!(sflag_for_kind(INODE_KIND_FILE), SFlag::S_IFREG);
+        assert_eq!(sflag_for_kind(INODE_KIND_SYMLINK), SFlag::S_IFLNK);
+        
+        // Fallback for unknown kind
+        assert_eq!(sflag_for_kind(255), SFlag::S_IFREG);
+    }
+}
