@@ -1,6 +1,7 @@
 # VerFSNext
 
 ⚠️ DISCLAIMER: Althogh I've been using for my own data with no issues, this is a personal project and is not recommended for critical data. Use at your own risk.
+
 ⚠️ As of 20 Feb 2026, development and ALL tests were made on Manjaro Linux with kernel 6.12.68-1. I have no plans to support other platforms, but contributions are welcome (Just open a discussion, so we can chat and I can help).
 
 VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top of **FUSE**.
