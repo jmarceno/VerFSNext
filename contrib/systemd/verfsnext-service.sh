@@ -179,6 +179,7 @@ install_config() {
 validate_config_paths() {
   local mount_point data_dir
   local check_write_perms=1
+  local caller_user="${SUDO_USER:-${USER:-root}}"
   mount_point="$(toml_path_value mount_point "$VALIDATION_CONFIG_FILE" || true)"
   data_dir="$(toml_path_value data_dir "$VALIDATION_CONFIG_FILE" || true)"
 
@@ -189,12 +190,12 @@ validate_config_paths() {
 
   if [[ ! -d "$mount_point" ]]; then
     echo "Creating mount_point: $mount_point"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$mount_point"
+    run_cmd "${SUDO[@]}" install -d -m 0777 -o "$caller_user" "$mount_point"
   fi
 
   if [[ ! -d "$data_dir" ]]; then
     echo "Creating data_dir: $data_dir"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$data_dir"
+    run_cmd "${SUDO[@]}" install -d -m 0777 -o "$caller_user" "$data_dir"
   fi
 
   ensure_subdir_owned "$data_dir/metadata"
@@ -206,23 +207,15 @@ validate_config_paths() {
   fi
 
   if [[ $check_write_perms -eq 1 ]]; then
-    if ! can_user_write_dir "$mount_point"; then
-      echo "Adjusting ownership for mount_point: $mount_point"
-      run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$mount_point"
-    fi
-
-    if ! can_user_write_dir "$data_dir"; then
-      echo "Adjusting ownership for data_dir: $data_dir"
-      run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$data_dir"
-    fi
-
     if [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$mount_point"; then
       echo "config validation failed: $SERVICE_USER cannot write mount_point: $mount_point" >&2
+      echo "Please fix the permissions for $mount_point so that user $SERVICE_USER can write to it." >&2
       exit 1
     fi
 
     if [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$data_dir"; then
       echo "config validation failed: $SERVICE_USER cannot write data_dir: $data_dir" >&2
+      echo "Please fix the permissions for $data_dir so that user $SERVICE_USER can write to it." >&2
       exit 1
     fi
   fi
@@ -236,9 +229,15 @@ ensure_subdir_owned() {
     return 0
   fi
 
-  if ! can_user_write_dir "$dir_path"; then
-    echo "Adjusting ownership recursively for: $dir_path"
-    run_cmd "${SUDO[@]}" chown -R "$SERVICE_USER:$SERVICE_GROUP" "$dir_path"
+  local check_write_perms=1
+  if [[ $DRY_RUN -eq 1 ]] && ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    check_write_perms=0
+  fi
+
+  if [[ $check_write_perms -eq 1 ]] && [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$dir_path"; then
+    echo "config validation failed: $SERVICE_USER cannot write to $dir_path" >&2
+    echo "Please fix the permissions for $dir_path so that it is writable." >&2
+    exit 1
   fi
 }
 
