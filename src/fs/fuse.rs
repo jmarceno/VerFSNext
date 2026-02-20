@@ -91,7 +91,7 @@ impl VirtualFs for VerFs {
         FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
 
         if let Some(mode) = param.mode {
-            inode.perm = (mode & 0o7777) as u16;
+            inode.perm = (mode & MODE_PERM_MASK) as u16;
         }
         if let Some(uid) = param.u_id {
             inode.uid = uid;

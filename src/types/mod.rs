@@ -28,6 +28,25 @@ pub const PERM_VAULT_DIRECTORY: u16 = 0o700;
 pub const PERM_SYMLINK_DEFAULT: u16 = 0o777;
 pub const PERM_KEY_FILE: u32 = 0o600;
 
+/// Mask applied to a POSIX mode_t to retain only the permission bits
+/// (user/group/other rwx + setuid/setgid/sticky).  Drops the file-type
+/// nibble so that the value fits in the 16-bit `InodeRecord::perm` field.
+pub const MODE_PERM_MASK: u32 = 0o7777;
+
+/// Mask to extract a single rwx triplet (3 bits) after shifting.
+pub const PERM_TRIPLET_MASK: u32 = 0o7;
+
+// Individual bit positions within a permission triplet.
+pub const PERM_BIT_READ: u32 = 0o4;
+pub const PERM_BIT_WRITE: u32 = 0o2;
+pub const PERM_BIT_EXEC: u32 = 0o1;
+
+// Execute bits for each class, used when checking whether *any* class
+// grants execute access (root bypass path).
+pub const PERM_BIT_USER_EXEC: u32 = 0o100;
+pub const PERM_BIT_GROUP_EXEC: u32 = 0o010;
+pub const PERM_BIT_OTHER_EXEC: u32 = 0o001;
+
 pub const SNAPSHOTS_DIR_NAME: &str = ".snapshots";
 pub const VAULT_DIR_NAME: &str = ".vault";
 

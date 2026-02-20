@@ -41,8 +41,8 @@ use crate::types::{
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_INODE, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
-    VAULT_DIR_NAME,
+    KEY_PREFIX_INODE, MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE,
+    SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,

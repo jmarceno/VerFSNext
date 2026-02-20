@@ -1,5 +1,9 @@
 use super::*;
 use crate::fs::FsCore;
+use crate::types::{
+    MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
+    PERM_BIT_USER_EXEC, PERM_BIT_WRITE, PERM_TRIPLET_MASK,
+};
 
 impl FsCore {
     pub(crate) fn file_attr_from_inode(&self, inode: &InodeRecord) -> FileAttr {
@@ -150,7 +154,7 @@ impl FsCore {
             ino,
             parent,
             kind,
-            perm: (mode & 0o7777) as u16,
+            perm: (mode & MODE_PERM_MASK) as u16,
             uid,
             gid,
             nlink: if kind == INODE_KIND_DIR { 2 } else { 1 },
@@ -306,8 +310,9 @@ impl FsCore {
             if !exec_requested {
                 return Ok(());
             }
-            let any_exec =
-                (mode_bits & 0o100) != 0 || (mode_bits & 0o010) != 0 || (mode_bits & 0o001) != 0;
+            let any_exec = (mode_bits & PERM_BIT_USER_EXEC) != 0
+                || (mode_bits & PERM_BIT_GROUP_EXEC) != 0
+                || (mode_bits & PERM_BIT_OTHER_EXEC) != 0;
             if any_exec {
                 return Ok(());
             }
@@ -315,9 +320,9 @@ impl FsCore {
         }
 
         let perm_triplet = if uid == inode.uid {
-            (mode_bits >> 6) & 0o7
+            (mode_bits >> 6) & PERM_TRIPLET_MASK
         } else if gid == inode.gid {
-            (mode_bits >> 3) & 0o7
+            (mode_bits >> 3) & PERM_TRIPLET_MASK
         } else {
             let groups = self.uid_groups_cache.get_with(uid, || {
                 let mut fallback = vec![gid];
@@ -335,21 +340,21 @@ impl FsCore {
                 std::sync::Arc::new(fallback)
             });
             if groups.contains(&inode.gid) {
-                (mode_bits >> 3) & 0o7
+                (mode_bits >> 3) & PERM_TRIPLET_MASK
             } else {
-                mode_bits & 0o7
+                mode_bits & PERM_TRIPLET_MASK
             }
         };
 
         let mut required = 0_u32;
         if (access_mask & libc::R_OK as u32) != 0 {
-            required |= 0o4;
+            required |= PERM_BIT_READ;
         }
         if (access_mask & libc::W_OK as u32) != 0 {
-            required |= 0o2;
+            required |= PERM_BIT_WRITE;
         }
         if (access_mask & libc::X_OK as u32) != 0 {
-            required |= 0o1;
+            required |= PERM_BIT_EXEC;
         }
 
         if (perm_triplet & required) == required {
