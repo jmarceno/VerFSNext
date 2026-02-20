@@ -41,7 +41,8 @@ use crate::types::{
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_INODE, ROOT_INODE, SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
+    KEY_PREFIX_INODE, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -385,7 +386,7 @@ impl FsCore {
                     ino: vault_ino,
                     parent: ROOT_INODE,
                     kind: INODE_KIND_DIR,
-                    perm: 0o700,
+                    perm: PERM_VAULT_DIRECTORY,
                     uid: root_inode.uid,
                     gid: root_inode.gid,
                     nlink: 2,
@@ -2227,7 +2228,7 @@ impl VirtualFs for VerFs {
                     parent,
                     name,
                     INODE_KIND_SYMLINK,
-                    0o777,
+                    PERM_SYMLINK_DEFAULT as u32,
                     uid,
                     gid,
                 )?;

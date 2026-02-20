@@ -11,6 +11,8 @@ use rand::RngCore;
 use rkyv::{Archive, Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::types::PERM_KEY_FILE;
+
 pub const KEY_FILE_NAME: &str = "verfsnext.vault.key";
 pub const SYS_VAULT_STATE: &str = "vault.state";
 pub const SYS_VAULT_WRAP: &str = "vault.wrap";
@@ -125,7 +127,7 @@ pub fn write_key_file(path: &Path, material: &[u8; 32]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
+        let perms = std::fs::Permissions::from_mode(PERM_KEY_FILE);
         std::fs::set_permissions(path, perms)
             .with_context(|| format!("failed to set key file permissions {}", path.display()))?;
     }

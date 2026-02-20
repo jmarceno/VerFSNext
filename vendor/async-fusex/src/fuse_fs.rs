@@ -26,7 +26,10 @@ pub struct FuseFs {
 
 impl FuseFs {
     pub fn new(virtual_fs: Arc<dyn VirtualFs>) -> Self {
-        Self { virtual_fs, direct_io: false }
+        Self {
+            virtual_fs,
+            direct_io: false,
+        }
     }
 
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
