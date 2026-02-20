@@ -154,7 +154,6 @@ impl FsCore {
         let ready = tokio::task::spawn_blocking(move || compress_parallel(pending, zstd_level))
             .await
             .map_err(|e| anyhow!("compression task failed: {}", e))??;
-
         let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
             let (payload, disk_compressed_len, nonce, flags) = if encrypt_for_vault {
