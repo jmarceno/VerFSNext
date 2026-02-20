@@ -1,9 +1,8 @@
 # AGENTS.md - VerFS3
 
-[YOU SHOULD NEVER, FOR ANY REASON ADD BACKWARD COMPATIBILITY TO ANYTHING IF YOU
-WHERE NOT EXPLICITLY ASKED FOR. **ALL CHANGES ARE BREAKING** AND **WE DO NOT CARE ABOUT THOSE LEFT BEHIND**, THEY SHOULD NOT EVEN BE MENTIONED. THIS RULE IS SACRED AND UNBREAKABLE.]
-
-This is an unreleased, all the code need to be cannonical.
+# IMPORTANT NOTICE ABOUT COMPATIBILITY
+We are now in production and any change that breaks compatibility with previous versions must provide a one time migration path.
+This migration path must be documented in the migration guide and must be run automatically when the system starts, its code must be as separate as possible from the main code, compartamentalized and easy to remove after we discontinue support for the previous version.
 
 ## Main Priorities (in order of importance)
 1. Never lose data
