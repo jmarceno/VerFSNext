@@ -1412,7 +1412,9 @@ impl VirtualFs for VerFs {
         if mask == libc::F_OK as u32 {
             return Ok(());
         }
-        FsCore::check_access_for_mask(&inode, uid, gid, mask).map_err(map_anyhow_to_fuse)
+        self.core
+            .check_access_for_mask(&inode, uid, gid, mask)
+            .map_err(map_anyhow_to_fuse)
     }
 
     async fn getlk(

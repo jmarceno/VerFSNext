@@ -194,10 +194,15 @@ mod tests {
 #[tokio::test]
 async fn bench_scan_range_pairs_baseline() -> Result<()> {
     // Basic setup to allow us to measure the baseline
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let db_path = std::env::temp_dir().join(format!("verfs_bench_scan_{}", t));
-    let tree = surrealkv::TreeBuilder::new().with_path(db_path.clone()).build()?;
-    
+    let tree = surrealkv::TreeBuilder::new()
+        .with_path(db_path.clone())
+        .build()?;
+
     let mut txn = tree.begin()?;
     for i in 0..10_000u32 {
         let key = format!("KEY_{:08}", i).into_bytes();
@@ -205,13 +210,14 @@ async fn bench_scan_range_pairs_baseline() -> Result<()> {
         txn.set(key, val)?;
     }
     txn.commit().await?;
-    
+
     let txn = tree.begin_with_mode(surrealkv::Mode::ReadOnly)?;
     let start_time = std::time::Instant::now();
-    let res = scan_range_pairs(&txn, b"KEY_".to_vec(), b"KEY_a".to_vec())?.collect::<Result<Vec<_>>>()?;
+    let res =
+        scan_range_pairs(&txn, b"KEY_".to_vec(), b"KEY_a".to_vec())?.collect::<Result<Vec<_>>>()?;
     println!("scan_range_pairs took: {:?}", start_time.elapsed());
     assert_eq!(res.len(), 10000);
-    
+
     std::fs::remove_dir_all(&db_path)?;
     Ok(())
 }

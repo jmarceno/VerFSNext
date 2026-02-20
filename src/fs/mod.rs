@@ -125,6 +125,7 @@ struct FsCore {
     packs: PackStore,
     chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
     chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
+    uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
     next_handle: AtomicU64,
     last_persisted_active_pack_id: AtomicU64,
     dedup_hits: AtomicU64,
@@ -179,6 +180,10 @@ impl VerFs {
             chunk_data_cache: Cache::builder()
                 .max_capacity(config.chunk_cache_capacity_mb.saturating_mul(1024 * 1024))
                 .weigher(|_k, v: &Arc<Vec<u8>>| v.capacity() as u32)
+                .build(),
+            uid_groups_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(60))
                 .build(),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),

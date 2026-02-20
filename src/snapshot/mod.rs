@@ -324,7 +324,8 @@ fn remove_snapshot_subtree(
 
     let xattr_prefix_bytes = xattr_prefix(ino);
     let xattr_end = prefix_end(&xattr_prefix_bytes);
-    let pairs = scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
+    let pairs =
+        scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
     for (key, _) in pairs {
         txn.delete(key)?;
     }

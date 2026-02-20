@@ -40,17 +40,17 @@ impl UltraStreamChunker {
 
         while !self.carry.is_empty() {
             let skip_len = self.scanned_len.max(self.sizes.min);
-            
+
             let mut sizes = self.sizes;
             sizes.min = skip_len;
 
             let mut chunker = ultra::Chunker::new(&self.carry, sizes);
             let Some(chunk) = chunker.next() else {
-                break; 
+                break;
             };
 
             if chunk.pos + chunk.len == self.carry.len() && !finalize {
-                self.scanned_len = self.carry.len().saturating_sub(8); 
+                self.scanned_len = self.carry.len().saturating_sub(8);
                 break;
             }
 
@@ -61,7 +61,7 @@ impl UltraStreamChunker {
 
             self.carry.drain(..chunk.len);
             self.consumed_prefix += chunk.len;
-            self.scanned_len = 0; 
+            self.scanned_len = 0;
         }
 
         if finalize {
@@ -95,10 +95,10 @@ mod tests {
     fn benchmark_streaming_chunker_baseline() {
         use std::time::Instant;
         let mut streaming = UltraStreamChunker::new(1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024);
-        
+
         let chunk_size = 4096; // Feed 4KB at a time (like a slow disk or stream)
         let total_size = 64 * 1024 * 1024; // 64 MB total
-        
+
         // Generate pseudo-random data to prevent extreme early match patterns
         // but keep it fast to generate.
         let mut data = vec![0_u8; total_size];
@@ -112,9 +112,12 @@ mod tests {
             spans.extend(streaming.feed(part));
         }
         spans.extend(streaming.finish());
-        
+
         let duration = start.elapsed();
-        println!("baseline_benchmark: Chunking 64MB (4KB feeds, 4MB avg chunks) took: {:?}", duration);
+        println!(
+            "baseline_benchmark: Chunking 64MB (4KB feeds, 4MB avg chunks) took: {:?}",
+            duration
+        );
         assert!(!spans.is_empty());
     }
 }

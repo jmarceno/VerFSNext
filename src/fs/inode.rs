@@ -207,7 +207,8 @@ impl FsCore {
 
         let xattr_prefix_bytes = xattr_prefix(inode.ino);
         let xattr_end = prefix_end(&xattr_prefix_bytes);
-        let pairs = scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
+        let pairs =
+            scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
         for (key, _) in pairs {
             txn.delete(key)?;
         }
@@ -279,6 +280,7 @@ impl FsCore {
         Ok(())
     }
     pub(crate) fn check_access_for_mask(
+        &self,
         inode: &InodeRecord,
         uid: u32,
         gid: u32,
@@ -308,7 +310,26 @@ impl FsCore {
         } else if gid == inode.gid {
             (mode_bits >> 3) & 0o7
         } else {
-            mode_bits & 0o7
+            let groups = self.uid_groups_cache.get_with(uid, || {
+                let mut fallback = vec![gid];
+                if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                {
+                    if let Ok(cname) = std::ffi::CString::new(user.name) {
+                        if let Ok(sups) = nix::unistd::getgrouplist(
+                            cname.as_c_str(),
+                            nix::unistd::Gid::from_raw(gid),
+                        ) {
+                            fallback.extend(sups.into_iter().map(|g| g.as_raw()));
+                        }
+                    }
+                }
+                std::sync::Arc::new(fallback)
+            });
+            if groups.contains(&inode.gid) {
+                (mode_bits >> 3) & 0o7
+            } else {
+                mode_bits & 0o7
+            }
         };
 
         let mut required = 0_u32;
