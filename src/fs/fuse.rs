@@ -21,17 +21,7 @@ impl VirtualFs for VerFs {
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
         let parent_inode = self
             .core
-            .meta
-            .get_inode(parent)
-            .map_err(map_anyhow_to_fuse)?
-            .ok_or_else(|| {
-                AsyncFusexError::from(anyhow_errno(
-                    Errno::ENOENT,
-                    format!("lookup: inode {} not found", parent),
-                ))
-            })?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "lookup")
+            .load_inode_with_vault_access(parent, "lookup")
             .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(parent, name)
@@ -57,17 +47,7 @@ impl VirtualFs for VerFs {
 
         let inode = self
             .core
-            .meta
-            .get_inode(ino)
-            .map_err(map_anyhow_to_fuse)?
-            .ok_or_else(|| {
-                AsyncFusexError::from(anyhow_errno(
-                    Errno::ENOENT,
-                    format!("lookup: inode {} not found", ino),
-                ))
-            })?;
-        self.core
-            .ensure_inode_vault_access(&inode, "lookup")
+            .load_inode_with_vault_access(ino, "lookup")
             .map_err(map_anyhow_to_fuse)?;
 
         let attr = self.core.file_attr_from_inode(&inode);
@@ -79,14 +59,7 @@ impl VirtualFs for VerFs {
     async fn getattr(&self, ino: u64) -> AsyncFusexResult<(Duration, FileAttr)> {
         let inode = self
             .core
-            .meta
-            .get_inode(ino)
-            .map_err(map_anyhow_to_fuse)?
-            .ok_or_else(|| {
-                AsyncFusexError::from(anyhow_errno(Errno::ENOENT, "getattr: inode not found"))
-            })?;
-        self.core
-            .ensure_inode_vault_access(&inode, "getattr")
+            .load_inode_with_vault_access(ino, "getattr")
             .map_err(map_anyhow_to_fuse)?;
 
         Ok((ATTR_TTL, self.core.file_attr_from_inode(&inode)))
@@ -101,18 +74,20 @@ impl VirtualFs for VerFs {
     ) -> AsyncFusexResult<(Duration, FileAttr)> {
         let _guard = self.core.write_lock.lock().await;
         let mut inode = if let Some(size) = param.size {
-            self.core
+            let inode = self
+                .core
                 .truncate_file_locked(ino, size)
                 .await
-                .map_err(map_anyhow_to_fuse)?
+                .map_err(map_anyhow_to_fuse)?;
+            self.core
+                .ensure_inode_vault_access(&inode, "setattr")
+                .map_err(map_anyhow_to_fuse)?;
+            inode
         } else {
             self.core
-                .load_inode_or_errno(ino, "setattr")
+                .load_inode_with_vault_access(ino, "setattr")
                 .map_err(map_anyhow_to_fuse)?
         };
-        self.core
-            .ensure_inode_vault_access(&inode, "setattr")
-            .map_err(map_anyhow_to_fuse)?;
         FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
 
         if let Some(mode) = param.mode {
@@ -156,10 +131,7 @@ impl VirtualFs for VerFs {
     async fn readlink(&self, ino: u64) -> AsyncFusexResult<Vec<u8>> {
         let inode = self
             .core
-            .load_inode_or_errno(ino, "readlink")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "readlink")
+            .load_inode_with_vault_access(ino, "readlink")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_SYMLINK {
             return build_error_result_from_errno(
@@ -183,12 +155,9 @@ impl VirtualFs for VerFs {
     }
 
     async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(param.parent, "mknod")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "mknod")
+            .load_inode_with_vault_access(param.parent, "mknod")
             .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
@@ -230,12 +199,9 @@ impl VirtualFs for VerFs {
     }
 
     async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(param.parent, "mkdir")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "mkdir")
+            .load_inode_with_vault_access(param.parent, "mkdir")
             .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
@@ -274,12 +240,9 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(parent, "unlink")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "unlink")
+            .load_inode_with_vault_access(parent, "unlink")
             .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
 
@@ -323,12 +286,9 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(parent, dir_name)
             .map_err(map_anyhow_to_fuse)?;
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(parent, "rmdir")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "rmdir")
+            .load_inode_with_vault_access(parent, "rmdir")
             .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
 
@@ -387,12 +347,9 @@ impl VirtualFs for VerFs {
         name: &str,
         target_path: &Path,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(parent, "symlink")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "symlink")
+            .load_inode_with_vault_access(parent, "symlink")
             .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(parent, name)
@@ -447,17 +404,11 @@ impl VirtualFs for VerFs {
         }
         let old_parent_inode = self
             .core
-            .load_inode_or_errno(param.old_parent, "rename")
+            .load_inode_with_vault_access(param.old_parent, "rename")
             .map_err(map_anyhow_to_fuse)?;
         let new_parent_inode = self
             .core
-            .load_inode_or_errno(param.new_parent, "rename")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&old_parent_inode, "rename")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&new_parent_inode, "rename")
+            .load_inode_with_vault_access(param.new_parent, "rename")
             .map_err(map_anyhow_to_fuse)?;
         if FsCore::inode_is_vault(&old_parent_inode) != FsCore::inode_is_vault(&new_parent_inode) {
             return build_error_result_from_errno(
@@ -655,10 +606,7 @@ impl VirtualFs for VerFs {
     async fn open(&self, _uid: u32, _gid: u32, ino: u64, flags: u32) -> AsyncFusexResult<u64> {
         let inode = self
             .core
-            .load_inode_or_errno(ino, "open")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "open")
+            .load_inode_with_vault_access(ino, "open")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind == INODE_KIND_DIR {
             return build_error_result_from_errno(
@@ -689,10 +637,7 @@ impl VirtualFs for VerFs {
         self.core.mark_activity();
         let inode = self
             .core
-            .load_inode_or_errno(ino, "read")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "read")
+            .load_inode_with_vault_access(ino, "read")
             .map_err(map_anyhow_to_fuse)?;
 
         if inode.kind != INODE_KIND_FILE {
@@ -845,12 +790,9 @@ impl VirtualFs for VerFs {
 
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
         self.core.mark_activity();
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "write")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "write")
+            .load_inode_with_vault_access(ino, "write")
             .map_err(map_anyhow_to_fuse)?;
         if offset < 0 {
             return build_error_result_from_errno(
@@ -908,12 +850,9 @@ impl VirtualFs for VerFs {
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
         self.core.mark_activity();
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(_ino, "fsync")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "fsync")
+            .load_inode_with_vault_access(_ino, "fsync")
             .map_err(map_anyhow_to_fuse)?;
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
@@ -925,10 +864,7 @@ impl VirtualFs for VerFs {
     async fn opendir(&self, _uid: u32, _gid: u32, ino: u64, _flags: u32) -> AsyncFusexResult<u64> {
         let inode = self
             .core
-            .load_inode_or_errno(ino, "opendir")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "opendir")
+            .load_inode_with_vault_access(ino, "opendir")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_DIR {
             return build_error_result_from_errno(
@@ -949,10 +885,7 @@ impl VirtualFs for VerFs {
     ) -> AsyncFusexResult<Vec<DirEntry>> {
         let inode = self
             .core
-            .load_inode_or_errno(ino, "readdir")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "readdir")
+            .load_inode_with_vault_access(ino, "readdir")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_DIR {
             return build_error_result_from_errno(
@@ -1005,12 +938,9 @@ impl VirtualFs for VerFs {
 
     async fn fsyncdir(&self, _ino: u64, _fh: u64, datasync: bool) -> AsyncFusexResult<()> {
         self.core.mark_activity();
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(_ino, "fsyncdir")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "fsyncdir")
+            .load_inode_with_vault_access(_ino, "fsyncdir")
             .map_err(map_anyhow_to_fuse)?;
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
         self.core
@@ -1046,12 +976,9 @@ impl VirtualFs for VerFs {
         mode: u32,
         _flags: u32,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64, u64, u32)> {
-        let parent_inode = self
+        let _parent_inode = self
             .core
-            .load_inode_or_errno(parent, "create")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "create")
+            .load_inode_with_vault_access(parent, "create")
             .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(parent, name)
@@ -1100,17 +1027,11 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
         let target_inode = self
             .core
-            .load_inode_or_errno(ino, "link")
+            .load_inode_with_vault_access(ino, "link")
             .map_err(map_anyhow_to_fuse)?;
         let parent_inode = self
             .core
-            .load_inode_or_errno(newparent, "link")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&target_inode, "link")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&parent_inode, "link")
+            .load_inode_with_vault_access(newparent, "link")
             .map_err(map_anyhow_to_fuse)?;
         if FsCore::inode_is_vault(&target_inode) != FsCore::inode_is_vault(&parent_inode) {
             return build_error_result_from_errno(
@@ -1202,12 +1123,9 @@ impl VirtualFs for VerFs {
         flags: u32,
         position: u32,
     ) -> AsyncFusexResult<()> {
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "setxattr")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "setxattr")
+            .load_inode_with_vault_access(ino, "setxattr")
             .map_err(map_anyhow_to_fuse)?;
         if position != 0 {
             return build_error_result_from_errno(
@@ -1269,12 +1187,9 @@ impl VirtualFs for VerFs {
     }
 
     async fn getxattr(&self, ino: u64, name: &str, size: u32) -> AsyncFusexResult<Vec<u8>> {
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "getxattr")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "getxattr")
+            .load_inode_with_vault_access(ino, "getxattr")
             .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
         let value = self
@@ -1307,12 +1222,9 @@ impl VirtualFs for VerFs {
     }
 
     async fn listxattr(&self, ino: u64, size: u32) -> AsyncFusexResult<Vec<u8>> {
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "listxattr")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "listxattr")
+            .load_inode_with_vault_access(ino, "listxattr")
             .map_err(map_anyhow_to_fuse)?;
         let mut buffer = self
             .core
@@ -1360,12 +1272,9 @@ impl VirtualFs for VerFs {
     }
 
     async fn removexattr(&self, ino: u64, name: &str) -> AsyncFusexResult<()> {
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "removexattr")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "removexattr")
+            .load_inode_with_vault_access(ino, "removexattr")
             .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.lock().await;
@@ -1404,10 +1313,7 @@ impl VirtualFs for VerFs {
     async fn access(&self, uid: u32, gid: u32, ino: u64, mask: u32) -> AsyncFusexResult<()> {
         let inode = self
             .core
-            .load_inode_or_errno(ino, "access")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "access")
+            .load_inode_with_vault_access(ino, "access")
             .map_err(map_anyhow_to_fuse)?;
         if mask == libc::F_OK as u32 {
             return Ok(());
@@ -1427,12 +1333,9 @@ impl VirtualFs for VerFs {
         if !FsCore::lock_type_valid(lk_param.typ) {
             return build_error_result_from_errno(Errno::EINVAL, "invalid lock type".to_owned());
         }
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "getlk")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "getlk")
+            .load_inode_with_vault_access(ino, "getlk")
             .map_err(map_anyhow_to_fuse)?;
 
         let request = FileLockState {
@@ -1480,12 +1383,9 @@ impl VirtualFs for VerFs {
         if !FsCore::lock_type_valid(lk_param.typ) {
             return build_error_result_from_errno(Errno::EINVAL, "invalid lock type".to_owned());
         }
-        let inode = self
+        let _inode = self
             .core
-            .load_inode_or_errno(ino, "setlk")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "setlk")
+            .load_inode_with_vault_access(ino, "setlk")
             .map_err(map_anyhow_to_fuse)?;
 
         let request = FileLockState {
@@ -1543,10 +1443,7 @@ impl VirtualFs for VerFs {
         }
         let inode = self
             .core
-            .load_inode_or_errno(ino, "bmap")
-            .map_err(map_anyhow_to_fuse)?;
-        self.core
-            .ensure_inode_vault_access(&inode, "bmap")
+            .load_inode_with_vault_access(ino, "bmap")
             .map_err(map_anyhow_to_fuse)?;
         if inode.kind != INODE_KIND_FILE {
             return build_error_result_from_errno(

@@ -31,6 +31,15 @@ impl FsCore {
             )
         })
     }
+    pub(crate) fn load_inode_with_vault_access(
+        &self,
+        ino: u64,
+        context: &'static str,
+    ) -> Result<InodeRecord> {
+        let inode = self.load_inode_or_errno(ino, context)?;
+        self.ensure_inode_vault_access(&inode, context)?;
+        Ok(inode)
+    }
     pub(crate) fn lookup_dirent(&self, parent: u64, name: &str) -> Result<Option<DirentRecord>> {
         self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(dirent_key(parent, name.as_bytes()))? else {
