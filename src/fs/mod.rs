@@ -272,8 +272,11 @@ impl VerFs {
         self.core.lock_vault().await
     }
 
-    pub fn collect_stats(&self) -> Result<VerFsStats> {
-        self.core.collect_stats()
+    pub async fn collect_stats(&self) -> Result<VerFsStats> {
+        let core = Arc::clone(&self.core);
+        tokio::task::spawn_blocking(move || core.collect_stats())
+            .await
+            .unwrap_or_else(|e| Err(anyhow!("stats task panicked: {:?}", e)))
     }
 
     pub fn is_gc_in_progress(&self) -> bool {

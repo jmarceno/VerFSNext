@@ -465,7 +465,7 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
                 error: err.to_string(),
             },
         },
-        ControlRequest::Stats => match fs.collect_stats() {
+        ControlRequest::Stats => match fs.collect_stats().await {
             Ok(stats) => ControlResponse {
                 ok: true,
                 names: Vec::new(),
