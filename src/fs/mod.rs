@@ -298,7 +298,8 @@ impl FsCore {
             let mut all_logical_size_bytes = 0_u64;
             let inode_prefix = vec![KEY_PREFIX_INODE];
             let inode_end = prefix_end(&inode_prefix);
-            for (_, value) in scan_range_pairs(txn, inode_prefix, inode_end)? {
+            for pair in scan_range_pairs(txn, inode_prefix, inode_end)? {
+                let (_, value) = pair?;
                 let inode: InodeRecord = decode_rkyv(&value)?;
                 if inode.kind == INODE_KIND_FILE {
                     all_logical_size_bytes = all_logical_size_bytes.saturating_add(inode.size);
@@ -314,7 +315,8 @@ impl FsCore {
             while let Some(dir_ino) = live_dir_stack.pop() {
                 let prefix = dirent_prefix(dir_ino);
                 let end = prefix_end(&prefix);
-                for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                for pair in scan_range_pairs(txn, prefix, end)? {
+                    let (key, value) = pair?;
                     let Some(name) = decode_dirent_name(&key) else {
                         continue;
                     };
@@ -337,7 +339,8 @@ impl FsCore {
                                 live_logical_size_bytes.saturating_add(child.size);
                             let ext_prefix = extent_prefix(child.ino);
                             let ext_end = prefix_end(&ext_prefix);
-                            for (_, ext_value) in scan_range_pairs(txn, ext_prefix, ext_end)? {
+                            for pair in scan_range_pairs(txn, ext_prefix, ext_end)? {
+                                let (_, ext_value) = pair?;
                                 let extent: ExtentRecord = decode_rkyv(&ext_value)?;
                                 let counter =
                                     live_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
@@ -361,7 +364,8 @@ impl FsCore {
 
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
             let chunk_end = prefix_end(&chunk_prefix);
-            for (key, value) in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
+            for pair in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
+                let (key, value) = pair?;
                 if key.len() != 17 {
                     continue;
                 }

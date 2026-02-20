@@ -184,7 +184,8 @@ impl FsCore {
                 let prefix = extent_prefix(ino);
                 let end = prefix_end(&prefix);
                 let mut out = Vec::<(u64, [u8; 16], Vec<u8>)>::new();
-                for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                for pair in scan_range_pairs(txn, prefix, end)? {
+                    let (key, value) = pair?;
                     let Some(block_idx) = FsCore::extent_block_idx_from_key(&key) else {
                         continue;
                     };

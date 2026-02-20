@@ -293,7 +293,8 @@ impl FsCore {
             let mut out = HashSet::new();
             let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
             let end = prefix_end(&prefix);
-            for (key, value) in scan_range_pairs(txn, prefix, end)? {
+            for pair in scan_range_pairs(txn, prefix, end)? {
+                let (key, value) = pair?;
                 if key.len() != 17 {
                     continue;
                 }

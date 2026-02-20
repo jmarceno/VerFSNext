@@ -28,7 +28,8 @@ impl<'a> SnapshotManager<'a> {
             let prefix = snapshot_prefix();
             let end = prefix_end(&prefix);
             let mut names = Vec::new();
-            for (key, _) in scan_range_pairs(txn, prefix, end)? {
+            for pair in scan_range_pairs(txn, prefix, end)? {
+                let (key, _) = pair?;
                 let Some(raw_name) = decode_snapshot_name(&key) else {
                     continue;
                 };
@@ -263,7 +264,8 @@ fn list_dirents(
     let mut out = Vec::new();
     let prefix = dirent_prefix(dir_ino);
     let end = prefix_end(&prefix);
-    for (key, value) in scan_range_pairs(txn, prefix, end)? {
+    for pair in scan_range_pairs(txn, prefix, end)? {
+        let (key, value) = pair?;
         let Some(name_bytes) = decode_dirent_name(&key) else {
             continue;
         };
@@ -276,7 +278,7 @@ fn list_dirents(
 fn clone_xattrs(txn: &mut surrealkv::Transaction, src_ino: u64, dst_ino: u64) -> Result<()> {
     let prefix = xattr_prefix(src_ino);
     let end = prefix_end(&prefix);
-    let pairs = scan_range_pairs(txn, prefix, end)?;
+    let pairs = scan_range_pairs(txn, prefix, end)?.collect::<Result<Vec<_>>>()?;
     for (key, value) in pairs {
         let Some(name) = crate::types::decode_xattr_name(&key) else {
             continue;
@@ -294,7 +296,8 @@ fn clone_file_extents(
 ) -> Result<()> {
     let prefix = extent_prefix(src_ino);
     let end = prefix_end(&prefix);
-    for (key, value) in scan_range_pairs(txn, prefix, end)? {
+    let pairs = scan_range_pairs(txn, prefix, end)?.collect::<Result<Vec<_>>>()?;
+    for (key, value) in pairs {
         let mut dst_key = extent_prefix(dst_ino);
         dst_key.extend_from_slice(&key[9..]);
         txn.set(dst_key, value.clone())?;
@@ -321,7 +324,8 @@ fn remove_snapshot_subtree(
 
     let xattr_prefix_bytes = xattr_prefix(ino);
     let xattr_end = prefix_end(&xattr_prefix_bytes);
-    for (key, _) in scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)? {
+    let pairs = scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
+    for (key, _) in pairs {
         txn.delete(key)?;
     }
 
@@ -329,7 +333,8 @@ fn remove_snapshot_subtree(
         INODE_KIND_FILE => {
             let ext_prefix = extent_prefix(ino);
             let ext_end = prefix_end(&ext_prefix);
-            for (key, value) in scan_range_pairs(txn, ext_prefix, ext_end)? {
+            let pairs = scan_range_pairs(txn, ext_prefix, ext_end)?.collect::<Result<Vec<_>>>()?;
+            for (key, value) in pairs {
                 let extent: ExtentRecord = decode_rkyv(&value)?;
                 *ref_deltas.entry(extent.chunk_hash).or_insert(0) -= 1;
                 txn.delete(key)?;
@@ -384,19 +389,28 @@ fn apply_ref_deltas_in_txn(
     Ok(())
 }
 
-fn scan_range_pairs(
-    txn: &surrealkv::Transaction,
+fn scan_range_pairs<'a>(
+    txn: &'a surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut out = Vec::new();
+) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {
     let mut iter = txn.range(start, end)?;
     let mut valid = iter.seek_first()?;
-    while valid {
-        out.push((iter.key().user_key().to_vec(), iter.value()?));
-        valid = iter.next()?;
-    }
-    Ok(out)
+    Ok(std::iter::from_fn(move || {
+        if !valid {
+            return None;
+        }
+        let key = iter.key().user_key().to_vec();
+        let value = match iter.value() {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e.into())),
+        };
+        valid = match iter.next() {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e.into())),
+        };
+        Some(Ok((key, value)))
+    }))
 }
 
 fn anyhow_errno(message_errno: Errno, message: impl Into<String>) -> anyhow::Error {

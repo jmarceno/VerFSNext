@@ -194,7 +194,8 @@ impl FsCore {
         let extent_end = prefix_end(&extent_prefix_bytes);
         let mut extent_keys = Vec::new();
         let mut hashes = Vec::new();
-        for (key, value) in scan_range_pairs(txn, extent_prefix_bytes, extent_end)? {
+        for pair in scan_range_pairs(txn, extent_prefix_bytes, extent_end)? {
+            let (key, value) = pair?;
             let extent: ExtentRecord = decode_rkyv(&value)?;
             extent_keys.push(key);
             hashes.push(extent.chunk_hash);
@@ -206,7 +207,8 @@ impl FsCore {
 
         let xattr_prefix_bytes = xattr_prefix(inode.ino);
         let xattr_end = prefix_end(&xattr_prefix_bytes);
-        for (key, _) in scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)? {
+        let pairs = scan_range_pairs(txn, xattr_prefix_bytes, xattr_end)?.collect::<Result<Vec<_>>>()?;
+        for (key, _) in pairs {
             txn.delete(key)?;
         }
 

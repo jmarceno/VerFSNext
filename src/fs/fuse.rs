@@ -972,7 +972,8 @@ impl VirtualFs for VerFs {
                 let prefix = dirent_prefix(ino);
                 let end = prefix_end(&prefix);
                 let mut out = Vec::new();
-                for (key, value) in scan_range_pairs(txn, prefix, end)? {
+                for pair in scan_range_pairs(txn, prefix, end)? {
+                    let (key, value) = pair?;
                     let Some(name_bytes) = decode_dirent_name(&key) else {
                         continue;
                     };
@@ -1327,7 +1328,8 @@ impl VirtualFs for VerFs {
                 let prefix = xattr_prefix(ino);
                 let end = prefix_end(&prefix);
                 let mut names = Vec::<Vec<u8>>::new();
-                for (key, _) in scan_range_pairs(txn, prefix, end)? {
+                for pair in scan_range_pairs(txn, prefix, end)? {
+                    let (key, _) = pair?;
                     let Some(name) = decode_xattr_name(&key) else {
                         continue;
                     };
