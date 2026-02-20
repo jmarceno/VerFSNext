@@ -1,0 +1,17 @@
+[Unit]
+Description=VerFSNext FUSE Filesystem
+After=local-fs.target
+
+[Service]
+Type=simple
+User=verfs
+Group=verfs
+WorkingDirectory=/etc/verfsnext
+ExecStart=/usr/local/bin/verfsnext
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=3000
+
+[Install]
+WantedBy=multi-user.target

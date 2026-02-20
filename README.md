@@ -1,5 +1,8 @@
 # VerFSNext
 
+⚠️ DISCLAIMER: Althogh I've been using for my own data with no issues, this is a personal project and is not recommended for critical data. Use at your own risk.
+⚠️ As of 20 Feb 2026, development and ALL tests were made on Manjaro Linux with kernel 6.12.68-1. I have no plans to support other platforms, but contributions are welcome (Just open a discussion, so we can chat and I can help).
+
 VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top of **FUSE**.
 
 ## ✨ Features
@@ -109,6 +112,39 @@ After unlock `.vault` becomes visible and accessible for normal file operations.
 After lock:
 - `/.vault` disappears from directory listings
 - Direct access to `/.vault/*` fails until next unlock
+
+## Run As A Systemd Service
+
+1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start):
+   ```bash
+   ./contrib/systemd/verfsnext-service.sh install
+   ```
+   The installer also adds the invoking user to group `verfs` for metadata directory inspection (`newgrp verfs` or re-login required).
+
+2. If already installed, update only the executable:
+   ```bash
+   ./contrib/systemd/verfsnext-service.sh update-bin
+   ```
+
+3. Preview actions without changing the system:
+   ```bash
+   ./contrib/systemd/verfsnext-service.sh --dry-run install
+   ```
+
+4. Useful commands:
+   ```bash
+   sudo systemctl status verfsnext
+   sudo journalctl -u verfsnext -f
+   sudo systemctl restart verfsnext
+   sudo systemctl stop verfsnext
+   ```
+
+5. Uninstall service artifacts (keeps `data_dir` untouched):
+   ```bash
+   ./contrib/systemd/verfsnext-uninstall.sh
+   ```
+
+If startup fails with FUSE permission errors, verify `/dev/fuse` access and that the `fuse` group exists.
 
 # FAQ
 
