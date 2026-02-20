@@ -557,19 +557,33 @@ impl FsCore {
         Ok(chunk)
     }
 
-    fn read_block_bytes(&self, ino: u64, block_idx: u64, vault_encrypted: bool) -> Result<Vec<u8>> {
-        let maybe_extent = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(extent_key(ino, block_idx))? else {
-                return Ok(None);
-            };
-            let extent: ExtentRecord = decode_rkyv(&raw)?;
-            Ok(Some(extent))
-        })?;
+    fn prefetch_chunk_meta(&self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Result<()> {
+        let missing_hashes = hashes
+            .into_iter()
+            .filter(|h| !self.chunk_meta_cache.contains_key(h))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
 
-        let Some(extent) = maybe_extent else {
-            return Ok(vec![0_u8; BLOCK_SIZE]);
-        };
+        if !missing_hashes.is_empty() {
+            let chunks = self.meta.read_txn(|txn| {
+                let mut chunks = Vec::new();
+                for hash in &missing_hashes {
+                    if let Some(raw) = txn.get(chunk_key(hash))? {
+                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                        chunks.push((*hash, chunk));
+                    }
+                }
+                Ok(chunks)
+            })?;
+            for (hash, chunk) in chunks {
+                self.chunk_meta_cache.insert(hash, chunk);
+            }
+        }
+        Ok(())
+    }
 
+    fn read_extent_bytes(&self, extent: ExtentRecord, vault_encrypted: bool) -> Result<Vec<u8>> {
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut payload = cached.as_ref().clone();
@@ -624,6 +638,7 @@ impl FsCore {
         }
         Ok(payload)
     }
+
 
     fn stage_chunk_if_missing(
         &self,
@@ -963,10 +978,14 @@ impl FsCore {
                 Ok(out)
             })?;
 
+            self.prefetch_chunk_meta(extents.iter().map(|(_, hash, _)| *hash))?;
+
             for (block_idx, chunk_hash, key) in extents {
                 if has_boundary && block_idx == boundary_block {
-                    let mut block_data =
-                        self.read_block_bytes(ino, block_idx, FsCore::inode_is_vault(&inode))?;
+                    let mut block_data = self.read_extent_bytes(
+                        ExtentRecord { chunk_hash },
+                        FsCore::inode_is_vault(&inode),
+                    )?;
                     let offset_in_block = (new_size % block_size) as usize;
                     block_data[offset_in_block..].fill(0);
                     let new_hash = FsCore::hash_for_inode(&inode, &block_data);
@@ -1073,6 +1092,8 @@ impl FsCore {
             Ok(map)
         })?;
 
+        self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
+
         let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
         let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
@@ -1081,8 +1102,8 @@ impl FsCore {
         let mut dedup_misses = 0_u64;
 
         for block_idx in start_block..=end_block {
-            let mut block_data = if old_extents.contains_key(&block_idx) {
-                self.read_block_bytes(op.ino, block_idx, FsCore::inode_is_vault(&inode))?
+            let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
+                self.read_extent_bytes(extent.clone(), FsCore::inode_is_vault(&inode))?
             } else {
                 vec![0_u8; BLOCK_SIZE]
             };
@@ -3627,4 +3648,102 @@ fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
 
     existing.offset = merged_start;
     existing.data = merged;
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    use anyhow::anyhow;
+    use crate::config::Config;
+    use crate::types::ROOT_INODE;
+
+    fn temp_dir_manual() -> PathBuf {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let pid = std::process::id();
+        let mut path = std::env::temp_dir();
+        path.push(format!("verfs_bench_{}_{}", pid, t));
+        path
+    }
+
+    #[tokio::test]
+    async fn bench_overwrite_performance() -> anyhow::Result<()> {
+        let root = temp_dir_manual();
+        let data_dir = root.join("data");
+        let meta_dir = root.join("meta");
+        let packs_dir = data_dir.join("packs");
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(&meta_dir)?;
+        fs::create_dir_all(&packs_dir)?;
+
+        let config = Config {
+            mount_point: root.join("mnt"),
+            data_dir: data_dir.clone(),
+            sync_interval_ms: 1000,
+            batch_max_size_mb: 10,
+            batch_flush_interval_ms: 100,
+            metadata_cache_capacity_entries: 10000,
+            chunk_cache_capacity_mb: 100,
+            pack_index_cache_capacity_entries: 10000,
+            pack_max_size_mb: 10,
+            zstd_compression_level: 1,
+            ultracdc_min_size_bytes: 2048,
+            ultracdc_avg_size_bytes: 4096,
+            ultracdc_max_size_bytes: 8192,
+            fuse_max_write_bytes: 1024 * 1024,
+            fuse_direct_io: false,
+            fuse_fsname: "verfs_bench".to_string(),
+            fuse_subtype: "verfs".to_string(),
+            gc_idle_min_ms: 1000,
+            gc_pack_rewrite_min_reclaim_bytes: 1024 * 1024,
+            gc_pack_rewrite_min_reclaim_percent: 50.0,
+            gc_discard_filename: "discard.log".to_string(),
+            vault_enabled: false,
+            vault_argon2_mem_kib: 16,
+            vault_argon2_iters: 1,
+            vault_argon2_parallelism: 1,
+        };
+
+        let fs = VerFs::new(config).await?;
+
+        let (_ttl, attr, _gen, _fh, _) = fs.create(1000, 1000, ROOT_INODE, ROOT_INODE, "bench_file", 0o644, 0).await.map_err(|e| anyhow!("create failed: {:?}", e))?;
+        let ino = attr.ino;
+
+        let size = 50 * 1024 * 1024;
+        let data = vec![0xAA_u8; size];
+
+        let chunk_size = 1024 * 1024;
+        for offset in (0..size).step_by(chunk_size) {
+            let len = std::cmp::min(chunk_size, size - offset);
+            fs.write(ino, offset as i64, &data[offset..offset+len], 0).await.map_err(|e| anyhow!("write failed: {:?}", e))?;
+        }
+
+        fs.batcher.drain().await.map_err(|e| anyhow!("drain failed: {:?}", e))?;
+        fs.core.sync_cycle(true).await?;
+
+        fs.core.chunk_meta_cache.invalidate_all();
+        fs.core.chunk_data_cache.invalidate_all();
+
+        println!("Starting overwrite benchmark...");
+        let start = Instant::now();
+
+        for offset in (0..size).step_by(chunk_size) {
+            let len = std::cmp::min(chunk_size, size - offset);
+            fs.write(ino, offset as i64, &data[offset..offset+len], 0).await.map_err(|e| anyhow!("overwrite failed: {:?}", e))?;
+        }
+        fs.batcher.drain().await.map_err(|e| anyhow!("drain overwrite failed: {:?}", e))?;
+
+        let duration = start.elapsed();
+        println!("Overwrite took: {:?}", duration);
+
+        fs.graceful_shutdown().await?;
+        fs::remove_dir_all(&root)?;
+
+        Ok(())
+    }
 }
