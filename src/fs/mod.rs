@@ -1046,10 +1046,21 @@ impl FsCore {
 
         let old_extents = self.meta.read_txn(|txn| {
             let mut map = HashMap::<u64, ExtentRecord>::new();
-            for block_idx in start_block..=end_block {
-                if let Some(raw) = txn.get(extent_key(op.ino, block_idx))? {
-                    map.insert(block_idx, decode_rkyv(&raw)?);
+            let start_key = extent_key(op.ino, start_block);
+            let end_key = extent_key(op.ino, end_block + 1);
+
+            let mut iter = txn.range(start_key, end_key)?;
+            let mut valid = iter.seek_first()?;
+            while valid {
+                let key = iter.key().user_key();
+                if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
+                    if block_idx >= start_block && block_idx <= end_block {
+                        let val = iter.value()?;
+                        let extent: ExtentRecord = decode_rkyv(&val)?;
+                        map.insert(block_idx, extent);
+                    }
                 }
+                valid = iter.next()?;
             }
             Ok(map)
         })?;
@@ -2536,12 +2547,22 @@ impl VirtualFs for VerFs {
                 let mut extents = HashMap::<u64, ExtentRecord>::new();
                 let mut hashes = HashSet::<[u8; 16]>::new();
 
-                for block_idx in start_block..=end_block {
-                    if let Some(raw) = txn.get(extent_key(ino, block_idx))? {
-                        let extent: ExtentRecord = decode_rkyv(&raw)?;
-                        hashes.insert(extent.chunk_hash);
-                        extents.insert(block_idx, extent);
+                let start_key = extent_key(ino, start_block);
+                let end_key = extent_key(ino, end_block + 1);
+
+                let mut iter = txn.range(start_key, end_key)?;
+                let mut valid = iter.seek_first()?;
+                while valid {
+                    let key = iter.key().user_key();
+                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
+                        if block_idx >= start_block && block_idx <= end_block {
+                            let val = iter.value()?;
+                            let extent: ExtentRecord = decode_rkyv(&val)?;
+                            hashes.insert(extent.chunk_hash);
+                            extents.insert(block_idx, extent);
+                        }
                     }
+                    valid = iter.next()?;
                 }
 
                 let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
