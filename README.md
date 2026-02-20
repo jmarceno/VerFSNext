@@ -38,7 +38,18 @@ And as obviuous, I'm not responsible for any data loss!
    ```bash
    ./target/release/verfsnext
    ```
-   It reads `./config.toml`, mounts at `mount_point`, and stays in the foreground.
+   Config resolution order is:
+   - `./config.toml`
+   - `~/.config/verfsnext/config.toml`
+   - `/etc/verfsnext/config.toml`
+   If found by search, the CLI shows the selected file and asks for confirmation (auto-accept after 5 seconds).
+
+   You can bypass discovery and confirmation with an explicit config file:
+   ```bash
+   ./target/release/verfsnext --config /etc/verfsnext/config.toml
+   # or
+   ./target/release/verfsnext -c /etc/verfsnext/config.toml
+   ```
 
 3. Use the mount normally:
    ```bash
@@ -66,6 +77,11 @@ Use snapshots through the control CLI:
 ./target/release/verfsnext snapshot list
 # Delete
 ./target/release/verfsnext snapshot delete snap1
+```
+
+To force a specific config file for any control command:
+```bash
+./target/release/verfsnext --config /etc/verfsnext/config.toml snapshot list
 ```
 Mounted snapshot view:
 - Snapshot roots appear under `/.snapshots` and can be accessed like normal directories.
@@ -119,7 +135,8 @@ After lock:
    ```bash
    ./contrib/systemd/verfsnext-service.sh install
    ```
-   The installer also adds the invoking user to group `verfs` for metadata directory inspection (`newgrp verfs` or re-login required).
+   The installer also adds the invoking user to group `verfs` and prints a highlighted reminder that control commands require `verfs` group membership (`newgrp verfs` or re-login required).
+   The service starts with `--config /etc/verfsnext/config.toml`.
 
 2. If already installed, update only the executable:
    ```bash

@@ -25,10 +25,19 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext crypt -l`
 - Runtime stats control path:
   - `verfsnext stats`
+- Global config-file CLI option:
+  - `verfsnext --config <path> ...`
+  - `verfsnext -c <path> ...`
 - Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
+- Auto config discovery order when `--config/-c` is not provided:
+  - `./config.toml`
+  - `~/.config/verfsnext/config.toml`
+  - `/etc/verfsnext/config.toml`
+- Auto-discovered config path is shown before command execution and requires confirmation with 5-second auto-accept.
 - Snapshot CLI first tries socket RPC; if no socket listener is available, it falls back to offline metadata mode.
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
+- Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands.
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata

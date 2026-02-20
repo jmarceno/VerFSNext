@@ -59,6 +59,16 @@ need_cmd() {
   fi
 }
 
+print_group_access_notice() {
+  local caller_user="${SUDO_USER:-${USER:-}}"
+  local yellow='\033[1;33m'
+  local reset='\033[0m'
+  echo -e "${yellow}NOTICE:${reset} verfsnext control commands require access to group '${SERVICE_GROUP}'."
+  if [[ -n "$caller_user" && "$caller_user" != "root" ]]; then
+    echo -e "${yellow}NOTICE:${reset} user '${caller_user}' must be in '${SERVICE_GROUP}' (re-login or run: newgrp ${SERVICE_GROUP})."
+  fi
+}
+
 grant_caller_group_access() {
   local caller_user="${SUDO_USER:-${USER:-}}"
 
@@ -77,6 +87,37 @@ grant_caller_group_access() {
   echo "Granting user $caller_user membership in group $SERVICE_GROUP..."
   run_cmd "${SUDO[@]}" usermod -a -G "$SERVICE_GROUP" "$caller_user"
   echo "Group update applied for $caller_user. Re-login or run: newgrp $SERVICE_GROUP"
+}
+
+ensure_control_socket_permissions() {
+  local data_dir socket_path attempt
+  data_dir="$(toml_path_value data_dir "$CONFIG_FILE" || true)"
+  if [[ -z "$data_dir" ]]; then
+    echo "warning: unable to parse data_dir from $CONFIG_FILE; skipping socket permission adjustment." >&2
+    return 0
+  fi
+
+  socket_path="$data_dir/verfsnext.sock"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Dry run: would ensure $socket_path is owned by group $SERVICE_GROUP with mode 660."
+    return 0
+  fi
+
+  for attempt in {1..20}; do
+    if "${SUDO[@]}" test -S "$socket_path"; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  if ! "${SUDO[@]}" test -S "$socket_path"; then
+    echo "warning: control socket not found at $socket_path after service start." >&2
+    return 0
+  fi
+
+  echo "Ensuring control socket group access on $socket_path..."
+  run_cmd "${SUDO[@]}" chgrp "$SERVICE_GROUP" "$socket_path"
+  run_cmd "${SUDO[@]}" chmod 660 "$socket_path"
 }
 
 toml_path_value() {
@@ -282,6 +323,8 @@ need_cmd sed
 need_cmd grep
 need_cmd getent
 need_cmd id
+need_cmd chgrp
+need_cmd chmod
 if [[ $EUID -ne 0 ]]; then
   need_cmd sudo
 fi
@@ -298,6 +341,7 @@ case "$ACTION" in
     build_binary
     install_binary
     ensure_service_user
+    print_group_access_notice
     grant_caller_group_access
     if getent group fuse >/dev/null 2>&1; then
       run_cmd "${SUDO[@]}" usermod -a -G fuse "$SERVICE_USER"
@@ -306,6 +350,7 @@ case "$ACTION" in
     validate_config_paths
     install_unit
     enable_and_start
+    ensure_control_socket_permissions
     echo "Done. Check status with: ${SUDO[*]} systemctl status ${SERVICE_NAME}"
     ;;
   update-bin)
@@ -316,6 +361,7 @@ case "$ACTION" in
     build_binary
     install_binary
     restart_if_active
+    ensure_control_socket_permissions
     ;;
   *)
     echo "unknown command: $ACTION" >&2

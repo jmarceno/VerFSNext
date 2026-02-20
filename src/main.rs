@@ -10,9 +10,13 @@ mod vault;
 mod write;
 
 use std::io::ErrorKind;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_fusex::{
@@ -38,17 +42,22 @@ type LogHandle =
 async fn main() -> Result<()> {
     let log_handle = init_logging();
 
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !args.is_empty() {
-        return run_control_command(args).await;
+    let parsed = parse_global_cli_options(std::env::args().skip(1).collect::<Vec<_>>())?;
+    let selection = resolve_config_path(parsed.explicit_config.as_deref())?;
+
+    if parsed.explicit_config.is_none() {
+        confirm_config_selection(&selection)?;
     }
 
-    run_mount(log_handle).await
+    if !parsed.command_args.is_empty() {
+        return run_control_command(selection.path.clone(), parsed.command_args).await;
+    }
+
+    run_mount(log_handle, selection.path).await
 }
 
-async fn run_mount(log_handle: LogHandle) -> Result<()> {
-    let config_path = Path::new("config.toml");
-    let config = Config::load_from_file(config_path)
+async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
+    let config = Config::load_from_file(&config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
 
     let fs = Arc::new(VerFs::new(config.clone()).await?);
@@ -123,31 +132,24 @@ async fn run_mount(log_handle: LogHandle) -> Result<()> {
     run_result.context("FUSE run loop failed")
 }
 
-async fn run_control_command(args: Vec<String>) -> Result<()> {
-    let mut idx = 0_usize;
-    let mut config_path = "config.toml".to_owned();
-    if args.len() >= 2 && args[0] == "--config" {
-        config_path = args[1].clone();
-        idx = 2;
-    }
-
-    if idx >= args.len() {
+async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<()> {
+    if args.is_empty() {
         bail!("missing control command");
     }
 
-    let config = Config::load_from_file(Path::new(&config_path))
-        .with_context(|| format!("failed to load {}", config_path))?;
+    let config = Config::load_from_file(&config_path)
+        .with_context(|| format!("failed to load {}", config_path.display()))?;
     config.ensure_dirs()?;
 
-    match args[idx].as_str() {
+    match args[0].as_str() {
         "snapshot" => {
-            let cmd = parse_snapshot_cmd(&args[(idx + 1)..])?;
+            let cmd = parse_snapshot_cmd(&args[1..])?;
             if !try_run_snapshot_via_socket(&config, &cmd).await? {
                 run_snapshot_via_metadata(&config, &cmd).await?;
             }
         }
         "stats" => {
-            if !args[(idx + 1)..].is_empty() {
+            if !args[1..].is_empty() {
                 bail!("stats does not take arguments");
             }
             if !try_run_stats_via_socket(&config).await? {
@@ -155,7 +157,7 @@ async fn run_control_command(args: Vec<String>) -> Result<()> {
             }
         }
         "crypt" => {
-            let cmd = parse_crypt_cmd(&args[(idx + 1)..])?;
+            let cmd = parse_crypt_cmd(&args[1..])?;
             if !try_run_crypt_via_socket(&config, &cmd).await? {
                 run_crypt_via_metadata(&config, &cmd).await?;
             }
@@ -356,8 +358,159 @@ fn bind_control_socket(socket_path: &Path) -> Result<UnixListener> {
             }
         }
     }
-    UnixListener::bind(socket_path)
-        .with_context(|| format!("failed to bind control socket {}", socket_path.display()))
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed to bind control socket {}", socket_path.display()))?;
+    let permissions = std::fs::Permissions::from_mode(0o660);
+    std::fs::set_permissions(socket_path, permissions).with_context(|| {
+        format!(
+            "failed to set permissions on control socket {}",
+            socket_path.display()
+        )
+    })?;
+    Ok(listener)
+}
+
+struct ParsedCli {
+    explicit_config: Option<PathBuf>,
+    command_args: Vec<String>,
+}
+
+#[derive(Clone)]
+enum ConfigSource {
+    Explicit,
+    WorkingDirectory,
+    UserConfig,
+    SystemConfig,
+}
+
+impl ConfigSource {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Explicit => "from --config/-c",
+            Self::WorkingDirectory => "from current working directory",
+            Self::UserConfig => "from ~/.config/verfsnext",
+            Self::SystemConfig => "from /etc/verfsnext",
+        }
+    }
+}
+
+struct ConfigSelection {
+    path: PathBuf,
+    source: ConfigSource,
+}
+
+fn parse_global_cli_options(args: Vec<String>) -> Result<ParsedCli> {
+    if args.is_empty() {
+        return Ok(ParsedCli {
+            explicit_config: None,
+            command_args: Vec::new(),
+        });
+    }
+
+    if args[0] == "--config" || args[0] == "-c" {
+        let Some(path) = args.get(1) else {
+            bail!(
+                "missing value for {} (expected path to config file)",
+                args[0]
+            );
+        };
+        return Ok(ParsedCli {
+            explicit_config: Some(PathBuf::from(path)),
+            command_args: args[2..].to_vec(),
+        });
+    }
+
+    Ok(ParsedCli {
+        explicit_config: None,
+        command_args: args,
+    })
+}
+
+fn resolve_config_path(explicit: Option<&Path>) -> Result<ConfigSelection> {
+    if let Some(path) = explicit {
+        return Ok(ConfigSelection {
+            path: path.to_path_buf(),
+            source: ConfigSource::Explicit,
+        });
+    }
+
+    let cwd_candidate = std::env::current_dir()
+        .context("failed to resolve current working directory")?
+        .join("config.toml");
+    if cwd_candidate.is_file() {
+        return Ok(ConfigSelection {
+            path: cwd_candidate,
+            source: ConfigSource::WorkingDirectory,
+        });
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_candidate = PathBuf::from(home)
+            .join(".config")
+            .join("verfsnext")
+            .join("config.toml");
+        if user_candidate.is_file() {
+            return Ok(ConfigSelection {
+                path: user_candidate,
+                source: ConfigSource::UserConfig,
+            });
+        }
+    }
+
+    let system_candidate = PathBuf::from("/etc/verfsnext/config.toml");
+    if system_candidate.is_file() {
+        return Ok(ConfigSelection {
+            path: system_candidate,
+            source: ConfigSource::SystemConfig,
+        });
+    }
+
+    bail!(
+        "no config.toml found. searched in: {}, ~/.config/verfsnext/config.toml, /etc/verfsnext/config.toml",
+        cwd_candidate.display()
+    );
+}
+
+fn confirm_config_selection(selection: &ConfigSelection) -> Result<()> {
+    println!(
+        "Using config file: {} ({})",
+        selection.path.display(),
+        selection.source.label()
+    );
+    print!("Proceed? [Y/n] (auto-accept in 5 seconds): ");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush confirmation prompt")?;
+
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let read_result = std::io::stdin().read_line(&mut input);
+        if read_result.is_ok() {
+            let _ = tx.send(Some(input));
+        } else {
+            let _ = tx.send(None);
+        }
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Some(input)) => {
+            let normalized = input.trim().to_ascii_lowercase();
+            if normalized.is_empty() || normalized == "y" || normalized == "yes" {
+                Ok(())
+            } else if normalized == "n" || normalized == "no" {
+                bail!("aborted by user confirmation");
+            } else {
+                bail!("invalid confirmation answer '{}'", input.trim());
+            }
+        }
+        Ok(None)
+        | Err(mpsc::RecvTimeoutError::Timeout)
+        | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            println!("\nNo confirmation received in time, proceeding.");
+            Ok(())
+        }
+    }
 }
 
 async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()> {
@@ -963,8 +1116,12 @@ fn init_logging() -> LogHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_stats_report, human_bytes_signed, render_stats_table};
+    use super::{
+        format_stats_report, human_bytes_signed, parse_global_cli_options, render_stats_table,
+        resolve_config_path, ConfigSource,
+    };
     use crate::fs::VerFsStats;
+    use std::path::Path;
 
     fn sample_stats() -> VerFsStats {
         VerFsStats {
@@ -1034,5 +1191,44 @@ mod tests {
     fn signed_human_bytes_has_minus_prefix_for_negative() {
         assert!(human_bytes_signed(-1024).starts_with('-'));
         assert!(!human_bytes_signed(1024).starts_with('-'));
+    }
+
+    #[test]
+    fn global_config_option_is_parsed_when_present() {
+        let parsed = parse_global_cli_options(vec![
+            "--config".to_owned(),
+            "/etc/verfsnext/config.toml".to_owned(),
+            "stats".to_owned(),
+        ])
+        .expect("parse should succeed");
+        assert_eq!(
+            parsed.explicit_config.as_deref(),
+            Some(Path::new("/etc/verfsnext/config.toml"))
+        );
+        assert_eq!(parsed.command_args, vec!["stats"]);
+    }
+
+    #[test]
+    fn global_short_config_option_is_parsed_when_present() {
+        let parsed = parse_global_cli_options(vec![
+            "-c".to_owned(),
+            "/tmp/custom.toml".to_owned(),
+            "crypt".to_owned(),
+            "-l".to_owned(),
+        ])
+        .expect("parse should succeed");
+        assert_eq!(
+            parsed.explicit_config.as_deref(),
+            Some(Path::new("/tmp/custom.toml"))
+        );
+        assert_eq!(parsed.command_args, vec!["crypt", "-l"]);
+    }
+
+    #[test]
+    fn explicit_config_resolution_skips_search() {
+        let selected =
+            resolve_config_path(Some(Path::new("/etc/verfsnext/config.toml"))).expect("resolve");
+        assert_eq!(selected.path, Path::new("/etc/verfsnext/config.toml"));
+        assert!(matches!(selected.source, ConfigSource::Explicit));
     }
 }
