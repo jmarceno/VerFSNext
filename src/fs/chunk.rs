@@ -6,13 +6,16 @@ impl FsCore {
         if data.is_empty() {
             return 0;
         }
+
+        const CHUNK_FEED_BUFFER_SIZE: usize = 64 * 1024;
+
         let mut chunker = UltraStreamChunker::new(
             self.config.ultracdc_min_size_bytes,
             self.config.ultracdc_avg_size_bytes,
             self.config.ultracdc_max_size_bytes,
         );
         let mut count = 0_usize;
-        for piece in data.chunks(64 * 1024) {
+        for piece in data.chunks(CHUNK_FEED_BUFFER_SIZE) {
             count = count.saturating_add(chunker.feed(piece).len());
         }
         count.saturating_add(chunker.finish().len())
