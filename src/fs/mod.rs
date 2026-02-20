@@ -1047,7 +1047,10 @@ impl FsCore {
         let old_extents = self.meta.read_txn(|txn| {
             let mut map = HashMap::<u64, ExtentRecord>::new();
             let start_key = extent_key(op.ino, start_block);
-            let end_key = extent_key(op.ino, end_block + 1);
+            let end_key = end_block
+                .checked_add(1)
+                .map(|end| extent_key(op.ino, end))
+                .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
 
             let mut iter = txn.range(start_key, end_key)?;
             let mut valid = iter.seek_first()?;
@@ -2548,7 +2551,10 @@ impl VirtualFs for VerFs {
                 let mut hashes = HashSet::<[u8; 16]>::new();
 
                 let start_key = extent_key(ino, start_block);
-                let end_key = extent_key(ino, end_block + 1);
+                let end_key = end_block
+                    .checked_add(1)
+                    .map(|end| extent_key(ino, end))
+                    .unwrap_or_else(|| prefix_end(&extent_prefix(ino)));
 
                 let mut iter = txn.range(start_key, end_key)?;
                 let mut valid = iter.seek_first()?;
