@@ -646,7 +646,7 @@ impl FsCore {
         Ok(true)
     }
 
-    fn materialize_pending_chunks(
+    async fn materialize_pending_chunks(
         &self,
         pending_chunks: HashMap<[u8; 16], Vec<u8>>,
         encrypt_for_vault: bool,
@@ -659,7 +659,10 @@ impl FsCore {
             .into_iter()
             .map(|(hash, data)| PendingChunk { hash, data })
             .collect::<Vec<_>>();
-        let ready = compress_parallel(pending, self.config.zstd_compression_level)?;
+        let zstd_level = self.config.zstd_compression_level;
+        let ready = tokio::task::spawn_blocking(move || compress_parallel(pending, zstd_level))
+            .await
+            .map_err(|e| anyhow!("compression task failed: {}", e))??;
 
         let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
@@ -986,8 +989,9 @@ impl FsCore {
                 }
             }
         }
-        let new_chunk_records =
-            self.materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))?;
+        let new_chunk_records = self
+            .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))
+            .await?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -1102,8 +1106,9 @@ impl FsCore {
                 dedup_hits = dedup_hits.saturating_add(1);
             }
         }
-        let new_chunk_records =
-            self.materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))?;
+        let new_chunk_records = self
+            .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))
+            .await?;
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
