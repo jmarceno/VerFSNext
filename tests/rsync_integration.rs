@@ -187,15 +187,49 @@ fn setup_large_source_file(src: &Path) -> Result<PathBuf> {
     fs::create_dir_all(src).context("failed to create large source dir")?;
     let large = src.join("large.bin");
     let mut file = File::create(&large).context("failed to create large.bin")?;
+    // Generate deterministic high-entropy bytes so dedup/compression does not
+    // collapse the 4 MiB payload into a tiny physical write.
     let mut block = vec![0_u8; 1024 * 1024];
-    for (idx, byte) in block.iter_mut().enumerate() {
-        *byte = (idx % 251) as u8;
-    }
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     for _ in 0..4 {
+        for byte in &mut block {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 56) as u8;
+        }
         file.write_all(&block)
             .context("failed to write large.bin block")?;
     }
     Ok(large)
+}
+
+fn count_files_with_extension_recursive(root: &Path, extension: &str) -> Result<usize> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut count = 0_usize;
+
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+                continue;
+            }
+            let matches = entry_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == extension)
+                .unwrap_or(false);
+            if matches {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 fn create_recursive_delete_fanout(mount_point: &Path, dir_count: usize) -> Result<PathBuf> {
@@ -393,18 +427,7 @@ fn rsync_large_file_rollover_multpack_persists() -> Result<()> {
     daemon.stop_graceful()?;
 
     let packs_dir = data_dir.join("packs");
-    let pack_files = fs::read_dir(&packs_dir)
-        .with_context(|| format!("failed to list packs dir {}", packs_dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext == "vpk")
-                .unwrap_or(false)
-        })
-        .count();
+    let pack_files = count_files_with_extension_recursive(&packs_dir, "vpk")?;
     if pack_files < 2 {
         bail!(
             "expected rollover to create multiple packs, found {}",
