@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -20,9 +20,9 @@ use nix::fcntl::OFlag;
 use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
-use parking_lot::RwLock;
+use parking_lot::RwLock as ParkingRwLock;
 use surrealkv::LSMIterator;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
 use tracing::{debug, error};
 
@@ -152,11 +152,12 @@ struct FsCore {
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
-    write_lock: Mutex<()>,
+    write_lock: AsyncRwLock<()>,
+    inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
-    vault: RwLock<VaultRuntime>,
+    vault: ParkingRwLock<VaultRuntime>,
 }
 
 impl VerFs {
@@ -220,11 +221,12 @@ impl VerFs {
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
-            write_lock: Mutex::new(()),
+            write_lock: AsyncRwLock::new(()),
+            inode_write_locks: Mutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
-            vault: RwLock::new(VaultRuntime::new(vault_initialized)),
+            vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
         let write_sink: Arc<dyn WriteApply> = core.clone();
@@ -264,7 +266,7 @@ impl VerFs {
     }
 
     pub async fn create_snapshot(&self, name: &str) -> Result<()> {
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.create(name).await?;
         self.core.mark_mutation();
@@ -272,7 +274,7 @@ impl VerFs {
     }
 
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.delete(name).await?;
         self.core.mark_mutation();
@@ -308,6 +310,17 @@ impl VerFs {
 }
 
 impl FsCore {
+    async fn inode_write_lock(&self, ino: u64) -> Arc<Mutex<()>> {
+        let mut locks = self.inode_write_locks.lock().await;
+        if let Some(lock) = locks.get(&ino).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(ino, Arc::downgrade(&lock));
+        lock
+    }
+
     fn new_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
     }

@@ -7,7 +7,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - FUSE runtime via `vendor/async-fusex`
 - Metadata runtime via `vendor/surrealkv`
   - WAL batches, SSTable table metadata, and partitioned top-level index payloads are archived with `rkyv` and validated at decode boundaries
-- Write batching (`>= 3000` blocks or `500ms`) with synchronous syscall completion
+- Two-stage write batching pipeline:
+  - ingest stage batches by byte threshold or flush interval
+  - apply stage drains ordered batches and reports completion to waiting syscalls
 - Background sync + shutdown full-sync barrier
 - Streaming UltraCDC chunking telemetry in write ingress path
 - XXH3-128 hash-authoritative dedup decisions
@@ -53,6 +55,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 - `src/fs/mod.rs`
   - `VirtualFs` implementation
+  - global mutation gate is now an async `RwLock`:
+    - write-side lock for namespace/global metadata mutations (rename/unlink/rmdir/link/xattr/vault/snapshot)
+    - read-side lock for file-content writes/truncates so unrelated inode writes can continue concurrently
+  - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`)
   - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
   - read path resolves chunk location through pack-local hash index
   - bounded chunk metadata and chunk payload caches
@@ -73,6 +79,20 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
   - directory handles now keep a per-`opendir` snapshot for stable pagination while the namespace is mutating (prevents recursive-delete entry skips)
+
+- `src/fs/write.rs`
+  - `apply_batch` still coalesces adjacent writes first, then executes per-inode groups sequentially while running different inodes concurrently
+  - preserves per-inode operation order while unlocking cross-inode parallelism
+  - `apply_single_write` now acquires:
+    - global mutation read lock
+    - per-inode write lock
+  - this removes the prior global stop-the-world serialization for data writes across unrelated files
+
+- `src/write/batcher.rs`
+  - queue ingestion no longer blocks on `sink.apply_batch`
+  - ingestion flushes pending ops into an internal apply queue and immediately resumes receiving FUSE writes
+  - apply worker preserves batch order, applies each batch, and resolves per-write completion channels
+  - `drain` and `shutdown` are implemented as ordered barriers in the apply queue
 
 - `vendor/async-fusex/src/fuse_fs.rs`
   - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
@@ -121,10 +141,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `mount_point`
 - `data_dir`
 - `sync_interval_ms`
-- `batch_max_blocks`
+- `batch_max_size_mb`
 - `batch_flush_interval_ms`
 - `metadata_cache_capacity_entries`
-- `chunk_cache_capacity_entries`
+- `chunk_cache_capacity_mb`
 - `pack_index_cache_capacity_entries`
 - `pack_max_size_mb`
 - `zstd_compression_level`
@@ -203,11 +223,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 ## Validation Run
 
-Executed after Phase 5 changes:
+Executed after write-path concurrency/pipeline changes:
 
 - `cargo build --release`
-- `cargo test parse_pack_id -- --nocapture`
-- `cargo test --test rsync_integration`
-- `CARGO_BIN_EXE_verfsnext=/home/jmarceno/Projects/VerFSNext/target/debug/verfsnext VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test --test rsync_integration rm_rf_large_fanout_directory_succeeds -- --exact --nocapture`
+- `cargo test --release`
 
 Build completed successfully in this repository state.

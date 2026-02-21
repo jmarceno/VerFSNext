@@ -31,9 +31,16 @@ enum QueueMessage {
     Shutdown(oneshot::Sender<Result<()>>),
 }
 
+enum ApplyMessage {
+    Batch(Vec<QueuedWrite>),
+    Drain(oneshot::Sender<Result<()>>),
+    Shutdown(oneshot::Sender<Result<()>>),
+}
+
 pub struct WriteBatcher {
     tx: mpsc::Sender<QueueMessage>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    ingest_worker: Mutex<Option<JoinHandle<()>>>,
+    apply_worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl WriteBatcher {
@@ -44,13 +51,33 @@ impl WriteBatcher {
         queue_capacity: usize,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<QueueMessage>(queue_capacity);
+        let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyMessage>();
 
-        let handle = tokio::spawn(async move {
+        let apply_sink = Arc::clone(&sink);
+        let apply_handle = tokio::spawn(async move {
+            let mut pending_error: Option<anyhow::Error> = None;
+
+            while let Some(msg) = apply_rx.recv().await {
+                match msg {
+                    ApplyMessage::Batch(batch) => {
+                        apply_queued_batch(&apply_sink, batch, &mut pending_error).await;
+                    }
+                    ApplyMessage::Drain(done_tx) => {
+                        let _ = done_tx.send(take_pending_error(&mut pending_error));
+                    }
+                    ApplyMessage::Shutdown(done_tx) => {
+                        let _ = done_tx.send(take_pending_error(&mut pending_error));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let ingest_handle = tokio::spawn(async move {
             let mut pending = Vec::<QueuedWrite>::new();
             let mut pending_bytes = 0_usize;
             let mut ticker = tokio::time::interval(flush_interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            let mut pending_error: Option<anyhow::Error> = None;
 
             loop {
                 tokio::select! {
@@ -60,40 +87,50 @@ impl WriteBatcher {
                                 pending_bytes = pending_bytes.saturating_add(msg.bytes);
                                 pending.push(msg);
                                 if pending_bytes >= max_size_bytes {
-                                    flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
+                                    dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
                                 }
                             }
                             Some(QueueMessage::Drain(done_tx)) => {
-                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
-                                let _ = done_tx.send(match pending_error.take() {
-                                    Some(err) => Err(err),
-                                    None => Ok(()),
-                                });
+                                dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
+                                if let Err(err) = apply_tx.send(ApplyMessage::Drain(done_tx)) {
+                                    match err.0 {
+                                        ApplyMessage::Drain(done_tx) => {
+                                            let _ = done_tx.send(Err(anyhow!("write apply worker is closed")));
+                                        }
+                                        _ => unreachable!("apply control channel mismatch"),
+                                    }
+                                }
                             }
                             Some(QueueMessage::Shutdown(done_tx)) => {
-                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
-                                let _ = done_tx.send(match pending_error.take() {
-                                    Some(err) => Err(err),
-                                    None => Ok(()),
-                                });
+                                dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
+                                if let Err(err) = apply_tx.send(ApplyMessage::Shutdown(done_tx)) {
+                                    match err.0 {
+                                        ApplyMessage::Shutdown(done_tx) => {
+                                            let _ = done_tx.send(Err(anyhow!("write apply worker is closed")));
+                                        }
+                                        _ => unreachable!("apply control channel mismatch"),
+                                    }
+                                }
                                 break;
                             }
                             None => {
-                                flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
+                                dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
                                 break;
                             }
                         }
                     }
                     _ = ticker.tick() => {
-                        flush_pending(&sink, &mut pending, &mut pending_bytes, &mut pending_error).await;
+                        dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
                     }
                 }
             }
+            drop(apply_tx);
         });
 
         Self {
             tx,
-            worker: Mutex::new(Some(handle)),
+            ingest_worker: Mutex::new(Some(ingest_handle)),
+            apply_worker: Mutex::new(Some(apply_handle)),
         }
     }
 
@@ -144,36 +181,75 @@ impl WriteBatcher {
         let flush_result = done_rx
             .await
             .map_err(|_| anyhow!("write batcher worker exited before shutdown reply"))?;
-        if let Some(worker) = self.worker.lock().await.take() {
+        if let Some(worker) = self.ingest_worker.lock().await.take() {
+            let _ = worker.await;
+        }
+        if let Some(worker) = self.apply_worker.lock().await.take() {
             let _ = worker.await;
         }
         flush_result
     }
 }
 
-async fn flush_pending(
-    sink: &Arc<dyn WriteApply>,
+fn dispatch_pending(
+    apply_tx: &mpsc::UnboundedSender<ApplyMessage>,
     pending: &mut Vec<QueuedWrite>,
     pending_bytes: &mut usize,
-    pending_error: &mut Option<anyhow::Error>,
 ) {
     if pending.is_empty() {
         return;
     }
 
-    let ops = pending
+    let batch = std::mem::take(pending);
+    *pending_bytes = 0;
+    if let Err(err) = apply_tx.send(ApplyMessage::Batch(batch)) {
+        match err.0 {
+            ApplyMessage::Batch(batch) => {
+                fail_batch(batch, anyhow!("write apply worker is closed"))
+            }
+            _ => unreachable!("apply data channel mismatch"),
+        }
+    }
+}
+
+fn fail_batch(batch: Vec<QueuedWrite>, err: anyhow::Error) {
+    let err_text = err.to_string();
+    for entry in batch {
+        if let Some(done) = entry.done {
+            let _ = done.send(Err(anyhow!(err_text.clone())));
+        }
+    }
+}
+
+fn take_pending_error(pending_error: &mut Option<anyhow::Error>) -> Result<()> {
+    match pending_error.take() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+async fn apply_queued_batch(
+    sink: &Arc<dyn WriteApply>,
+    batch: Vec<QueuedWrite>,
+    pending_error: &mut Option<anyhow::Error>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let ops = batch
         .iter()
         .map(|entry| entry.op.clone())
         .collect::<Vec<_>>();
     let results = sink.apply_batch(ops).await;
 
-    if results.len() != pending.len() {
+    if results.len() != batch.len() {
         let err = anyhow!(
             "write sink returned {} results for {} queued writes",
             results.len(),
-            pending.len()
+            batch.len()
         );
-        for entry in pending.drain(..) {
+        for entry in batch {
             if let Some(done) = entry.done {
                 let _ = done.send(Err(anyhow!(err.to_string())));
             }
@@ -181,11 +257,10 @@ async fn flush_pending(
         if pending_error.is_none() {
             *pending_error = Some(err);
         }
-        *pending_bytes = 0;
         return;
     }
 
-    for (entry, result) in pending.drain(..).zip(results.into_iter()) {
+    for (entry, result) in batch.into_iter().zip(results.into_iter()) {
         match result {
             Ok(()) => {
                 if let Some(done) = entry.done {
@@ -202,5 +277,4 @@ async fn flush_pending(
             }
         }
     }
-    *pending_bytes = 0;
 }

@@ -19,7 +19,7 @@ impl FsCore {
             return false;
         }
 
-        if let Ok(guard) = self.write_lock.try_lock() {
+        if let Ok(guard) = self.write_lock.try_write() {
             drop(guard);
             return true;
         }

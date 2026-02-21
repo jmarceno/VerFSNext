@@ -72,7 +72,9 @@ impl VirtualFs for VerFs {
         ino: u64,
         param: SetAttrParam,
     ) -> AsyncFusexResult<(Duration, FileAttr)> {
-        let _guard = self.core.write_lock.lock().await;
+        let _mutation_guard = self.core.write_lock.read().await;
+        let inode_lock = self.core.inode_write_lock(ino).await;
+        let _inode_guard = inode_lock.lock().await;
         let mut inode = if let Some(size) = param.size {
             let inode = self
                 .core
@@ -244,7 +246,7 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(parent, "unlink")
             .map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -290,7 +292,7 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(parent, "rmdir")
             .map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -416,7 +418,7 @@ impl VirtualFs for VerFs {
                 "cannot rename across vault boundary".to_owned(),
             );
         }
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -617,7 +619,9 @@ impl VirtualFs for VerFs {
 
         let oflags = OFlag::from_bits_truncate(flags as i32);
         if oflags.contains(OFlag::O_TRUNC) {
-            let _guard = self.core.write_lock.lock().await;
+            let _mutation_guard = self.core.write_lock.read().await;
+            let inode_lock = self.core.inode_write_lock(ino).await;
+            let _inode_guard = inode_lock.lock().await;
             let _truncated = self
                 .core
                 .truncate_file_locked(ino, 0)
@@ -1052,7 +1056,7 @@ impl VirtualFs for VerFs {
                 "cannot hard-link across vault boundary".to_owned(),
             );
         }
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let mut linked: Option<InodeRecord> = None;
 
         self.core
@@ -1158,7 +1162,7 @@ impl VirtualFs for VerFs {
             return build_error_result_from_errno(Errno::EINVAL, "invalid xattr flags".to_owned());
         }
 
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         self.core
             .meta
             .write_txn(|txn| {
@@ -1290,7 +1294,7 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(ino, "removexattr")
             .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         self.core
             .meta
             .write_txn(|txn| {

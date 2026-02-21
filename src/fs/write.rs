@@ -1,9 +1,12 @@
 use super::*;
 use crate::fs::FsCore;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 impl FsCore {
     pub(crate) async fn apply_single_write(&self, op: WriteOp) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
+        let _mutation_guard = self.write_lock.read().await;
+        let inode_lock = self.inode_write_lock(op.ino).await;
+        let _inode_guard = inode_lock.lock().await;
 
         let mut inode = self.load_inode_or_errno(op.ino, "write")?;
         self.ensure_inode_vault_access(&inode, "write")?;
@@ -297,14 +300,35 @@ impl WriteApply for FsCore {
             groups.push((op, vec![idx]));
         }
 
-        let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
+        let mut by_inode = HashMap::<u64, Vec<(WriteOp, Vec<usize>)>>::new();
         for (group_op, indices) in groups {
-            let group_result = self.apply_single_write(group_op).await;
-            for idx in indices {
-                out[idx] = Some(match &group_result {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err(anyhow!(err.to_string())),
-                });
+            by_inode
+                .entry(group_op.ino)
+                .or_default()
+                .push((group_op, indices));
+        }
+
+        let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
+        let mut pending = FuturesUnordered::new();
+        for inode_groups in by_inode.into_values() {
+            pending.push(async move {
+                let mut inode_results = Vec::with_capacity(inode_groups.len());
+                for (group_op, indices) in inode_groups {
+                    let group_result = self.apply_single_write(group_op).await;
+                    inode_results.push((indices, group_result));
+                }
+                inode_results
+            });
+        }
+
+        while let Some(inode_results) = pending.next().await {
+            for (indices, group_result) in inode_results {
+                for idx in indices {
+                    out[idx] = Some(match &group_result {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(anyhow!(err.to_string())),
+                    });
+                }
             }
         }
 
