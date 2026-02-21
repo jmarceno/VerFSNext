@@ -3,6 +3,7 @@ mod data;
 mod fs;
 mod gc;
 mod meta;
+mod migration;
 mod snapshot;
 mod sync;
 mod types;
@@ -33,6 +34,7 @@ use tracing::{error, info};
 use crate::config::Config;
 use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
+use crate::migration::pack_size::run_pack_size_migration;
 use crate::snapshot::SnapshotManager;
 
 type LogHandle =
@@ -161,6 +163,12 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
             if !try_run_crypt_via_socket(&config, &cmd).await? {
                 run_crypt_via_metadata(&config, &cmd).await?;
             }
+        }
+        "pack-size-migrate" => {
+            if !args[1..].is_empty() {
+                bail!("pack-size-migrate does not take arguments");
+            }
+            run_pack_size_migration(&config).await?;
         }
         other => bail!("unknown control command '{other}'"),
     }

@@ -134,6 +134,19 @@ After lock:
 - `/.vault` disappears from directory listings
 - Direct access to `/.vault/*` fails until next unlock
 
+## Pack Size Migration
+
+To migrate to a new pack size:
+
+```bash
+./target/release/verfsnext pack-size-migrate
+```
+
+Notes:
+- This command must run while the daemon is stopped.
+- It rewrites all packs and updates chunk metadata pack mappings.
+- Old packs are moved to a backup directory under `data_dir`; remove that backup only after validation.
+
 ## Run As A Systemd Service
 
 1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start):

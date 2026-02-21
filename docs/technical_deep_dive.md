@@ -25,6 +25,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext crypt -l`
 - Runtime stats control path:
   - `verfsnext stats`
+- Offline pack-size migration control path:
+  - `verfsnext pack-size-migrate`
 - Global config-file CLI option:
   - `verfsnext --config <path> ...`
   - `verfsnext -c <path> ...`
@@ -38,6 +40,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
 - Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands.
+- Startup enforces persisted pack-size compatibility:
+  - `SYS:pack_max_size_mb` is initialized automatically on first startup after upgrade.
+  - Daemon startup fails if `config.pack_max_size_mb` differs from `SYS:pack_max_size_mb`.
+  - Pack-size changes require explicit offline migration via `pack-size-migrate`.
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
@@ -100,6 +106,14 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
   - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
 
+- `src/migration/pack_size.rs`
+  - Compatibility guard for persisted `SYS:pack_max_size_mb`
+  - Offline pack rewrite flow for pack-size changes:
+    - rewrites all chunk payloads into new packs using configured size
+    - updates chunk metadata `pack_id` mappings
+    - resets GC discard cursor/phase and truncates discard file
+    - moves old pack/index files into a backup directory for manual cleanup
+
 ## Config
 
 `config.toml` now includes Phase 5 tuning:
@@ -137,6 +151,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Snapshot metadata records are keyed under `S:<name>` and point to snapshot root inode.
 - System keys now include:
   - `SYS:active_pack_id`
+  - `SYS:pack_max_size_mb`
   - `SYS:gc.discard_checkpoint`
   - `SYS:gc.epoch`
   - `SYS:vault.state`
@@ -175,11 +190,23 @@ The repository now includes a Phase 5 implementation on top of the existing full
 4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, rewrites live chunks only, and atomically swaps rewritten pack/index files.
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
 
+## Pack-Size Compatibility and Migration
+
+1. On startup, if `SYS:pack_max_size_mb` is missing, it is written from `config.pack_max_size_mb` (legacy upgrade path).
+2. On startup, if persisted and configured pack size differ, mount fails fast and logs an error.
+3. To change pack size safely:
+   - stop daemon
+   - run `verfsnext pack-size-migrate`
+   - confirm prompt
+4. Migration rewrites chunk payloads into newly allocated pack IDs (above existing max), updates `ChunkRecord.pack_id`, updates `SYS:active_pack_id`, and then moves previous pack files to a backup directory under `data_dir`.
+5. Old packs are not deleted automatically; operator removes backup after validation.
+
 ## Validation Run
 
 Executed after Phase 5 changes:
 
 - `cargo build --release`
+- `cargo test parse_pack_id -- --nocapture`
 - `cargo test --test rsync_integration`
 - `CARGO_BIN_EXE_verfsnext=/home/jmarceno/Projects/VerFSNext/target/debug/verfsnext VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test --test rsync_integration rm_rf_large_fanout_directory_succeeds -- --exact --nocapture`
 

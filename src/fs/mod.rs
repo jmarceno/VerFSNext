@@ -24,7 +24,7 @@ use parking_lot::RwLock;
 use surrealkv::LSMIterator;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::config::Config;
 use crate::data::chunker::UltraStreamChunker;
@@ -33,6 +33,7 @@ use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
+use crate::migration::pack_size::ensure_pack_size_metadata_compat;
 use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
@@ -163,6 +164,14 @@ impl VerFs {
         config.ensure_dirs()?;
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
+        if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {
+            error!(
+                error = %err,
+                configured_pack_max_size_mb = config.pack_max_size_mb,
+                "pack-size metadata compatibility check failed"
+            );
+            return Err(err);
+        }
         let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
         let packs = PackStore::open(
             &config.packs_dir(),
