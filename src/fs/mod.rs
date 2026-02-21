@@ -41,8 +41,8 @@ use crate::types::{
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_INODE, MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE,
-    SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
+    MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -87,16 +87,16 @@ struct ZeroRefCandidate {
 pub struct VerFsStats {
     pub live_logical_size_bytes: u64,
     pub snapshots_logical_size_bytes: u64,
+    pub hidden_vault_logical_size_bytes: u64,
     pub all_logical_size_bytes: u64,
-    pub live_referenced_uncompressed_bytes: u64,
-    pub live_referenced_compressed_bytes: u64,
-    pub live_unique_uncompressed_bytes: u64,
-    pub live_unique_compressed_bytes: u64,
     pub stored_unique_uncompressed_bytes: u64,
     pub stored_unique_compressed_bytes: u64,
     pub metadata_size_bytes: u64,
     pub data_dir_size_bytes: u64,
-    pub live_dedup_savings_bytes: u64,
+    pub vault_locked: bool,
+    pub chunk_refcount_mismatch_count: u64,
+    pub missing_chunk_records_for_extents: u64,
+    pub orphan_extent_records: u64,
     pub cache_hits: u64,
     pub cache_requests: u64,
     pub cache_hit_rate: f64,
@@ -289,87 +289,151 @@ impl FsCore {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn accumulate_namespace_logical_size(
+        txn: &surrealkv::Transaction,
+        start_ino: u64,
+        seen_inodes: &mut HashSet<u64>,
+    ) -> Result<u64> {
+        let mut logical_size_bytes = 0_u64;
+        let mut stack = vec![start_ino];
+
+        while let Some(ino) = stack.pop() {
+            if !seen_inodes.insert(ino) {
+                continue;
+            }
+
+            let Some(raw) = txn.get(inode_key(ino))? else {
+                continue;
+            };
+            let inode: InodeRecord = decode_rkyv(&raw)?;
+
+            match inode.kind {
+                INODE_KIND_FILE => {
+                    logical_size_bytes = logical_size_bytes.saturating_add(inode.size);
+                }
+                INODE_KIND_DIR => {
+                    let prefix = dirent_prefix(ino);
+                    let end = prefix_end(&prefix);
+                    for pair in scan_range_pairs(txn, prefix, end)? {
+                        let (_, value) = pair?;
+                        let dirent: DirentRecord = decode_rkyv(&value)?;
+                        stack.push(dirent.ino);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(logical_size_bytes)
+    }
+
+    fn extent_owner_ino_from_key(key: &[u8]) -> Option<u64> {
+        if key.len() != 17 || key[0] != crate::types::KEY_PREFIX_EXTENT {
+            return None;
+        }
+        let mut ino = [0_u8; 8];
+        ino.copy_from_slice(&key[1..9]);
+        Some(u64::from_be_bytes(ino))
+    }
+
     fn collect_stats(&self) -> Result<VerFsStats> {
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
+        let vault_locked = self.vault_locked();
 
         let (
-            all_logical_size_bytes,
             live_logical_size_bytes,
+            snapshots_logical_size_bytes,
+            hidden_vault_logical_size_bytes,
+            all_logical_size_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
-            live_unique_uncompressed_bytes,
-            live_unique_compressed_bytes,
-            live_referenced_uncompressed_bytes,
-            live_referenced_compressed_bytes,
+            chunk_refcount_mismatch_count,
+            missing_chunk_records_for_extents,
+            orphan_extent_records,
         ) = self.meta.read_txn(|txn| {
-            let mut all_logical_size_bytes = 0_u64;
-            let inode_prefix = vec![KEY_PREFIX_INODE];
-            let inode_end = prefix_end(&inode_prefix);
-            for pair in scan_range_pairs(txn, inode_prefix, inode_end)? {
-                let (_, value) = pair?;
-                let inode: InodeRecord = decode_rkyv(&value)?;
-                if inode.kind == INODE_KIND_FILE {
-                    all_logical_size_bytes = all_logical_size_bytes.saturating_add(inode.size);
+            let mut live_logical_size_bytes = 0_u64;
+            let mut snapshots_logical_size_bytes = 0_u64;
+            let mut hidden_vault_logical_size_bytes = 0_u64;
+
+            let mut live_seen_inodes = HashSet::<u64>::new();
+            let mut snapshots_seen_inodes = HashSet::<u64>::new();
+            let mut hidden_vault_seen_inodes = HashSet::<u64>::new();
+
+            let root_prefix = dirent_prefix(ROOT_INODE);
+            let root_end = prefix_end(&root_prefix);
+            for pair in scan_range_pairs(txn, root_prefix, root_end)? {
+                let (key, value) = pair?;
+                let Some(name) = decode_dirent_name(&key) else {
+                    continue;
+                };
+                let dirent: DirentRecord = decode_rkyv(&value)?;
+
+                if name == SNAPSHOTS_DIR_NAME.as_bytes() {
+                    snapshots_logical_size_bytes = snapshots_logical_size_bytes.saturating_add(
+                        FsCore::accumulate_namespace_logical_size(
+                            txn,
+                            dirent.ino,
+                            &mut snapshots_seen_inodes,
+                        )?,
+                    );
+                    continue;
                 }
+
+                if vault_locked && name == VAULT_DIR_NAME.as_bytes() {
+                    hidden_vault_logical_size_bytes = hidden_vault_logical_size_bytes
+                        .saturating_add(FsCore::accumulate_namespace_logical_size(
+                            txn,
+                            dirent.ino,
+                            &mut hidden_vault_seen_inodes,
+                        )?);
+                    continue;
+                }
+
+                live_logical_size_bytes = live_logical_size_bytes.saturating_add(
+                    FsCore::accumulate_namespace_logical_size(
+                        txn,
+                        dirent.ino,
+                        &mut live_seen_inodes,
+                    )?,
+                );
             }
 
-            let mut live_logical_size_bytes = 0_u64;
-            let mut live_seen_inodes = HashSet::<u64>::new();
-            let mut live_dir_stack = vec![ROOT_INODE];
-            let mut live_extent_refcounts = HashMap::<[u8; 16], u64>::new();
-            live_seen_inodes.insert(ROOT_INODE);
+            let all_logical_size_bytes = live_logical_size_bytes
+                .saturating_add(snapshots_logical_size_bytes)
+                .saturating_add(hidden_vault_logical_size_bytes);
 
-            while let Some(dir_ino) = live_dir_stack.pop() {
-                let prefix = dirent_prefix(dir_ino);
-                let end = prefix_end(&prefix);
-                for pair in scan_range_pairs(txn, prefix, end)? {
-                    let (key, value) = pair?;
-                    let Some(name) = decode_dirent_name(&key) else {
-                        continue;
-                    };
-                    if dir_ino == ROOT_INODE && name == SNAPSHOTS_DIR_NAME.as_bytes() {
-                        continue;
-                    }
+            let mut all_extent_refcounts = HashMap::<[u8; 16], u64>::new();
+            let mut inode_present_cache = HashMap::<u64, bool>::new();
+            let mut orphan_extent_records = 0_u64;
+            let extent_prefix_all = vec![crate::types::KEY_PREFIX_EXTENT];
+            let extent_end_all = prefix_end(&extent_prefix_all);
+            for pair in scan_range_pairs(txn, extent_prefix_all, extent_end_all)? {
+                let (key, value) = pair?;
+                let Some(owner_ino) = FsCore::extent_owner_ino_from_key(&key) else {
+                    continue;
+                };
 
-                    let dirent: DirentRecord = decode_rkyv(&value)?;
-                    if !live_seen_inodes.insert(dirent.ino) {
-                        continue;
-                    }
-                    let Some(child_raw) = txn.get(inode_key(dirent.ino))? else {
-                        continue;
-                    };
-                    let child: InodeRecord = decode_rkyv(&child_raw)?;
-
-                    match child.kind {
-                        INODE_KIND_FILE => {
-                            live_logical_size_bytes =
-                                live_logical_size_bytes.saturating_add(child.size);
-                            let ext_prefix = extent_prefix(child.ino);
-                            let ext_end = prefix_end(&ext_prefix);
-                            for pair in scan_range_pairs(txn, ext_prefix, ext_end)? {
-                                let (_, ext_value) = pair?;
-                                let extent: ExtentRecord = decode_rkyv(&ext_value)?;
-                                let counter =
-                                    live_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
-                                *counter = counter.saturating_add(1);
-                            }
-                        }
-                        INODE_KIND_DIR => {
-                            live_dir_stack.push(child.ino);
-                        }
-                        _ => {}
-                    }
+                let owner_exists = if let Some(exists) = inode_present_cache.get(&owner_ino) {
+                    *exists
+                } else {
+                    let exists = txn.get(inode_key(owner_ino))?.is_some();
+                    inode_present_cache.insert(owner_ino, exists);
+                    exists
+                };
+                if !owner_exists {
+                    orphan_extent_records = orphan_extent_records.saturating_add(1);
                 }
+
+                let extent: ExtentRecord = decode_rkyv(&value)?;
+                let counter = all_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
+                *counter = counter.saturating_add(1);
             }
 
             let mut stored_unique_uncompressed_bytes = 0_u64;
             let mut stored_unique_compressed_bytes = 0_u64;
-            let mut live_unique_uncompressed_bytes = 0_u64;
-            let mut live_unique_compressed_bytes = 0_u64;
-            let mut live_referenced_uncompressed_bytes = 0_u64;
-            let mut live_referenced_compressed_bytes = 0_u64;
-
+            let mut chunk_refcount_mismatch_count = 0_u64;
+            let mut seen_chunk_records = HashSet::<[u8; 16]>::new();
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
             let chunk_end = prefix_end(&chunk_prefix);
             for pair in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
@@ -387,37 +451,33 @@ impl FsCore {
                     stored_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
                 stored_unique_compressed_bytes =
                     stored_unique_compressed_bytes.saturating_add(chunk_compressed);
-
-                if let Some(reference_count) = live_extent_refcounts.get(&hash) {
-                    live_unique_uncompressed_bytes =
-                        live_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
-                    live_unique_compressed_bytes =
-                        live_unique_compressed_bytes.saturating_add(chunk_compressed);
-                    live_referenced_uncompressed_bytes = live_referenced_uncompressed_bytes
-                        .saturating_add(chunk_uncompressed.saturating_mul(*reference_count));
-                    live_referenced_compressed_bytes = live_referenced_compressed_bytes
-                        .saturating_add(chunk_compressed.saturating_mul(*reference_count));
+                let expected_refcount = all_extent_refcounts.get(&hash).copied().unwrap_or(0);
+                if chunk.refcount != expected_refcount {
+                    chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
                 }
+                seen_chunk_records.insert(hash);
             }
 
+            let missing_chunk_records_for_extents = all_extent_refcounts
+                .keys()
+                .filter(|hash| !seen_chunk_records.contains(*hash))
+                .count() as u64;
+
             Ok((
-                all_logical_size_bytes,
                 live_logical_size_bytes,
+                snapshots_logical_size_bytes,
+                hidden_vault_logical_size_bytes,
+                all_logical_size_bytes,
                 stored_unique_uncompressed_bytes,
                 stored_unique_compressed_bytes,
-                live_unique_uncompressed_bytes,
-                live_unique_compressed_bytes,
-                live_referenced_uncompressed_bytes,
-                live_referenced_compressed_bytes,
+                chunk_refcount_mismatch_count,
+                missing_chunk_records_for_extents,
+                orphan_extent_records,
             ))
         })?;
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
-        let snapshots_logical_size_bytes =
-            all_logical_size_bytes.saturating_sub(live_logical_size_bytes);
-        let live_dedup_savings_bytes =
-            live_referenced_compressed_bytes.saturating_sub(live_unique_compressed_bytes);
 
         let cache_hits = self
             .chunk_meta_cache_hits
@@ -454,16 +514,16 @@ impl FsCore {
         Ok(VerFsStats {
             live_logical_size_bytes,
             snapshots_logical_size_bytes,
+            hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
-            live_referenced_uncompressed_bytes,
-            live_referenced_compressed_bytes,
-            live_unique_uncompressed_bytes,
-            live_unique_compressed_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
             metadata_size_bytes,
             data_dir_size_bytes,
-            live_dedup_savings_bytes,
+            vault_locked,
+            chunk_refcount_mismatch_count,
+            missing_chunk_records_for_extents,
+            orphan_extent_records,
             cache_hits,
             cache_requests,
             cache_hit_rate,
@@ -505,7 +565,6 @@ mod tests {
     use anyhow::anyhow;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     fn temp_dir_manual() -> PathBuf {

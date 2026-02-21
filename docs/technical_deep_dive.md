@@ -52,8 +52,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
-  - `collect_stats` computes live-scope logical/chunk/dedup/cache/memory/throughput metrics
-  - live scope is traversed from root while excluding `/.snapshots`; snapshot and all-namespace logical totals are also exposed separately
+  - `collect_stats` computes namespace-scoped logical size plus cache/memory/throughput metrics
+  - live scope is traversed from root while excluding `/.snapshots`, and excludes `/.vault` when vault is locked
+  - snapshot logical and hidden-vault logical totals are computed separately, with an all-reachable-namespaces total
+  - metadata consistency checks are computed in stats output:
+    chunk refcount mismatches, extents referencing missing chunk records, and orphan extent records
   - stats output includes full `data_dir` size and disk delta `data_dir_size - live_logical_size`
   - stats are rendered as an aligned table for terminal readability
   - read-only inode flag enforcement across mutating FUSE operations

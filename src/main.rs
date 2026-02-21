@@ -816,15 +816,11 @@ async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
 }
 
 fn format_stats_report(stats: &VerFsStats) -> String {
-    let compression_ratio = ratio(
-        stats.live_unique_compressed_bytes,
-        stats.live_unique_uncompressed_bytes,
+    let stored_compression_ratio = ratio(
+        stats.stored_unique_compressed_bytes,
+        stats.stored_unique_uncompressed_bytes,
     );
-    let compression_savings_ratio = (1.0 - compression_ratio).max(0.0);
-    let dedup_ratio = ratio(
-        stats.live_dedup_savings_bytes,
-        stats.live_referenced_compressed_bytes,
-    );
+    let stored_compression_savings_ratio = (1.0 - stored_compression_ratio).max(0.0);
     let disk_vs_live_logical =
         stats.data_dir_size_bytes as i128 - stats.live_logical_size_bytes as i128;
     let disk_delta_note = if disk_vs_live_logical < 0 {
@@ -840,12 +836,28 @@ fn format_stats_report(stats: &VerFsStats) -> String {
     } else {
         "exactly equal to live logical".to_owned()
     };
+    let all_namespaces_note = if stats.vault_locked {
+        "live + snapshots + hidden /.vault"
+    } else {
+        "live + snapshots"
+    };
+    let live_scope_note = if stats.vault_locked {
+        "locked /.vault excluded from live scope"
+    } else {
+        "includes /.vault when unlocked"
+    };
+    let consistency_ok = stats.chunk_refcount_mismatch_count == 0
+        && stats.missing_chunk_records_for_extents == 0
+        && stats.orphan_extent_records == 0;
 
-    let rows = vec![
+    let mut rows = vec![
         (
             "Live Logical Size (/.snapshots excluded)".to_owned(),
             human_bytes(stats.live_logical_size_bytes),
-            format!("{} bytes", stats.live_logical_size_bytes),
+            format!(
+                "{} bytes, {}",
+                stats.live_logical_size_bytes, live_scope_note
+            ),
         ),
         (
             "Logical Size in Snapshots".to_owned(),
@@ -853,39 +865,20 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             format!("{} bytes", stats.snapshots_logical_size_bytes),
         ),
         (
-            "Logical Size (All Namespaces)".to_owned(),
+            "Logical Size (All Reachable Namespaces)".to_owned(),
             human_bytes(stats.all_logical_size_bytes),
-            format!("{} bytes", stats.all_logical_size_bytes),
+            format!(
+                "{} bytes ({})",
+                stats.all_logical_size_bytes, all_namespaces_note
+            ),
         ),
         (
-            "Live Referenced Uncompressed".to_owned(),
-            human_bytes(stats.live_referenced_uncompressed_bytes),
-            format!("{} bytes", stats.live_referenced_uncompressed_bytes),
-        ),
-        (
-            "Live Referenced Compressed".to_owned(),
-            human_bytes(stats.live_referenced_compressed_bytes),
-            format!("{} bytes", stats.live_referenced_compressed_bytes),
-        ),
-        (
-            "Live Unique Uncompressed".to_owned(),
-            human_bytes(stats.live_unique_uncompressed_bytes),
-            format!("{} bytes", stats.live_unique_uncompressed_bytes),
-        ),
-        (
-            "Live Unique Compressed".to_owned(),
-            human_bytes(stats.live_unique_compressed_bytes),
-            format!("{} bytes", stats.live_unique_compressed_bytes),
-        ),
-        (
-            "Compression (Live Unique)".to_owned(),
-            format!("{:.2}% smaller", compression_savings_ratio * 100.0),
-            format!("compressed/original: {:.2}%", compression_ratio * 100.0),
-        ),
-        (
-            "Dedup Savings (Live)".to_owned(),
-            human_bytes(stats.live_dedup_savings_bytes),
-            format!("{:.2}% of non-dedup compressed", dedup_ratio * 100.0),
+            "Compression (Stored Unique Chunks)".to_owned(),
+            format!("{:.2}% smaller", stored_compression_savings_ratio * 100.0),
+            format!(
+                "compressed/original: {:.2}%",
+                stored_compression_ratio * 100.0
+            ),
         ),
         (
             "Stored Unique Uncompressed (All Chunks)".to_owned(),
@@ -896,6 +889,16 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             "Stored Unique Compressed (All Chunks)".to_owned(),
             human_bytes(stats.stored_unique_compressed_bytes),
             format!("{} bytes", stats.stored_unique_compressed_bytes),
+        ),
+        (
+            "Metadata Consistency".to_owned(),
+            if consistency_ok { "ok" } else { "warning" }.to_owned(),
+            format!(
+                "refcount mismatches {}, missing chunks {}, orphan extents {}",
+                stats.chunk_refcount_mismatch_count,
+                stats.missing_chunk_records_for_extents,
+                stats.orphan_extent_records
+            ),
         ),
         (
             "Metadata Size".to_owned(),
@@ -965,10 +968,23 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
     ];
+    if stats.vault_locked {
+        rows.insert(
+            1,
+            (
+                "Hidden Vault Logical Size".to_owned(),
+                human_bytes(stats.hidden_vault_logical_size_bytes),
+                format!(
+                    "{} bytes (excluded from live while locked)",
+                    stats.hidden_vault_logical_size_bytes
+                ),
+            ),
+        );
+    }
 
     let table = render_stats_table(&rows);
     format!(
-        "VerFSNext Stats\n(scoped to live tree unless explicitly marked otherwise)\n{}",
+        "VerFSNext Stats\n(scoped to mounted live tree unless explicitly marked otherwise)\n{}",
         table
     )
 }
@@ -1127,16 +1143,16 @@ mod tests {
         VerFsStats {
             live_logical_size_bytes: 10_000,
             snapshots_logical_size_bytes: 2_000,
+            hidden_vault_logical_size_bytes: 0,
             all_logical_size_bytes: 12_000,
-            live_referenced_uncompressed_bytes: 9_000,
-            live_referenced_compressed_bytes: 4_000,
-            live_unique_uncompressed_bytes: 8_000,
-            live_unique_compressed_bytes: 3_000,
             stored_unique_uncompressed_bytes: 11_000,
             stored_unique_compressed_bytes: 5_000,
             metadata_size_bytes: 1_000,
             data_dir_size_bytes: 7_500,
-            live_dedup_savings_bytes: 1_000,
+            vault_locked: false,
+            chunk_refcount_mismatch_count: 0,
+            missing_chunk_records_for_extents: 0,
+            orphan_extent_records: 0,
             cache_hits: 9,
             cache_requests: 10,
             cache_hit_rate: 0.9,
@@ -1159,7 +1175,8 @@ mod tests {
         assert!(report.contains("VerFSNext Stats"));
         assert!(report.contains("Metric"));
         assert!(report.contains("Live Logical Size (/.snapshots excluded)"));
-        assert!(report.contains("Compression (Live Unique)"));
+        assert!(report.contains("Compression (Stored Unique Chunks)"));
+        assert!(report.contains("Metadata Consistency"));
         assert!(report.contains("Average Throughput"));
         assert!(report.contains("I/O Totals"));
     }
@@ -1172,6 +1189,25 @@ mod tests {
         let report = format_stats_report(&stats);
         assert!(report.contains("Disk Delta (data_dir - live_logical)"));
         assert!(report.contains("saving"));
+    }
+
+    #[test]
+    fn stats_report_shows_hidden_vault_row_when_locked() {
+        let mut stats = sample_stats();
+        stats.vault_locked = true;
+        stats.hidden_vault_logical_size_bytes = 2_048;
+        let report = format_stats_report(&stats);
+        assert!(report.contains("Hidden Vault Logical Size"));
+        assert!(report.contains("excluded from live while locked"));
+    }
+
+    #[test]
+    fn stats_report_marks_metadata_warning_on_inconsistency() {
+        let mut stats = sample_stats();
+        stats.chunk_refcount_mismatch_count = 1;
+        let report = format_stats_report(&stats);
+        assert!(report.contains("Metadata Consistency"));
+        assert!(report.contains("warning"));
     }
 
     #[test]
