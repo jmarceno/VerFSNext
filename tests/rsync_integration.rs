@@ -198,6 +198,17 @@ fn setup_large_source_file(src: &Path) -> Result<PathBuf> {
     Ok(large)
 }
 
+fn create_recursive_delete_fanout(mount_point: &Path, dir_count: usize) -> Result<PathBuf> {
+    let target = mount_point.join("rm_fanout");
+    let target_s = target.to_string_lossy().into_owned();
+    let script = format!(
+        "set -euo pipefail; target='{}'; mkdir -p \"$target\"; for i in $(seq 1 {}); do d=\"$target/dir_$i\"; mkdir -p \"$d\"; printf 'payload-%s' \"$i\" > \"$d/file.txt\"; done",
+        target_s, dir_count
+    );
+    run_cmd(240, None, "bash", &["-c", &script])?;
+    Ok(target)
+}
+
 #[test]
 fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
     if std::env::consts::OS != "linux" {
@@ -406,6 +417,60 @@ fn rsync_large_file_rollover_multpack_persists() -> Result<()> {
     let remount_hash = sha256(&dst_large)?;
     if remount_hash != src_hash {
         bail!("large file checksum mismatch after remount")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn rm_rf_large_fanout_directory_succeeds() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in ["timeout", "mountpoint", "fusermount", "rm", "stat", "bash"] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 500\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let rm_target = create_recursive_delete_fanout(&mount_point, 1200)?;
+    let rm_target_s = rm_target.to_string_lossy().into_owned();
+    run_cmd(240, None, "rm", &["-rf", &rm_target_s])?;
+
+    let stat_out = run_cmd_raw(120, None, "stat", &[&rm_target_s])?;
+    if stat_out.status.success() {
+        bail!("rm_fanout still exists after rm -rf")
+    }
+
+    daemon.stop_graceful()?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    let stat_out_post = run_cmd_raw(120, None, "stat", &[&rm_target_s])?;
+    if stat_out_post.status.success() {
+        bail!("rm_fanout reappeared after remount")
     }
 
     daemon.stop_graceful()?;

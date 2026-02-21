@@ -770,13 +770,16 @@ impl FileSystem for FuseFs {
         match readdir_res {
             Ok(dir_entries) => {
                 for (i, dir_etnry) in dir_entries.iter().enumerate().skip(offset.cast()) {
-                    reply.add(
+                    let full = reply.add(
                         dir_etnry.ino(),
-                        offset.overflow_add(i.cast()).overflow_add(1), /* i + 1 means the index of
-                                                                        * the next entry */
+                        i.cast::<i64>().overflow_add(1), /* i + 1 means the index of
+                                                          * the next entry */
                         dir_etnry.file_type().into(),
                         dir_etnry.name(),
                     );
+                    if full {
+                        break;
+                    }
                 }
 
                 debug!(
@@ -844,7 +847,7 @@ impl FileSystem for FuseFs {
                     if let Ok((ttl, fuse_attr, generation)) = resolved {
                         let full = reply.add(
                             dir_entry.ino(),
-                            offset.overflow_add(i.cast()).overflow_add(1),
+                            i.cast::<i64>().overflow_add(1),
                             dir_entry.file_type().into(),
                             dir_entry.name(),
                             ttl,

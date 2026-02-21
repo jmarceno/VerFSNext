@@ -66,6 +66,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - marks vault inodes using inode flags and applies data encryption/decryption only for those inodes
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
+  - directory handles now keep a per-`opendir` snapshot for stable pagination while the namespace is mutating (prevents recursive-delete entry skips)
+
+- `vendor/async-fusex/src/fuse_fs.rs`
+  - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
+  - `readdir` now stops filling once the reply buffer is full, matching `readdirplus` behavior and preserving correct continuation semantics
 
 - `src/vault/mod.rs`
   - Envelope wrapping metadata type (`VaultWrapRecord`) encoded with `rkyv`
@@ -175,5 +180,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 Executed after Phase 5 changes:
 
 - `cargo build --release`
+- `cargo test --test rsync_integration`
+- `CARGO_BIN_EXE_verfsnext=/home/jmarceno/Projects/VerFSNext/target/debug/verfsnext VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test --test rsync_integration rm_rf_large_fanout_directory_succeeds -- --exact --nocapture`
 
 Build completed successfully in this repository state.

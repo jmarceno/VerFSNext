@@ -872,7 +872,16 @@ impl VirtualFs for VerFs {
                 "opendir called on non-directory".to_owned(),
             );
         }
-        Ok(self.core.new_handle())
+        let fh = self.core.new_handle();
+        let mut dir_handles = self.core.dir_handles.lock().await;
+        dir_handles.insert(
+            fh,
+            DirHandleState {
+                ino,
+                snapshot: None,
+            },
+        );
+        Ok(fh)
     }
 
     async fn readdir(
@@ -880,7 +889,7 @@ impl VirtualFs for VerFs {
         _uid: u32,
         _gid: u32,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _offset: i64,
     ) -> AsyncFusexResult<Vec<DirEntry>> {
         let inode = self
@@ -894,45 +903,49 @@ impl VirtualFs for VerFs {
             );
         }
 
-        let mut entries = Vec::new();
-        entries.push(DirEntry::new(ino, ".".to_owned(), FileType::Dir));
-        entries.push(DirEntry::new(inode.parent, "..".to_owned(), FileType::Dir));
-
-        let dir_entries = self
-            .core
-            .meta
-            .read_txn(|txn| {
-                let prefix = dirent_prefix(ino);
-                let end = prefix_end(&prefix);
-                let mut out = Vec::new();
-                for pair in scan_range_pairs(txn, prefix, end)? {
-                    let (key, value) = pair?;
-                    let Some(name_bytes) = decode_dirent_name(&key) else {
-                        continue;
-                    };
-                    let name = String::from_utf8_lossy(name_bytes).to_string();
-                    let dirent: DirentRecord = decode_rkyv(&value)?;
-                    if self.core.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
-                        continue;
-                    }
-                    out.push((name, dirent.ino, dirent.kind));
+        {
+            let dir_handles = self.core.dir_handles.lock().await;
+            if let Some(state) = dir_handles.get(&fh) {
+                if state.ino != ino {
+                    return build_error_result_from_errno(
+                        Errno::EBADF,
+                        format!("readdir handle {} does not match inode {}", fh, ino),
+                    );
                 }
-                Ok(out)
-            })
-            .map_err(map_anyhow_to_fuse)?;
-
-        for (name, child_ino, kind) in dir_entries {
-            entries.push(DirEntry::new(
-                child_ino,
-                name,
-                FsCore::inode_kind_to_file_type(kind),
-            ));
+                if let Some(snapshot) = state.snapshot.as_ref() {
+                    return Ok(FsCore::snapshot_to_dir_entries(snapshot));
+                }
+            }
         }
 
-        Ok(entries)
+        let snapshot = self
+            .core
+            .build_dir_snapshot(ino, &inode)
+            .map_err(map_anyhow_to_fuse)?;
+        {
+            let mut dir_handles = self.core.dir_handles.lock().await;
+            if let Some(state) = dir_handles.get_mut(&fh) {
+                if state.ino != ino {
+                    return build_error_result_from_errno(
+                        Errno::EBADF,
+                        format!("readdir handle {} does not match inode {}", fh, ino),
+                    );
+                }
+                if state.snapshot.is_none() {
+                    state.snapshot = Some(snapshot.clone());
+                }
+                if let Some(handle_snapshot) = state.snapshot.as_ref() {
+                    return Ok(FsCore::snapshot_to_dir_entries(handle_snapshot));
+                }
+            }
+        }
+
+        Ok(FsCore::snapshot_to_dir_entries(&snapshot))
     }
 
-    async fn releasedir(&self, _ino: u64, _fh: u64, _flags: u32) -> AsyncFusexResult<()> {
+    async fn releasedir(&self, _ino: u64, fh: u64, _flags: u32) -> AsyncFusexResult<()> {
+        let mut dir_handles = self.core.dir_handles.lock().await;
+        dir_handles.remove(&fh);
         Ok(())
     }
 

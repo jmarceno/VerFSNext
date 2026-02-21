@@ -76,6 +76,18 @@ struct FileLockState {
     pid: u32,
 }
 
+#[derive(Clone)]
+struct CachedDirEntry {
+    ino: u64,
+    name: String,
+    file_type: FileType,
+}
+
+struct DirHandleState {
+    ino: u64,
+    snapshot: Option<Vec<CachedDirEntry>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
     hash: [u8; 16],
@@ -142,6 +154,7 @@ struct FsCore {
     write_lock: Mutex<()>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
+    dir_handles: Mutex<HashMap<u64, DirHandleState>>,
     vault: RwLock<VaultRuntime>,
 }
 
@@ -201,6 +214,7 @@ impl VerFs {
             write_lock: Mutex::new(()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
+            dir_handles: Mutex::new(HashMap::new()),
             vault: RwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
@@ -287,6 +301,52 @@ impl VerFs {
 impl FsCore {
     fn new_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn build_dir_snapshot(&self, ino: u64, inode: &InodeRecord) -> Result<Vec<CachedDirEntry>> {
+        let mut entries = Vec::new();
+        entries.push(CachedDirEntry {
+            ino,
+            name: ".".to_owned(),
+            file_type: FileType::Dir,
+        });
+        entries.push(CachedDirEntry {
+            ino: inode.parent,
+            name: "..".to_owned(),
+            file_type: FileType::Dir,
+        });
+
+        let dir_entries = self.meta.read_txn(|txn| {
+            let prefix = dirent_prefix(ino);
+            let end = prefix_end(&prefix);
+            let mut out = Vec::new();
+            for pair in scan_range_pairs(txn, prefix, end)? {
+                let (key, value) = pair?;
+                let Some(name_bytes) = decode_dirent_name(&key) else {
+                    continue;
+                };
+                let name = String::from_utf8_lossy(name_bytes).to_string();
+                let dirent: DirentRecord = decode_rkyv(&value)?;
+                if self.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
+                    continue;
+                }
+                out.push(CachedDirEntry {
+                    ino: dirent.ino,
+                    name,
+                    file_type: FsCore::inode_kind_to_file_type(dirent.kind),
+                });
+            }
+            Ok(out)
+        })?;
+        entries.extend(dir_entries);
+        Ok(entries)
+    }
+
+    fn snapshot_to_dir_entries(snapshot: &[CachedDirEntry]) -> Vec<DirEntry> {
+        snapshot
+            .iter()
+            .map(|entry| DirEntry::new(entry.ino, entry.name.clone(), entry.file_type.clone()))
+            .collect()
     }
 
     fn accumulate_namespace_logical_size(
