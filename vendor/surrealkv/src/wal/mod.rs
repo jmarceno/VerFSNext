@@ -136,7 +136,7 @@ impl CompressionType {
 // ===== Options =====
 
 /// Default file mode for newly created files.
-const DEFAULT_FILE_MODE: u32 = 0o644;
+const DEFAULT_FILE_MODE: u32 = 0o660;
 
 /// Default maximum size of the segment file (100MB).
 const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
@@ -166,7 +166,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            dir_mode: Some(0o750),
+            dir_mode: Some(0o770),
             file_mode: Some(DEFAULT_FILE_MODE),
             compression_type: CompressionType::None,
             file_extension: Some("wal".to_string()),

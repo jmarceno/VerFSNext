@@ -4,6 +4,7 @@ mod fs;
 mod gc;
 mod meta;
 mod migration;
+mod permissions;
 mod snapshot;
 mod sync;
 mod types;
@@ -12,7 +13,6 @@ mod write;
 
 use std::io::ErrorKind;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -35,6 +35,7 @@ use crate::config::Config;
 use crate::fs::{VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
+use crate::permissions::set_socket_mode;
 use crate::snapshot::SnapshotManager;
 
 type LogHandle =
@@ -368,13 +369,7 @@ fn bind_control_socket(socket_path: &Path) -> Result<UnixListener> {
     }
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind control socket {}", socket_path.display()))?;
-    let permissions = std::fs::Permissions::from_mode(0o660);
-    std::fs::set_permissions(socket_path, permissions).with_context(|| {
-        format!(
-            "failed to set permissions on control socket {}",
-            socket_path.display()
-        )
-    })?;
+    set_socket_mode(socket_path)?;
     Ok(listener)
 }
 

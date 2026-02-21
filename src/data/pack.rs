@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::data::compress::decompress_chunk;
+use crate::permissions::{ensure_dir, set_file_mode};
 
 const RECORD_MAGIC: [u8; 4] = *b"VPK2";
 const RECORD_RESERVED: [u8; 3] = [0_u8; 3];
@@ -90,21 +91,11 @@ impl PackStore {
         index_cache_capacity: u64,
         max_pack_size_bytes: u64,
     ) -> Result<Self> {
-        std::fs::create_dir_all(packs_dir).with_context(|| {
-            format!(
-                "failed to create packs directory {}",
-                packs_dir.to_string_lossy()
-            )
-        })?;
+        ensure_dir(packs_dir)?;
 
         for subdir in ["A", "B", "C", "D", "E", "F"] {
             let subdir_path = packs_dir.join(subdir);
-            std::fs::create_dir_all(&subdir_path).with_context(|| {
-                format!(
-                    "failed to create packs subdirectory {}",
-                    subdir_path.display()
-                )
-            })?;
+            ensure_dir(&subdir_path)?;
         }
 
         let existing_pack_ids = Self::list_existing_pack_ids(packs_dir)?;
@@ -123,12 +114,14 @@ impl PackStore {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open active pack file {}", path.display()))?;
+        set_file_mode(&path)?;
         let index_file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&index_path)
             .with_context(|| format!("failed to open pack index file {}", index_path.display()))?;
+        set_file_mode(&index_path)?;
         let size_bytes = file
             .metadata()
             .with_context(|| format!("failed to stat active pack file {}", path.display()))?
@@ -429,6 +422,7 @@ impl PackStore {
                 .with_context(|| {
                     format!("failed to open next pack file {}", next_path.display())
                 })?;
+            set_file_mode(&next_path)?;
             let next_index_file = OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -440,6 +434,7 @@ impl PackStore {
                         next_index_path.display()
                     )
                 })?;
+            set_file_mode(&next_index_path)?;
             let next_size = next_file
                 .metadata()
                 .with_context(|| format!("failed to stat next pack file {}", next_path.display()))?
@@ -500,6 +495,7 @@ impl PackStore {
             .truncate(true)
             .open(&tmp_pack_path)
             .with_context(|| format!("failed to open temp pack {}", tmp_pack_path.display()))?;
+        set_file_mode(&tmp_pack_path)?;
         let mut dst_index = OpenOptions::new()
             .create(true)
             .write(true)
@@ -508,6 +504,7 @@ impl PackStore {
             .with_context(|| {
                 format!("failed to open temp pack index {}", tmp_idx_path.display())
             })?;
+        set_file_mode(&tmp_idx_path)?;
 
         let mut cursor = 0_u64;
         let mut new_offset = 0_u64;
@@ -768,6 +765,7 @@ impl PackStore {
             .truncate(true)
             .open(&index_path)
             .with_context(|| format!("failed to rebuild pack index {}", index_path.display()))?;
+        set_file_mode(&index_path)?;
 
         let mut cursor = 0_u64;
         loop {

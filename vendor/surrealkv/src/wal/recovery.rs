@@ -288,6 +288,7 @@ pub(crate) fn replay_wal(
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
     use std::fs;
 
+    use crate::ensure_dir_with_mode;
     use crate::wal::manager::Wal;
     use crate::wal::reader::Reader;
     use crate::wal::Options;
@@ -304,7 +305,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
     // Create a repair directory for the new WAL file
     let repair_dir = wal_dir.join("repair_temp");
-    fs::create_dir_all(&repair_dir)?;
+    ensure_dir_with_mode(&repair_dir)?;
 
     // Create a new Wal for writing the repaired data
     // We'll write to a temp directory then move the file

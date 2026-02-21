@@ -42,6 +42,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
 - Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands.
+- Startup now normalizes `<data_dir>` tree permissions to group-writable POSIX modes:
+  - directories: `0770`
+  - regular runtime files (packs/indices/metadata/discard): `0660`
+  - control socket: `0660`
+  - normalization is best-effort when mode changes are not permitted by ownership/capabilities
 - Startup enforces persisted pack-size compatibility:
   - `SYS:pack_max_size_mb` is initialized automatically on first startup after upgrade.
   - Daemon startup fails if `config.pack_max_size_mb` differs from `SYS:pack_max_size_mb`.

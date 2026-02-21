@@ -26,6 +26,9 @@ mod test;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,6 +42,38 @@ pub use crate::transaction::{
     Durability, HistoryOptions, MergeMissingBehavior, MergeOp, Mode, PutIfAbsentResult,
     ReadOptions, Transaction, WriteOptions,
 };
+
+pub(crate) const GROUP_DIR_MODE: u32 = 0o770;
+pub(crate) const GROUP_FILE_MODE: u32 = 0o660;
+
+pub(crate) fn ensure_dir_with_mode(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(|e| Error::Io(e.into()))?;
+    apply_mode(path, GROUP_DIR_MODE)
+}
+
+pub(crate) fn ensure_file_mode(path: &Path) -> Result<()> {
+    apply_mode(path, GROUP_FILE_MODE)
+}
+
+fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+            if err.kind() == ErrorKind::PermissionDenied {
+                log::warn!(
+                    "unable to adjust mode {:o} for {}: {}. continuing with existing mode",
+                    mode,
+                    path.display(),
+                    err
+                );
+                return Ok(());
+            }
+            return Err(Error::Io(err.into()));
+        }
+    }
+    Ok(())
+}
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {

@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::data::pack::PackStore;
 use crate::fs::utils::scan_range_pairs;
 use crate::meta::MetaStore;
+use crate::permissions::{ensure_dir, set_file_mode};
 use crate::types::{
     chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkRecord, KEY_PREFIX_CHUNK,
 };
@@ -179,6 +180,7 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
             discard_path.display()
         )
     })?;
+    set_file_mode(&discard_path)?;
 
     let backup_dir =
         move_old_packs_to_backup(&config.packs_dir(), &config.data_dir, old_max_pack_id)?;
@@ -301,8 +303,9 @@ fn move_old_packs_to_backup(
     max_old_pack_id: u64,
 ) -> Result<PathBuf> {
     let backup_dir = next_backup_dir(data_dir);
+    ensure_dir(&backup_dir)?;
     for subdir in ["A", "B", "C", "D", "E", "F"] {
-        fs::create_dir_all(backup_dir.join(subdir))
+        ensure_dir(&backup_dir.join(subdir))
             .with_context(|| format!("failed to create backup packs subdirectory {}", subdir))?;
     }
 

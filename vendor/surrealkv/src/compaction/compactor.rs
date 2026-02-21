@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use crate::bplustree::tree::DiskBPlusTree;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
+use crate::ensure_file_mode;
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog_and_index, resolve_vlog_cleanup_floor, CoreInner};
@@ -177,6 +178,7 @@ impl Compactor {
         input: &CompactionInput,
     ) -> Result<bool> {
         let file = SysFile::create(path)?;
+        ensure_file_mode(path)?;
         let mut writer = TableWriter::new(
             file,
             table_id,

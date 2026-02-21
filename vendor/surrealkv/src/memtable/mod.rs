@@ -10,6 +10,7 @@ use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
 use crate::error::Result;
+use crate::ensure_file_mode;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
@@ -249,6 +250,7 @@ impl MemTable {
 
         {
             let file = SysFile::create(&table_file_path)?;
+            ensure_file_mode(&table_file_path)?;
             let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
             let mut iter = self.iter();

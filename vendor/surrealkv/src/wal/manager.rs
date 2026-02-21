@@ -207,15 +207,13 @@ impl Wal {
             .create(true)
             .append(true);
 
+        let file = open_options.open(file_path)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Some(file_mode) = opts.file_mode {
-                open_options.mode(file_mode);
-            }
+        if let Some(file_mode) = opts.file_mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(file_path, fs::Permissions::from_mode(file_mode))?;
         }
-
-        Ok(open_options.open(file_path)?)
+        Ok(file)
     }
 
     fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
@@ -230,7 +228,7 @@ impl Wal {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
+                permissions.set_mode(opts.dir_mode.unwrap_or(0o770));
             }
 
             #[cfg(windows)]

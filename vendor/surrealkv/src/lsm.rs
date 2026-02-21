@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,6 +26,7 @@ use crate::transaction::{
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
+use crate::ensure_dir_with_mode;
 use crate::{
     BytewiseComparator, Comparator, Error, FilterPolicy, InternalKey, InternalKeyKind, IntoBytes,
     LSMIterator, Options, TimestampComparator, VLogChecksumLevel, Value, WalRecoveryMode,
@@ -1575,20 +1576,20 @@ impl Tree {
     /// Creates all required directory structure for the LSM tree
     fn create_directory_structure(opts: &Options) -> Result<()> {
         // Create base directory
-        create_dir_all(&opts.path)?;
+        ensure_dir_with_mode(&opts.path)?;
 
         // Create all subdirectories
-        create_dir_all(opts.sstable_dir())?;
-        create_dir_all(opts.wal_dir())?;
-        create_dir_all(opts.manifest_dir())?;
+        ensure_dir_with_mode(&opts.sstable_dir())?;
+        ensure_dir_with_mode(&opts.wal_dir())?;
+        ensure_dir_with_mode(&opts.manifest_dir())?;
 
         // Create VLog directories
         if opts.enable_vlog {
-            create_dir_all(opts.vlog_dir())?;
+            ensure_dir_with_mode(&opts.vlog_dir())?;
         }
 
         if opts.enable_versioning {
-            create_dir_all(opts.versioned_index_dir())?;
+            ensure_dir_with_mode(&opts.versioned_index_dir())?;
         }
 
         Ok(())

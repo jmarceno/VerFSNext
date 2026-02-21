@@ -34,6 +34,7 @@ use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::ensure_pack_size_metadata_compat;
+use crate::permissions::normalize_data_tree;
 use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
@@ -164,6 +165,7 @@ struct FsCore {
 impl VerFs {
     pub async fn new(config: Config) -> Result<Self> {
         config.ensure_dirs()?;
+        normalize_data_tree(&config.data_dir)?;
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
         if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {

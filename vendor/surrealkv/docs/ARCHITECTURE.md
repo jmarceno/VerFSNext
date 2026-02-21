@@ -53,11 +53,14 @@ This keeps the vendored engine buildable as a first-class in-repo component for 
 - Partitioned index top-level entries are persisted as a `rkyv` archive payload, then materialized directly into `Index::blocks` during open.
 - These format updates are intentionally breaking and no compatibility path is maintained.
 
-## WAL Directory Permission Behavior
+## POSIX Permission Policy (VerFSNext Vendor)
 
-- WAL initialization (`src/wal/manager.rs`) attempts to normalize directory mode based on WAL options.
-- Permission normalization is best-effort: if `set_permissions` fails with `PermissionDenied`, WAL startup continues using the existing directory mode.
-- Rationale: deployments where data directories are writable but not owned by the service user must remain operational.
+- SurrealKV paths created by VerFSNext now use explicit POSIX modes (no ACLs):
+  - directories: `0770`
+  - files: `0660`
+- Permission normalization is applied in directory/file creation paths used by WAL, SSTable flush/compaction, checkpoint metadata, lock file, VLog, and versioned index file creation.
+- Mode normalization is best-effort on `PermissionDenied` and continues with existing mode.
+- WAL directory normalization remains best-effort on `PermissionDenied` so existing deployments with non-owned directories can still start.
 
 ---
 
