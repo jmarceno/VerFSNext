@@ -83,10 +83,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `src/fs/write.rs`
   - `apply_batch` still coalesces adjacent writes first, then executes per-inode groups sequentially while running different inodes concurrently
   - preserves per-inode operation order while unlocking cross-inode parallelism
-  - `apply_single_write` now acquires:
-    - global mutation read lock
-    - per-inode write lock
-  - this removes the prior global stop-the-world serialization for data writes across unrelated files
+  - `apply_single_write` is now two-phase:
+    - phase 1 (outside inode lock): reads extents, assembles block payloads, hashes, dedup checks, and chunk compression/materialization
+    - phase 2 (short critical section): acquires global mutation read lock plus per-inode lock, then commits extent/refcount/inode metadata
+  - per-inode data-version counters detect races with truncation; on mismatch, write preparation is recomputed against current inode state before commit
+  - this removes chunk/compression work from the steady-state inode critical section while preserving ordered inode commits
 
 - `src/write/batcher.rs`
   - queue ingestion no longer blocks on `sink.apply_batch`

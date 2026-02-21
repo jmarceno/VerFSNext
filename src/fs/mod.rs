@@ -154,6 +154,7 @@ struct FsCore {
     last_activity_ms: AtomicU64,
     write_lock: AsyncRwLock<()>,
     inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
+    inode_data_versions: Mutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
@@ -223,6 +224,7 @@ impl VerFs {
             last_activity_ms: AtomicU64::new(now_millis()),
             write_lock: AsyncRwLock::new(()),
             inode_write_locks: Mutex::new(HashMap::new()),
+            inode_data_versions: Mutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
@@ -319,6 +321,17 @@ impl FsCore {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(ino, Arc::downgrade(&lock));
         lock
+    }
+
+    async fn inode_data_version(&self, ino: u64) -> u64 {
+        let mut versions = self.inode_data_versions.lock().await;
+        *versions.entry(ino).or_insert(0)
+    }
+
+    async fn bump_inode_data_version(&self, ino: u64) {
+        let mut versions = self.inode_data_versions.lock().await;
+        let entry = versions.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 
     fn new_handle(&self) -> u64 {
