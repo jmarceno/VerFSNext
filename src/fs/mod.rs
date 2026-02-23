@@ -33,6 +33,9 @@ use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
+use crate::migration::pack_index_crc32::{
+    ensure_pack_index_crc32_compat, SYS_PACK_CRC32_READ_ERRORS,
+};
 use crate::migration::pack_size::ensure_pack_size_metadata_compat;
 use crate::permissions::normalize_data_tree;
 use crate::snapshot::SnapshotManager;
@@ -111,6 +114,7 @@ pub struct VerFsStats {
     pub chunk_refcount_mismatch_count: u64,
     pub missing_chunk_records_for_extents: u64,
     pub orphan_extent_records: u64,
+    pub pack_crc32_read_error_count: u64,
     pub cache_hits: u64,
     pub cache_requests: u64,
     pub cache_hit_rate: f64,
@@ -142,6 +146,7 @@ struct FsCore {
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
     next_handle: AtomicU64,
     last_persisted_active_pack_id: AtomicU64,
+    last_persisted_pack_crc32_read_error_count: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
     chunk_meta_cache_hits: AtomicU64,
@@ -150,6 +155,7 @@ struct FsCore {
     chunk_data_cache_misses: AtomicU64,
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
+    pack_crc32_read_error_count: AtomicU64,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
@@ -168,6 +174,7 @@ impl VerFs {
         normalize_data_tree(&config.data_dir)?;
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
+        ensure_pack_index_crc32_compat(&config, &meta).await?;
         if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {
             error!(
                 error = %err,
@@ -177,6 +184,8 @@ impl VerFs {
             return Err(err);
         }
         let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
+        let persisted_pack_crc32_read_error_count =
+            meta.get_u64_sys(SYS_PACK_CRC32_READ_ERRORS).unwrap_or(0);
         let packs = PackStore::open(
             &config.packs_dir(),
             configured_active_pack_id,
@@ -213,6 +222,9 @@ impl VerFs {
                 .build(),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
+            last_persisted_pack_crc32_read_error_count: AtomicU64::new(
+                persisted_pack_crc32_read_error_count,
+            ),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
             chunk_meta_cache_hits: AtomicU64::new(0),
@@ -221,6 +233,7 @@ impl VerFs {
             chunk_data_cache_misses: AtomicU64::new(0),
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
+            pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
@@ -603,6 +616,7 @@ impl FsCore {
             read_process_private_memory_bytes().unwrap_or(process_rss_bytes);
         let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
         let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
+        let pack_crc32_read_error_count = self.pack_crc32_read_error_count.load(Ordering::Relaxed);
         let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
         let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
         let read_throughput_bps = read_bytes_total as f64 / uptime_secs;
@@ -621,6 +635,7 @@ impl FsCore {
             chunk_refcount_mismatch_count,
             missing_chunk_records_for_extents,
             orphan_extent_records,
+            pack_crc32_read_error_count,
             cache_hits,
             cache_requests,
             cache_hit_rate,
@@ -642,6 +657,7 @@ impl FsCore {
 impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
         self.persist_active_pack_id_if_needed().await?;
+        self.persist_pack_crc32_read_error_count_if_needed().await?;
         if full {
             self.packs.sync(true)?;
             self.meta.flush_wal(true)?;

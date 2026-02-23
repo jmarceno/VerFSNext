@@ -730,10 +730,10 @@ impl VirtualFs for VerFs {
                                     "encrypted chunk mapped outside vault inode".to_owned(),
                                 );
                             }
-                            let encrypted = self
+                            let (encrypted, index) = self
                                 .core
                                 .packs
-                                .read_chunk_payload(
+                                .read_chunk_payload_with_index(
                                     chunk.pack_id,
                                     extent.chunk_hash,
                                     chunk.codec,
@@ -741,6 +741,12 @@ impl VirtualFs for VerFs {
                                     chunk.compressed_len,
                                 )
                                 .map_err(map_anyhow_to_fuse)?;
+                            self.core.validate_pack_payload_crc32(
+                                chunk.pack_id,
+                                extent.chunk_hash,
+                                index.payload_crc32,
+                                &encrypted,
+                            );
                             let folder_key =
                                 self.core.current_vault_key().map_err(map_anyhow_to_fuse)?;
                             let compressed =
@@ -753,16 +759,29 @@ impl VirtualFs for VerFs {
                             )
                             .map_err(map_anyhow_to_fuse)?
                         } else {
-                            self.core
+                            let (compressed, index) = self
+                                .core
                                 .packs
-                                .read_chunk(
+                                .read_chunk_payload_with_index(
                                     chunk.pack_id,
                                     extent.chunk_hash,
                                     chunk.codec,
                                     chunk.uncompressed_len,
                                     chunk.compressed_len,
                                 )
-                                .map_err(map_anyhow_to_fuse)?
+                                .map_err(map_anyhow_to_fuse)?;
+                            self.core.validate_pack_payload_crc32(
+                                chunk.pack_id,
+                                extent.chunk_hash,
+                                index.payload_crc32,
+                                &compressed,
+                            );
+                            crate::data::compress::decompress_chunk(
+                                chunk.codec,
+                                &compressed,
+                                chunk.uncompressed_len,
+                            )
+                            .map_err(map_anyhow_to_fuse)?
                         };
                         self.core
                             .chunk_data_cache

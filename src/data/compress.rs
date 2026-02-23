@@ -10,6 +10,7 @@ pub struct CompressedChunk {
     pub compressed: Vec<u8>,
     pub uncompressed_len: u32,
     pub compressed_len: u32,
+    pub payload_crc32: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub fn compress_chunk(data: &[u8], zstd_level: i32) -> Result<CompressedChunk> {
         codec,
         uncompressed_len: data.len() as u32,
         compressed_len: payload.len() as u32,
+        payload_crc32: crc32c::crc32c(&payload),
         compressed: payload,
     })
 }

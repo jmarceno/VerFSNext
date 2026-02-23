@@ -36,6 +36,7 @@ struct PackIndexRecord {
     reserved: [u8; 3],
     uncompressed_len: u32,
     compressed_len: u32,
+    payload_crc32: u32,
 }
 
 const RECORD_HEADER_LEN: usize = size_of::<ArchivedPackRecordHeader>();
@@ -68,6 +69,7 @@ pub struct PackIndexEntry {
     pub codec: u8,
     pub uncompressed_len: u32,
     pub compressed_len: u32,
+    pub payload_crc32: u32,
 }
 
 struct ActivePack {
@@ -156,6 +158,24 @@ impl PackStore {
         uncompressed_len: u32,
         compressed_data: &[u8],
     ) -> Result<u64> {
+        let payload_crc32 = crc32c::crc32c(compressed_data);
+        self.append_chunk_with_crc32(
+            chunk_hash,
+            codec,
+            uncompressed_len,
+            compressed_data,
+            payload_crc32,
+        )
+    }
+
+    pub fn append_chunk_with_crc32(
+        &self,
+        chunk_hash: [u8; 16],
+        codec: u8,
+        uncompressed_len: u32,
+        compressed_data: &[u8],
+        payload_crc32: u32,
+    ) -> Result<u64> {
         if compressed_data.len() > u32::MAX as usize {
             bail!("compressed chunk too large: {}", compressed_data.len());
         }
@@ -203,6 +223,7 @@ impl PackStore {
             codec,
             uncompressed_len,
             compressed_len,
+            payload_crc32,
         };
         Self::append_index_record(&mut active.index_file, chunk_hash, index)?;
 
@@ -212,6 +233,7 @@ impl PackStore {
         Ok(active.pack_id)
     }
 
+    #[allow(dead_code)]
     pub fn read_chunk(
         &self,
         pack_id: u64,
@@ -230,14 +252,14 @@ impl PackStore {
         decompress_chunk(expected_codec, &payload, expected_uncompressed_len)
     }
 
-    pub fn read_chunk_payload(
+    pub fn read_chunk_payload_with_index(
         &self,
         pack_id: u64,
         expected_hash: [u8; 16],
         expected_codec: u8,
         expected_uncompressed_len: u32,
         expected_compressed_len: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, PackIndexEntry)> {
         let index = self
             .lookup_index_entry(pack_id, expected_hash)?
             .with_context(|| {
@@ -330,6 +352,24 @@ impl PackStore {
         file.read_exact_at(&mut payload, payload_offset)
             .with_context(|| format!("failed to read pack payload from {}", path.display()))?;
 
+        Ok((payload, index))
+    }
+
+    pub fn read_chunk_payload(
+        &self,
+        pack_id: u64,
+        expected_hash: [u8; 16],
+        expected_codec: u8,
+        expected_uncompressed_len: u32,
+        expected_compressed_len: u32,
+    ) -> Result<Vec<u8>> {
+        let (payload, _) = self.read_chunk_payload_with_index(
+            pack_id,
+            expected_hash,
+            expected_codec,
+            expected_uncompressed_len,
+            expected_compressed_len,
+        )?;
         Ok(payload)
     }
 
@@ -562,6 +602,7 @@ impl PackStore {
                                 codec,
                                 uncompressed_len: ulen,
                                 compressed_len: clen,
+                                payload_crc32: crc32c::crc32c(&payload),
                             },
                         )?;
                         new_offset = new_offset
@@ -786,6 +827,20 @@ impl PackStore {
                         codec: header.codec,
                         uncompressed_len: header.uncompressed_len,
                         compressed_len: header.compressed_len,
+                        payload_crc32: {
+                            let payload_offset = cursor
+                                .checked_add(RECORD_HEADER_LEN_U64)
+                                .context("pack offset overflow while rebuilding index payload")?;
+                            let mut payload = vec![0_u8; header.compressed_len as usize];
+                            pack.read_exact_at(&mut payload, payload_offset)
+                                .with_context(|| {
+                                    format!(
+                                        "failed reading pack payload while rebuilding index {}",
+                                        pack_path.display()
+                                    )
+                                })?;
+                            crc32c::crc32c(&payload)
+                        },
                     };
                     Self::append_index_record(&mut index, header.hash, entry)?;
 
@@ -854,6 +909,7 @@ impl PackStore {
             reserved: RECORD_RESERVED,
             uncompressed_len: entry.uncompressed_len,
             compressed_len: entry.compressed_len,
+            payload_crc32: entry.payload_crc32,
         };
         let raw = Self::encode_index_record(&record)?;
         index_file
@@ -874,6 +930,7 @@ impl PackStore {
                 codec: archived.codec,
                 uncompressed_len: archived.uncompressed_len.to_native(),
                 compressed_len: archived.compressed_len.to_native(),
+                payload_crc32: archived.payload_crc32.to_native(),
             },
         ))
     }
@@ -971,6 +1028,7 @@ mod tests {
             reserved: RECORD_RESERVED,
             uncompressed_len: 2048,
             compressed_len: 1200,
+            payload_crc32: 0xAABBCCDD,
         };
 
         let header_bytes =

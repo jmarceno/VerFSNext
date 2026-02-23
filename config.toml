@@ -1,5 +1,5 @@
-mount_point = "/mnt/verfs/" # FUSE mount point path.
-data_dir = "/mnt/snapshots/verfs/" # Root data directory for metadata and packs.
+mount_point = "/mnt/verfs_test/" # FUSE mount point path.
+data_dir = "/mnt/snapshots/verfs_test/" # Root data directory for metadata and packs.
 sync_interval_ms = 20000 # Background sync interval in milliseconds.
 batch_max_size_mb = 1024 # Maximum unwritten block data per write batch in megabytes.
 batch_flush_interval_ms = 500 # Maximum write batching delay in milliseconds.

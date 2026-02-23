@@ -288,6 +288,28 @@ impl FsCore {
             .store(active_pack_id, Ordering::Relaxed);
         Ok(())
     }
+    pub(crate) async fn persist_pack_crc32_read_error_count_if_needed(&self) -> Result<()> {
+        let current = self.pack_crc32_read_error_count.load(Ordering::Relaxed);
+        let last_persisted = self
+            .last_persisted_pack_crc32_read_error_count
+            .load(Ordering::Relaxed);
+        if current == last_persisted {
+            return Ok(());
+        }
+
+        self.meta
+            .write_txn(|txn| {
+                txn.set(
+                    sys_key(crate::migration::pack_index_crc32::SYS_PACK_CRC32_READ_ERRORS),
+                    current.to_le_bytes().to_vec(),
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.last_persisted_pack_crc32_read_error_count
+            .store(current, Ordering::Relaxed);
+        Ok(())
+    }
     pub(crate) fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {
         self.meta.read_txn(|txn| {
             let mut out = HashSet::new();

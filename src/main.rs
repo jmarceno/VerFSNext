@@ -904,6 +904,11 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
         (
+            "Pack CRC32 Read Errors".to_owned(),
+            stats.pack_crc32_read_error_count.to_string(),
+            "read-time checksum mismatches (read continues)".to_owned(),
+        ),
+        (
             "Metadata Size".to_owned(),
             human_bytes(stats.metadata_size_bytes),
             format!("{} bytes", stats.metadata_size_bytes),
@@ -1156,6 +1161,7 @@ mod tests {
             chunk_refcount_mismatch_count: 0,
             missing_chunk_records_for_extents: 0,
             orphan_extent_records: 0,
+            pack_crc32_read_error_count: 0,
             cache_hits: 9,
             cache_requests: 10,
             cache_hit_rate: 0.9,
@@ -1180,6 +1186,7 @@ mod tests {
         assert!(report.contains("Live Logical Size (/.snapshots excluded)"));
         assert!(report.contains("Compression (Stored Unique Chunks)"));
         assert!(report.contains("Metadata Consistency"));
+        assert!(report.contains("Pack CRC32 Read Errors"));
         assert!(report.contains("Average Throughput"));
         assert!(report.contains("I/O Totals"));
     }

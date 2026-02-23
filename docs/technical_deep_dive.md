@@ -51,6 +51,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `SYS:pack_max_size_mb` is initialized automatically on first startup after upgrade.
   - Daemon startup fails if `config.pack_max_size_mb` differs from `SYS:pack_max_size_mb`.
   - Pack-size changes require explicit offline migration via `pack-size-migrate`.
+- Startup runs a one-time pack-index CRC32 migration:
+  - rewrites all `.idx` files to include a payload CRC32 field
+  - stores completion marker in `SYS:pack_index_crc32_migration_v1`
+  - initializes `SYS:pack_crc32_read_errors`
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
@@ -66,10 +70,12 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`)
   - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
   - read path resolves chunk location through pack-local hash index
+  - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
   - `collect_stats` computes namespace-scoped logical size plus cache/memory/throughput metrics
+  - stats include cumulative pack payload CRC32 read mismatch count
   - live scope is traversed from root while excluding `/.snapshots`, and excludes `/.vault` when vault is locked
   - snapshot logical and hidden-vault logical totals are computed separately, with an all-reachable-namespaces total
   - metadata consistency checks are computed in stats output:
@@ -123,11 +129,12 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 - `src/data/pack.rs`
   - Pack record format `VPK2` archived with `rkyv`
-  - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records
+  - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records including `payload_crc32`
   - Pack header and index record decode paths use checked `rkyv::access` for zero-copy validation
   - Automatic active-pack rollover on append when configured pack size target is reached
   - Existing packs are discovered on startup; highest pack id becomes active if metadata lags
   - Hash lookup path reads index entry first, then seeks pack payload
+  - CRC32 is computed on stored payload bytes (ciphertext for vault chunks, compressed/raw payload for non-vault chunks)
   - Supports encrypted-payload reads (`read_chunk_payload`) for vault decrypt-then-decompress flow
   - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
   - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
@@ -226,6 +233,14 @@ The repository now includes a Phase 5 implementation on top of the existing full
    - confirm prompt
 4. Migration rewrites chunk payloads into newly allocated pack IDs (above existing max), updates `ChunkRecord.pack_id`, updates `SYS:active_pack_id`, and then moves previous pack files to a backup directory under `data_dir`.
 5. Old packs are not deleted automatically; operator removes backup after validation.
+
+## Pack-Index CRC32 Compatibility Migration
+
+1. On startup, before `PackStore::open`, VerFS checks `SYS:pack_index_crc32_migration_v1`.
+2. If the marker is missing, VerFS scans every pack file (`*.vpk`) and rewrites every pack index (`*.idx`) with the new fixed-size record format that includes `payload_crc32`.
+3. The CRC32 is computed from the stored payload bytes in the pack record (so migration works even when `/.vault` is locked).
+4. Each rewritten index is written to a temporary file and atomically renamed into place.
+5. After all indexes are rewritten, VerFS writes the migration marker and initializes `SYS:pack_crc32_read_errors` if it does not already exist.
 
 ## Validation Run
 
