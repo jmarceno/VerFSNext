@@ -1026,6 +1026,7 @@ impl VLog {
 
     /// Returns the oldest non-active VLog file eligible for relocation under the
     /// provided minimum age policy.
+    #[allow(dead_code)]
     pub(crate) fn oldest_relocatable_file_id(&self, min_age_files: u32) -> Option<u32> {
         let active = self.active_file_id();
         let files_map = self.files_map.read();
