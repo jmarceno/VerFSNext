@@ -147,6 +147,23 @@ Notes:
 - It rewrites all packs and updates chunk metadata pack mappings.
 - Old packs are moved to a backup directory under `data_dir`; remove that backup only after validation.
 
+## Offline GC Recovery / Full Rebuild
+
+Use this when you want to rebuild `.DISCARD` from scratch (instead of relying on the existing file), for example after large deletions or to catch data left behind by a previous GC run.
+
+```bash
+# Rebuild .DISCARD only
+./target/release/verfsnext gc offline
+
+# Rebuild .DISCARD and immediately run the pack-rewrite GC phase
+./target/release/verfsnext gc offline --run
+```
+
+Notes:
+- This command must run while the daemon is stopped.
+- `gc offline --run` only runs the second GC phase (pack rewrite), because the discard list was just rebuilt.
+- Pack rewrite decisions still honor `gc_pack_rewrite_min_reclaim_bytes` and `gc_pack_rewrite_min_reclaim_percent` from `config.toml`.
+
 ## Run As A Systemd Service
 
 1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start):

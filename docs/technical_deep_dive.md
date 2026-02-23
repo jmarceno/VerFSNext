@@ -59,6 +59,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
   - Pack stage: rewrites eligible non-active packs by reclaim threshold and atomically replaces pack + index files
+  - Offline recovery path: `verfsnext gc offline [--run]` rebuilds `.DISCARD` by scanning pack indexes against current chunk metadata (including orphaned/stale pack entries) and can optionally run only the pack-stage rewrite loop afterward
 
 ## Runtime Layout
 
@@ -222,6 +223,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
 3. `SYS:gc.discard_checkpoint` is advanced only after `.DISCARD` append + sync.
 4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, rewrites live chunks only, and atomically swaps rewritten pack/index files.
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
+6. Offline rebuild command (`gc offline`) rewrites `.DISCARD` from scratch by walking pack indexes pack-by-pack and marking entries as dead when the chunk metadata is missing, zero-ref, or points to a different pack; it then sets `SYS:gc.phase = 1` so the next GC work starts at the pack stage.
+7. `gc offline --run` immediately executes the pack-stage rewrite loop (no metadata scan phase), honoring the configured reclaim thresholds (`gc_pack_rewrite_min_reclaim_bytes` / `gc_pack_rewrite_min_reclaim_percent`).
 
 ## Pack-Size Compatibility and Migration
 
