@@ -1769,6 +1769,7 @@ dependencies = [
  "cdc-chunkers",
  "chacha20poly1305",
  "crc32c",
+ "futures",
  "moka",
  "nix",
  "parking_lot",

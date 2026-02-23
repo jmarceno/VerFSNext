@@ -61,6 +61,12 @@ impl MetaStore {
             if txn.get(sys_key("active_pack_id"))?.is_none() {
                 txn.set(sys_key("active_pack_id"), 1_u64.to_le_bytes().to_vec())?;
             }
+            if txn.get(sys_key("pack_crc32_read_errors"))?.is_none() {
+                txn.set(
+                    sys_key("pack_crc32_read_errors"),
+                    0_u64.to_le_bytes().to_vec(),
+                )?;
+            }
             if txn.get(sys_key("gc.discard_checkpoint"))?.is_none() {
                 txn.set(
                     sys_key("gc.discard_checkpoint"),

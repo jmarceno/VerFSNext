@@ -6,12 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
+use crate::{ensure_dir_with_mode, ensure_file_mode};
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dst, fs::Permissions::from_mode(crate::GROUP_DIR_MODE))?;
+    }
 
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -177,7 +183,7 @@ impl DatabaseCheckpoint {
         let checkpoint_path = checkpoint_dir.as_ref();
 
         // Create checkpoint directory
-        fs::create_dir_all(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_dir_with_mode(checkpoint_path)?;
 
         // Step 1: Flush all memtables to ensure consistency
         self.flush_all_memtables()?;
@@ -191,8 +197,8 @@ impl DatabaseCheckpoint {
         // Step 3: Create checkpoint subdirectories
         let sstables_dir = checkpoint_path.join("sstables");
         let wal_dir = checkpoint_path.join("wal");
-        fs::create_dir_all(&sstables_dir).map_err(|e| Error::Io(Arc::new(e)))?;
-        fs::create_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_dir_with_mode(&sstables_dir)?;
+        ensure_dir_with_mode(&wal_dir)?;
 
         // Step 4: Copy all SSTables
         let (sstable_count, sstables_size) = self.copy_sstables(&sstables_dir)?;
@@ -323,11 +329,11 @@ impl DatabaseCheckpoint {
         // in the SSTables.
         //
         // We create an empty WAL directory structure for the restored database.
-        fs::create_dir_all(dest_dir).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_dir_with_mode(dest_dir)?;
 
         // Create an empty checkpoint subdirectory for WAL checkpoint tracking
         let checkpoint_subdir = dest_dir.join("checkpoint");
-        fs::create_dir_all(&checkpoint_subdir).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_dir_with_mode(&checkpoint_subdir)?;
 
         Ok(())
     }
@@ -420,6 +426,7 @@ impl DatabaseCheckpoint {
     ) -> Result<()> {
         let metadata_path = checkpoint_dir.join(CHECKPOINT_METADATA_FILE);
         let mut file = File::create(&metadata_path).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_file_mode(&metadata_path)?;
 
         let data = metadata.to_bytes()?;
         file.write_all(&data).map_err(|e| Error::Io(Arc::new(e)))?;
@@ -443,7 +450,7 @@ impl DatabaseCheckpoint {
             return Ok(0);
         }
 
-        fs::create_dir_all(dest).map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_dir_with_mode(dest)?;
 
         let mut total_size = 0u64;
 

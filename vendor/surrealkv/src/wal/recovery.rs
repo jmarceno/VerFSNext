@@ -78,6 +78,7 @@ pub(crate) fn replay_wal(
     arena_size: usize,
 ) -> Result<ReplayResult> {
     log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
+    eprintln!("Starting WAL recovery from directory: {:?}", wal_dir);
     log::debug!(
         "WAL recovery parameters: min_wal_number={}, arena_size={}",
         min_wal_number,
@@ -127,6 +128,10 @@ pub(crate) fn replay_wal(
         "Replaying WAL segments #{:020} to #{:020}",
         start_segment,
         last
+    );
+    eprintln!(
+        "Replaying WAL segments #{:020} to #{:020}",
+        start_segment, last
     );
 
     // Track statistics
@@ -281,6 +286,13 @@ pub(crate) fn replay_wal(
 		memtables.len(),
 		result
 	);
+    eprintln!(
+        "WAL recovery complete: {} batches across {} segments, {} memtables created, max_seq_num={:?}",
+        total_batches_replayed,
+        segments_processed,
+        memtables.len(),
+        result
+    );
 
     Ok((result, memtables))
 }
@@ -288,6 +300,7 @@ pub(crate) fn replay_wal(
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
     use std::fs;
 
+    use crate::ensure_dir_with_mode;
     use crate::wal::manager::Wal;
     use crate::wal::reader::Reader;
     use crate::wal::Options;
@@ -304,7 +317,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
     // Create a repair directory for the new WAL file
     let repair_dir = wal_dir.join("repair_temp");
-    fs::create_dir_all(&repair_dir)?;
+    ensure_dir_with_mode(&repair_dir)?;
 
     // Create a new Wal for writing the repaired data
     // We'll write to a temp directory then move the file

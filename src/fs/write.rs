@@ -1,29 +1,81 @@
 use super::*;
 use crate::fs::FsCore;
+use futures::stream::{FuturesUnordered, StreamExt};
+
+struct PreparedWritePlan {
+    write_end: u64,
+    cdc_chunk_count: usize,
+    dedup_hits: u64,
+    dedup_misses: u64,
+    extent_updates: Vec<(u64, [u8; 16])>,
+    ref_deltas: HashMap<[u8; 16], i64>,
+    new_chunk_records: HashMap<[u8; 16], ChunkRecord>,
+}
 
 impl FsCore {
     pub(crate) async fn apply_single_write(&self, op: WriteOp) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
+        let prepared_version = self.inode_data_version(op.ino).await;
+        let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
+        self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
+        if op.data.is_empty() {
+            return Ok(());
+        }
+        let mut plan = self.prepare_write_plan(&op, &inode_snapshot).await?;
+
+        let _mutation_guard = self.write_lock.read().await;
+        let inode_lock = self.inode_write_lock(op.ino).await;
+        let _inode_guard = inode_lock.lock().await;
 
         let mut inode = self.load_inode_or_errno(op.ino, "write")?;
-        self.ensure_inode_vault_access(&inode, "write")?;
+        self.ensure_write_target_inode(op.ino, &inode)?;
+        let current_version = self.inode_data_version(op.ino).await;
+        if current_version != prepared_version {
+            // The inode data changed while this write was being prepared (e.g., truncate).
+            // Re-prepare against the latest state while we hold the inode lock.
+            plan = self.prepare_write_plan(&op, &inode).await?;
+        }
+
+        self.commit_prepared_write(op.ino, &mut inode, &plan)
+            .await?;
+        self.bump_inode_data_version(op.ino).await;
+        self.mark_mutation();
+
+        self.dedup_hits
+            .fetch_add(plan.dedup_hits, Ordering::Relaxed);
+        self.dedup_misses
+            .fetch_add(plan.dedup_misses, Ordering::Relaxed);
+        self.write_bytes_total
+            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
+        debug!(
+            ino = op.ino,
+            offset = op.offset,
+            bytes = op.data.len(),
+            cdc_chunks = plan.cdc_chunk_count,
+            dedup_hits = plan.dedup_hits,
+            dedup_misses = plan.dedup_misses,
+            "write completed through streaming dedup/compress pipeline"
+        );
+        Ok(())
+    }
+    fn ensure_write_target_inode(&self, ino: u64, inode: &InodeRecord) -> Result<()> {
+        self.ensure_inode_vault_access(inode, "write")?;
         if inode.kind != INODE_KIND_FILE {
             return Err(anyhow_errno(
                 Errno::EISDIR,
-                format!("write target inode {} is not a regular file", op.ino),
+                format!("write target inode {} is not a regular file", ino),
             ));
         }
-        FsCore::ensure_inode_writable(&inode, "write")?;
-
+        FsCore::ensure_inode_writable(inode, "write")
+    }
+    async fn prepare_write_plan(
+        &self,
+        op: &WriteOp,
+        inode: &InodeRecord,
+    ) -> Result<PreparedWritePlan> {
         let write_end = op
             .offset
             .checked_add(op.data.len() as u64)
             .ok_or_else(|| anyhow_errno(Errno::EOVERFLOW, "write offset overflow"))?;
-
-        if op.data.is_empty() {
-            return Ok(());
-        }
-
         let cdc_chunk_count = self.ultracdc_chunk_count(&op.data);
         let start_block = op.offset / BLOCK_SIZE as u64;
         let end_block = (write_end - 1) / BLOCK_SIZE as u64;
@@ -63,7 +115,7 @@ impl FsCore {
 
         for block_idx in start_block..=end_block {
             let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
-                self.read_extent_bytes(extent.clone(), FsCore::inode_is_vault(&inode))?
+                self.read_extent_bytes(extent.clone(), FsCore::inode_is_vault(inode))?
             } else {
                 vec![0_u8; BLOCK_SIZE]
             };
@@ -77,7 +129,7 @@ impl FsCore {
             let dst_end = dst_start + (src_end - src_start);
             block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
 
-            let new_hash = FsCore::hash_for_inode(&inode, &block_data);
+            let new_hash = FsCore::hash_for_inode(inode, &block_data);
             let old_hash = old_extents.get(&block_idx).map(|extent| extent.chunk_hash);
 
             if old_hash == Some(new_hash) {
@@ -102,13 +154,30 @@ impl FsCore {
                 dedup_hits = dedup_hits.saturating_add(1);
             }
         }
+
         let new_chunk_records = self
-            .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))
+            .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(inode))
             .await?;
 
+        Ok(PreparedWritePlan {
+            write_end,
+            cdc_chunk_count,
+            dedup_hits,
+            dedup_misses,
+            extent_updates,
+            ref_deltas,
+            new_chunk_records,
+        })
+    }
+    async fn commit_prepared_write(
+        &self,
+        ino: u64,
+        inode: &mut InodeRecord,
+        plan: &PreparedWritePlan,
+    ) -> Result<()> {
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
-        inode.size = inode.size.max(write_end);
+        inode.size = inode.size.max(plan.write_end);
         inode.mtime_sec = sec;
         inode.mtime_nsec = nsec;
         inode.ctime_sec = sec;
@@ -116,33 +185,16 @@ impl FsCore {
 
         self.meta
             .write_txn(|txn| {
-                for (block_idx, hash) in extent_updates.iter().copied() {
+                for (block_idx, hash) in plan.extent_updates.iter().copied() {
                     let extent = ExtentRecord { chunk_hash: hash };
-                    txn.set(extent_key(op.ino, block_idx), encode_rkyv(&extent)?)?;
+                    txn.set(extent_key(ino, block_idx), encode_rkyv(&extent)?)?;
                 }
 
-                FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
-
-                txn.set(inode_key(op.ino), encode_rkyv(&inode)?)?;
+                FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunk_records)?;
+                txn.set(inode_key(ino), encode_rkyv(inode)?)?;
                 Ok(())
             })
-            .await?;
-        self.mark_mutation();
-
-        self.dedup_hits.fetch_add(dedup_hits, Ordering::Relaxed);
-        self.dedup_misses.fetch_add(dedup_misses, Ordering::Relaxed);
-        self.write_bytes_total
-            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
-        debug!(
-            ino = op.ino,
-            offset = op.offset,
-            bytes = op.data.len(),
-            cdc_chunks = cdc_chunk_count,
-            dedup_hits,
-            dedup_misses,
-            "write completed through streaming dedup/compress pipeline"
-        );
-        Ok(())
+            .await
     }
     pub(crate) async fn truncate_file_locked(
         &self,
@@ -255,6 +307,7 @@ impl FsCore {
             })
             .await?;
         self.mark_mutation();
+        self.bump_inode_data_version(ino).await;
 
         Ok(inode)
     }
@@ -297,14 +350,35 @@ impl WriteApply for FsCore {
             groups.push((op, vec![idx]));
         }
 
-        let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
+        let mut by_inode = HashMap::<u64, Vec<(WriteOp, Vec<usize>)>>::new();
         for (group_op, indices) in groups {
-            let group_result = self.apply_single_write(group_op).await;
-            for idx in indices {
-                out[idx] = Some(match &group_result {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err(anyhow!(err.to_string())),
-                });
+            by_inode
+                .entry(group_op.ino)
+                .or_default()
+                .push((group_op, indices));
+        }
+
+        let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
+        let mut pending = FuturesUnordered::new();
+        for inode_groups in by_inode.into_values() {
+            pending.push(async move {
+                let mut inode_results = Vec::with_capacity(inode_groups.len());
+                for (group_op, indices) in inode_groups {
+                    let group_result = self.apply_single_write(group_op).await;
+                    inode_results.push((indices, group_result));
+                }
+                inode_results
+            });
+        }
+
+        while let Some(inode_results) = pending.next().await {
+            for (indices, group_result) in inode_results {
+                for idx in indices {
+                    out[idx] = Some(match &group_result {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(anyhow!(err.to_string())),
+                    });
+                }
             }
         }
 

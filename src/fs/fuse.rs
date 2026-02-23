@@ -72,7 +72,9 @@ impl VirtualFs for VerFs {
         ino: u64,
         param: SetAttrParam,
     ) -> AsyncFusexResult<(Duration, FileAttr)> {
-        let _guard = self.core.write_lock.lock().await;
+        let _mutation_guard = self.core.write_lock.read().await;
+        let inode_lock = self.core.inode_write_lock(ino).await;
+        let _inode_guard = inode_lock.lock().await;
         let mut inode = if let Some(size) = param.size {
             let inode = self
                 .core
@@ -162,6 +164,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let create_kind = if param.node_type == SFlag::S_IFDIR {
             INODE_KIND_DIR
         } else {
@@ -186,7 +189,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created inode"))
@@ -206,6 +209,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -224,7 +228,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created directory"))
@@ -244,7 +248,7 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(parent, "unlink")
             .map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -253,7 +257,11 @@ impl VirtualFs for VerFs {
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "unlink")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, name, "unlink")?;
                 let Some(inode_raw) = txn.get(inode_key(dirent.ino))? else {
-                    return Err(anyhow_errno(Errno::ENOENT, "unlink target inode not found"));
+                    txn.delete(dirent_key(parent, name.as_bytes()))?;
+                    let now = SystemTime::now();
+                    let (sec, nsec) = system_time_to_parts(now);
+                    FsCore::touch_parent_inode_in_txn(txn, parent, 0, sec, nsec)?;
+                    return Ok(());
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "unlink")?;
@@ -267,12 +275,14 @@ impl VirtualFs for VerFs {
                 let (sec, nsec) = system_time_to_parts(now);
                 inode.ctime_sec = sec;
                 inode.ctime_nsec = nsec;
-                let _removed_inode = FsCore::remove_name_from_inode_in_txn(txn, &mut inode)?;
+                let defer_final_delete = inode.nlink <= 1 && self.core.open_file_count(inode.ino) > 0;
+                let _removed_inode =
+                    FsCore::remove_name_from_inode_in_txn(txn, &mut inode, defer_final_delete)?;
                 Ok(())
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
         Ok(())
     }
 
@@ -290,7 +300,7 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(parent, "rmdir")
             .map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -310,6 +320,7 @@ impl VirtualFs for VerFs {
                     ));
                 }
 
+                let _pruned = FsCore::prune_orphan_dirents_in_dir_txn(txn, dirent.ino)?;
                 if !FsCore::is_dir_empty(txn, dirent.ino)? {
                     return Err(anyhow_errno(Errno::ENOTEMPTY, "directory not empty"));
                 }
@@ -334,7 +345,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         Ok(None)
     }
@@ -355,6 +366,7 @@ impl VirtualFs for VerFs {
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
         let target_bytes = target_path.as_os_str().as_encoded_bytes().to_vec();
+        let _guard = self.core.write_lock.write().await;
 
         let mut created: Option<InodeRecord> = None;
         self.core
@@ -377,7 +389,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing symlink inode"))
@@ -416,7 +428,7 @@ impl VirtualFs for VerFs {
                 "cannot rename across vault boundary".to_owned(),
             );
         }
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
 
         self.core
             .meta
@@ -551,6 +563,9 @@ impl VirtualFs for VerFs {
                             "cannot overwrite directory with non-directory",
                         ));
                     }
+                    if target_is_dir {
+                        let _pruned = FsCore::prune_orphan_dirents_in_dir_txn(txn, target_inode.ino)?;
+                    }
                     if target_is_dir && !FsCore::is_dir_empty(txn, target_inode.ino)? {
                         return Err(anyhow_errno(
                             Errno::ENOTEMPTY,
@@ -561,8 +576,13 @@ impl VirtualFs for VerFs {
                     txn.delete(dirent_key(param.new_parent, param.new_name.as_bytes()))?;
                     target_inode.ctime_sec = sec;
                     target_inode.ctime_nsec = nsec;
-                    let _removed_target =
-                        FsCore::remove_name_from_inode_in_txn(txn, &mut target_inode)?;
+                    let defer_final_delete =
+                        target_inode.nlink <= 1 && self.core.open_file_count(target_inode.ino) > 0;
+                    let _removed_target = FsCore::remove_name_from_inode_in_txn(
+                        txn,
+                        &mut target_inode,
+                        defer_final_delete,
+                    )?;
 
                     if target_is_dir {
                         FsCore::touch_parent_inode_in_txn(txn, param.new_parent, -1, sec, nsec)?;
@@ -599,7 +619,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
         Ok(())
     }
 
@@ -617,12 +637,18 @@ impl VirtualFs for VerFs {
 
         let oflags = OFlag::from_bits_truncate(flags as i32);
         if oflags.contains(OFlag::O_TRUNC) {
-            let _guard = self.core.write_lock.lock().await;
+            let _mutation_guard = self.core.write_lock.read().await;
+            let inode_lock = self.core.inode_write_lock(ino).await;
+            let _inode_guard = inode_lock.lock().await;
             let _truncated = self
                 .core
                 .truncate_file_locked(ino, 0)
                 .await
                 .map_err(map_anyhow_to_fuse)?;
+        }
+        {
+            let _open_guard = self.core.write_lock.read().await;
+            self.core.increment_open_file_count(ino);
         }
         Ok(self.core.new_handle())
     }
@@ -726,10 +752,10 @@ impl VirtualFs for VerFs {
                                     "encrypted chunk mapped outside vault inode".to_owned(),
                                 );
                             }
-                            let encrypted = self
+                            let (encrypted, index) = self
                                 .core
                                 .packs
-                                .read_chunk_payload(
+                                .read_chunk_payload_with_index(
                                     chunk.pack_id,
                                     extent.chunk_hash,
                                     chunk.codec,
@@ -737,6 +763,12 @@ impl VirtualFs for VerFs {
                                     chunk.compressed_len,
                                 )
                                 .map_err(map_anyhow_to_fuse)?;
+                            self.core.validate_pack_payload_crc32(
+                                chunk.pack_id,
+                                extent.chunk_hash,
+                                index.payload_crc32,
+                                &encrypted,
+                            );
                             let folder_key =
                                 self.core.current_vault_key().map_err(map_anyhow_to_fuse)?;
                             let compressed =
@@ -749,16 +781,29 @@ impl VirtualFs for VerFs {
                             )
                             .map_err(map_anyhow_to_fuse)?
                         } else {
-                            self.core
+                            let (compressed, index) = self
+                                .core
                                 .packs
-                                .read_chunk(
+                                .read_chunk_payload_with_index(
                                     chunk.pack_id,
                                     extent.chunk_hash,
                                     chunk.codec,
                                     chunk.uncompressed_len,
                                     chunk.compressed_len,
                                 )
-                                .map_err(map_anyhow_to_fuse)?
+                                .map_err(map_anyhow_to_fuse)?;
+                            self.core.validate_pack_payload_crc32(
+                                chunk.pack_id,
+                                extent.chunk_hash,
+                                index.payload_crc32,
+                                &compressed,
+                            );
+                            crate::data::compress::decompress_chunk(
+                                chunk.codec,
+                                &compressed,
+                                chunk.uncompressed_len,
+                            )
+                            .map_err(map_anyhow_to_fuse)?
                         };
                         self.core
                             .chunk_data_cache
@@ -845,7 +890,15 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "release")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        {
+            let _open_guard = self.core.write_lock.read().await;
+            self.core.decrement_open_file_count(_ino);
+        }
+        self.core
+            .cleanup_unlinked_inode_if_closed(_ino)
+            .await
+            .map_err(map_anyhow_to_fuse)
     }
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
@@ -872,7 +925,16 @@ impl VirtualFs for VerFs {
                 "opendir called on non-directory".to_owned(),
             );
         }
-        Ok(self.core.new_handle())
+        let fh = self.core.new_handle();
+        let mut dir_handles = self.core.dir_handles.lock().await;
+        dir_handles.insert(
+            fh,
+            DirHandleState {
+                ino,
+                snapshot: None,
+            },
+        );
+        Ok(fh)
     }
 
     async fn readdir(
@@ -880,7 +942,7 @@ impl VirtualFs for VerFs {
         _uid: u32,
         _gid: u32,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _offset: i64,
     ) -> AsyncFusexResult<Vec<DirEntry>> {
         let inode = self
@@ -894,45 +956,49 @@ impl VirtualFs for VerFs {
             );
         }
 
-        let mut entries = Vec::new();
-        entries.push(DirEntry::new(ino, ".".to_owned(), FileType::Dir));
-        entries.push(DirEntry::new(inode.parent, "..".to_owned(), FileType::Dir));
-
-        let dir_entries = self
-            .core
-            .meta
-            .read_txn(|txn| {
-                let prefix = dirent_prefix(ino);
-                let end = prefix_end(&prefix);
-                let mut out = Vec::new();
-                for pair in scan_range_pairs(txn, prefix, end)? {
-                    let (key, value) = pair?;
-                    let Some(name_bytes) = decode_dirent_name(&key) else {
-                        continue;
-                    };
-                    let name = String::from_utf8_lossy(name_bytes).to_string();
-                    let dirent: DirentRecord = decode_rkyv(&value)?;
-                    if self.core.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
-                        continue;
-                    }
-                    out.push((name, dirent.ino, dirent.kind));
+        {
+            let dir_handles = self.core.dir_handles.lock().await;
+            if let Some(state) = dir_handles.get(&fh) {
+                if state.ino != ino {
+                    return build_error_result_from_errno(
+                        Errno::EBADF,
+                        format!("readdir handle {} does not match inode {}", fh, ino),
+                    );
                 }
-                Ok(out)
-            })
-            .map_err(map_anyhow_to_fuse)?;
-
-        for (name, child_ino, kind) in dir_entries {
-            entries.push(DirEntry::new(
-                child_ino,
-                name,
-                FsCore::inode_kind_to_file_type(kind),
-            ));
+                if let Some(snapshot) = state.snapshot.as_ref() {
+                    return Ok(FsCore::snapshot_to_dir_entries(snapshot));
+                }
+            }
         }
 
-        Ok(entries)
+        let snapshot = self
+            .core
+            .build_dir_snapshot(ino, &inode)
+            .map_err(map_anyhow_to_fuse)?;
+        {
+            let mut dir_handles = self.core.dir_handles.lock().await;
+            if let Some(state) = dir_handles.get_mut(&fh) {
+                if state.ino != ino {
+                    return build_error_result_from_errno(
+                        Errno::EBADF,
+                        format!("readdir handle {} does not match inode {}", fh, ino),
+                    );
+                }
+                if state.snapshot.is_none() {
+                    state.snapshot = Some(snapshot.clone());
+                }
+                if let Some(handle_snapshot) = state.snapshot.as_ref() {
+                    return Ok(FsCore::snapshot_to_dir_entries(handle_snapshot));
+                }
+            }
+        }
+
+        Ok(FsCore::snapshot_to_dir_entries(&snapshot))
     }
 
-    async fn releasedir(&self, _ino: u64, _fh: u64, _flags: u32) -> AsyncFusexResult<()> {
+    async fn releasedir(&self, _ino: u64, fh: u64, _flags: u32) -> AsyncFusexResult<()> {
+        let mut dir_handles = self.core.dir_handles.lock().await;
+        dir_handles.remove(&fh);
         Ok(())
     }
 
@@ -983,6 +1049,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -1001,11 +1068,12 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created file inode"))
         })?;
+        self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
         Ok((
             ATTR_TTL,
@@ -1039,7 +1107,7 @@ impl VirtualFs for VerFs {
                 "cannot hard-link across vault boundary".to_owned(),
             );
         }
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let mut linked: Option<InodeRecord> = None;
 
         self.core
@@ -1103,7 +1171,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = linked.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing linked inode"))
@@ -1145,7 +1213,7 @@ impl VirtualFs for VerFs {
             return build_error_result_from_errno(Errno::EINVAL, "invalid xattr flags".to_owned());
         }
 
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         self.core
             .meta
             .write_txn(|txn| {
@@ -1277,7 +1345,7 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(ino, "removexattr")
             .map_err(map_anyhow_to_fuse)?;
         FsCore::xattr_name_nonempty(name).map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         self.core
             .meta
             .write_txn(|txn| {

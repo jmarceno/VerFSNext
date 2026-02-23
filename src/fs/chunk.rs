@@ -20,6 +20,32 @@ impl FsCore {
         }
         count.saturating_add(chunker.finish().len())
     }
+
+    pub(crate) fn validate_pack_payload_crc32(
+        &self,
+        pack_id: u64,
+        chunk_hash: [u8; 16],
+        expected_crc32: u32,
+        payload: &[u8],
+    ) {
+        let actual_crc32 = crc32c::crc32c(payload);
+        if actual_crc32 == expected_crc32 {
+            return;
+        }
+
+        let total = self
+            .pack_crc32_read_error_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        tracing::error!(
+            pack_id,
+            chunk_hash = ?chunk_hash,
+            expected_crc32,
+            actual_crc32,
+            total_crc32_errors = total,
+            "pack payload crc32 mismatch detected during read"
+        );
+    }
     pub(crate) fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
         if let Some(cached) = self.chunk_meta_cache.get(&hash) {
             self.chunk_meta_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -93,13 +119,19 @@ impl FsCore {
                     "encrypted chunk referenced by non-vault inode",
                 ));
             }
-            let encrypted = self.packs.read_chunk_payload(
+            let (encrypted, index) = self.packs.read_chunk_payload_with_index(
                 chunk.pack_id,
                 extent.chunk_hash,
                 chunk.codec,
                 chunk.uncompressed_len,
                 chunk.compressed_len,
             )?;
+            self.validate_pack_payload_crc32(
+                chunk.pack_id,
+                extent.chunk_hash,
+                index.payload_crc32,
+                &encrypted,
+            );
             let folder_key = self.current_vault_key()?;
             let compressed = decrypt_chunk_payload(&folder_key, &chunk.nonce, &encrypted)?;
             crate::data::compress::decompress_chunk(
@@ -108,12 +140,23 @@ impl FsCore {
                 chunk.uncompressed_len,
             )?
         } else {
-            self.packs.read_chunk(
+            let (compressed, index) = self.packs.read_chunk_payload_with_index(
                 chunk.pack_id,
                 extent.chunk_hash,
                 chunk.codec,
                 chunk.uncompressed_len,
                 chunk.compressed_len,
+            )?;
+            self.validate_pack_payload_crc32(
+                chunk.pack_id,
+                extent.chunk_hash,
+                index.payload_crc32,
+                &compressed,
+            );
+            crate::data::compress::decompress_chunk(
+                chunk.codec,
+                &compressed,
+                chunk.uncompressed_len,
             )?
         };
         self.chunk_data_cache
@@ -166,25 +209,28 @@ impl FsCore {
             .map_err(|e| anyhow!("compression task failed: {}", e))??;
         let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
-            let (payload, disk_compressed_len, nonce, flags) = if encrypt_for_vault {
+            let (payload, disk_compressed_len, payload_crc32, nonce, flags) = if encrypt_for_vault {
                 let folder_key = self.current_vault_key()?;
                 let (ciphertext, nonce) =
                     encrypt_chunk_payload(&folder_key, &ready_chunk.chunk.compressed)?;
                 let clen = ciphertext.len() as u32;
-                (ciphertext, clen, nonce, CHUNK_FLAG_ENCRYPTED)
+                let crc32 = crc32c::crc32c(&ciphertext);
+                (ciphertext, clen, crc32, nonce, CHUNK_FLAG_ENCRYPTED)
             } else {
                 (
                     ready_chunk.chunk.compressed.clone(),
                     ready_chunk.chunk.compressed_len,
+                    ready_chunk.chunk.payload_crc32,
                     [0_u8; 24],
                     0,
                 )
             };
-            let pack_id = self.packs.append_chunk(
+            let pack_id = self.packs.append_chunk_with_crc32(
                 ready_chunk.hash,
                 ready_chunk.chunk.codec,
                 ready_chunk.chunk.uncompressed_len,
                 &payload,
+                payload_crc32,
             )?;
             let chunk = ChunkRecord {
                 refcount: 0,

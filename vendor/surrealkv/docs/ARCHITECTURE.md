@@ -53,6 +53,15 @@ This keeps the vendored engine buildable as a first-class in-repo component for 
 - Partitioned index top-level entries are persisted as a `rkyv` archive payload, then materialized directly into `Index::blocks` during open.
 - These format updates are intentionally breaking and no compatibility path is maintained.
 
+## POSIX Permission Policy (VerFSNext Vendor)
+
+- SurrealKV paths created by VerFSNext now use explicit POSIX modes (no ACLs):
+  - directories: `0770`
+  - files: `0660`
+- Permission normalization is applied in directory/file creation paths used by WAL, SSTable flush/compaction, checkpoint metadata, lock file, VLog, and versioned index file creation.
+- Mode normalization is best-effort on `PermissionDenied` and continues with existing mode.
+- WAL directory normalization remains best-effort on `PermissionDenied` so existing deployments with non-owned directories can still start.
+
 ---
 
 ## Overall Architecture

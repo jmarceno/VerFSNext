@@ -10,6 +10,7 @@ use crc32fast::Hasher;
 use parking_lot::RwLock;
 
 use crate::error::{Error, Result};
+use crate::ensure_file_mode;
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 
 /// VLog format version
@@ -472,6 +473,7 @@ impl VLogWriter {
     ) -> Result<Self> {
         let file_exists = path.exists();
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        ensure_file_mode(path)?;
 
         let current_offset = file.metadata()?.len();
         let mut writer = BufWriter::new(file);

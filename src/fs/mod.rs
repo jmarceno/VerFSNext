@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -20,11 +20,11 @@ use nix::fcntl::OFlag;
 use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use surrealkv::LSMIterator;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::config::Config;
 use crate::data::chunker::UltraStreamChunker;
@@ -33,6 +33,11 @@ use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::MetaStore;
+use crate::migration::pack_index_crc32::{
+    ensure_pack_index_crc32_compat, SYS_PACK_CRC32_READ_ERRORS,
+};
+use crate::migration::pack_size::ensure_pack_size_metadata_compat;
+use crate::permissions::normalize_data_tree;
 use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
@@ -41,8 +46,8 @@ use crate::types::{
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_INODE, MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE,
-    SNAPSHOTS_DIR_NAME, VAULT_DIR_NAME,
+    MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -52,7 +57,9 @@ use crate::vault::{
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
+// Correctness-first: we currently do not send FUSE entry invalidation notifications on
+// namespace mutations, so a non-zero TTL can leave stale dentries/attrs visible to the kernel.
+const ATTR_TTL: Duration = Duration::ZERO;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE as u32;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE as u32;
@@ -76,6 +83,18 @@ struct FileLockState {
     pid: u32,
 }
 
+#[derive(Clone)]
+struct CachedDirEntry {
+    ino: u64,
+    name: String,
+    file_type: FileType,
+}
+
+struct DirHandleState {
+    ino: u64,
+    snapshot: Option<Vec<CachedDirEntry>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
     hash: [u8; 16],
@@ -87,16 +106,17 @@ struct ZeroRefCandidate {
 pub struct VerFsStats {
     pub live_logical_size_bytes: u64,
     pub snapshots_logical_size_bytes: u64,
+    pub hidden_vault_logical_size_bytes: u64,
     pub all_logical_size_bytes: u64,
-    pub live_referenced_uncompressed_bytes: u64,
-    pub live_referenced_compressed_bytes: u64,
-    pub live_unique_uncompressed_bytes: u64,
-    pub live_unique_compressed_bytes: u64,
     pub stored_unique_uncompressed_bytes: u64,
     pub stored_unique_compressed_bytes: u64,
     pub metadata_size_bytes: u64,
     pub data_dir_size_bytes: u64,
-    pub live_dedup_savings_bytes: u64,
+    pub vault_locked: bool,
+    pub chunk_refcount_mismatch_count: u64,
+    pub missing_chunk_records_for_extents: u64,
+    pub orphan_extent_records: u64,
+    pub pack_crc32_read_error_count: u64,
     pub cache_hits: u64,
     pub cache_requests: u64,
     pub cache_hit_rate: f64,
@@ -110,6 +130,12 @@ pub struct VerFsStats {
     pub metadata_cache_entries: u64,
     pub chunk_cache_entries: u64,
     pub approx_cache_memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PackCrc32ReadErrorCounters {
+    pub persisted_sys_total: u64,
+    pub current_total: u64,
 }
 
 pub struct VerFs {
@@ -128,6 +154,7 @@ struct FsCore {
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
     next_handle: AtomicU64,
     last_persisted_active_pack_id: AtomicU64,
+    last_persisted_pack_crc32_read_error_count: AtomicU64,
     dedup_hits: AtomicU64,
     dedup_misses: AtomicU64,
     chunk_meta_cache_hits: AtomicU64,
@@ -136,21 +163,38 @@ struct FsCore {
     chunk_data_cache_misses: AtomicU64,
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
+    pack_crc32_read_error_count: AtomicU64,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
-    write_lock: Mutex<()>,
+    write_lock: AsyncRwLock<()>,
+    inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
+    inode_data_versions: Mutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
-    vault: RwLock<VaultRuntime>,
+    dir_handles: Mutex<HashMap<u64, DirHandleState>>,
+    open_file_counts: ParkingMutex<HashMap<u64, u64>>,
+    vault: ParkingRwLock<VaultRuntime>,
 }
 
 impl VerFs {
     pub async fn new(config: Config) -> Result<Self> {
         config.ensure_dirs()?;
+        normalize_data_tree(&config.data_dir)?;
 
         let meta = MetaStore::open(&config.metadata_dir()).await?;
+        ensure_pack_index_crc32_compat(&config, &meta).await?;
+        if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {
+            error!(
+                error = %err,
+                configured_pack_max_size_mb = config.pack_max_size_mb,
+                "pack-size metadata compatibility check failed"
+            );
+            return Err(err);
+        }
         let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
+        let persisted_pack_crc32_read_error_count =
+            meta.get_u64_sys(SYS_PACK_CRC32_READ_ERRORS).unwrap_or(0);
         let packs = PackStore::open(
             &config.packs_dir(),
             configured_active_pack_id,
@@ -187,6 +231,9 @@ impl VerFs {
                 .build(),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
+            last_persisted_pack_crc32_read_error_count: AtomicU64::new(
+                persisted_pack_crc32_read_error_count,
+            ),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
             chunk_meta_cache_hits: AtomicU64::new(0),
@@ -195,13 +242,18 @@ impl VerFs {
             chunk_data_cache_misses: AtomicU64::new(0),
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
+            pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
-            write_lock: Mutex::new(()),
+            write_lock: AsyncRwLock::new(()),
+            inode_write_locks: Mutex::new(HashMap::new()),
+            inode_data_versions: Mutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
-            vault: RwLock::new(VaultRuntime::new(vault_initialized)),
+            dir_handles: Mutex::new(HashMap::new()),
+            open_file_counts: ParkingMutex::new(HashMap::new()),
+            vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
         let write_sink: Arc<dyn WriteApply> = core.clone();
@@ -241,7 +293,7 @@ impl VerFs {
     }
 
     pub async fn create_snapshot(&self, name: &str) -> Result<()> {
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.create(name).await?;
         self.core.mark_mutation();
@@ -249,7 +301,7 @@ impl VerFs {
     }
 
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        let _guard = self.core.write_lock.lock().await;
+        let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.delete(name).await?;
         self.core.mark_mutation();
@@ -279,97 +331,269 @@ impl VerFs {
             .unwrap_or_else(|e| Err(anyhow!("stats task panicked: {:?}", e)))
     }
 
+    pub fn pack_crc32_read_error_counters(&self) -> PackCrc32ReadErrorCounters {
+        PackCrc32ReadErrorCounters {
+            persisted_sys_total: self
+                .core
+                .last_persisted_pack_crc32_read_error_count
+                .load(Ordering::Relaxed),
+            current_total: self.core.pack_crc32_read_error_count.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn is_gc_in_progress(&self) -> bool {
         self.core.gc_lock.try_lock().is_err()
     }
 }
 
 impl FsCore {
+    async fn inode_write_lock(&self, ino: u64) -> Arc<Mutex<()>> {
+        let mut locks = self.inode_write_locks.lock().await;
+        if let Some(lock) = locks.get(&ino).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(ino, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn inode_data_version(&self, ino: u64) -> u64 {
+        let mut versions = self.inode_data_versions.lock().await;
+        *versions.entry(ino).or_insert(0)
+    }
+
+    async fn bump_inode_data_version(&self, ino: u64) {
+        let mut versions = self.inode_data_versions.lock().await;
+        let entry = versions.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
     fn new_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn increment_open_file_count(&self, ino: u64) {
+        let mut counts = self.open_file_counts.lock();
+        let entry = counts.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn decrement_open_file_count(&self, ino: u64) -> u64 {
+        let mut counts = self.open_file_counts.lock();
+        let Some(entry) = counts.get_mut(&ino) else {
+            return 0;
+        };
+        *entry = entry.saturating_sub(1);
+        let remaining = *entry;
+        if remaining == 0 {
+            counts.remove(&ino);
+        }
+        remaining
+    }
+
+    fn open_file_count(&self, ino: u64) -> u64 {
+        self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    async fn mark_namespace_mutation(&self) {
+        self.mark_mutation();
+    }
+
+    fn build_dir_snapshot(&self, ino: u64, inode: &InodeRecord) -> Result<Vec<CachedDirEntry>> {
+        let mut entries = Vec::new();
+        entries.push(CachedDirEntry {
+            ino,
+            name: ".".to_owned(),
+            file_type: FileType::Dir,
+        });
+        entries.push(CachedDirEntry {
+            ino: inode.parent,
+            name: "..".to_owned(),
+            file_type: FileType::Dir,
+        });
+
+        let dir_entries = self.meta.read_txn(|txn| {
+            let prefix = dirent_prefix(ino);
+            let end = prefix_end(&prefix);
+            let mut out = Vec::new();
+            for pair in scan_range_pairs(txn, prefix, end)? {
+                let (key, value) = pair?;
+                let Some(name_bytes) = decode_dirent_name(&key) else {
+                    continue;
+                };
+                let name = String::from_utf8_lossy(name_bytes).to_string();
+                let dirent: DirentRecord = decode_rkyv(&value)?;
+                if txn.get(inode_key(dirent.ino))?.is_none() {
+                    continue;
+                }
+                if self.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
+                    continue;
+                }
+                out.push(CachedDirEntry {
+                    ino: dirent.ino,
+                    name,
+                    file_type: FsCore::inode_kind_to_file_type(dirent.kind),
+                });
+            }
+            Ok(out)
+        })?;
+        entries.extend(dir_entries);
+        Ok(entries)
+    }
+
+    fn snapshot_to_dir_entries(snapshot: &[CachedDirEntry]) -> Vec<DirEntry> {
+        snapshot
+            .iter()
+            .map(|entry| DirEntry::new(entry.ino, entry.name.clone(), entry.file_type.clone()))
+            .collect()
+    }
+
+    fn accumulate_namespace_logical_size(
+        txn: &surrealkv::Transaction,
+        start_ino: u64,
+        seen_inodes: &mut HashSet<u64>,
+    ) -> Result<u64> {
+        let mut logical_size_bytes = 0_u64;
+        let mut stack = vec![start_ino];
+
+        while let Some(ino) = stack.pop() {
+            if !seen_inodes.insert(ino) {
+                continue;
+            }
+
+            let Some(raw) = txn.get(inode_key(ino))? else {
+                continue;
+            };
+            let inode: InodeRecord = decode_rkyv(&raw)?;
+
+            match inode.kind {
+                INODE_KIND_FILE => {
+                    logical_size_bytes = logical_size_bytes.saturating_add(inode.size);
+                }
+                INODE_KIND_DIR => {
+                    let prefix = dirent_prefix(ino);
+                    let end = prefix_end(&prefix);
+                    for pair in scan_range_pairs(txn, prefix, end)? {
+                        let (_, value) = pair?;
+                        let dirent: DirentRecord = decode_rkyv(&value)?;
+                        stack.push(dirent.ino);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(logical_size_bytes)
+    }
+
+    fn extent_owner_ino_from_key(key: &[u8]) -> Option<u64> {
+        if key.len() != 17 || key[0] != crate::types::KEY_PREFIX_EXTENT {
+            return None;
+        }
+        let mut ino = [0_u8; 8];
+        ino.copy_from_slice(&key[1..9]);
+        Some(u64::from_be_bytes(ino))
     }
 
     fn collect_stats(&self) -> Result<VerFsStats> {
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
+        let vault_locked = self.vault_locked();
 
         let (
-            all_logical_size_bytes,
             live_logical_size_bytes,
+            snapshots_logical_size_bytes,
+            hidden_vault_logical_size_bytes,
+            all_logical_size_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
-            live_unique_uncompressed_bytes,
-            live_unique_compressed_bytes,
-            live_referenced_uncompressed_bytes,
-            live_referenced_compressed_bytes,
+            chunk_refcount_mismatch_count,
+            missing_chunk_records_for_extents,
+            orphan_extent_records,
         ) = self.meta.read_txn(|txn| {
-            let mut all_logical_size_bytes = 0_u64;
-            let inode_prefix = vec![KEY_PREFIX_INODE];
-            let inode_end = prefix_end(&inode_prefix);
-            for pair in scan_range_pairs(txn, inode_prefix, inode_end)? {
-                let (_, value) = pair?;
-                let inode: InodeRecord = decode_rkyv(&value)?;
-                if inode.kind == INODE_KIND_FILE {
-                    all_logical_size_bytes = all_logical_size_bytes.saturating_add(inode.size);
+            let mut live_logical_size_bytes = 0_u64;
+            let mut snapshots_logical_size_bytes = 0_u64;
+            let mut hidden_vault_logical_size_bytes = 0_u64;
+
+            let mut live_seen_inodes = HashSet::<u64>::new();
+            let mut snapshots_seen_inodes = HashSet::<u64>::new();
+            let mut hidden_vault_seen_inodes = HashSet::<u64>::new();
+
+            let root_prefix = dirent_prefix(ROOT_INODE);
+            let root_end = prefix_end(&root_prefix);
+            for pair in scan_range_pairs(txn, root_prefix, root_end)? {
+                let (key, value) = pair?;
+                let Some(name) = decode_dirent_name(&key) else {
+                    continue;
+                };
+                let dirent: DirentRecord = decode_rkyv(&value)?;
+
+                if name == SNAPSHOTS_DIR_NAME.as_bytes() {
+                    snapshots_logical_size_bytes = snapshots_logical_size_bytes.saturating_add(
+                        FsCore::accumulate_namespace_logical_size(
+                            txn,
+                            dirent.ino,
+                            &mut snapshots_seen_inodes,
+                        )?,
+                    );
+                    continue;
                 }
+
+                if vault_locked && name == VAULT_DIR_NAME.as_bytes() {
+                    hidden_vault_logical_size_bytes = hidden_vault_logical_size_bytes
+                        .saturating_add(FsCore::accumulate_namespace_logical_size(
+                            txn,
+                            dirent.ino,
+                            &mut hidden_vault_seen_inodes,
+                        )?);
+                    continue;
+                }
+
+                live_logical_size_bytes = live_logical_size_bytes.saturating_add(
+                    FsCore::accumulate_namespace_logical_size(
+                        txn,
+                        dirent.ino,
+                        &mut live_seen_inodes,
+                    )?,
+                );
             }
 
-            let mut live_logical_size_bytes = 0_u64;
-            let mut live_seen_inodes = HashSet::<u64>::new();
-            let mut live_dir_stack = vec![ROOT_INODE];
-            let mut live_extent_refcounts = HashMap::<[u8; 16], u64>::new();
-            live_seen_inodes.insert(ROOT_INODE);
+            let all_logical_size_bytes = live_logical_size_bytes
+                .saturating_add(snapshots_logical_size_bytes)
+                .saturating_add(hidden_vault_logical_size_bytes);
 
-            while let Some(dir_ino) = live_dir_stack.pop() {
-                let prefix = dirent_prefix(dir_ino);
-                let end = prefix_end(&prefix);
-                for pair in scan_range_pairs(txn, prefix, end)? {
-                    let (key, value) = pair?;
-                    let Some(name) = decode_dirent_name(&key) else {
-                        continue;
-                    };
-                    if dir_ino == ROOT_INODE && name == SNAPSHOTS_DIR_NAME.as_bytes() {
-                        continue;
-                    }
+            let mut all_extent_refcounts = HashMap::<[u8; 16], u64>::new();
+            let mut inode_present_cache = HashMap::<u64, bool>::new();
+            let mut orphan_extent_records = 0_u64;
+            let extent_prefix_all = vec![crate::types::KEY_PREFIX_EXTENT];
+            let extent_end_all = prefix_end(&extent_prefix_all);
+            for pair in scan_range_pairs(txn, extent_prefix_all, extent_end_all)? {
+                let (key, value) = pair?;
+                let Some(owner_ino) = FsCore::extent_owner_ino_from_key(&key) else {
+                    continue;
+                };
 
-                    let dirent: DirentRecord = decode_rkyv(&value)?;
-                    if !live_seen_inodes.insert(dirent.ino) {
-                        continue;
-                    }
-                    let Some(child_raw) = txn.get(inode_key(dirent.ino))? else {
-                        continue;
-                    };
-                    let child: InodeRecord = decode_rkyv(&child_raw)?;
-
-                    match child.kind {
-                        INODE_KIND_FILE => {
-                            live_logical_size_bytes =
-                                live_logical_size_bytes.saturating_add(child.size);
-                            let ext_prefix = extent_prefix(child.ino);
-                            let ext_end = prefix_end(&ext_prefix);
-                            for pair in scan_range_pairs(txn, ext_prefix, ext_end)? {
-                                let (_, ext_value) = pair?;
-                                let extent: ExtentRecord = decode_rkyv(&ext_value)?;
-                                let counter =
-                                    live_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
-                                *counter = counter.saturating_add(1);
-                            }
-                        }
-                        INODE_KIND_DIR => {
-                            live_dir_stack.push(child.ino);
-                        }
-                        _ => {}
-                    }
+                let owner_exists = if let Some(exists) = inode_present_cache.get(&owner_ino) {
+                    *exists
+                } else {
+                    let exists = txn.get(inode_key(owner_ino))?.is_some();
+                    inode_present_cache.insert(owner_ino, exists);
+                    exists
+                };
+                if !owner_exists {
+                    orphan_extent_records = orphan_extent_records.saturating_add(1);
                 }
+
+                let extent: ExtentRecord = decode_rkyv(&value)?;
+                let counter = all_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
+                *counter = counter.saturating_add(1);
             }
 
             let mut stored_unique_uncompressed_bytes = 0_u64;
             let mut stored_unique_compressed_bytes = 0_u64;
-            let mut live_unique_uncompressed_bytes = 0_u64;
-            let mut live_unique_compressed_bytes = 0_u64;
-            let mut live_referenced_uncompressed_bytes = 0_u64;
-            let mut live_referenced_compressed_bytes = 0_u64;
-
+            let mut chunk_refcount_mismatch_count = 0_u64;
+            let mut seen_chunk_records = HashSet::<[u8; 16]>::new();
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
             let chunk_end = prefix_end(&chunk_prefix);
             for pair in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
@@ -387,37 +611,33 @@ impl FsCore {
                     stored_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
                 stored_unique_compressed_bytes =
                     stored_unique_compressed_bytes.saturating_add(chunk_compressed);
-
-                if let Some(reference_count) = live_extent_refcounts.get(&hash) {
-                    live_unique_uncompressed_bytes =
-                        live_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
-                    live_unique_compressed_bytes =
-                        live_unique_compressed_bytes.saturating_add(chunk_compressed);
-                    live_referenced_uncompressed_bytes = live_referenced_uncompressed_bytes
-                        .saturating_add(chunk_uncompressed.saturating_mul(*reference_count));
-                    live_referenced_compressed_bytes = live_referenced_compressed_bytes
-                        .saturating_add(chunk_compressed.saturating_mul(*reference_count));
+                let expected_refcount = all_extent_refcounts.get(&hash).copied().unwrap_or(0);
+                if chunk.refcount != expected_refcount {
+                    chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
                 }
+                seen_chunk_records.insert(hash);
             }
 
+            let missing_chunk_records_for_extents = all_extent_refcounts
+                .keys()
+                .filter(|hash| !seen_chunk_records.contains(*hash))
+                .count() as u64;
+
             Ok((
-                all_logical_size_bytes,
                 live_logical_size_bytes,
+                snapshots_logical_size_bytes,
+                hidden_vault_logical_size_bytes,
+                all_logical_size_bytes,
                 stored_unique_uncompressed_bytes,
                 stored_unique_compressed_bytes,
-                live_unique_uncompressed_bytes,
-                live_unique_compressed_bytes,
-                live_referenced_uncompressed_bytes,
-                live_referenced_compressed_bytes,
+                chunk_refcount_mismatch_count,
+                missing_chunk_records_for_extents,
+                orphan_extent_records,
             ))
         })?;
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
-        let snapshots_logical_size_bytes =
-            all_logical_size_bytes.saturating_sub(live_logical_size_bytes);
-        let live_dedup_savings_bytes =
-            live_referenced_compressed_bytes.saturating_sub(live_unique_compressed_bytes);
 
         let cache_hits = self
             .chunk_meta_cache_hits
@@ -446,6 +666,7 @@ impl FsCore {
             read_process_private_memory_bytes().unwrap_or(process_rss_bytes);
         let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
         let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
+        let pack_crc32_read_error_count = self.pack_crc32_read_error_count.load(Ordering::Relaxed);
         let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
         let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
         let read_throughput_bps = read_bytes_total as f64 / uptime_secs;
@@ -454,16 +675,17 @@ impl FsCore {
         Ok(VerFsStats {
             live_logical_size_bytes,
             snapshots_logical_size_bytes,
+            hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
-            live_referenced_uncompressed_bytes,
-            live_referenced_compressed_bytes,
-            live_unique_uncompressed_bytes,
-            live_unique_compressed_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
             metadata_size_bytes,
             data_dir_size_bytes,
-            live_dedup_savings_bytes,
+            vault_locked,
+            chunk_refcount_mismatch_count,
+            missing_chunk_records_for_extents,
+            orphan_extent_records,
+            pack_crc32_read_error_count,
             cache_hits,
             cache_requests,
             cache_hit_rate,
@@ -485,6 +707,7 @@ impl FsCore {
 impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
         self.persist_active_pack_id_if_needed().await?;
+        self.persist_pack_crc32_read_error_count_if_needed().await?;
         if full {
             self.packs.sync(true)?;
             self.meta.flush_wal(true)?;
@@ -505,7 +728,6 @@ mod tests {
     use anyhow::anyhow;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     fn temp_dir_manual() -> PathBuf {

@@ -94,6 +94,11 @@ Read live runtime/internal statistics from the mounted daemon through the contro
 ./target/release/verfsnext stats
 ```
 
+Stats namespace behavior:
+- Live logical size excludes `/.snapshots`.
+- If vault is locked, live logical size also excludes hidden `/.vault` and reports it separately as hidden vault logical size.
+- The report includes metadata consistency checks (chunk refcount mismatches, missing chunk records, orphan extents).
+
 ## Encryption (`.vault`)
 
 `/.vault` is a reserved encrypted namespace at filesystem root.
@@ -128,6 +133,19 @@ After unlock `.vault` becomes visible and accessible for normal file operations.
 After lock:
 - `/.vault` disappears from directory listings
 - Direct access to `/.vault/*` fails until next unlock
+
+## Pack Size Migration
+
+To migrate to a new pack size:
+
+```bash
+./target/release/verfsnext pack-size-migrate
+```
+
+Notes:
+- This command must run while the daemon is stopped.
+- It rewrites all packs and updates chunk metadata pack mappings.
+- Old packs are moved to a backup directory under `data_dir`; remove that backup only after validation.
 
 ## Run As A Systemd Service
 

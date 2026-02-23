@@ -126,11 +126,18 @@ impl FsCore {
             ));
         }
 
-        if txn.get(dirent_key(parent, name.as_bytes()))?.is_some() {
-            return Err(anyhow_errno(
-                Errno::EEXIST,
-                format!("create: {} already exists", name),
-            ));
+        let dirent_key_bytes = dirent_key(parent, name.as_bytes());
+        if let Some(existing_dirent_raw) = txn.get(dirent_key_bytes.clone())? {
+            let existing_dirent: DirentRecord = decode_rkyv(&existing_dirent_raw)?;
+            if txn.get(inode_key(existing_dirent.ino))?.is_none() {
+                // Self-heal stale directory entry left behind by an earlier failed/mixed version.
+                txn.delete(dirent_key_bytes)?;
+            } else {
+                return Err(anyhow_errno(
+                    Errno::EEXIST,
+                    format!("create: {} already exists", name),
+                ));
+            }
         }
 
         let Some(next_inode_raw) = txn.get(crate::types::sys_key("next_inode"))? else {
@@ -234,6 +241,7 @@ impl FsCore {
     pub(crate) fn remove_name_from_inode_in_txn(
         txn: &mut surrealkv::Transaction,
         inode: &mut InodeRecord,
+        defer_final_delete: bool,
     ) -> Result<bool> {
         if inode.kind == INODE_KIND_DIR {
             FsCore::remove_inode_payload_in_txn(txn, inode)?;
@@ -245,11 +253,32 @@ impl FsCore {
             inode.nlink -= 1;
             txn.set(inode_key(inode.ino), encode_rkyv(inode)?)?;
             Ok(false)
+        } else if defer_final_delete {
+            inode.nlink = 0;
+            txn.set(inode_key(inode.ino), encode_rkyv(inode)?)?;
+            Ok(false)
         } else {
             FsCore::remove_inode_payload_in_txn(txn, inode)?;
             txn.delete(inode_key(inode.ino))?;
             Ok(true)
         }
+    }
+    pub(crate) async fn cleanup_unlinked_inode_if_closed(&self, ino: u64) -> Result<()> {
+        let _guard = self.write_lock.write().await;
+        self.meta
+            .write_txn(|txn| {
+                let Some(raw) = txn.get(inode_key(ino))? else {
+                    return Ok(());
+                };
+                let inode: InodeRecord = decode_rkyv(&raw)?;
+                if inode.nlink != 0 || inode.kind == INODE_KIND_DIR {
+                    return Ok(());
+                }
+                FsCore::remove_inode_payload_in_txn(txn, &inode)?;
+                txn.delete(inode_key(ino))?;
+                Ok(())
+            })
+            .await
     }
     pub(crate) fn is_dir_empty(txn: &surrealkv::Transaction, ino: u64) -> Result<bool> {
         let prefix = dirent_prefix(ino);
@@ -257,6 +286,23 @@ impl FsCore {
         let mut iter = txn.range(prefix, end)?;
         let not_empty = iter.seek_first()?;
         Ok(!not_empty)
+    }
+    pub(crate) fn prune_orphan_dirents_in_dir_txn(
+        txn: &mut surrealkv::Transaction,
+        ino: u64,
+    ) -> Result<u64> {
+        let prefix = dirent_prefix(ino);
+        let end = prefix_end(&prefix);
+        let pairs = scan_range_pairs(txn, prefix, end)?.collect::<Result<Vec<_>>>()?;
+        let mut removed = 0_u64;
+        for (key, value) in pairs {
+            let dirent: DirentRecord = decode_rkyv(&value)?;
+            if txn.get(inode_key(dirent.ino))?.is_none() {
+                txn.delete(key)?;
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
     }
     pub(crate) fn touch_parent_inode_in_txn(
         txn: &mut surrealkv::Transaction,

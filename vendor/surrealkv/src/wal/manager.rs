@@ -207,27 +207,28 @@ impl Wal {
             .create(true)
             .append(true);
 
+        let file = open_options.open(file_path)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Some(file_mode) = opts.file_mode {
-                open_options.mode(file_mode);
-            }
+        if let Some(file_mode) = opts.file_mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(file_path, fs::Permissions::from_mode(file_mode))?;
         }
-
-        Ok(open_options.open(file_path)?)
+        Ok(file)
     }
 
     fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
         // Directory should already be created by Tree::new()
-        // Just set permissions if needed
+        // Just set permissions if needed.
+        // If mode adjustment is not permitted (e.g. service user does not own
+        // pre-existing directory), continue as long as directory access itself
+        // is otherwise valid.
         if let Ok(metadata) = fs::metadata(dir) {
             let mut permissions = metadata.permissions();
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
+                permissions.set_mode(opts.dir_mode.unwrap_or(0o770));
             }
 
             #[cfg(windows)]
@@ -235,7 +236,17 @@ impl Wal {
                 permissions.set_readonly(false);
             }
 
-            fs::set_permissions(dir, permissions)?;
+            if let Err(err) = fs::set_permissions(dir, permissions) {
+                if err.kind() == io::ErrorKind::PermissionDenied {
+                    log::warn!(
+                        "WAL: unable to adjust directory permissions for {}: {}. continuing with existing mode",
+                        dir.display(),
+                        err
+                    );
+                } else {
+                    return Err(Error::IO(IOError::new(err.kind(), &err.to_string())));
+                }
+            }
         }
 
         Ok(())

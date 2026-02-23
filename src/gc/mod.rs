@@ -4,6 +4,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::permissions::set_file_mode;
+
 pub const DISCARD_MAGIC: [u8; 8] = *b"VFDISC01";
 pub const DISCARD_VERSION: u16 = 1;
 pub const DISCARD_HEADER_LEN: u64 = 16;
@@ -98,6 +100,7 @@ pub fn rewrite_records(path: &Path, records: &[DiscardRecord]) -> Result<u64> {
         .truncate(true)
         .open(&tmp_path)
         .with_context(|| format!("failed to open discard temp file {}", tmp_path.display()))?;
+    set_file_mode(&tmp_path)?;
 
     write_header(&mut file)?;
     for record in records {
@@ -138,6 +141,7 @@ fn open_for_append(path: &Path) -> Result<std::fs::File> {
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open discard file {}", path.display()))?;
+    set_file_mode(path)?;
 
     ensure_header(&mut file, path)?;
     Ok(file)

@@ -56,7 +56,7 @@ impl FsCore {
                 "vault is disabled by configuration",
             ));
         }
-        let _guard = self.write_lock.lock().await;
+        let _guard = self.write_lock.write().await;
 
         if self.meta.get_sys(SYS_VAULT_WRAP)?.is_some() {
             return Err(anyhow_errno(Errno::EEXIST, "vault is already initialized"));
@@ -166,7 +166,7 @@ impl FsCore {
                 "vault is disabled by configuration",
             ));
         }
-        let _guard = self.write_lock.lock().await;
+        let _guard = self.write_lock.write().await;
 
         let wrap_raw = self
             .meta
@@ -194,7 +194,7 @@ impl FsCore {
         Ok(())
     }
     pub(crate) async fn lock_vault(&self) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
+        let _guard = self.write_lock.write().await;
         {
             let mut vault = self.vault.write();
             if !vault.unlocked() {

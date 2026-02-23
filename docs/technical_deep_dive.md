@@ -7,7 +7,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - FUSE runtime via `vendor/async-fusex`
 - Metadata runtime via `vendor/surrealkv`
   - WAL batches, SSTable table metadata, and partitioned top-level index payloads are archived with `rkyv` and validated at decode boundaries
-- Write batching (`>= 3000` blocks or `500ms`) with synchronous syscall completion
+- Two-stage write batching pipeline:
+  - ingest stage batches by byte threshold or flush interval
+  - apply stage drains ordered batches and reports completion to waiting syscalls
 - Background sync + shutdown full-sync barrier
 - Streaming UltraCDC chunking telemetry in write ingress path
 - XXH3-128 hash-authoritative dedup decisions
@@ -25,6 +27,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext crypt -l`
 - Runtime stats control path:
   - `verfsnext stats`
+- Offline pack-size migration control path:
+  - `verfsnext pack-size-migrate`
 - Global config-file CLI option:
   - `verfsnext --config <path> ...`
   - `verfsnext -c <path> ...`
@@ -38,6 +42,19 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
 - Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands.
+- Startup now normalizes `<data_dir>` tree permissions to group-writable POSIX modes:
+  - directories: `0770`
+  - regular runtime files (packs/indices/metadata/discard): `0660`
+  - control socket: `0660`
+  - normalization is best-effort when mode changes are not permitted by ownership/capabilities
+- Startup enforces persisted pack-size compatibility:
+  - `SYS:pack_max_size_mb` is initialized automatically on first startup after upgrade.
+  - Daemon startup fails if `config.pack_max_size_mb` differs from `SYS:pack_max_size_mb`.
+  - Pack-size changes require explicit offline migration via `pack-size-migrate`.
+- Startup runs a one-time pack-index CRC32 migration:
+  - rewrites all `.idx` files to include a payload CRC32 field
+  - stores completion marker in `SYS:pack_index_crc32_migration_v1`
+  - initializes `SYS:pack_crc32_read_errors`
 - Snapshot trees are materialized as read-only inode clones with chunk-ref accounting
 - Two-stage GC with `.DISCARD` checkpointed metadata handoff:
   - Metadata stage: retains zero-ref chunks until GC stage, emits `.DISCARD` records, then deletes chunk metadata
@@ -47,13 +64,22 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 - `src/fs/mod.rs`
   - `VirtualFs` implementation
+  - global mutation gate is now an async `RwLock`:
+    - write-side lock for namespace/global metadata mutations (rename/unlink/rmdir/link/xattr/vault/snapshot)
+    - read-side lock for file-content writes/truncates so unrelated inode writes can continue concurrently
+  - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`)
   - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
   - read path resolves chunk location through pack-local hash index
+  - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
   - bounded chunk metadata and chunk payload caches
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
-  - `collect_stats` computes live-scope logical/chunk/dedup/cache/memory/throughput metrics
-  - live scope is traversed from root while excluding `/.snapshots`; snapshot and all-namespace logical totals are also exposed separately
+  - `collect_stats` computes namespace-scoped logical size plus cache/memory/throughput metrics
+  - stats include cumulative pack payload CRC32 read mismatch count
+  - live scope is traversed from root while excluding `/.snapshots`, and excludes `/.vault` when vault is locked
+  - snapshot logical and hidden-vault logical totals are computed separately, with an all-reachable-namespaces total
+  - metadata consistency checks are computed in stats output:
+    chunk refcount mismatches, extents referencing missing chunk records, and orphan extent records
   - stats output includes full `data_dir` size and disk delta `data_dir_size - live_logical_size`
   - stats are rendered as an aligned table for terminal readability
   - read-only inode flag enforcement across mutating FUSE operations
@@ -63,6 +89,26 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - marks vault inodes using inode flags and applies data encryption/decryption only for those inodes
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
+  - directory handles now keep a per-`opendir` snapshot for stable pagination while the namespace is mutating (prevents recursive-delete entry skips)
+
+- `src/fs/write.rs`
+  - `apply_batch` still coalesces adjacent writes first, then executes per-inode groups sequentially while running different inodes concurrently
+  - preserves per-inode operation order while unlocking cross-inode parallelism
+  - `apply_single_write` is now two-phase:
+    - phase 1 (outside inode lock): reads extents, assembles block payloads, hashes, dedup checks, and chunk compression/materialization
+    - phase 2 (short critical section): acquires global mutation read lock plus per-inode lock, then commits extent/refcount/inode metadata
+  - per-inode data-version counters detect races with truncation; on mismatch, write preparation is recomputed against current inode state before commit
+  - this removes chunk/compression work from the steady-state inode critical section while preserving ordered inode commits
+
+- `src/write/batcher.rs`
+  - queue ingestion no longer blocks on `sink.apply_batch`
+  - ingestion flushes pending ops into an internal apply queue and immediately resumes receiving FUSE writes
+  - apply worker preserves batch order, applies each batch, and resolves per-write completion channels
+  - `drain` and `shutdown` are implemented as ordered barriers in the apply queue
+
+- `vendor/async-fusex/src/fuse_fs.rs`
+  - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
+  - `readdir` now stops filling once the reply buffer is full, matching `readdirplus` behavior and preserving correct continuation semantics
 
 - `src/vault/mod.rs`
   - Envelope wrapping metadata type (`VaultWrapRecord`) encoded with `rkyv`
@@ -83,14 +129,23 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 - `src/data/pack.rs`
   - Pack record format `VPK2` archived with `rkyv`
-  - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records
+  - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records including `payload_crc32`
   - Pack header and index record decode paths use checked `rkyv::access` for zero-copy validation
   - Automatic active-pack rollover on append when configured pack size target is reached
   - Existing packs are discovered on startup; highest pack id becomes active if metadata lags
   - Hash lookup path reads index entry first, then seeks pack payload
+  - CRC32 is computed on stored payload bytes (ciphertext for vault chunks, compressed/raw payload for non-vault chunks)
   - Supports encrypted-payload reads (`read_chunk_payload`) for vault decrypt-then-decompress flow
   - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
   - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
+
+- `src/migration/pack_size.rs`
+  - Compatibility guard for persisted `SYS:pack_max_size_mb`
+  - Offline pack rewrite flow for pack-size changes:
+    - rewrites all chunk payloads into new packs using configured size
+    - updates chunk metadata `pack_id` mappings
+    - resets GC discard cursor/phase and truncates discard file
+    - moves old pack/index files into a backup directory for manual cleanup
 
 ## Config
 
@@ -99,10 +154,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `mount_point`
 - `data_dir`
 - `sync_interval_ms`
-- `batch_max_blocks`
+- `batch_max_size_mb`
 - `batch_flush_interval_ms`
 - `metadata_cache_capacity_entries`
-- `chunk_cache_capacity_entries`
+- `chunk_cache_capacity_mb`
 - `pack_index_cache_capacity_entries`
 - `pack_max_size_mb`
 - `zstd_compression_level`
@@ -129,6 +184,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Snapshot metadata records are keyed under `S:<name>` and point to snapshot root inode.
 - System keys now include:
   - `SYS:active_pack_id`
+  - `SYS:pack_max_size_mb`
   - `SYS:gc.discard_checkpoint`
   - `SYS:gc.epoch`
   - `SYS:vault.state`
@@ -167,10 +223,30 @@ The repository now includes a Phase 5 implementation on top of the existing full
 4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, rewrites live chunks only, and atomically swaps rewritten pack/index files.
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
 
+## Pack-Size Compatibility and Migration
+
+1. On startup, if `SYS:pack_max_size_mb` is missing, it is written from `config.pack_max_size_mb` (legacy upgrade path).
+2. On startup, if persisted and configured pack size differ, mount fails fast and logs an error.
+3. To change pack size safely:
+   - stop daemon
+   - run `verfsnext pack-size-migrate`
+   - confirm prompt
+4. Migration rewrites chunk payloads into newly allocated pack IDs (above existing max), updates `ChunkRecord.pack_id`, updates `SYS:active_pack_id`, and then moves previous pack files to a backup directory under `data_dir`.
+5. Old packs are not deleted automatically; operator removes backup after validation.
+
+## Pack-Index CRC32 Compatibility Migration
+
+1. On startup, before `PackStore::open`, VerFS checks `SYS:pack_index_crc32_migration_v1`.
+2. If the marker is missing, VerFS scans every pack file (`*.vpk`) and rewrites every pack index (`*.idx`) with the new fixed-size record format that includes `payload_crc32`.
+3. The CRC32 is computed from the stored payload bytes in the pack record (so migration works even when `/.vault` is locked).
+4. Each rewritten index is written to a temporary file and atomically renamed into place.
+5. After all indexes are rewritten, VerFS writes the migration marker and initializes `SYS:pack_crc32_read_errors` if it does not already exist.
+
 ## Validation Run
 
-Executed after Phase 5 changes:
+Executed after write-path concurrency/pipeline changes:
 
 - `cargo build --release`
+- `cargo test --release`
 
 Build completed successfully in this repository state.

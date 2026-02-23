@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,11 +26,20 @@ use crate::transaction::{
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
+use crate::ensure_dir_with_mode;
 use crate::{
     BytewiseComparator, Comparator, Error, FilterPolicy, InternalKey, InternalKeyKind, IntoBytes,
     LSMIterator, Options, TimestampComparator, VLogChecksumLevel, Value, WalRecoveryMode,
     INTERNAL_KEY_TIMESTAMP_MAX,
 };
+
+macro_rules! info_and_print {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        log::info!("{}", msg);
+        eprintln!("{}", msg);
+    }};
+}
 
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
@@ -316,7 +325,7 @@ impl CoreInner {
         // Remove successfully flushed memtable from tracking
         memtable_lock.remove(table_id);
 
-        log::info!(
+        info_and_print!(
             "Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
             table_id,
             wal_number + 1,
@@ -609,7 +618,7 @@ impl CoreInner {
     /// is set to current_wal + 1, indicating all data up to current WAL is
     /// persisted.
     fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
-        log::info!("Flushing all memtables for shutdown...");
+        info_and_print!("Flushing all memtables for shutdown...");
 
         // STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
         // We need to collect them first to avoid holding the lock during I/O
@@ -620,7 +629,7 @@ impl CoreInner {
 
         let immutable_count = immutables_to_flush.len();
         if immutable_count > 0 {
-            log::info!(
+            info_and_print!(
                 "Flushing {} immutable memtable(s) first (older data)",
                 immutable_count
             );
@@ -662,7 +671,7 @@ impl CoreInner {
         }
 
         if flushed_count > 0 {
-            log::info!(
+            info_and_print!(
                 "Flushed {} immutable memtable(s) successfully",
                 flushed_count
             );
@@ -675,7 +684,7 @@ impl CoreInner {
         drop(active_memtable);
 
         if !active_is_empty {
-            log::info!(
+            info_and_print!(
                 "Flushing active memtable last (newest data): size={}",
                 active_size
             );
@@ -687,7 +696,7 @@ impl CoreInner {
             // Fail-fast: return immediately on error
             match self.flush_memtable_and_update_manifest(None)? {
                 Some(table) => {
-                    log::info!(
+                    info_and_print!(
                         "Active memtable flushed: table_id={}, file_size={}",
                         table.id,
                         table.file_size
@@ -729,7 +738,7 @@ impl CoreInner {
             }
         }
 
-        log::info!("All memtables flushed successfully for shutdown");
+        info_and_print!("All memtables flushed successfully for shutdown");
         Ok(())
     }
 
@@ -1255,8 +1264,8 @@ impl Core {
 
     /// Creates a new LSM tree with background task management
     pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-        log::info!("=== Starting LSM tree initialization ===");
-        log::info!("Database path: {:?}", opts.path);
+        info_and_print!("=== Starting LSM tree initialization ===");
+        info_and_print!("Database path: {:?}", opts.path);
 
         let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
@@ -1282,7 +1291,7 @@ impl Core {
         let min_wal_number = inner.level_manifest.read()?.get_log_number();
         let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
 
-        log::info!(
+        info_and_print!(
             "Manifest state: log_number={}, last_sequence={}",
             min_wal_number,
             manifest_last_seq
@@ -1299,7 +1308,7 @@ impl Core {
                 // Flush intermediate memtable to SST during recovery
                 let table_id = inner.level_manifest.read()?.next_table_id();
                 inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
-                log::info!(
+                info_and_print!(
                     "Recovery: flushed memtable to SST table_id={}, wal_number={}",
                     table_id,
                     wal_number
@@ -1366,7 +1375,7 @@ impl Core {
             task_manager: Mutex::new(Some(task_manager)),
         };
 
-        log::info!("=== LSM tree initialization complete ===");
+        info_and_print!("=== LSM tree initialization complete ===");
 
         Ok(core)
     }
@@ -1433,7 +1442,7 @@ impl Core {
     /// Unlike `make_room_for_write`, this does NOT rotate the WAL before
     /// flushing. This prevents creating an empty WAL file on clean shutdown.
     pub async fn close(&self) -> Result<()> {
-        log::info!("Shutting down LSM tree...");
+        info_and_print!("Shutting down LSM tree...");
 
         // Step 1: Shutdown the commit pipeline to stop accepting new writes
         self.commit_pipeline.shutdown();
@@ -1466,14 +1475,14 @@ impl Core {
         // to preserve SSTable ordering (older data = lower table_ids)
         // IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
         if self.inner.opts.flush_on_close {
-            log::info!("Flushing all memtables on shutdown (flush_on_close=true)");
+            info_and_print!("Flushing all memtables on shutdown (flush_on_close=true)");
 
             // Flush ALL memtables: immutables first (older data), then active (newest data)
             self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
                 Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
             })?;
 
-            log::info!("All memtables flushed successfully on shutdown");
+            info_and_print!("All memtables flushed successfully on shutdown");
         }
 
         // Step 4: Close the WAL to ensure all data is flushed
@@ -1481,7 +1490,7 @@ impl Core {
         // stopped NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may
         // delete the active WAL file
         let wal_log_number = self.inner.wal.read().get_active_log_number();
-        log::info!("Closing WAL: active_log_number={}", wal_log_number);
+        info_and_print!("Closing WAL: active_log_number={}", wal_log_number);
 
         let mut wal_guard = self.inner.wal.write();
         wal_guard
@@ -1504,7 +1513,7 @@ impl Core {
 
         match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
             Ok(count) if count > 0 => {
-                log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+                info_and_print!("Cleaned up {} obsolete WAL files during shutdown", count);
             }
             Ok(_) => {
                 log::debug!("No obsolete WAL files to clean up");
@@ -1534,7 +1543,7 @@ impl Core {
 
         // Log final state
         let final_manifest = self.inner.level_manifest.read()?;
-        log::info!(
+        info_and_print!(
             "=== LSM tree shutdown complete === log_number={}, last_sequence={}",
             final_manifest.get_log_number(),
             final_manifest.get_last_sequence()
@@ -1575,20 +1584,20 @@ impl Tree {
     /// Creates all required directory structure for the LSM tree
     fn create_directory_structure(opts: &Options) -> Result<()> {
         // Create base directory
-        create_dir_all(&opts.path)?;
+        ensure_dir_with_mode(&opts.path)?;
 
         // Create all subdirectories
-        create_dir_all(opts.sstable_dir())?;
-        create_dir_all(opts.wal_dir())?;
-        create_dir_all(opts.manifest_dir())?;
+        ensure_dir_with_mode(&opts.sstable_dir())?;
+        ensure_dir_with_mode(&opts.wal_dir())?;
+        ensure_dir_with_mode(&opts.manifest_dir())?;
 
         // Create VLog directories
         if opts.enable_vlog {
-            create_dir_all(opts.vlog_dir())?;
+            ensure_dir_with_mode(&opts.vlog_dir())?;
         }
 
         if opts.enable_versioning {
-            create_dir_all(opts.versioned_index_dir())?;
+            ensure_dir_with_mode(&opts.versioned_index_dir())?;
         }
 
         Ok(())

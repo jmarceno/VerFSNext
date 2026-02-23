@@ -1357,12 +1357,14 @@ impl<F: VfsFile> Drop for BPlusTree<F> {
 impl BPlusTree<File> {
     pub fn disk<P: AsRef<Path>>(path: P, compare: Arc<dyn Comparator>) -> Result<Self> {
         use std::fs::OpenOptions;
+        let path_ref = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(path_ref)?;
+        crate::ensure_file_mode(path_ref)?;
         Self::with_file(file, compare)
     }
 }

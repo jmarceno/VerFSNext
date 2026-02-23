@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt;
 
+use crate::ensure_file_mode;
 use crate::error::{Error, Result}; // Use fs2 for file locking
 
 /// LockFile prevents multiple processes from accessing the same database
@@ -74,6 +75,7 @@ impl LockFile {
             .truncate(true)
             .open(&self.path)
             .map_err(|e| Error::Io(Arc::new(e)))?;
+        ensure_file_mode(&self.path)?;
 
         // Try to lock the file exclusively using fs2
         file.try_lock_exclusive().map_err(|e| match e.kind() {

@@ -580,6 +580,14 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
     // Create and write to the temporary file
     {
         let mut temp_file = SysFile::create(&temp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &temp_path,
+                std::fs::Permissions::from_mode(crate::GROUP_FILE_MODE),
+            )?;
+        }
         temp_file.write_all(new_content)?;
         temp_file.sync_all()?;
     }

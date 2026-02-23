@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::permissions::ensure_dir;
 use crate::types::BLOCK_SIZE;
 
 fn default_sync_interval_ms() -> u64 {
@@ -247,17 +248,9 @@ impl Config {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("failed to create data dir {}", self.data_dir.display()))?;
-        std::fs::create_dir_all(self.metadata_dir()).with_context(|| {
-            format!(
-                "failed to create metadata dir {}",
-                self.metadata_dir().display()
-            )
-        })?;
-        std::fs::create_dir_all(self.packs_dir()).with_context(|| {
-            format!("failed to create packs dir {}", self.packs_dir().display())
-        })?;
+        ensure_dir(&self.data_dir)?;
+        ensure_dir(&self.metadata_dir())?;
+        ensure_dir(&self.packs_dir())?;
         Ok(())
     }
 }

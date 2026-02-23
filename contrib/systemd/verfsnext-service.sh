@@ -99,7 +99,7 @@ ensure_control_socket_permissions() {
 
   socket_path="$data_dir/verfsnext.sock"
   if [[ $DRY_RUN -eq 1 ]]; then
-    echo "Dry run: would ensure $socket_path is owned by group $SERVICE_GROUP with mode 660."
+    echo "Dry run: would ensure $socket_path is readable/writable by all users."
     return 0
   fi
 
@@ -115,9 +115,8 @@ ensure_control_socket_permissions() {
     return 0
   fi
 
-  echo "Ensuring control socket group access on $socket_path..."
-  run_cmd "${SUDO[@]}" chgrp "$SERVICE_GROUP" "$socket_path"
-  run_cmd "${SUDO[@]}" chmod 660 "$socket_path"
+  echo "Ensuring control socket access on $socket_path..."
+  run_cmd "${SUDO[@]}" chmod 666 "$socket_path"
 }
 
 toml_path_value() {
@@ -167,18 +166,19 @@ ensure_service_user() {
 
 install_config() {
   echo "Preparing config at $CONFIG_FILE..."
-  run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_DIR"
+  run_cmd "${SUDO[@]}" install -d "$CONFIG_DIR"
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    run_cmd "${SUDO[@]}" install -m640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$CONFIG_SRC" "$CONFIG_FILE"
+    run_cmd "${SUDO[@]}" install -m644 "$CONFIG_SRC" "$CONFIG_FILE"
     echo "Installed config template from $CONFIG_SRC"
   else
-    run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
+    run_cmd "${SUDO[@]}" chmod 644 "$CONFIG_FILE"
   fi
 }
 
 validate_config_paths() {
   local mount_point data_dir
   local check_write_perms=1
+  local caller_user="${SUDO_USER:-${USER:-root}}"
   mount_point="$(toml_path_value mount_point "$VALIDATION_CONFIG_FILE" || true)"
   data_dir="$(toml_path_value data_dir "$VALIDATION_CONFIG_FILE" || true)"
 
@@ -189,12 +189,12 @@ validate_config_paths() {
 
   if [[ ! -d "$mount_point" ]]; then
     echo "Creating mount_point: $mount_point"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$mount_point"
+    run_cmd "${SUDO[@]}" install -d -o "$caller_user" "$mount_point"
   fi
 
   if [[ ! -d "$data_dir" ]]; then
     echo "Creating data_dir: $data_dir"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$data_dir"
+    run_cmd "${SUDO[@]}" install -d -o "$caller_user" "$data_dir"
   fi
 
   ensure_subdir_owned "$data_dir/metadata"
@@ -206,23 +206,15 @@ validate_config_paths() {
   fi
 
   if [[ $check_write_perms -eq 1 ]]; then
-    if ! can_user_write_dir "$mount_point"; then
-      echo "Adjusting ownership for mount_point: $mount_point"
-      run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$mount_point"
-    fi
-
-    if ! can_user_write_dir "$data_dir"; then
-      echo "Adjusting ownership for data_dir: $data_dir"
-      run_cmd "${SUDO[@]}" chown "$SERVICE_USER:$SERVICE_GROUP" "$data_dir"
-    fi
-
     if [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$mount_point"; then
       echo "config validation failed: $SERVICE_USER cannot write mount_point: $mount_point" >&2
+      echo "Please fix the permissions for $mount_point so that user $SERVICE_USER can write to it." >&2
       exit 1
     fi
 
     if [[ $DRY_RUN -eq 0 ]] && ! can_user_write_dir "$data_dir"; then
       echo "config validation failed: $SERVICE_USER cannot write data_dir: $data_dir" >&2
+      echo "Please fix the permissions for $data_dir so that user $SERVICE_USER can write to it." >&2
       exit 1
     fi
   fi
@@ -230,15 +222,39 @@ validate_config_paths() {
 
 ensure_subdir_owned() {
   local dir_path=$1
+  local caller_user="${SUDO_USER:-${USER:-root}}"
   if [[ ! -d "$dir_path" ]]; then
     echo "Creating directory: $dir_path"
-    run_cmd "${SUDO[@]}" install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$dir_path"
+    run_cmd "${SUDO[@]}" install -d -o "$caller_user" "$dir_path"
     return 0
   fi
 
-  if ! can_user_write_dir "$dir_path"; then
-    echo "Adjusting ownership recursively for: $dir_path"
-    run_cmd "${SUDO[@]}" chown -R "$SERVICE_USER:$SERVICE_GROUP" "$dir_path"
+  local check_write_perms=1
+  if [[ $DRY_RUN -eq 1 ]] && ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    check_write_perms=0
+  fi
+
+  if [[ $check_write_perms -eq 1 ]] && [[ $DRY_RUN -eq 0 ]]; then
+    if ! can_user_write_dir "$dir_path"; then
+      echo "config validation failed: $SERVICE_USER cannot write to $dir_path" >&2
+      echo "Please fix the permissions for $dir_path so that it is writable." >&2
+      exit 1
+    fi
+
+    local unreadable
+    if command -v runuser >/dev/null 2>&1; then
+      unreadable="$("${SUDO[@]}" runuser -u "$SERVICE_USER" -- find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    elif command -v sudo >/dev/null 2>&1; then
+      unreadable="$(sudo -u "$SERVICE_USER" find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    else
+      unreadable="$("${SUDO[@]}" -u "$SERVICE_USER" find "$dir_path" ! -writable -print -quit 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$unreadable" ]]; then
+       echo "config validation failed: $SERVICE_USER cannot write to inner files, e.g. $unreadable" >&2
+       echo "Please fix the permissions for $dir_path (e.g. by running: sudo chmod -R a+rw $dir_path) so that all inner files are writable by the service." >&2
+       exit 1
+    fi
   fi
 }
 
@@ -323,7 +339,6 @@ need_cmd sed
 need_cmd grep
 need_cmd getent
 need_cmd id
-need_cmd chgrp
 need_cmd chmod
 if [[ $EUID -ne 0 ]]; then
   need_cmd sudo

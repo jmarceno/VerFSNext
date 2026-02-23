@@ -72,7 +72,6 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 need_cmd systemctl
-need_cmd install
 need_cmd rm
 need_cmd sed
 need_cmd id
