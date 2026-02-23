@@ -15,6 +15,7 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::fs::{VerFs, VerFsStats};
+use crate::fs::{PackCrc32ReadErrorCounters, VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
 use crate::permissions::set_socket_mode;
@@ -64,6 +65,9 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to load {}", config_path.display()))?;
 
     let fs = Arc::new(VerFs::new(config.clone()).await?);
+    let startup_crc32 = fs.pack_crc32_read_error_counters();
+    let crc32_session_start_total = startup_crc32.current_total;
+    announce_crc32_startup(startup_crc32);
     let virtual_fs: Arc<dyn VirtualFs> = fs.clone();
     let fuse_fs = FuseFs::new(virtual_fs).with_direct_io(config.fuse_direct_io);
 
@@ -90,27 +94,37 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();
     let fs_for_signal = fs.clone();
+    let crc32_shutdown_reported = Arc::new(AtomicBool::new(false));
+    let crc32_shutdown_reported_for_signal = crc32_shutdown_reported.clone();
     let control_socket_path = config.control_socket_path();
     let control_listener = bind_control_socket(&control_socket_path)?;
+    info!(path = %control_socket_path.display(), "control socket listening");
+    eprintln!(
+        "control socket listening path={}",
+        control_socket_path.display()
+    );
     let control_server = tokio::spawn(run_control_socket_server(
         fs.clone(),
         control_listener,
         control_socket_path.clone(),
         cancel.clone(),
-        Some(log_handle.clone()),
     ));
-    let log_handle_for_signal = log_handle.clone();
-
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = log_handle_for_signal
-                .modify(|filter| *filter = tracing_subscriber::EnvFilter::new("info"));
             info!("SIGINT received, starting graceful shutdown");
+            eprintln!("SIGINT received, starting graceful shutdown");
             if fs_for_signal.is_gc_in_progress() {
                 info!("Garbage collection is currently in progress, shutdown might take a while");
+                eprintln!("Garbage collection is currently in progress, shutdown might take a while");
             }
             if let Err(err) = fs_for_signal.graceful_shutdown().await {
                 error!(error = %err, "graceful shutdown failed during SIGINT handling");
+            } else {
+                announce_crc32_shutdown(
+                    &fs_for_signal,
+                    crc32_session_start_total,
+                    &crc32_shutdown_reported_for_signal,
+                );
             }
             cancel_for_signal.cancel();
         }
@@ -121,6 +135,12 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
         data_dir = %config.data_dir.display(),
         "VerFSNext Phase 1 mounted"
     );
+    eprintln!(
+        "VerFSNext Phase 1 mounted mount_point={} data_dir={}",
+        config.mount_point.display(),
+        config.data_dir.display()
+    );
+    let _ = log_handle.modify(|filter| *filter = tracing_subscriber::EnvFilter::new("error"));
 
     let run_result = session.run(cancel.clone()).await;
     cancel.cancel();
@@ -130,6 +150,8 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
 
     if let Err(err) = fs.graceful_shutdown().await {
         error!(error = %err, "graceful shutdown after run loop failed");
+    } else {
+        announce_crc32_shutdown(&fs, crc32_session_start_total, &crc32_shutdown_reported);
     }
 
     run_result.context("FUSE run loop failed")
@@ -315,14 +337,7 @@ async fn run_control_socket_server(
     listener: UnixListener,
     socket_path: PathBuf,
     cancel: CancellationToken,
-    log_handle: Option<LogHandle>,
 ) -> Result<()> {
-    info!(path = %socket_path.display(), "control socket listening");
-
-    if let Some(handle) = log_handle {
-        let _ = handle.modify(|filter| *filter = tracing_subscriber::EnvFilter::new("error"));
-    }
-
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -353,6 +368,44 @@ async fn run_control_socket_server(
         }
     }
     Ok(())
+}
+
+fn announce_crc32_startup(counters: PackCrc32ReadErrorCounters) {
+    info!(
+        sys_total = counters.persisted_sys_total,
+        current_total = counters.current_total,
+        session_total = counters.current_total.saturating_sub(counters.persisted_sys_total),
+        "pack CRC32 read error counters at startup"
+    );
+    eprintln!(
+        "pack CRC32 read error counters (startup): sys_total={} session_total={}",
+        counters.persisted_sys_total,
+        counters
+            .current_total
+            .saturating_sub(counters.persisted_sys_total)
+    );
+}
+
+fn announce_crc32_shutdown(
+    fs: &VerFs,
+    session_start_total: u64,
+    reported: &AtomicBool,
+) {
+    if reported.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let counters = fs.pack_crc32_read_error_counters();
+    let session_total = counters.current_total.saturating_sub(session_start_total);
+    info!(
+        sys_total = counters.persisted_sys_total,
+        current_total = counters.current_total,
+        session_total,
+        "pack CRC32 read error counters at shutdown"
+    );
+    eprintln!(
+        "pack CRC32 read error counters (shutdown): sys_total={} session_total={}",
+        counters.persisted_sys_total, session_total
+    );
 }
 
 fn bind_control_socket(socket_path: &Path) -> Result<UnixListener> {
@@ -1129,7 +1182,7 @@ async fn run_crypt_via_metadata(config: &Config, cmd: &CryptCommand) -> Result<(
 fn init_logging() -> LogHandle {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
     let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     tracing_subscriber::registry()
         .with(filter)

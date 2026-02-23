@@ -148,6 +148,10 @@ async fn fuser_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result
         "fusermount path={:?} to FUSE device successfully!",
         mount_point,
     );
+    eprintln!(
+        "fusermount path={:?} to FUSE device successfully!",
+        mount_point
+    );
 
     tokio::task::spawn_blocking(move || {
         let mut buf = [0_u8; 5];

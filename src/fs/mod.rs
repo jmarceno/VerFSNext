@@ -130,6 +130,12 @@ pub struct VerFsStats {
     pub approx_cache_memory_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PackCrc32ReadErrorCounters {
+    pub persisted_sys_total: u64,
+    pub current_total: u64,
+}
+
 pub struct VerFs {
     core: Arc<FsCore>,
     batcher: WriteBatcher,
@@ -319,6 +325,16 @@ impl VerFs {
         tokio::task::spawn_blocking(move || core.collect_stats())
             .await
             .unwrap_or_else(|e| Err(anyhow!("stats task panicked: {:?}", e)))
+    }
+
+    pub fn pack_crc32_read_error_counters(&self) -> PackCrc32ReadErrorCounters {
+        PackCrc32ReadErrorCounters {
+            persisted_sys_total: self
+                .core
+                .last_persisted_pack_crc32_read_error_count
+                .load(Ordering::Relaxed),
+            current_total: self.core.pack_crc32_read_error_count.load(Ordering::Relaxed),
+        }
     }
 
     pub fn is_gc_in_progress(&self) -> bool {
