@@ -164,6 +164,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let create_kind = if param.node_type == SFlag::S_IFDIR {
             INODE_KIND_DIR
         } else {
@@ -188,7 +189,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created inode"))
@@ -208,6 +209,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -226,7 +228,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created directory"))
@@ -255,7 +257,11 @@ impl VirtualFs for VerFs {
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "unlink")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, name, "unlink")?;
                 let Some(inode_raw) = txn.get(inode_key(dirent.ino))? else {
-                    return Err(anyhow_errno(Errno::ENOENT, "unlink target inode not found"));
+                    txn.delete(dirent_key(parent, name.as_bytes()))?;
+                    let now = SystemTime::now();
+                    let (sec, nsec) = system_time_to_parts(now);
+                    FsCore::touch_parent_inode_in_txn(txn, parent, 0, sec, nsec)?;
+                    return Ok(());
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "unlink")?;
@@ -269,12 +275,14 @@ impl VirtualFs for VerFs {
                 let (sec, nsec) = system_time_to_parts(now);
                 inode.ctime_sec = sec;
                 inode.ctime_nsec = nsec;
-                let _removed_inode = FsCore::remove_name_from_inode_in_txn(txn, &mut inode)?;
+                let defer_final_delete = inode.nlink <= 1 && self.core.open_file_count(inode.ino) > 0;
+                let _removed_inode =
+                    FsCore::remove_name_from_inode_in_txn(txn, &mut inode, defer_final_delete)?;
                 Ok(())
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
         Ok(())
     }
 
@@ -312,6 +320,7 @@ impl VirtualFs for VerFs {
                     ));
                 }
 
+                let _pruned = FsCore::prune_orphan_dirents_in_dir_txn(txn, dirent.ino)?;
                 if !FsCore::is_dir_empty(txn, dirent.ino)? {
                     return Err(anyhow_errno(Errno::ENOTEMPTY, "directory not empty"));
                 }
@@ -336,7 +345,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         Ok(None)
     }
@@ -357,6 +366,7 @@ impl VirtualFs for VerFs {
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
         let target_bytes = target_path.as_os_str().as_encoded_bytes().to_vec();
+        let _guard = self.core.write_lock.write().await;
 
         let mut created: Option<InodeRecord> = None;
         self.core
@@ -379,7 +389,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing symlink inode"))
@@ -553,6 +563,9 @@ impl VirtualFs for VerFs {
                             "cannot overwrite directory with non-directory",
                         ));
                     }
+                    if target_is_dir {
+                        let _pruned = FsCore::prune_orphan_dirents_in_dir_txn(txn, target_inode.ino)?;
+                    }
                     if target_is_dir && !FsCore::is_dir_empty(txn, target_inode.ino)? {
                         return Err(anyhow_errno(
                             Errno::ENOTEMPTY,
@@ -563,8 +576,13 @@ impl VirtualFs for VerFs {
                     txn.delete(dirent_key(param.new_parent, param.new_name.as_bytes()))?;
                     target_inode.ctime_sec = sec;
                     target_inode.ctime_nsec = nsec;
-                    let _removed_target =
-                        FsCore::remove_name_from_inode_in_txn(txn, &mut target_inode)?;
+                    let defer_final_delete =
+                        target_inode.nlink <= 1 && self.core.open_file_count(target_inode.ino) > 0;
+                    let _removed_target = FsCore::remove_name_from_inode_in_txn(
+                        txn,
+                        &mut target_inode,
+                        defer_final_delete,
+                    )?;
 
                     if target_is_dir {
                         FsCore::touch_parent_inode_in_txn(txn, param.new_parent, -1, sec, nsec)?;
@@ -601,7 +619,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
         Ok(())
     }
 
@@ -627,6 +645,10 @@ impl VirtualFs for VerFs {
                 .truncate_file_locked(ino, 0)
                 .await
                 .map_err(map_anyhow_to_fuse)?;
+        }
+        {
+            let _open_guard = self.core.write_lock.read().await;
+            self.core.increment_open_file_count(ino);
         }
         Ok(self.core.new_handle())
     }
@@ -868,7 +890,15 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "release")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)
+        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        {
+            let _open_guard = self.core.write_lock.read().await;
+            self.core.decrement_open_file_count(_ino);
+        }
+        self.core
+            .cleanup_unlinked_inode_if_closed(_ino)
+            .await
+            .map_err(map_anyhow_to_fuse)
     }
 
     async fn fsync(&self, _ino: u64, datasync: bool) -> AsyncFusexResult<()> {
@@ -1019,6 +1049,7 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
         let mut created: Option<InodeRecord> = None;
         self.core
             .meta
@@ -1037,11 +1068,12 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created file inode"))
         })?;
+        self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
         Ok((
             ATTR_TTL,
@@ -1139,7 +1171,7 @@ impl VirtualFs for VerFs {
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.core.mark_mutation();
+        self.core.mark_namespace_mutation().await;
 
         let inode = linked.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing linked inode"))

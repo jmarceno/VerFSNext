@@ -20,7 +20,7 @@ use nix::fcntl::OFlag;
 use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
-use parking_lot::RwLock as ParkingRwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
@@ -57,7 +57,9 @@ use crate::vault::{
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
+// Correctness-first: we currently do not send FUSE entry invalidation notifications on
+// namespace mutations, so a non-zero TTL can leave stale dentries/attrs visible to the kernel.
+const ATTR_TTL: Duration = Duration::ZERO;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE as u32;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE as u32;
@@ -171,6 +173,7 @@ struct FsCore {
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
+    open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
 }
 
@@ -249,6 +252,7 @@ impl VerFs {
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
+            open_file_counts: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
@@ -369,6 +373,33 @@ impl FsCore {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn increment_open_file_count(&self, ino: u64) {
+        let mut counts = self.open_file_counts.lock();
+        let entry = counts.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn decrement_open_file_count(&self, ino: u64) -> u64 {
+        let mut counts = self.open_file_counts.lock();
+        let Some(entry) = counts.get_mut(&ino) else {
+            return 0;
+        };
+        *entry = entry.saturating_sub(1);
+        let remaining = *entry;
+        if remaining == 0 {
+            counts.remove(&ino);
+        }
+        remaining
+    }
+
+    fn open_file_count(&self, ino: u64) -> u64 {
+        self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    async fn mark_namespace_mutation(&self) {
+        self.mark_mutation();
+    }
+
     fn build_dir_snapshot(&self, ino: u64, inode: &InodeRecord) -> Result<Vec<CachedDirEntry>> {
         let mut entries = Vec::new();
         entries.push(CachedDirEntry {
@@ -393,6 +424,9 @@ impl FsCore {
                 };
                 let name = String::from_utf8_lossy(name_bytes).to_string();
                 let dirent: DirentRecord = decode_rkyv(&value)?;
+                if txn.get(inode_key(dirent.ino))?.is_none() {
+                    continue;
+                }
                 if self.vault_locked() && ino == ROOT_INODE && name == VAULT_DIR_NAME {
                     continue;
                 }
