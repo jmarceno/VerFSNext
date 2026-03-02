@@ -138,6 +138,20 @@ pub struct PackCrc32ReadErrorCounters {
     pub current_total: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OfflineGcReport {
+    pub packs_scanned: u64,
+    pub pack_index_entries_scanned: u64,
+    pub live_entries_found: u64,
+    pub dead_entries_found: u64,
+    pub discard_records_written: u64,
+    pub duplicate_dead_entries_collapsed: u64,
+    pub discard_checkpoint_bytes: u64,
+    pub rewrite_phase_requested: bool,
+    pub rewrite_cycles: u64,
+    pub packs_rewritten: u64,
+}
+
 pub struct VerFs {
     core: Arc<FsCore>,
     batcher: WriteBatcher,
@@ -337,7 +351,10 @@ impl VerFs {
                 .core
                 .last_persisted_pack_crc32_read_error_count
                 .load(Ordering::Relaxed),
-            current_total: self.core.pack_crc32_read_error_count.load(Ordering::Relaxed),
+            current_total: self
+                .core
+                .pack_crc32_read_error_count
+                .load(Ordering::Relaxed),
         }
     }
 

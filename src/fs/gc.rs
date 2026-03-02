@@ -1,6 +1,25 @@
 use super::*;
 use crate::fs::FsCore;
 
+impl VerFs {
+    pub async fn run_offline_gc_rebuild_discard(
+        &self,
+        run_rewrite_phase: bool,
+    ) -> Result<OfflineGcReport> {
+        let mut report = self.core.rebuild_discard_from_pack_state_offline().await?;
+        report.rewrite_phase_requested = run_rewrite_phase;
+        if run_rewrite_phase {
+            let (rewrite_cycles, packs_rewritten) = self
+                .core
+                .run_gc_rewrite_phase_only_offline_until_stable()
+                .await?;
+            report.rewrite_cycles = rewrite_cycles;
+            report.packs_rewritten = packs_rewritten;
+        }
+        Ok(report)
+    }
+}
+
 impl FsCore {
     pub(crate) fn mark_activity(&self) {
         self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
@@ -181,6 +200,189 @@ impl FsCore {
         }
 
         Ok(())
+    }
+    pub(crate) async fn rebuild_discard_from_pack_state_offline(&self) -> Result<OfflineGcReport> {
+        let _gc_guard = self.gc_lock.lock().await;
+
+        let discard_path = self
+            .config
+            .packs_dir()
+            .join(&self.config.gc_discard_filename);
+        let mut checkpoint = rewrite_records(&discard_path, &[])?;
+        let epoch = self.next_gc_epoch().await?;
+        let mut report = OfflineGcReport {
+            discard_checkpoint_bytes: checkpoint,
+            ..OfflineGcReport::default()
+        };
+
+        for pack_id in self.packs.pack_ids()? {
+            let entries = self.packs.read_index_entries(pack_id)?;
+            report.packs_scanned = report.packs_scanned.saturating_add(1);
+            report.pack_index_entries_scanned = report
+                .pack_index_entries_scanned
+                .saturating_add(entries.len() as u64);
+
+            if entries.is_empty() {
+                continue;
+            }
+
+            let mut pack_records = Vec::new();
+            let mut seen_dead_hashes = HashSet::<[u8; 16]>::new();
+            self.meta.read_txn(|txn| {
+                for (hash, index_entry) in entries.iter() {
+                    let is_live = match txn.get(chunk_key(hash))? {
+                        Some(raw) => {
+                            let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                            chunk.refcount > 0 && chunk.pack_id == pack_id
+                        }
+                        None => false,
+                    };
+
+                    if is_live {
+                        report.live_entries_found = report.live_entries_found.saturating_add(1);
+                        continue;
+                    }
+
+                    report.dead_entries_found = report.dead_entries_found.saturating_add(1);
+                    if !seen_dead_hashes.insert(*hash) {
+                        report.duplicate_dead_entries_collapsed =
+                            report.duplicate_dead_entries_collapsed.saturating_add(1);
+                        continue;
+                    }
+
+                    pack_records.push(DiscardRecord {
+                        epoch_id: epoch,
+                        pack_id,
+                        chunk_hash128: *hash,
+                        block_size_bytes: index_entry.compressed_len,
+                    });
+                }
+                Ok(())
+            })?;
+
+            if pack_records.is_empty() {
+                continue;
+            }
+
+            checkpoint = append_records(&discard_path, &pack_records)?;
+            report.discard_records_written = report
+                .discard_records_written
+                .saturating_add(pack_records.len() as u64);
+            report.discard_checkpoint_bytes = checkpoint;
+        }
+
+        self.meta
+            .write_txn(|txn| {
+                txn.set(
+                    sys_key("gc.discard_checkpoint"),
+                    checkpoint.to_le_bytes().to_vec(),
+                )?;
+                txn.delete(sys_key("gc.scan_cursor"))?;
+                txn.set(sys_key("gc.phase"), 1_u64.to_le_bytes().to_vec())?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(report)
+    }
+    pub(crate) async fn run_gc_rewrite_phase_only_offline_until_stable(
+        &self,
+    ) -> Result<(u64, u64)> {
+        let _gc_guard = self.gc_lock.lock().await;
+        self.meta
+            .write_txn(|txn| {
+                txn.set(sys_key("gc.phase"), 1_u64.to_le_bytes().to_vec())?;
+                Ok(())
+            })
+            .await?;
+
+        let mut cycles = 0_u64;
+        let mut packs_rewritten = 0_u64;
+        loop {
+            cycles = cycles.saturating_add(1);
+            if self.run_gc_rewrite_phase_once_offline().await? {
+                packs_rewritten = packs_rewritten.saturating_add(1);
+                continue;
+            }
+            break;
+        }
+
+        Ok((cycles, packs_rewritten))
+    }
+    async fn run_gc_rewrite_phase_once_offline(&self) -> Result<bool> {
+        let discard_path = self
+            .config
+            .packs_dir()
+            .join(&self.config.gc_discard_filename);
+        let current_discard_len = ensure_file(&discard_path)?;
+        let checkpoint = self
+            .meta
+            .get_u64_sys("gc.discard_checkpoint")
+            .unwrap_or(current_discard_len);
+        let parsed = read_records(&discard_path, checkpoint)?;
+        if parsed.records.is_empty() {
+            self.switch_to_scan_phase().await?;
+            return Ok(false);
+        }
+
+        let mut by_pack = HashMap::<u64, HashMap<[u8; 16], DiscardRecord>>::new();
+        for record in parsed.records {
+            by_pack
+                .entry(record.pack_id)
+                .or_default()
+                .insert(record.chunk_hash128, record);
+        }
+
+        let active_pack_id = self.packs.active_pack_id();
+        let mut rewritten_pack: Option<u64> = None;
+
+        for (pack_id, dead_records) in by_pack.iter() {
+            if *pack_id == active_pack_id {
+                continue;
+            }
+            let reclaim_bytes = dead_records
+                .values()
+                .map(|record| record.block_size_bytes as u64)
+                .sum::<u64>();
+
+            let pack_size = self.packs.pack_size(*pack_id)?;
+            if pack_size == 0 {
+                continue;
+            }
+            let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
+            let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
+            let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
+            if meets_bytes || meets_percent {
+                let live_hashes = self.live_hashes_for_pack(*pack_id)?;
+                self.packs
+                    .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
+                rewritten_pack = Some(*pack_id);
+                break;
+            }
+        }
+
+        if let Some(rewritten_pack_id) = rewritten_pack {
+            let current = read_records(&discard_path, checkpoint)?;
+            let kept = current
+                .records
+                .into_iter()
+                .filter(|record| record.pack_id != rewritten_pack_id)
+                .collect::<Vec<_>>();
+            let new_len = rewrite_records(&discard_path, &kept)?;
+            self.meta
+                .write_txn(|txn| {
+                    txn.set(
+                        sys_key("gc.discard_checkpoint"),
+                        new_len.to_le_bytes().to_vec(),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            Ok(true)
+        } else {
+            self.switch_to_scan_phase().await?;
+            Ok(false)
+        }
     }
     pub(crate) async fn switch_to_scan_phase(&self) -> Result<()> {
         self.meta

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::fs::{PackCrc32ReadErrorCounters, VerFs, VerFsStats};
+use crate::fs::{OfflineGcReport, PackCrc32ReadErrorCounters, VerFs, VerFsStats};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
 use crate::permissions::set_socket_mode;
@@ -115,7 +115,9 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
             eprintln!("SIGINT received, starting graceful shutdown");
             if fs_for_signal.is_gc_in_progress() {
                 info!("Garbage collection is currently in progress, shutdown might take a while");
-                eprintln!("Garbage collection is currently in progress, shutdown might take a while");
+                eprintln!(
+                    "Garbage collection is currently in progress, shutdown might take a while"
+                );
             }
             if let Err(err) = fs_for_signal.graceful_shutdown().await {
                 error!(error = %err, "graceful shutdown failed during SIGINT handling");
@@ -193,6 +195,10 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
             }
             run_pack_size_migration(&config).await?;
         }
+        "gc" => {
+            let cmd = parse_gc_cmd(&args[1..])?;
+            run_gc_offline_command(&config, &cmd).await?;
+        }
         other => bail!("unknown control command '{other}'"),
     }
 
@@ -215,6 +221,10 @@ enum CryptCommand {
         key_file: PathBuf,
     },
     Lock,
+}
+
+enum GcCommand {
+    Offline { run_rewrite_phase: bool },
 }
 
 fn parse_snapshot_cmd(args: &[String]) -> Result<SnapshotCommand> {
@@ -302,6 +312,26 @@ fn parse_crypt_cmd(args: &[String]) -> Result<CryptCommand> {
     Ok(CryptCommand::Lock)
 }
 
+fn parse_gc_cmd(args: &[String]) -> Result<GcCommand> {
+    if args.is_empty() {
+        bail!("missing gc subcommand (offline)");
+    }
+
+    match args[0].as_str() {
+        "offline" => {
+            let mut run_rewrite_phase = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--run" | "--run-gc" | "--run-rewrite" => run_rewrite_phase = true,
+                    other => bail!("unknown gc offline argument '{other}'"),
+                }
+            }
+            Ok(GcCommand::Offline { run_rewrite_phase })
+        }
+        other => bail!("unknown gc subcommand '{other}'"),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum ControlRequest {
@@ -374,7 +404,9 @@ fn announce_crc32_startup(counters: PackCrc32ReadErrorCounters) {
     info!(
         sys_total = counters.persisted_sys_total,
         current_total = counters.current_total,
-        session_total = counters.current_total.saturating_sub(counters.persisted_sys_total),
+        session_total = counters
+            .current_total
+            .saturating_sub(counters.persisted_sys_total),
         "pack CRC32 read error counters at startup"
     );
     eprintln!(
@@ -386,11 +418,7 @@ fn announce_crc32_startup(counters: PackCrc32ReadErrorCounters) {
     );
 }
 
-fn announce_crc32_shutdown(
-    fs: &VerFs,
-    session_start_total: u64,
-    reported: &AtomicBool,
-) {
+fn announce_crc32_shutdown(fs: &VerFs, session_start_total: u64, reported: &AtomicBool) {
     if reported.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1179,6 +1207,62 @@ async fn run_crypt_via_metadata(config: &Config, cmd: &CryptCommand) -> Result<(
     }
 }
 
+async fn run_gc_offline_command(config: &Config, cmd: &GcCommand) -> Result<()> {
+    if is_control_daemon_reachable(config).await? {
+        bail!("gc offline requires the mounted daemon to be stopped");
+    }
+
+    match cmd {
+        GcCommand::Offline { run_rewrite_phase } => {
+            let fs = VerFs::new(config.clone()).await?;
+            let run_result = fs.run_offline_gc_rebuild_discard(*run_rewrite_phase).await;
+            let shutdown_result = fs.graceful_shutdown().await;
+
+            let report = run_result?;
+            shutdown_result?;
+            print_offline_gc_report(&report);
+            Ok(())
+        }
+    }
+}
+
+async fn is_control_daemon_reachable(config: &Config) -> Result<bool> {
+    let socket_path = config.control_socket_path();
+    match UnixStream::connect(&socket_path).await {
+        Ok(_stream) => Ok(true),
+        Err(err) if socket_unavailable(&err) => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to connect control socket {}", socket_path.display())),
+    }
+}
+
+fn print_offline_gc_report(report: &OfflineGcReport) {
+    println!("offline gc discard rebuild complete");
+    println!("packs_scanned={}", report.packs_scanned);
+    println!(
+        "pack_index_entries_scanned={}",
+        report.pack_index_entries_scanned
+    );
+    println!("live_entries_found={}", report.live_entries_found);
+    println!("dead_entries_found={}", report.dead_entries_found);
+    println!("discard_records_written={}", report.discard_records_written);
+    println!(
+        "duplicate_dead_entries_collapsed={}",
+        report.duplicate_dead_entries_collapsed
+    );
+    println!(
+        "discard_checkpoint_bytes={}",
+        report.discard_checkpoint_bytes
+    );
+    if report.rewrite_phase_requested {
+        println!("rewrite_phase=enabled");
+        println!("rewrite_cycles={}", report.rewrite_cycles);
+        println!("packs_rewritten={}", report.packs_rewritten);
+    } else {
+        println!("rewrite_phase=disabled");
+    }
+}
+
 fn init_logging() -> LogHandle {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1194,8 +1278,8 @@ fn init_logging() -> LogHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_stats_report, human_bytes_signed, parse_global_cli_options, render_stats_table,
-        resolve_config_path, ConfigSource,
+        format_stats_report, human_bytes_signed, parse_gc_cmd, parse_global_cli_options,
+        render_stats_table, resolve_config_path, ConfigSource, GcCommand,
     };
     use crate::fs::VerFsStats;
     use std::path::Path;
@@ -1329,5 +1413,16 @@ mod tests {
             resolve_config_path(Some(Path::new("/etc/verfsnext/config.toml"))).expect("resolve");
         assert_eq!(selected.path, Path::new("/etc/verfsnext/config.toml"));
         assert!(matches!(selected.source, ConfigSource::Explicit));
+    }
+
+    #[test]
+    fn gc_offline_parser_accepts_run_flag() {
+        let cmd = parse_gc_cmd(&["offline".to_owned(), "--run".to_owned()]).expect("parse");
+        assert!(matches!(
+            cmd,
+            GcCommand::Offline {
+                run_rewrite_phase: true
+            }
+        ));
     }
 }

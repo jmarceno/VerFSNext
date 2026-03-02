@@ -400,6 +400,43 @@ impl PackStore {
         self.active.lock().pack_id
     }
 
+    pub fn pack_ids(&self) -> Result<Vec<u64>> {
+        Ok(Self::list_existing_pack_ids(&self.packs_dir)?
+            .into_iter()
+            .collect())
+    }
+
+    pub fn read_index_entries(&self, pack_id: u64) -> Result<Vec<([u8; 16], PackIndexEntry)>> {
+        let path = self.index_path(pack_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(&path)
+            .with_context(|| format!("failed to open pack index file {}", path.display()))?;
+        let mut cursor = 0_u64;
+        let mut out = Vec::new();
+
+        loop {
+            let mut raw = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
+            match file.read_exact_at(raw.as_mut_slice(), cursor) {
+                Ok(()) => {
+                    out.push(Self::decode_index_record(raw.as_slice())?);
+                    cursor = cursor
+                        .checked_add(INDEX_ENTRY_LEN_U64)
+                        .context("pack index cursor overflow")?;
+                }
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to scan pack index {}", path.display()));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     fn list_existing_pack_ids(packs_dir: &Path) -> Result<BTreeSet<u64>> {
         let mut out = BTreeSet::new();
         for subdir in ["A", "B", "C", "D", "E", "F"] {

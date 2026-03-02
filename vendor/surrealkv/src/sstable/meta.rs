@@ -117,6 +117,7 @@ impl Properties {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let archived = PropertiesArchive {
             id: self.id,
@@ -150,6 +151,7 @@ impl Properties {
             .expect("rkyv failed to encode SSTable properties")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
         let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(buf.len());
         aligned.extend_from_slice(&buf);
