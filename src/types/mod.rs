@@ -50,7 +50,7 @@ pub const PERM_BIT_OTHER_EXEC: u32 = 0o001;
 pub const SNAPSHOTS_DIR_NAME: &str = ".snapshots";
 pub const VAULT_DIR_NAME: &str = ".vault";
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[rkyv(bytecheck())]
 pub struct InodeRecord {
     pub ino: u64,
@@ -71,20 +71,20 @@ pub struct InodeRecord {
     pub flags: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[rkyv(bytecheck())]
 pub struct DirentRecord {
     pub ino: u64,
     pub kind: u8,
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[rkyv(bytecheck())]
 pub struct ExtentRecord {
     pub chunk_hash: [u8; 16],
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[rkyv(bytecheck())]
 pub struct ChunkRecord {
     pub refcount: u64,
@@ -96,7 +96,7 @@ pub struct ChunkRecord {
     pub compressed_len: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
 #[rkyv(bytecheck())]
 pub struct SnapshotRecord {
     pub root_ino: u64,

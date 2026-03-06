@@ -131,7 +131,7 @@ impl FsCore {
             let existing_dirent: DirentRecord = decode_rkyv(&existing_dirent_raw)?;
             if txn.get(inode_key(existing_dirent.ino))?.is_none() {
                 // Self-heal stale directory entry left behind by an earlier failed/mixed version.
-                txn.delete(dirent_key_bytes)?;
+                txn.delete(dirent_key_bytes.clone())?;
             } else {
                 return Err(anyhow_errno(
                     Errno::EEXIST,
@@ -140,7 +140,8 @@ impl FsCore {
             }
         }
 
-        let Some(next_inode_raw) = txn.get(crate::types::sys_key("next_inode"))? else {
+        let next_inode_key = crate::types::sys_key("next_inode");
+        let Some(next_inode_raw) = txn.get(next_inode_key.clone())? else {
             return Err(anyhow_errno(Errno::EIO, "missing SYS:next_inode"));
         };
         if next_inode_raw.len() != 8 {
@@ -178,13 +179,10 @@ impl FsCore {
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
         txn.set(
-            dirent_key(parent, name.as_bytes()),
+            dirent_key_bytes,
             encode_rkyv(&DirentRecord { ino, kind })?,
         )?;
-        txn.set(
-            crate::types::sys_key("next_inode"),
-            (ino + 1).to_le_bytes().to_vec(),
-        )?;
+        txn.set(next_inode_key, (ino + 1).to_le_bytes().to_vec())?;
 
         if kind == INODE_KIND_DIR {
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);

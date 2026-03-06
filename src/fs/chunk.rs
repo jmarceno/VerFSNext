@@ -62,7 +62,7 @@ impl FsCore {
             let chunk: ChunkRecord = decode_rkyv(&raw)?;
             Ok(chunk)
         })?;
-        self.chunk_meta_cache.insert(hash, chunk.clone());
+        self.chunk_meta_cache.insert(hash, chunk);
         Ok(chunk)
     }
     pub(crate) fn prefetch_chunk_meta(
@@ -71,14 +71,12 @@ impl FsCore {
     ) -> Result<()> {
         let missing_hashes = hashes
             .into_iter()
-            .filter(|h| !self.chunk_meta_cache.contains_key(h))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .filter(|hash| !self.chunk_meta_cache.contains_key(hash))
+            .collect::<HashSet<_>>();
 
         if !missing_hashes.is_empty() {
             let chunks = self.meta.read_txn(|txn| {
-                let mut chunks = Vec::new();
+                let mut chunks = Vec::with_capacity(missing_hashes.len());
                 for hash in &missing_hashes {
                     if let Some(raw) = txn.get(chunk_key(hash))? {
                         let chunk: ChunkRecord = decode_rkyv(&raw)?;

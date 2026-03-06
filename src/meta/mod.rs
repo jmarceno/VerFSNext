@@ -52,42 +52,52 @@ impl MetaStore {
         };
 
         self.write_txn(|txn| {
-            if txn.get(inode_key(ROOT_INODE))?.is_none() {
-                txn.set(inode_key(ROOT_INODE), encode_rkyv(&root)?)?;
+            let root_inode_key = inode_key(ROOT_INODE);
+            let next_inode_key = sys_key("next_inode");
+            let active_pack_id_key = sys_key("active_pack_id");
+            let pack_crc32_read_errors_key = sys_key("pack_crc32_read_errors");
+            let gc_discard_checkpoint_key = sys_key("gc.discard_checkpoint");
+            let gc_epoch_key = sys_key("gc.epoch");
+            let vault_state_key = sys_key(SYS_VAULT_STATE);
+            let vault_policy_key = sys_key(SYS_VAULT_POLICY);
+
+            if txn.get(root_inode_key.clone())?.is_none() {
+                txn.set(root_inode_key.clone(), encode_rkyv(&root)?)?;
             }
-            if txn.get(sys_key("next_inode"))?.is_none() {
-                txn.set(sys_key("next_inode"), 2_u64.to_le_bytes().to_vec())?;
+            if txn.get(next_inode_key.clone())?.is_none() {
+                txn.set(next_inode_key.clone(), 2_u64.to_le_bytes().to_vec())?;
             }
-            if txn.get(sys_key("active_pack_id"))?.is_none() {
-                txn.set(sys_key("active_pack_id"), 1_u64.to_le_bytes().to_vec())?;
+            if txn.get(active_pack_id_key.clone())?.is_none() {
+                txn.set(active_pack_id_key, 1_u64.to_le_bytes().to_vec())?;
             }
-            if txn.get(sys_key("pack_crc32_read_errors"))?.is_none() {
+            if txn.get(pack_crc32_read_errors_key.clone())?.is_none() {
                 txn.set(
-                    sys_key("pack_crc32_read_errors"),
+                    pack_crc32_read_errors_key,
                     0_u64.to_le_bytes().to_vec(),
                 )?;
             }
-            if txn.get(sys_key("gc.discard_checkpoint"))?.is_none() {
+            if txn.get(gc_discard_checkpoint_key.clone())?.is_none() {
                 txn.set(
-                    sys_key("gc.discard_checkpoint"),
+                    gc_discard_checkpoint_key,
                     0_u64.to_le_bytes().to_vec(),
                 )?;
             }
-            if txn.get(sys_key("gc.epoch"))?.is_none() {
-                txn.set(sys_key("gc.epoch"), 0_u64.to_le_bytes().to_vec())?;
+            if txn.get(gc_epoch_key.clone())?.is_none() {
+                txn.set(gc_epoch_key, 0_u64.to_le_bytes().to_vec())?;
             }
-            if txn.get(sys_key(SYS_VAULT_STATE))?.is_none() {
-                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+            if txn.get(vault_state_key.clone())?.is_none() {
+                txn.set(vault_state_key, vec![VAULT_STATE_LOCKED])?;
             }
-            if txn.get(sys_key(SYS_VAULT_POLICY))?.is_none() {
-                txn.set(sys_key(SYS_VAULT_POLICY), vec![0_u8])?;
+            if txn.get(vault_policy_key.clone())?.is_none() {
+                txn.set(vault_policy_key, vec![0_u8])?;
             }
 
             let snapshots_name = SNAPSHOTS_DIR_NAME.as_bytes();
             let snapshots_entry_key = dirent_key(ROOT_INODE, snapshots_name);
+            let snapshots_dirent_raw = txn.get(snapshots_entry_key.clone())?;
             let mut next_inode = {
                 let raw = txn
-                    .get(sys_key("next_inode"))?
+                    .get(next_inode_key.clone())?
                     .context("missing SYS:next_inode after bootstrap initialization")?;
                 if raw.len() != 8 {
                     anyhow::bail!("invalid SYS:next_inode length {}", raw.len());
@@ -97,9 +107,9 @@ impl MetaStore {
                 u64::from_le_bytes(bytes)
             };
 
-            if txn.get(snapshots_entry_key.clone())?.is_none() {
+            if snapshots_dirent_raw.is_none() {
                 let mut root_inode: InodeRecord = decode_rkyv(
-                    &txn.get(inode_key(ROOT_INODE))?
+                    &txn.get(root_inode_key.clone())?
                         .context("missing root inode during snapshots bootstrap")?,
                 )?;
                 let snapshots_ino = next_inode;
@@ -130,7 +140,7 @@ impl MetaStore {
                 root_inode.ctime_sec = sec;
                 root_inode.ctime_nsec = nsec;
 
-                txn.set(inode_key(ROOT_INODE), encode_rkyv(&root_inode)?)?;
+                txn.set(root_inode_key.clone(), encode_rkyv(&root_inode)?)?;
                 txn.set(inode_key(snapshots_ino), encode_rkyv(&snapshots_inode)?)?;
                 txn.set(
                     snapshots_entry_key,
@@ -139,8 +149,8 @@ impl MetaStore {
                         kind: INODE_KIND_DIR,
                     })?,
                 )?;
-                txn.set(sys_key("next_inode"), next_inode.to_le_bytes().to_vec())?;
-            } else if let Some(raw_dirent) = txn.get(snapshots_entry_key)? {
+                txn.set(next_inode_key, next_inode.to_le_bytes().to_vec())?;
+            } else if let Some(raw_dirent) = snapshots_dirent_raw {
                 let dirent: DirentRecord = decode_rkyv(&raw_dirent)?;
                 if let Some(raw_inode) = txn.get(inode_key(dirent.ino))? {
                     let mut inode: InodeRecord = decode_rkyv(&raw_inode)?;

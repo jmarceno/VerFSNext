@@ -79,6 +79,7 @@ impl FsCore {
         let cdc_chunk_count = self.ultracdc_chunk_count(&op.data);
         let start_block = op.offset / BLOCK_SIZE as u64;
         let end_block = (write_end - 1) / BLOCK_SIZE as u64;
+        let touched_blocks = (end_block - start_block + 1) as usize;
 
         let old_extents = self.meta.read_txn(|txn| {
             let mut map = HashMap::<u64, ExtentRecord>::new();
@@ -106,8 +107,8 @@ impl FsCore {
 
         self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
 
-        let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
-        let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
+        let mut extent_updates = Vec::<(u64, [u8; 16])>::with_capacity(touched_blocks);
+        let mut ref_deltas = HashMap::<[u8; 16], i64>::with_capacity(touched_blocks.saturating_mul(2));
         let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
         let mut dedup_hits = 0_u64;
@@ -115,7 +116,7 @@ impl FsCore {
 
         for block_idx in start_block..=end_block {
             let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
-                self.read_extent_bytes(extent.clone(), FsCore::inode_is_vault(inode))?
+                self.read_extent_bytes(*extent, FsCore::inode_is_vault(inode))?
             } else {
                 vec![0_u8; BLOCK_SIZE]
             };
