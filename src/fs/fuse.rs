@@ -1,8 +1,13 @@
 use super::*;
 use async_trait::async_trait;
+use tracing::info;
 #[async_trait]
 impl VirtualFs for VerFs {
     async fn init(&self) -> AsyncFusexResult<()> {
+        info!(
+            attr_ttl_ms = ATTR_TTL.as_millis(),
+            "mounted with conservative zero FUSE attr TTL; kernel invalidation is not wired yet"
+        );
         Ok(())
     }
 
@@ -629,17 +634,27 @@ impl VirtualFs for VerFs {
             let _open_guard = self.core.write_lock.read().await;
             self.core.increment_open_file_count(ino);
         }
-        Ok(self.core.new_handle())
+        let fh = self.core.new_handle();
+        let inode_data_version = self.core.inode_data_version(ino).await;
+        self.core
+            .register_file_handle(fh, ino, inode_data_version)
+            .await;
+        Ok(fh)
     }
 
     async fn read(
         &self,
         ino: u64,
+        fh: u64,
         offset: u64,
         size: u32,
         buf: &mut Vec<u8>,
     ) -> AsyncFusexResult<usize> {
         self.core.mark_activity();
+        self.core
+            .validate_file_handle(fh, ino)
+            .await
+            .map_err(map_anyhow_to_fuse)?;
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "read")
@@ -657,6 +672,126 @@ impl VirtualFs for VerFs {
         }
 
         let read_end = inode.size.min(offset.saturating_add(size as u64));
+
+        const HANDLE_READ_PLAN_MAX_BLOCKS: u64 = 4;
+        if inode.size <= BLOCK_SIZE as u64 * HANDLE_READ_PLAN_MAX_BLOCKS {
+            let current_version = self.core.inode_data_version(ino).await;
+            let mut plan = self
+                .core
+                .get_small_file_read_plan(fh, ino, current_version)
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+
+            if plan.is_none() {
+                let end_block = if inode.size == 0 {
+                    0
+                } else {
+                    (inode.size - 1) / BLOCK_SIZE as u64
+                };
+                let built_plan = self
+                    .core
+                    .meta
+                    .read_txn(|txn| {
+                        let mut extents = HashMap::<u64, ExtentRecord>::new();
+                        let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
+                        for block_idx in 0..=end_block {
+                            let Some(raw_extent) = txn.get(extent_key(ino, block_idx))? else {
+                                continue;
+                            };
+                            let extent: ExtentRecord = decode_rkyv(&raw_extent)?;
+                            extents.insert(block_idx, extent);
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                chunks.entry(extent.chunk_hash)
+                            {
+                                let Some(raw_chunk) = txn.get(chunk_key(&extent.chunk_hash))? else {
+                                    continue;
+                                };
+                                let chunk: ChunkRecord = decode_rkyv(&raw_chunk)?;
+                                entry.insert(chunk);
+                            }
+                        }
+                        Ok(SmallFileReadPlan {
+                            file_size: inode.size,
+                            extents,
+                            chunks,
+                        })
+                    })
+                    .map_err(map_anyhow_to_fuse)?;
+
+                self.core
+                    .store_small_file_read_plan(
+                        fh,
+                        ino,
+                        current_version,
+                        Some(built_plan.clone()),
+                    )
+                    .await
+                    .map_err(map_anyhow_to_fuse)?;
+                plan = Some(built_plan);
+            }
+
+            let from = offset as usize;
+            let to = read_end as usize;
+            let initial_buf_len = buf.len();
+            buf.reserve((read_end - offset) as usize);
+
+            if let Some(plan) = plan {
+                if plan.file_size != inode.size {
+                    self.core
+                        .store_small_file_read_plan(fh, ino, current_version, None)
+                        .await
+                        .map_err(map_anyhow_to_fuse)?;
+                    buf.resize(buf.len() + (to - from), 0);
+                    let read_len = buf.len() - initial_buf_len;
+                    self.core
+                        .read_bytes_total
+                        .fetch_add(read_len as u64, Ordering::Relaxed);
+                    return Ok(read_len);
+                }
+                for (hash, chunk) in plan.chunks.iter() {
+                    self.core.chunk_meta_cache.insert(*hash, chunk.clone());
+                }
+                let start_block = offset / BLOCK_SIZE as u64;
+                let end_block = (read_end - 1) / BLOCK_SIZE as u64;
+                for block_idx in start_block..=end_block {
+                    let block_start = block_idx * BLOCK_SIZE as u64;
+                    let block_from = offset.max(block_start) as usize - block_start as usize;
+                    let block_to =
+                        read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
+                    if let Some(extent) = plan.extents.get(&block_idx) {
+                        if !plan.chunks.contains_key(&extent.chunk_hash) {
+                            return build_error_result_from_errno(
+                                Errno::EIO,
+                                format!("missing chunk metadata for block {}", block_idx),
+                            );
+                        }
+                        let payload = self
+                            .core
+                            .load_extent_payload(*extent, FsCore::inode_is_vault(&inode))
+                            .map_err(map_anyhow_to_fuse)?;
+                        let payload_len = payload.len().min(BLOCK_SIZE);
+                        let available_end = payload_len.min(block_to);
+                        if available_end > block_from {
+                            buf.extend_from_slice(&payload[block_from..available_end]);
+                        }
+                        if block_to > available_end {
+                            buf.resize(buf.len() + (block_to - available_end), 0);
+                        }
+                        continue;
+                    }
+                    buf.resize(buf.len() + (block_to - block_from), 0);
+                }
+            } else {
+                buf.resize(buf.len() + (to - from), 0);
+            }
+
+            let read_len = buf.len() - initial_buf_len;
+            self.core
+                .read_bytes_total
+                .fetch_add(read_len as u64, Ordering::Relaxed);
+            return Ok(read_len);
+        }
+
         let start_block = offset / BLOCK_SIZE as u64;
         let end_block = (read_end - 1) / BLOCK_SIZE as u64;
 
@@ -789,24 +924,26 @@ impl VirtualFs for VerFs {
 
     async fn release(
         &self,
-        _ino: u64,
+        ino: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> AsyncFusexResult<()> {
         self.core.mark_activity();
-        if let Ok(inode) = self.core.load_inode_or_errno(_ino, "release") {
+        if let Ok(inode) = self.core.load_inode_or_errno(ino, "release") {
             self.core
                 .ensure_inode_vault_access(&inode, "release")
                 .map_err(map_anyhow_to_fuse)?;
         }
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        self.core.unregister_file_handle(fh).await;
         {
             let _open_guard = self.core.write_lock.read().await;
-            self.core.decrement_open_file_count(_ino);
+            self.core.decrement_open_file_count(ino);
         }
         self.core
-            .cleanup_unlinked_inode_if_closed(_ino)
+            .cleanup_unlinked_inode_if_closed(ino)
             .await
             .map_err(map_anyhow_to_fuse)
     }
@@ -985,6 +1122,10 @@ impl VirtualFs for VerFs {
         })?;
         self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
+        let inode_data_version = self.core.inode_data_version(inode.ino).await;
+        self.core
+            .register_file_handle(fh, inode.ino, inode_data_version)
+            .await;
         Ok((
             ATTR_TTL,
             self.core.file_attr_from_inode(&inode),

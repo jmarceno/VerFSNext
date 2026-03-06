@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -241,6 +242,286 @@ fn create_recursive_delete_fanout(mount_point: &Path, dir_count: usize) -> Resul
     );
     run_cmd(240, None, "bash", &["-c", &script])?;
     Ok(target)
+}
+
+fn worker_hash(worker: usize) -> String {
+    format!("{worker:02}{worker:02}{worker:02}{worker:02}")
+}
+
+fn write_text_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent dir for {}", path.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn build_expected_cargo_like_tree(
+    root: &Path,
+    workers: usize,
+    final_iteration: usize,
+) -> Result<()> {
+    let registry_prefix = "index.crates.io-1949cf8c6b5b557f";
+
+    fs::create_dir_all(root.join("workspace"))?;
+    fs::create_dir_all(root.join("registry/src").join(registry_prefix))?;
+    fs::create_dir_all(root.join("target/debug/.fingerprint"))?;
+    fs::create_dir_all(root.join("target/debug/deps"))?;
+    fs::create_dir_all(root.join("target/debug/build"))?;
+    fs::create_dir_all(root.join("target/debug/incremental"))?;
+    fs::create_dir_all(root.join("target/tmp"))?;
+
+    for worker in 1..=workers {
+        let hash = worker_hash(worker);
+        let crate_name = format!("member_{worker}");
+
+        write_text_file(
+            &root.join("workspace").join(&crate_name).join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{crate_name}\"\nversion = \"0.{final_iteration}.0\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n"
+            ),
+        )?;
+        write_text_file(
+            &root.join("workspace").join(&crate_name).join("src/lib.rs"),
+            &format!(
+                "pub const WORKER: usize = {worker};\npub const ITERATION: usize = {final_iteration};\npub fn marker() -> &'static str {{ \"worker-{worker}-iter-{final_iteration}\" }}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("registry/src")
+                .join(registry_prefix)
+                .join(format!("{crate_name}-0.1.0"))
+                .join("src/lib.rs"),
+            &format!(
+                "pub const REGISTRY_MARKER: &str = \"registry-{worker}-{final_iteration}\";\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/deps")
+                .join(format!("lib{crate_name}.d")),
+            &format!(
+                "workspace/{crate_name}/src/lib.rs: /deps/shared-{worker}-{final_iteration}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/.fingerprint")
+                .join(format!("{crate_name}-{hash}"))
+                .join("invoked.timestamp"),
+            &format!(
+                "{{\"worker\":{worker},\"iteration\":{final_iteration},\"crate\":\"{crate_name}\"}}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/build")
+                .join(format!("{crate_name}-{hash}"))
+                .join("out/generated.rs"),
+            &format!("pub const GENERATED: &str = \"gen-{worker}-{final_iteration}\";\n"),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/incremental")
+                .join(&crate_name)
+                .join(format!("s-{hash}"))
+                .join("work-products.txt"),
+            &format!("work-product=member_{worker} iteration={final_iteration}\n"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_tree_entries(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut dirs = BTreeSet::new();
+    let mut files = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let rel = entry_path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to strip prefix {}", root.display()))?
+                .to_string_lossy()
+                .replace('\u{5c}', "/");
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                dirs.insert(rel);
+                stack.push(entry_path);
+            } else if file_type.is_file() {
+                files.insert(rel);
+            } else {
+                bail!("unexpected non-file entry under {}", root.display());
+            }
+        }
+    }
+
+    Ok((dirs, files))
+}
+
+fn assert_trees_match(expected_root: &Path, actual_root: &Path) -> Result<()> {
+    let (expected_dirs, expected_files) = collect_tree_entries(expected_root)?;
+    let (actual_dirs, actual_files) = collect_tree_entries(actual_root)?;
+
+    if expected_dirs != actual_dirs {
+        bail!(
+            "directory layout mismatch under {}\nexpected: {:?}\nactual: {:?}",
+            actual_root.display(),
+            expected_dirs,
+            actual_dirs
+        );
+    }
+    if expected_files != actual_files {
+        bail!(
+            "file layout mismatch under {}\nexpected: {:?}\nactual: {:?}",
+            actual_root.display(),
+            expected_files,
+            actual_files
+        );
+    }
+
+    for rel in expected_files {
+        let expected = expected_root.join(&rel);
+        let actual = actual_root.join(&rel);
+        let expected_s = expected.to_string_lossy().into_owned();
+        let actual_s = actual.to_string_lossy().into_owned();
+        run_cmd(30, None, "cmp", &["-s", &expected_s, &actual_s])?;
+    }
+
+    Ok(())
+}
+
+fn verify_cargo_like_mount_state(expected_root: &Path, mount_point: &Path) -> Result<()> {
+    for subtree in ["workspace", "registry", "target"] {
+        assert_trees_match(&expected_root.join(subtree), &mount_point.join(subtree))?;
+    }
+    Ok(())
+}
+
+fn cargo_like_workload_script(
+    mount_point: &Path,
+    workers: usize,
+    iterations: usize,
+    readers: usize,
+) -> String {
+    let mut script = String::new();
+    script.push_str("set -euo pipefail\n");
+    script.push_str(&format!("mnt={:?}\n", mount_point.to_string_lossy()));
+    script.push_str(&format!("workers={}\n", workers));
+    script.push_str(&format!("iterations={}\n", iterations));
+    script.push_str(&format!("readers={}\n", readers));
+    script.push_str(
+        "registry_root=\"$mnt/registry/src/index.crates.io-1949cf8c6b5b557f\"\nworkspace_root=\"$mnt/workspace\"\nfingerprint_root=\"$mnt/target/debug/.fingerprint\"\ndeps_root=\"$mnt/target/debug/deps\"\nbuild_root=\"$mnt/target/debug/build\"\nincremental_root=\"$mnt/target/debug/incremental\"\nscratch_root=\"$mnt/target/tmp\"\nmkdir -p \"$registry_root\" \"$workspace_root\" \"$fingerprint_root\" \"$deps_root\" \"$build_root\" \"$incremental_root\" \"$scratch_root\"\n",
+    );
+    script.push_str(
+        r#"
+worker() {
+  w="$1"
+  crate="member_${w}"
+  hash=$(printf '%02d%02d%02d%02d' "$w" "$w" "$w" "$w")
+  crate_dir="$workspace_root/$crate"
+  registry_dir="$registry_root/$crate-0.1.0"
+  fp_dir="$fingerprint_root/$crate-$hash"
+  build_out="$build_root/$crate-$hash/out"
+  incr_dir="$incremental_root/$crate/s-$hash"
+
+  for i in $(seq 1 "$iterations"); do
+    if [ $((i % 4)) -eq 0 ]; then
+      rm -rf "$build_out" "$incr_dir"
+    fi
+    mkdir -p "$crate_dir/src" "$registry_dir/src" "$fp_dir" "$build_out" "$incr_dir"
+
+    cargo_tmp="$crate_dir/Cargo.toml.tmp.$i.$$"
+    lib_tmp="$crate_dir/src/lib.rs.tmp.$i.$$"
+    registry_tmp="$registry_dir/src/lib.rs.tmp.$i.$$"
+    dep_tmp="$deps_root/lib${crate}.d.tmp.$i.$$"
+    fp_tmp="$fp_dir/invoked.timestamp.tmp.$i.$$"
+    build_tmp="$build_out/generated.rs.tmp.$i.$$"
+    incr_tmp="$incr_dir/work-products.txt.tmp.$i.$$"
+
+    printf '[package]\nname = "%s"\nversion = "0.%s.0"\nedition = "2021"\n[lib]\npath = "src/lib.rs"\n' "$crate" "$i" > "$cargo_tmp"
+    printf 'pub const WORKER: usize = %s;\npub const ITERATION: usize = %s;\npub fn marker() -> &'"'"'static str { "worker-%s-iter-%s" }\n' "$w" "$i" "$w" "$i" > "$lib_tmp"
+    printf 'pub const REGISTRY_MARKER: &str = "registry-%s-%s";\n' "$w" "$i" > "$registry_tmp"
+    printf 'workspace/%s/src/lib.rs: /deps/shared-%s-%s\n' "$crate" "$w" "$i" > "$dep_tmp"
+    printf '{"worker":%s,"iteration":%s,"crate":"%s"}\n' "$w" "$i" "$crate" > "$fp_tmp"
+    printf 'pub const GENERATED: &str = "gen-%s-%s";\n' "$w" "$i" > "$build_tmp"
+    printf 'work-product=member_%s iteration=%s\n' "$w" "$i" > "$incr_tmp"
+
+    if [ $((i % 3)) -eq 0 ]; then
+      rm -f "$deps_root/lib${crate}.d" "$fp_dir/invoked.timestamp"
+    fi
+
+    mv "$cargo_tmp" "$crate_dir/Cargo.toml"
+    mv "$lib_tmp" "$crate_dir/src/lib.rs"
+    mv "$registry_tmp" "$registry_dir/src/lib.rs"
+    mv "$dep_tmp" "$deps_root/lib${crate}.d"
+    mv "$fp_tmp" "$fp_dir/invoked.timestamp"
+    mv "$build_tmp" "$build_out/generated.rs"
+    mv "$incr_tmp" "$incr_dir/work-products.txt"
+
+    cat "$crate_dir/Cargo.toml" "$crate_dir/src/lib.rs" "$registry_dir/src/lib.rs" >/dev/null
+    cat "$deps_root/lib${crate}.d" "$fp_dir/invoked.timestamp" "$build_out/generated.rs" "$incr_dir/work-products.txt" >/dev/null
+    sha256sum "$crate_dir/Cargo.toml" "$crate_dir/src/lib.rs" "$registry_dir/src/lib.rs" >/dev/null
+
+    scratch="$scratch_root/$crate-$i"
+    mkdir -p "$scratch/dir_a" "$scratch/dir_b"
+    printf 'scratch-%s-%s-a\n' "$w" "$i" > "$scratch/dir_a/a.txt"
+    printf 'scratch-%s-%s-b\n' "$w" "$i" > "$scratch/dir_b/b.txt"
+    cat "$scratch/dir_a/a.txt" "$scratch/dir_b/b.txt" >/dev/null
+    rm -rf "$scratch"
+  done
+}
+
+reader() {
+  for round in $(seq 1 $((iterations * 6))); do
+    for w in $(seq 1 "$workers"); do
+      crate="member_${w}"
+      hash=$(printf '%02d%02d%02d%02d' "$w" "$w" "$w" "$w")
+      crate_dir="$workspace_root/$crate"
+      registry_dir="$registry_root/$crate-0.1.0"
+      fp_dir="$fingerprint_root/$crate-$hash"
+      build_out="$build_root/$crate-$hash/out"
+      incr_dir="$incremental_root/$crate/s-$hash"
+
+      ls "$crate_dir" >/dev/null 2>&1 || true
+      cat "$crate_dir/Cargo.toml" >/dev/null 2>&1 || true
+      cat "$crate_dir/src/lib.rs" >/dev/null 2>&1 || true
+      cat "$registry_dir/src/lib.rs" >/dev/null 2>&1 || true
+      cat "$deps_root/lib${crate}.d" >/dev/null 2>&1 || true
+      cat "$fp_dir/invoked.timestamp" >/dev/null 2>&1 || true
+      cat "$build_out/generated.rs" >/dev/null 2>&1 || true
+      cat "$incr_dir/work-products.txt" >/dev/null 2>&1 || true
+    done
+
+    ls "$workspace_root" >/dev/null 2>&1 || true
+    ls "$deps_root" >/dev/null 2>&1 || true
+    ls "$fingerprint_root" >/dev/null 2>&1 || true
+    ls "$build_root" >/dev/null 2>&1 || true
+    ls "$incremental_root" >/dev/null 2>&1 || true
+  done
+}
+
+pids=""
+for w in $(seq 1 "$workers"); do
+  worker "$w" &
+  pids="$pids $!"
+done
+for r in $(seq 1 "$readers"); do
+  reader &
+  pids="$pids $!"
+done
+for pid in $pids; do
+  wait "$pid"
+done
+"#,
+    );
+    script
 }
 
 #[test]
@@ -495,6 +776,70 @@ fn rm_rf_large_fanout_directory_succeeds() -> Result<()> {
     if stat_out_post.status.success() {
         bail!("rm_fanout reappeared after remount")
     }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn cargo_like_concurrent_crud_integrity_persists() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "cat",
+        "cmp",
+        "ls",
+        "sha256sum",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let workers = 6_usize;
+    let iterations = 12_usize;
+    let readers = 3_usize;
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let expected_dir = root.join("expected");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&expected_dir).context("failed to create expected dir")?;
+    build_expected_cargo_like_tree(&expected_dir, workers, iterations)?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let workload = cargo_like_workload_script(&mount_point, workers, iterations, readers);
+    run_cmd(300, None, "bash", &["-c", &workload])?;
+
+    verify_cargo_like_mount_state(&expected_dir, &mount_point)?;
+
+    daemon.stop_graceful()?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    verify_cargo_like_mount_state(&expected_dir, &mount_point)?;
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);

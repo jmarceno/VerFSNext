@@ -95,6 +95,19 @@ struct DirHandleState {
     snapshot: Option<Vec<CachedDirEntry>>,
 }
 
+#[derive(Clone)]
+struct SmallFileReadPlan {
+    file_size: u64,
+    extents: HashMap<u64, ExtentRecord>,
+    chunks: HashMap<[u8; 16], ChunkRecord>,
+}
+
+#[derive(Clone)]
+struct FileHandleState {
+    ino: u64,
+    inode_data_version: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
     hash: [u8; 16],
@@ -187,6 +200,8 @@ struct FsCore {
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
+    file_handles: Mutex<HashMap<u64, FileHandleState>>,
+    file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
 }
@@ -266,6 +281,10 @@ impl VerFs {
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
+            file_handles: Mutex::new(HashMap::new()),
+            file_read_plan_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
             open_file_counts: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
@@ -411,6 +430,106 @@ impl FsCore {
 
     fn open_file_count(&self, ino: u64) -> u64 {
         self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    async fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {
+        let mut handles = self.file_handles.lock().await;
+        handles.insert(
+            fh,
+            FileHandleState {
+                ino,
+                inode_data_version,
+            },
+        );
+        self.file_read_plan_cache.invalidate(&fh);
+    }
+
+    async fn validate_file_handle(&self, fh: u64, ino: u64) -> Result<()> {
+        let handles = self.file_handles.lock().await;
+        let Some(state) = handles.get(&fh) else {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!("unknown file handle {}", fh),
+            ));
+        };
+        if state.ino != ino {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!(
+                    "file handle {} does not match inode {} (got {})",
+                    fh, ino, state.ino
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn get_small_file_read_plan(
+        &self,
+        fh: u64,
+        ino: u64,
+        inode_data_version: u64,
+    ) -> Result<Option<SmallFileReadPlan>> {
+        let handles = self.file_handles.lock().await;
+        let Some(state) = handles.get(&fh) else {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!("unknown file handle {}", fh),
+            ));
+        };
+        if state.ino != ino {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!(
+                    "file handle {} does not match inode {} (got {})",
+                    fh, ino, state.ino
+                ),
+            ));
+        }
+        if state.inode_data_version != inode_data_version {
+            return Ok(None);
+        }
+        Ok(self.file_read_plan_cache.get(&fh).map(|plan| plan.as_ref().clone()))
+    }
+
+    async fn store_small_file_read_plan(
+        &self,
+        fh: u64,
+        ino: u64,
+        inode_data_version: u64,
+        small_file_read_plan: Option<SmallFileReadPlan>,
+    ) -> Result<()> {
+        let mut handles = self.file_handles.lock().await;
+        let Some(state) = handles.get_mut(&fh) else {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!("unknown file handle {}", fh),
+            ));
+        };
+        if state.ino != ino {
+            return Err(anyhow_errno(
+                Errno::EBADF,
+                format!(
+                    "file handle {} does not match inode {} (got {})",
+                    fh, ino, state.ino
+                ),
+            ));
+        }
+        state.inode_data_version = inode_data_version;
+        drop(handles);
+        if let Some(plan) = small_file_read_plan {
+            self.file_read_plan_cache.insert(fh, Arc::new(plan));
+        } else {
+            self.file_read_plan_cache.invalidate(&fh);
+        }
+        Ok(())
+    }
+
+    async fn unregister_file_handle(&self, fh: u64) {
+        let mut handles = self.file_handles.lock().await;
+        handles.remove(&fh);
+        drop(handles);
+        self.file_read_plan_cache.invalidate(&fh);
     }
 
     async fn mark_namespace_mutation(&self) {

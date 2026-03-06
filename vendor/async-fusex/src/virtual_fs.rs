@@ -219,6 +219,7 @@ pub trait VirtualFs: Sync + Send {
     async fn read(
         &self,
         ino: u64,
+        fh: u64,
         offset: u64,
         size: u32,
         buf: &mut Vec<u8>,
@@ -234,6 +235,7 @@ pub trait VirtualFs: Sync + Send {
     async fn release(
         &self,
         ino: u64,
+        fh: u64,
         flags: u32, // same as the open flags
         lock_owner: u64,
         flush: bool,

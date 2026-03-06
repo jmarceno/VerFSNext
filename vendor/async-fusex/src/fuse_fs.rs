@@ -438,7 +438,7 @@ impl FileSystem for FuseFs {
         // Try to use the buffer size as the size of the read buffer
         let mut buf = Vec::new();
 
-        let read_res = self.virtual_fs.read(ino, offset, size, &mut buf).await;
+        let read_res = self.virtual_fs.read(ino, fh, offset, size, &mut buf).await;
 
         // Check the load result
         match read_res {
@@ -508,7 +508,7 @@ impl FileSystem for FuseFs {
     async fn copy_file_range(
         &self,
         req: &Request<'_>,
-        _fh_in: u64,
+        fh_in: u64,
         offset_in: i64,
         nodeid_out: u64,
         _fh_out: u64,
@@ -541,7 +541,7 @@ impl FileSystem for FuseFs {
 
             let read_size = match self
                 .virtual_fs
-                .read(nodeid_in, in_offset, chunk_size, &mut buf)
+                .read(nodeid_in, fh_in, in_offset, chunk_size, &mut buf)
                 .await
             {
                 Ok(read_size) => read_size,
@@ -650,7 +650,10 @@ impl FileSystem for FuseFs {
             ino, fh, flags, lock_owner, flush, req,
         );
 
-        let release_res = self.virtual_fs.release(ino, flags, lock_owner, flush).await;
+        let release_res = self
+            .virtual_fs
+            .release(ino, fh, flags, lock_owner, flush)
+            .await;
 
         match release_res {
             Ok(()) => {
