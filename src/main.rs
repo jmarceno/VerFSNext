@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::fs::{OfflineGcReport, PackCrc32ReadErrorCounters, VerFs, VerFsStats};
@@ -90,6 +90,15 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
             config.mount_point.display()
         )
     })?;
+    match session.notifier() {
+        Ok(notifier) => {
+            fs.install_session_notifier(notifier);
+            info!("session notifier installed for kernel invalidations");
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to install session notifier; invalidation disabled");
+        }
+    }
 
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();

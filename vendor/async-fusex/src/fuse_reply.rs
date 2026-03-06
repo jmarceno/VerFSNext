@@ -425,15 +425,21 @@ pub struct ReplyEntry<'a> {
 
 impl ReplyEntry<'_> {
     /// Reply to a request with the given entry
-    pub async fn entry(self, ttl: Duration, attr: FuseAttr, generation: u64) -> nix::Result<usize> {
+    pub async fn entry(
+        self,
+        entry_ttl: Duration,
+        attr_ttl: Duration,
+        attr: FuseAttr,
+        generation: u64,
+    ) -> nix::Result<usize> {
         self.reply
             .send(FuseEntryOut {
                 nodeid: attr.ino,
                 generation,
-                entry_valid: ttl.as_secs(),
-                attr_valid: ttl.as_secs(),
-                entry_valid_nsec: ttl.subsec_nanos(),
-                attr_valid_nsec: ttl.subsec_nanos(),
+                entry_valid: entry_ttl.as_secs(),
+                attr_valid: attr_ttl.as_secs(),
+                entry_valid_nsec: entry_ttl.subsec_nanos(),
+                attr_valid_nsec: attr_ttl.subsec_nanos(),
                 attr,
             })
             .await
@@ -537,7 +543,8 @@ impl ReplyCreate<'_> {
     #[allow(dead_code)]
     pub async fn created(
         self,
-        ttl: &Duration,
+        entry_ttl: &Duration,
+        attr_ttl: &Duration,
         attr: FuseAttr,
         generation: u64,
         fh: u64,
@@ -548,10 +555,10 @@ impl ReplyCreate<'_> {
                 FuseEntryOut {
                     nodeid: attr.ino,
                     generation,
-                    entry_valid: ttl.as_secs(),
-                    attr_valid: ttl.as_secs(),
-                    entry_valid_nsec: ttl.subsec_nanos(),
-                    attr_valid_nsec: ttl.subsec_nanos(),
+                    entry_valid: entry_ttl.as_secs(),
+                    attr_valid: attr_ttl.as_secs(),
+                    entry_valid_nsec: entry_ttl.subsec_nanos(),
+                    attr_valid_nsec: attr_ttl.subsec_nanos(),
                     attr,
                 },
                 FuseOpenOut {
@@ -642,7 +649,8 @@ impl<'a> ReplyDirectoryPlus<'a> {
         offset: i64,
         kind: SFlag,
         name: T,
-        ttl: Duration,
+        entry_ttl: Duration,
+        attr_ttl: Duration,
         attr: FuseAttr,
         generation: u64,
     ) -> bool {
@@ -651,10 +659,10 @@ impl<'a> ReplyDirectoryPlus<'a> {
             entry_out: FuseEntryOut {
                 nodeid: attr.ino,
                 generation,
-                entry_valid: ttl.as_secs(),
-                attr_valid: ttl.as_secs(),
-                entry_valid_nsec: ttl.subsec_nanos(),
-                attr_valid_nsec: ttl.subsec_nanos(),
+                entry_valid: entry_ttl.as_secs(),
+                attr_valid: attr_ttl.as_secs(),
+                entry_valid_nsec: entry_ttl.subsec_nanos(),
+                attr_valid_nsec: attr_ttl.subsec_nanos(),
                 attr,
             },
             dirent: FuseDirEnt {

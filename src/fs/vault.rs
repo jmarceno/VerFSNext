@@ -79,6 +79,7 @@ impl FsCore {
 
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
+        let mut created_vault_ino: Option<u64> = None;
 
         self.meta
             .write_txn(|txn| {
@@ -101,6 +102,7 @@ impl FsCore {
                 let mut next_inode_bytes = [0_u8; 8];
                 next_inode_bytes.copy_from_slice(&next_inode_raw);
                 let vault_ino = u64::from_le_bytes(next_inode_bytes);
+                created_vault_ino = Some(vault_ino);
 
                 let Some(root_raw) = txn.get(inode_key(ROOT_INODE))? else {
                     return Err(anyhow_errno(Errno::EIO, "missing root inode"));
@@ -156,7 +158,12 @@ impl FsCore {
         }
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
-        self.mark_mutation();
+        self.mark_namespace_mutation().await;
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        self.invalidate_inode_attr_best_effort(ROOT_INODE);
+        if let Some(vault_ino) = created_vault_ino {
+            self.invalidate_inode_attr_best_effort(vault_ino);
+        }
         Ok(out_key_path)
     }
     pub(crate) async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
@@ -191,6 +198,11 @@ impl FsCore {
             .await?;
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
+        self.mark_mutation();
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        if let Ok(Some(vault_dirent)) = self.load_dirent_cached(ROOT_INODE, VAULT_DIR_NAME.as_bytes()) {
+            self.invalidate_inode_attr_best_effort(vault_dirent.ino);
+        }
         Ok(())
     }
     pub(crate) async fn lock_vault(&self) -> Result<()> {
@@ -210,6 +222,11 @@ impl FsCore {
             .await?;
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
+        self.mark_mutation();
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        if let Ok(Some(vault_dirent)) = self.load_dirent_cached(ROOT_INODE, VAULT_DIR_NAME.as_bytes()) {
+            self.invalidate_inode_attr_best_effort(vault_dirent.ino);
+        }
         Ok(())
     }
 }

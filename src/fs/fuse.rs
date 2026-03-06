@@ -1,13 +1,23 @@
 use super::*;
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 #[async_trait]
 impl VirtualFs for VerFs {
     async fn init(&self) -> AsyncFusexResult<()> {
         info!(
-            attr_ttl_ms = ATTR_TTL.as_millis(),
-            "mounted with conservative zero FUSE attr TTL; kernel invalidation is not wired yet"
+            configured_attr_ttl_ms = self.core.configured_attr_ttl().as_millis(),
+            configured_entry_ttl_ms = self.core.configured_entry_ttl().as_millis(),
+            effective_attr_ttl_ms = self.core.attr_ttl().as_millis(),
+            effective_entry_ttl_ms = self.core.entry_ttl().as_millis(),
+            invalidation_enabled = self.core.invalidation_enabled(),
+            "mounted with configured FUSE TTLs and invalidation status"
         );
+        if self.core.configured_entry_ttl().as_millis() > 0 && !self.core.invalidation_enabled() {
+            warn!(
+                configured_entry_ttl_ms = self.core.configured_entry_ttl().as_millis(),
+                "entry TTL configured but kernel invalidation notifier is unavailable; effective entry TTL is clamped to zero"
+            );
+        }
         Ok(())
     }
 
@@ -23,7 +33,7 @@ impl VirtualFs for VerFs {
         _gid: u32,
         parent: INum,
         name: &str,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
@@ -33,7 +43,7 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
 
         let attr = self.core.file_attr_from_inode(&inode);
-        Ok((ATTR_TTL, attr, inode.generation))
+        Ok((self.core.entry_ttl(), self.core.attr_ttl(), attr, inode.generation))
     }
 
     async fn forget(&self, _ino: u64, _nlookup: u64) {}
@@ -44,7 +54,7 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(ino, "getattr")
             .map_err(map_anyhow_to_fuse)?;
 
-        Ok((ATTR_TTL, self.core.file_attr_from_inode(&inode)))
+        Ok((self.core.attr_ttl(), self.core.file_attr_from_inode(&inode)))
     }
 
     async fn setattr(
@@ -108,8 +118,9 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_mutation();
+        self.core.invalidate_inode_attr_best_effort(ino);
 
-        Ok((ATTR_TTL, self.core.file_attr_from_inode(&inode)))
+        Ok((self.core.attr_ttl(), self.core.file_attr_from_inode(&inode)))
     }
 
     async fn readlink(&self, ino: u64) -> AsyncFusexResult<Vec<u8>> {
@@ -138,7 +149,10 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)
     }
 
-    async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    async fn mknod(
+        &self,
+        param: CreateParam,
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(param.parent, "mknod")
@@ -172,18 +186,25 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(param.parent, &param.name);
+        self.core.invalidate_inode_attr_best_effort(param.parent);
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created inode"))
         })?;
+        self.core.invalidate_inode_attr_best_effort(inode.ino);
         Ok((
-            ATTR_TTL,
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
             self.core.file_attr_from_inode(&inode),
             inode.generation,
         ))
     }
 
-    async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    async fn mkdir(
+        &self,
+        param: CreateParam,
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(param.parent, "mkdir")
@@ -211,12 +232,16 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(param.parent, &param.name);
+        self.core.invalidate_inode_attr_best_effort(param.parent);
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created directory"))
         })?;
+        self.core.invalidate_inode_attr_best_effort(inode.ino);
         Ok((
-            ATTR_TTL,
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
             self.core.file_attr_from_inode(&inode),
             inode.generation,
         ))
@@ -232,12 +257,14 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.write().await;
 
+        let mut removed_ino: Option<u64> = None;
         self.core
             .meta
             .write_txn(|txn| {
                 let _parent_inode =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "unlink")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, name, "unlink")?;
+                removed_ino = Some(dirent.ino);
                 let Some(inode_raw) = txn.get(inode_key(dirent.ino))? else {
                     txn.delete(dirent_key(parent, name.as_bytes()))?;
                     let now = SystemTime::now();
@@ -266,6 +293,11 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(parent, name);
+        self.core.invalidate_inode_attr_best_effort(parent);
+        if let Some(removed_ino) = removed_ino {
+            self.core.invalidate_inode_attr_best_effort(removed_ino);
+        }
         Ok(())
     }
 
@@ -285,12 +317,14 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
         let _guard = self.core.write_lock.write().await;
 
+        let mut removed_ino: Option<u64> = None;
         self.core
             .meta
             .write_txn(|txn| {
                 let _parent_inode =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "rmdir")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, dir_name, "rmdir")?;
+                removed_ino = Some(dirent.ino);
                 let Some(raw) = txn.get(inode_key(dirent.ino))? else {
                     return Err(anyhow_errno(Errno::ENOENT, "rmdir target inode not found"));
                 };
@@ -329,6 +363,11 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(parent, dir_name);
+        self.core.invalidate_inode_attr_best_effort(parent);
+        if let Some(removed_ino) = removed_ino {
+            self.core.invalidate_inode_attr_best_effort(removed_ino);
+        }
 
         Ok(None)
     }
@@ -340,7 +379,7 @@ impl VirtualFs for VerFs {
         parent: INum,
         name: &str,
         target_path: &Path,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(parent, "symlink")
@@ -373,12 +412,16 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(parent, name);
+        self.core.invalidate_inode_attr_best_effort(parent);
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing symlink inode"))
         })?;
+        self.core.invalidate_inode_attr_best_effort(inode.ino);
         Ok((
-            ATTR_TTL,
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
             self.core.file_attr_from_inode(&inode),
             inode.generation,
         ))
@@ -413,6 +456,8 @@ impl VirtualFs for VerFs {
         }
         let _guard = self.core.write_lock.write().await;
 
+        let mut moved_ino: Option<u64> = None;
+        let mut replaced_ino: Option<u64> = None;
         self.core
             .meta
             .write_txn(|txn| {
@@ -443,6 +488,7 @@ impl VirtualFs for VerFs {
                     &param.old_name,
                     "rename source",
                 )?;
+                moved_ino = Some(source.ino);
                 let _old_parent =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, param.old_parent, "rename")?;
                 let _new_parent =
@@ -474,6 +520,7 @@ impl VirtualFs for VerFs {
                     if target.ino == source.ino {
                         return Ok(());
                     }
+                    replaced_ino = Some(target.ino);
 
                     let Some(target_inode_raw) = txn.get(inode_key(target.ino))? else {
                         return Err(anyhow_errno(
@@ -526,6 +573,7 @@ impl VirtualFs for VerFs {
                     if target.ino == source.ino {
                         return Ok(());
                     }
+                    replaced_ino = Some(target.ino);
 
                     let Some(target_inode_raw) = txn.get(inode_key(target.ino))? else {
                         return Err(anyhow_errno(Errno::ENOENT, "rename target inode not found"));
@@ -604,6 +652,18 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core
+            .invalidate_entry_best_effort(param.old_parent, &param.old_name);
+        self.core
+            .invalidate_entry_best_effort(param.new_parent, &param.new_name);
+        self.core.invalidate_inode_attr_best_effort(param.old_parent);
+        self.core.invalidate_inode_attr_best_effort(param.new_parent);
+        if let Some(moved_ino) = moved_ino {
+            self.core.invalidate_inode_attr_best_effort(moved_ino);
+        }
+        if let Some(replaced_ino) = replaced_ino {
+            self.core.invalidate_inode_attr_best_effort(replaced_ino);
+        }
         Ok(())
     }
 
@@ -1088,7 +1148,7 @@ impl VirtualFs for VerFs {
         name: &str,
         mode: u32,
         _flags: u32,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64, u64, u32)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(parent, "create")
@@ -1116,10 +1176,13 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(parent, name);
+        self.core.invalidate_inode_attr_best_effort(parent);
 
         let inode = created.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created file inode"))
         })?;
+        self.core.invalidate_inode_attr_best_effort(inode.ino);
         self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
         let inode_data_version = self.core.inode_data_version(inode.ino).await;
@@ -1127,7 +1190,8 @@ impl VirtualFs for VerFs {
             .register_file_handle(fh, inode.ino, inode_data_version)
             .await;
         Ok((
-            ATTR_TTL,
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
             self.core.file_attr_from_inode(&inode),
             inode.generation,
             fh,
@@ -1140,7 +1204,7 @@ impl VirtualFs for VerFs {
         ino: u64,
         newparent: u64,
         newname: &str,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         self.core
             .check_vault_parent_name_gate(newparent, newname)
             .map_err(map_anyhow_to_fuse)?;
@@ -1223,12 +1287,16 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_namespace_mutation().await;
+        self.core.invalidate_entry_best_effort(newparent, newname);
+        self.core.invalidate_inode_attr_best_effort(newparent);
 
         let inode = linked.ok_or_else(|| {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing linked inode"))
         })?;
+        self.core.invalidate_inode_attr_best_effort(inode.ino);
         Ok((
-            ATTR_TTL,
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
             self.core.file_attr_from_inode(&inode),
             inode.generation,
         ))
@@ -1302,6 +1370,7 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_mutation();
+        self.core.invalidate_inode_attr_best_effort(ino);
         Ok(())
     }
 
@@ -1426,6 +1495,7 @@ impl VirtualFs for VerFs {
             .await
             .map_err(map_anyhow_to_fuse)?;
         self.core.mark_mutation();
+        self.core.invalidate_inode_attr_best_effort(ino);
         Ok(())
     }
 

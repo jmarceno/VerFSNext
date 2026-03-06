@@ -17,6 +17,7 @@ use nix::errno::Errno;
 use nix::sys::stat::SFlag;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 pub struct FuseFs {
@@ -69,13 +70,13 @@ impl FileSystem for FuseFs {
             .await;
 
         match lookup_res {
-            Ok((ttl, file_attr, generation)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
                 debug!(
                     "fusefilesystem call lookup() successfully got the attr={:?} of parent={} and name={:?}",
                     file_attr, parent, name,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.entry(ttl, fuse_attr, generation).await
+                reply.entry(entry_ttl, attr_ttl, fuse_attr, generation).await
             }
             Err(e) => {
                 debug!("lookup() failed, the error is: {:?}", e);
@@ -230,13 +231,13 @@ impl FileSystem for FuseFs {
         let mknod_res = self.virtual_fs.mknod(param).await;
 
         match mknod_res {
-            Ok((ttl, file_attr, generation)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
                 debug!(
                     "fusefilesystem call mknod() successfully created a file name={:?} and mode={:?} under parent ino={} with attr={:?}",
                     name, mode, parent, file_attr,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.entry(ttl, fuse_attr, generation).await
+                reply.entry(entry_ttl, attr_ttl, fuse_attr, generation).await
             }
             Err(e) => {
                 debug!(
@@ -277,13 +278,13 @@ impl FileSystem for FuseFs {
         let mkdir_res = self.virtual_fs.mkdir(param).await;
 
         match mkdir_res {
-            Ok((ttl, file_attr, generation)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
                 debug!(
                     "fusefilesystem call mkdir() successfully created a directory name={:?} and mode={:?} under parent ino={} with attr={:?}",
                     name, mode, parent, file_attr,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.entry(ttl, fuse_attr, generation).await
+                reply.entry(entry_ttl, attr_ttl, fuse_attr, generation).await
             }
             Err(e) => {
                 debug!(
@@ -829,8 +830,13 @@ impl FileSystem for FuseFs {
                         .lookup(req.uid(), req.gid(), ino, dir_entry.name())
                         .await
                     {
-                        Ok((ttl, file_attr, generation)) => {
-                            Ok((ttl, fs_util::convert_to_fuse_attr(file_attr), generation))
+                        Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
+                            Ok((
+                                entry_ttl,
+                                attr_ttl,
+                                fs_util::convert_to_fuse_attr(file_attr),
+                                generation,
+                            ))
                         }
                         Err(lookup_err) => {
                             debug!(
@@ -840,20 +846,26 @@ impl FileSystem for FuseFs {
                                 lookup_err,
                             );
                             self.virtual_fs.getattr(dir_entry.ino()).await.map(
-                                |(ttl, file_attr)| {
-                                    (ttl, fs_util::convert_to_fuse_attr(file_attr), 0)
+                                |(attr_ttl, file_attr)| {
+                                    (
+                                        Duration::ZERO,
+                                        attr_ttl,
+                                        fs_util::convert_to_fuse_attr(file_attr),
+                                        0,
+                                    )
                                 },
                             )
                         }
                     };
 
-                    if let Ok((ttl, fuse_attr, generation)) = resolved {
+                    if let Ok((entry_ttl, attr_ttl, fuse_attr, generation)) = resolved {
                         let full = reply.add(
                             dir_entry.ino(),
                             i.cast::<i64>().overflow_add(1),
                             dir_entry.file_type().into(),
                             dir_entry.name(),
-                            ttl,
+                            entry_ttl,
+                            attr_ttl,
                             fuse_attr,
                             generation,
                         );
@@ -1030,13 +1042,13 @@ impl FileSystem for FuseFs {
             .await;
 
         match symlink_res {
-            Ok((ttl, file_attr, generation)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
                 debug!(
                     "fusefilesystem call symlink() successfully created a symlink name={:?} to target path={:?} under parent ino={}",
                     name, target_path, parent,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.entry(ttl, fuse_attr, generation).await
+                reply.entry(entry_ttl, attr_ttl, fuse_attr, generation).await
             }
             Err(e) => {
                 debug!(
@@ -1080,13 +1092,13 @@ impl FileSystem for FuseFs {
         let link_res = self.virtual_fs.link(old_ino, newparent, newname).await;
 
         match link_res {
-            Ok((ttl, file_attr, generation)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
                 debug!(
                     "fusefilesystem call link() successfully created a hard link old_ino={}, name={:?} under parent ino={}",
                     old_ino, newname, newparent,
                 );
                 let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
-                reply.entry(ttl, fuse_attr, generation).await
+                reply.entry(entry_ttl, attr_ttl, fuse_attr, generation).await
             }
             Err(AsyncFusexError::Unimplemented { context }) => {
                 debug!(
@@ -1354,7 +1366,7 @@ impl FileSystem for FuseFs {
             .await;
 
         match create_res {
-            Ok((ttl, file_attr, generation, fh, open_flags)) => {
+            Ok((entry_ttl, attr_ttl, file_attr, generation, fh, open_flags)) => {
                 debug!(
                     "fusefilesystem call create() successfully created a file name={:?} under parent ino={}",
                     name, parent,
@@ -1365,7 +1377,7 @@ impl FileSystem for FuseFs {
                     reply_flags |= crate::protocol::FOPEN_DIRECT_IO;
                 }
                 reply
-                    .created(&ttl, fuse_attr, generation, fh, reply_flags)
+                    .created(&entry_ttl, &attr_ttl, fuse_attr, generation, fh, reply_flags)
                     .await
             }
             Err(AsyncFusexError::Unimplemented { context }) => {

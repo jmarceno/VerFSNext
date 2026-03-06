@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use async_fusex::error::{AsyncFusexError, AsyncFusexResult};
+use async_fusex::session::SessionNotifier;
 use async_fusex::fs_util::{
     build_error_result_from_errno, CreateParam, FileAttr, FileLockParam, INum, RenameParam,
     SetAttrParam, StatFsParam,
@@ -24,7 +25,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::config::Config;
 use crate::data::chunker::UltraStreamChunker;
@@ -57,9 +58,6 @@ use crate::vault::{
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
-// Correctness-first: we currently do not send FUSE entry invalidation notifications on
-// namespace mutations, so a non-zero TTL can leave stale dentries/attrs visible to the kernel.
-const ATTR_TTL: Duration = Duration::ZERO;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE as u32;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE as u32;
@@ -88,6 +86,12 @@ struct CachedDirEntry {
     ino: u64,
     name: String,
     file_type: FileType,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct DirentCacheKey {
+    parent: u64,
+    name: Vec<u8>,
 }
 
 struct DirHandleState {
@@ -179,6 +183,8 @@ struct FsCore {
     chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
     chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
+    inode_cache: Cache<u64, Option<InodeRecord>>,
+    dirent_cache: Cache<DirentCacheKey, Option<DirentRecord>>,
     next_handle: AtomicU64,
     last_persisted_active_pack_id: AtomicU64,
     last_persisted_pack_crc32_read_error_count: AtomicU64,
@@ -202,6 +208,7 @@ struct FsCore {
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
     file_handles: Mutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
+    notifier: ParkingRwLock<Option<Arc<SessionNotifier>>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
 }
@@ -258,6 +265,12 @@ impl VerFs {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(60))
                 .build(),
+            inode_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
+            dirent_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
             last_persisted_pack_crc32_read_error_count: AtomicU64::new(
@@ -285,6 +298,7 @@ impl VerFs {
             file_read_plan_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
+            notifier: ParkingRwLock::new(None),
             open_file_counts: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
@@ -329,7 +343,15 @@ impl VerFs {
         let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.create(name).await?;
-        self.core.mark_mutation();
+        self.core.invalidate_metadata_caches_all();
+        self.core.mark_namespace_mutation().await;
+        if let Ok(Some(snapshots_dir)) = self
+            .core
+            .load_dirent_cached(ROOT_INODE, SNAPSHOTS_DIR_NAME.as_bytes())
+        {
+            self.core.invalidate_entry_best_effort(snapshots_dir.ino, name);
+            self.core.invalidate_inode_attr_best_effort(snapshots_dir.ino);
+        }
         Ok(())
     }
 
@@ -337,7 +359,15 @@ impl VerFs {
         let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
         snapshots.delete(name).await?;
-        self.core.mark_mutation();
+        self.core.invalidate_metadata_caches_all();
+        self.core.mark_namespace_mutation().await;
+        if let Ok(Some(snapshots_dir)) = self
+            .core
+            .load_dirent_cached(ROOT_INODE, SNAPSHOTS_DIR_NAME.as_bytes())
+        {
+            self.core.invalidate_entry_best_effort(snapshots_dir.ino, name);
+            self.core.invalidate_inode_attr_best_effort(snapshots_dir.ino);
+        }
         Ok(())
     }
 
@@ -380,9 +410,87 @@ impl VerFs {
     pub fn is_gc_in_progress(&self) -> bool {
         self.core.gc_lock.try_lock().is_err()
     }
+
+    pub fn install_session_notifier(&self, notifier: Arc<SessionNotifier>) {
+        self.core.install_session_notifier(notifier);
+    }
 }
 
 impl FsCore {
+    fn configured_attr_ttl(&self) -> Duration {
+        Duration::from_millis(self.config.fuse_attr_ttl_ms)
+    }
+
+    fn configured_entry_ttl(&self) -> Duration {
+        Duration::from_millis(self.config.fuse_entry_ttl_ms)
+    }
+
+    fn attr_ttl(&self) -> Duration {
+        if self.invalidation_enabled() {
+            self.configured_attr_ttl()
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn entry_ttl(&self) -> Duration {
+        if self.invalidation_enabled() {
+            self.configured_entry_ttl()
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn invalidation_enabled(&self) -> bool {
+        self.notifier.read().is_some()
+    }
+
+    fn dirent_cache_key(parent: u64, name: &[u8]) -> DirentCacheKey {
+        DirentCacheKey {
+            parent,
+            name: name.to_vec(),
+        }
+    }
+
+    fn load_inode_cached(&self, ino: u64) -> Result<Option<InodeRecord>> {
+        if let Some(inode) = self.inode_cache.get(&ino) {
+            return Ok(inode);
+        }
+        let inode = self.meta.get_inode(ino)?;
+        self.inode_cache.insert(ino, inode.clone());
+        Ok(inode)
+    }
+
+    fn load_dirent_cached(&self, parent: u64, name: &[u8]) -> Result<Option<DirentRecord>> {
+        let key = Self::dirent_cache_key(parent, name);
+        if let Some(dirent) = self.dirent_cache.get(&key) {
+            return Ok(dirent);
+        }
+        let dirent = self.meta.read_txn(|txn| {
+            let Some(raw) = txn.get(dirent_key(parent, name))? else {
+                return Ok(None);
+            };
+            let dirent: DirentRecord = decode_rkyv(&raw)?;
+            Ok(Some(dirent))
+        })?;
+        self.dirent_cache.insert(key, dirent.clone());
+        Ok(dirent)
+    }
+
+    fn invalidate_inode_cache(&self, ino: u64) {
+        self.inode_cache.invalidate(&ino);
+    }
+
+    fn invalidate_dirent_cache(&self, parent: u64, name: &[u8]) {
+        self.dirent_cache
+            .invalidate(&Self::dirent_cache_key(parent, name));
+    }
+
+    fn invalidate_metadata_caches_all(&self) {
+        self.inode_cache.invalidate_all();
+        self.dirent_cache.invalidate_all();
+    }
+
     async fn inode_write_lock(&self, ino: u64) -> Arc<Mutex<()>> {
         let mut locks = self.inode_write_locks.lock().await;
         if let Some(lock) = locks.get(&ino).and_then(Weak::upgrade) {
@@ -530,6 +638,40 @@ impl FsCore {
         handles.remove(&fh);
         drop(handles);
         self.file_read_plan_cache.invalidate(&fh);
+    }
+
+    fn install_session_notifier(&self, notifier: Arc<SessionNotifier>) {
+        let mut slot = self.notifier.write();
+        *slot = Some(notifier);
+    }
+
+    fn invalidate_inode_attr_best_effort(&self, ino: u64) {
+        self.invalidate_inode_cache(ino);
+        let Some(notifier) = self.notifier.read().clone() else {
+            return;
+        };
+        if let Err(err) = notifier.invalidate_inode(ino, -1, 0) {
+            if err != Errno::ENOENT {
+                warn!(ino, error = %err, "inode attr invalidation notify failed");
+            }
+        }
+    }
+
+    fn invalidate_entry_best_effort(&self, parent: u64, name: &str) {
+        self.invalidate_dirent_cache(parent, name.as_bytes());
+        let Some(notifier) = self.notifier.read().clone() else {
+            return;
+        };
+        if let Err(err) = notifier.invalidate_entry(parent, name) {
+            if err != Errno::ENOENT {
+                warn!(
+                    parent,
+                    name,
+                    error = %err,
+                    "directory entry invalidation notify failed"
+                );
+            }
+        }
     }
 
     async fn mark_namespace_mutation(&self) {
@@ -905,6 +1047,8 @@ mod tests {
             fuse_direct_io: false,
             fuse_fsname: "verfs_bench".to_string(),
             fuse_subtype: "verfs".to_string(),
+            fuse_attr_ttl_ms: 0,
+            fuse_entry_ttl_ms: 0,
             gc_idle_min_ms: 1000,
             gc_pack_rewrite_min_reclaim_bytes: 1024 * 1024,
             gc_pack_rewrite_min_reclaim_percent: 50.0,
@@ -917,7 +1061,7 @@ mod tests {
 
         let fs = VerFs::new(config).await?;
 
-        let (_ttl, attr, _gen, _fh, _) = fs
+        let (_entry_ttl, _attr_ttl, attr, _gen, _fh, _) = fs
             .create(1000, 1000, ROOT_INODE, ROOT_INODE, "bench_file", 0o644, 0)
             .await
             .map_err(|e| anyhow!("create failed: {:?}", e))?;

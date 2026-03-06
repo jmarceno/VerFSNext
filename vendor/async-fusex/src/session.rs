@@ -1,7 +1,9 @@
 //! The implementation of FUSE session
 
 use std::fs::File;
+use std::io::{IoSlice, Write};
 use std::io::Read;
+use std::mem;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -41,11 +43,17 @@ use super::protocol::FUSE_MAX_PAGES;
 #[cfg(feature = "abi-7-23")]
 use super::protocol::FUSE_WRITEBACK_CACHE;
 use super::protocol::{
-    FuseInitIn, FuseInitOut, FuseSetXAttrIn, FATTR_ATIME, FATTR_FH, FATTR_GID, FATTR_MODE,
-    FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
+    FuseInitIn, FuseInitOut, FuseOutHeader, FuseSetXAttrIn, FATTR_ATIME, FATTR_FH, FATTR_GID,
+    FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_RELEASE_FLUSH,
 };
+#[cfg(feature = "abi-7-12")]
+use super::protocol::{
+    FuseNotifyCode::{FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE}, FuseNotifyInvalEntryOut,
+    FuseNotifyInvalINodeOut,
+};
 use super::{mount, FuseFs};
+use crate::abi_marker;
 use crate::fs_util::{CreateParam, FileLockParam, RenameParam, SetAttrParam};
 
 /// Per-request metadata slack above payload bytes.
@@ -151,6 +159,77 @@ mod _fuse_fd_clone {
 
 use crate::de::DeserializeError;
 use _fuse_fd_clone::fuse_fd_clone;
+
+#[derive(Debug)]
+pub struct SessionNotifier {
+    device: std::sync::Mutex<File>,
+}
+
+impl SessionNotifier {
+    fn new(device: File) -> Self {
+        Self {
+            device: std::sync::Mutex::new(device),
+        }
+    }
+
+    #[cfg(feature = "abi-7-12")]
+    pub fn invalidate_inode(&self, ino: u64, off: i64, len: i64) -> nix::Result<usize> {
+        let payload = FuseNotifyInvalINodeOut { ino, off, len };
+        #[allow(clippy::as_conversions)]
+        self.send_notify(FUSE_NOTIFY_INVAL_INODE as i32, &[abi_marker::as_abi_bytes(&payload)])
+    }
+
+    #[cfg(not(feature = "abi-7-12"))]
+    pub fn invalidate_inode(&self, _ino: u64, _off: i64, _len: i64) -> nix::Result<usize> {
+        Err(nix::errno::Errno::ENOSYS)
+    }
+
+    #[cfg(feature = "abi-7-12")]
+    pub fn invalidate_entry(&self, parent: u64, name: &str) -> nix::Result<usize> {
+        let name_bytes = name.as_bytes();
+        let payload = FuseNotifyInvalEntryOut {
+            parent,
+            namelen: name_bytes.len() as u32,
+            padding: 0,
+        };
+        #[allow(clippy::as_conversions)]
+        self.send_notify(
+            FUSE_NOTIFY_INVAL_ENTRY as i32,
+            &[abi_marker::as_abi_bytes(&payload), name_bytes],
+        )
+    }
+
+    #[cfg(not(feature = "abi-7-12"))]
+    pub fn invalidate_entry(&self, _parent: u64, _name: &str) -> nix::Result<usize> {
+        Err(nix::errno::Errno::ENOSYS)
+    }
+
+    fn send_notify(&self, code: i32, payload_parts: &[&[u8]]) -> nix::Result<usize> {
+        let payload_len = payload_parts
+            .iter()
+            .fold(0_usize, |acc, p| acc.saturating_add(p.len()));
+        let header = FuseOutHeader {
+            len: (mem::size_of::<FuseOutHeader>() + payload_len) as u32,
+            error: code,
+            unique: 0,
+        };
+
+        let header_bytes = abi_marker::as_abi_bytes(&header);
+        let mut slices = Vec::with_capacity(payload_parts.len().saturating_add(1));
+        slices.push(IoSlice::new(header_bytes));
+        for part in payload_parts {
+            slices.push(IoSlice::new(part));
+        }
+
+        let mut device = self
+            .device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        device
+            .write_vectored(&slices)
+            .map_err(|err| nix::errno::Errno::try_from(err).unwrap_or(nix::errno::Errno::EIO))
+    }
+}
 
 /// A loop to read requests from FUSE device continuously
 #[allow(clippy::needless_pass_by_value)]
@@ -352,6 +431,19 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
     #[inline]
     pub fn dev_fd(&self) -> RawFd {
         self.fuse_fd.0
+    }
+
+    pub fn notifier(&self) -> anyhow::Result<Arc<SessionNotifier>> {
+        let session_fd = self.dev_fd();
+        let worker_fd = unsafe {
+            // SAFETY: session fd is owned by this live session.
+            fuse_fd_clone(session_fd)?
+        };
+        let device = unsafe {
+            // SAFETY: worker fd is freshly cloned and owned here.
+            File::from_raw_fd(worker_fd)
+        };
+        Ok(Arc::new(SessionNotifier::new(device)))
     }
 
     /// Run the FUSE session

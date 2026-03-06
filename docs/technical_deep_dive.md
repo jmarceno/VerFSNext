@@ -73,6 +73,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - read path resolves chunk location through pack-local hash index
   - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
   - bounded chunk metadata and chunk payload caches
+  - committed metadata read caches (bounded `moka`) for inode and dirent lookups with post-commit invalidation on mutation paths
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
   - `collect_stats` computes namespace-scoped logical size plus cache/memory/throughput metrics
@@ -91,6 +92,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
   - directory handles now keep a per-`opendir` snapshot for stable pagination while the namespace is mutating (prevents recursive-delete entry skips)
+  - file-handle read-plan cache uses bounded `moka` entries keyed by `fh`; plans are version-checked against inode data version before reuse
+  - session-level FUSE invalidation notifier is installed at mount and used for best-effort post-commit invalidation dispatch
 
 - `src/fs/write.rs`
   - `apply_batch` still coalesces adjacent writes first, then executes per-inode groups sequentially while running different inodes concurrently
@@ -110,6 +113,21 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `vendor/async-fusex/src/fuse_fs.rs`
   - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
   - `readdir` now stops filling once the reply buffer is full, matching `readdirplus` behavior and preserving correct continuation semantics
+  - entry responses now carry separate entry TTL and attr TTL values end-to-end
+
+- `vendor/async-fusex/src/session.rs`
+  - exposes `Session::notifier()` returning a cloneable session notifier handle
+  - notifier supports kernel invalidations for inode attrs and directory entries (`invalidate_inode`, `invalidate_entry`)
+  - notify writes are serialized through a mutex-protected FUSE device clone and use FUSE notify message framing with `unique = 0`
+
+- `src/fs/fuse.rs` and `src/fs/write.rs`
+  - namespace and inode mutations now trigger best-effort post-commit invalidation notifications (create/unlink/rmdir/rename/link/setattr/write/truncate/xattr paths)
+  - notification failures are non-fatal and logged; correctness remains independent because TTL is still conservative
+
+- `src/fs/mod.rs` and `src/fs/vault.rs`
+  - control-plane namespace/visibility mutations now also dispatch invalidations (`create_snapshot`, `delete_snapshot`, `create_vault`, `unlock_vault`, `lock_vault`)
+  - this keeps kernel entry/attr views coherent even when mutations happen outside direct FUSE syscall paths
+  - snapshot create/delete now also invalidate all committed inode/dirent metadata caches to avoid stale inode reuse after recursive snapshot subtree updates/removals
 
 - `src/vault/mod.rs`
   - Envelope wrapping metadata type (`VaultWrapRecord`) encoded with `rkyv`
@@ -160,6 +178,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `metadata_cache_capacity_entries`
 - `chunk_cache_capacity_mb`
 - `pack_index_cache_capacity_entries`
+- `fuse_attr_ttl_ms` and `fuse_entry_ttl_ms` are loaded from `config.toml` at mount (current defaults: 150ms each); effective runtime TTLs are zeroed automatically if kernel invalidation notifier is unavailable
 - `pack_max_size_mb`
 - `zstd_compression_level`
 - `ultracdc_min_size_bytes`
@@ -169,6 +188,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `fuse_direct_io`
 - `fuse_fsname`
 - `fuse_subtype`
+- `fuse_attr_ttl_ms`
+- `fuse_entry_ttl_ms`
 - `gc_idle_min_ms`
 - `gc_pack_rewrite_min_reclaim_bytes`
 - `gc_pack_rewrite_min_reclaim_percent`

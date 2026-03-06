@@ -28,7 +28,7 @@ impl FsCore {
         ino: u64,
         context: &'static str,
     ) -> Result<InodeRecord> {
-        self.meta.get_inode(ino)?.ok_or_else(|| {
+        self.load_inode_cached(ino)?.ok_or_else(|| {
             anyhow_errno(
                 Errno::ENOENT,
                 format!("{}: inode {} not found", context, ino),
@@ -49,39 +49,25 @@ impl FsCore {
         parent: u64,
         name: &str,
     ) -> Result<InodeRecord> {
-        let (parent_inode, inode) = self.meta.read_txn(|txn| {
-            let Some(parent_raw) = txn.get(inode_key(parent))? else {
-                return Err(anyhow_errno(
-                    Errno::ENOENT,
-                    format!("lookup: parent inode {} not found", parent),
-                ));
-            };
-            let parent_inode: InodeRecord = decode_rkyv(&parent_raw)?;
+        let parent_inode = self.load_inode_or_errno(parent, "lookup")?;
 
-            let ino = if name == "." {
-                parent
-            } else if name == ".." {
-                parent_inode.parent
-            } else {
-                let Some(dirent_raw) = txn.get(dirent_key(parent, name.as_bytes()))? else {
-                    return Err(anyhow_errno(
+        let ino = if name == "." {
+            parent
+        } else if name == ".." {
+            parent_inode.parent
+        } else {
+            let dirent = self
+                .load_dirent_cached(parent, name.as_bytes())?
+                .ok_or_else(|| {
+                    anyhow_errno(
                         Errno::ENOENT,
                         format!("lookup: {} not found under inode {}", name, parent),
-                    ));
-                };
-                let dirent: DirentRecord = decode_rkyv(&dirent_raw)?;
-                dirent.ino
-            };
+                    )
+                })?;
+            dirent.ino
+        };
 
-            let Some(inode_raw) = txn.get(inode_key(ino))? else {
-                return Err(anyhow_errno(
-                    Errno::ENOENT,
-                    format!("lookup: inode {} not found", ino),
-                ));
-            };
-            let inode: InodeRecord = decode_rkyv(&inode_raw)?;
-            Ok((parent_inode, inode))
-        })?;
+        let inode = self.load_inode_or_errno(ino, "lookup")?;
         self.ensure_inode_vault_access(&parent_inode, "lookup")?;
         self.ensure_inode_vault_access(&inode, "lookup")?;
         Ok(inode)
@@ -306,7 +292,9 @@ impl FsCore {
                 txn.delete(inode_key(ino))?;
                 Ok(())
             })
-            .await
+            .await?;
+        self.invalidate_inode_cache(ino);
+        Ok(())
     }
     pub(crate) fn is_dir_empty(txn: &surrealkv::Transaction, ino: u64) -> Result<bool> {
         let prefix = dirent_prefix(ino);

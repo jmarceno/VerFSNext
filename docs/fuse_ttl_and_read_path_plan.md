@@ -9,6 +9,13 @@ This plan covers two related tracks:
 1. Replace `ATTR_TTL = 0` with explicit kernel invalidation plus bounded TTLs.
 2. Add the next read-path improvements that become safe and worthwhile once invalidation and handle plumbing exist.
 
+## Current Implementation Status
+
+- Invalidation notifier support is implemented in `vendor/async-fusex` and wired into VerFS post-commit mutation paths.
+- `read` now receives `fh`, and handle-local read plans are implemented for small files.
+- Committed metadata caches (inode + dirent) are implemented with bounded `moka` caches and mutation-time invalidation.
+- `fuse_attr_ttl_ms` and `fuse_entry_ttl_ms` are live config knobs; defaults are now non-zero (150ms each) and are automatically clamped to zero if invalidation notifier wiring is unavailable at mount time.
+
 ## Non-Negotiables
 
 - Never return stale data or stale namespace state after a committed mutation.

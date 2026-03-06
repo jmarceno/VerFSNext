@@ -23,3 +23,5 @@ vault_enabled = true # Enable encrypted .vault support.
 vault_argon2_mem_kib = 131072 # Argon2 memory cost for vault key derivation (KiB).
 vault_argon2_iters = 3 # Argon2 iterations for vault key derivation.
 vault_argon2_parallelism = 1 # Argon2 parallelism for vault key derivation.
+fuse_attr_ttl_ms = 150 # Inode attribute cache TTL in milliseconds.
+fuse_entry_ttl_ms = 0 # Directory entry cache TTL in milliseconds (keep 0 until namespace invalidation is fully verified).

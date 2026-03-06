@@ -66,6 +66,14 @@ fn default_fuse_subtype() -> String {
     "verfsnext".to_owned()
 }
 
+fn default_fuse_attr_ttl_ms() -> u64 {
+    150
+}
+
+fn default_fuse_entry_ttl_ms() -> u64 {
+    150
+}
+
 fn default_gc_idle_min_ms() -> u64 {
     15_000
 }
@@ -132,6 +140,10 @@ pub struct Config {
     pub fuse_fsname: String,
     #[serde(default = "default_fuse_subtype")]
     pub fuse_subtype: String,
+    #[serde(default = "default_fuse_attr_ttl_ms")]
+    pub fuse_attr_ttl_ms: u64,
+    #[serde(default = "default_fuse_entry_ttl_ms")]
+    pub fuse_entry_ttl_ms: u64,
     #[serde(default = "default_gc_idle_min_ms")]
     pub gc_idle_min_ms: u64,
     #[serde(default = "default_gc_pack_rewrite_min_reclaim_bytes")]
@@ -211,6 +223,12 @@ impl Config {
         if self.fuse_subtype.trim().is_empty() {
             bail!("fuse_subtype must not be empty");
         }
+        if self.fuse_attr_ttl_ms > 60_000 {
+            bail!("fuse_attr_ttl_ms must be <= 60000");
+        }
+        if self.fuse_entry_ttl_ms > 60_000 {
+            bail!("fuse_entry_ttl_ms must be <= 60000");
+        }
         if self.gc_idle_min_ms == 0 {
             bail!("gc_idle_min_ms must be > 0");
         }
@@ -280,6 +298,8 @@ mod tests {
             fuse_direct_io: false,
             fuse_fsname: "verfsnext".to_owned(),
             fuse_subtype: "verfsnext".to_owned(),
+            fuse_attr_ttl_ms: 0,
+            fuse_entry_ttl_ms: 0,
             gc_idle_min_ms: 1,
             gc_pack_rewrite_min_reclaim_bytes: 1,
             gc_pack_rewrite_min_reclaim_percent: 25.0,

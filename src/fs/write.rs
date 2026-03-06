@@ -39,6 +39,7 @@ impl FsCore {
             .await?;
         self.bump_inode_data_version(op.ino).await;
         self.mark_mutation();
+        self.invalidate_inode_attr_best_effort(op.ino);
 
         self.dedup_hits
             .fetch_add(plan.dedup_hits, Ordering::Relaxed);
@@ -309,6 +310,7 @@ impl FsCore {
             .await?;
         self.mark_mutation();
         self.bump_inode_data_version(ino).await;
+        self.invalidate_inode_attr_best_effort(ino);
 
         Ok(inode)
     }

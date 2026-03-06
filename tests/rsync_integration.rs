@@ -845,3 +845,221 @@ fn cargo_like_concurrent_crud_integrity_persists() -> Result<()> {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+#[test]
+fn invalidation_sensitive_visibility_with_entry_ttl() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "mv",
+        "rm",
+        "ls",
+        "stat",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\nfuse_attr_ttl_ms = 4000\nfuse_entry_ttl_ms = 4000\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let vis_dir = mount_point.join("vis");
+    let vis_dir_s = vis_dir.to_string_lossy().into_owned();
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("mkdir -p '{}'", vis_dir_s)],
+    )?;
+
+    let created = vis_dir.join("created.txt");
+    let created_s = created.to_string_lossy().into_owned();
+    let created_stat_before = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if created_stat_before.status.success() {
+        bail!("created.txt unexpectedly existed before create")
+    }
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'create-visible' > '{}'", created_s)],
+    )?;
+
+    let created_stat_after = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if !created_stat_after.status.success() {
+        bail!("created.txt not visible immediately after create with entry TTL")
+    }
+
+    run_cmd(30, None, "rm", &["-f", &created_s])?;
+    let created_stat_deleted = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if created_stat_deleted.status.success() {
+        bail!("created.txt still visible immediately after unlink with entry TTL")
+    }
+
+    let old_name = vis_dir.join("old.txt");
+    let new_name = vis_dir.join("new.txt");
+    let old_s = old_name.to_string_lossy().into_owned();
+    let new_s = new_name.to_string_lossy().into_owned();
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'rename-source' > '{}'", old_s)],
+    )?;
+
+    let old_stat_before = run_cmd_raw(10, None, "stat", &[&old_s])?;
+    if !old_stat_before.status.success() {
+        bail!("old.txt missing before rename")
+    }
+    let new_stat_before = run_cmd_raw(10, None, "stat", &[&new_s])?;
+    if new_stat_before.status.success() {
+        bail!("new.txt unexpectedly existed before rename")
+    }
+
+    run_cmd(30, None, "mv", &[&old_s, &new_s])?;
+
+    let old_stat_after = run_cmd_raw(10, None, "stat", &[&old_s])?;
+    if old_stat_after.status.success() {
+        bail!("old.txt still visible immediately after rename with entry TTL")
+    }
+    let new_stat_after = run_cmd_raw(10, None, "stat", &[&new_s])?;
+    if !new_stat_after.status.success() {
+        bail!("new.txt not visible immediately after rename with entry TTL")
+    }
+
+    let ls_out = run_cmd(30, None, "ls", &["-1", &vis_dir_s])?;
+    let ls_text = String::from_utf8_lossy(&ls_out.stdout);
+    if ls_text.lines().any(|line| line == "old.txt") {
+        bail!("old.txt still listed after rename with entry TTL")
+    }
+    if !ls_text.lines().any(|line| line == "new.txt") {
+        bail!("new.txt missing from directory listing after rename with entry TTL")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn invalidation_sensitive_hardlink_visibility_with_entry_ttl() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "ln",
+        "rm",
+        "stat",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\nfuse_attr_ttl_ms = 4000\nfuse_entry_ttl_ms = 4000\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let hardlink_dir = mount_point.join("hardlink_vis");
+    let hardlink_dir_s = hardlink_dir.to_string_lossy().into_owned();
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("mkdir -p '{}'", hardlink_dir_s)],
+    )?;
+
+    let base = hardlink_dir.join("base.txt");
+    let alias = hardlink_dir.join("alias.txt");
+    let base_s = base.to_string_lossy().into_owned();
+    let alias_s = alias.to_string_lossy().into_owned();
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'hardlink-source' > '{}'", base_s)],
+    )?;
+
+    let alias_before = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if alias_before.status.success() {
+        bail!("alias.txt unexpectedly existed before link")
+    }
+
+    run_cmd(30, None, "ln", &[&base_s, &alias_s])?;
+
+    let alias_after = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if !alias_after.status.success() {
+        bail!("alias.txt not visible immediately after hardlink with entry TTL")
+    }
+
+    let base_stat = run_cmd(10, None, "stat", &["-c", "%i %h", &base_s])?;
+    let alias_stat = run_cmd(10, None, "stat", &["-c", "%i %h", &alias_s])?;
+    let base_sig = String::from_utf8_lossy(&base_stat.stdout).trim().to_owned();
+    let alias_sig = String::from_utf8_lossy(&alias_stat.stdout)
+        .trim()
+        .to_owned();
+    if base_sig != alias_sig {
+        bail!("hardlink inode/link-count mismatch: base={base_sig} alias={alias_sig}")
+    }
+
+    run_cmd(30, None, "rm", &["-f", &alias_s])?;
+    let alias_deleted = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if alias_deleted.status.success() {
+        bail!("alias.txt still visible immediately after unlink with entry TTL")
+    }
+
+    let base_after = run_cmd_raw(10, None, "stat", &[&base_s])?;
+    if !base_after.status.success() {
+        bail!("base.txt missing after alias unlink")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

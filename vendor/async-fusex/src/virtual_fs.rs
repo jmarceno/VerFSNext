@@ -148,7 +148,7 @@ pub trait VirtualFs: Sync + Send {
         gid: u32,
         parent: INum,
         name: &str,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)>;
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 
     /// Forget about an inode
     async fn forget(&self, ino: u64, nlookup: u64);
@@ -169,10 +169,10 @@ pub trait VirtualFs: Sync + Send {
     async fn readlink(&self, ino: u64) -> AsyncFusexResult<Vec<u8>>;
 
     /// Create file node.
-    async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)>;
+    async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 
     /// Create a directory
-    async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, FileAttr, u64)>;
+    async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 
     /// Remove a file
     async fn unlink(&self, uid: u32, gid: u32, parent: INum, name: &str) -> AsyncFusexResult<()>;
@@ -194,7 +194,7 @@ pub trait VirtualFs: Sync + Send {
         parent: INum,
         name: &str,
         target_path: &Path,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)>;
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 
     /// Rename a file
     async fn rename(&self, uid: u32, gid: u32, param: RenameParam) -> AsyncFusexResult<()>;
@@ -206,7 +206,7 @@ pub trait VirtualFs: Sync + Send {
         ino: u64,
         newparent: u64,
         newname: &str,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
         Err(AsyncFusexError::Unimplemented {
             context: vec!["link unimplemented".to_owned()],
         })
@@ -342,7 +342,7 @@ pub trait VirtualFs: Sync + Send {
         name: &str,
         mode: u32,
         flags: u32,
-    ) -> AsyncFusexResult<(Duration, FileAttr, u64, u64, u32)> {
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
         Err(AsyncFusexError::Unimplemented {
             context: vec!["create unimplemented".to_owned()],
         })
