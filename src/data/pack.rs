@@ -4,6 +4,7 @@ use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use moka::sync::Cache;
@@ -43,6 +44,7 @@ const RECORD_HEADER_LEN: usize = size_of::<ArchivedPackRecordHeader>();
 const RECORD_HEADER_LEN_U64: u64 = RECORD_HEADER_LEN as u64;
 const INDEX_ENTRY_LEN: usize = size_of::<ArchivedPackIndexRecord>();
 const INDEX_ENTRY_LEN_U64: u64 = INDEX_ENTRY_LEN as u64;
+const PACK_FILE_CACHE_CAPACITY: u64 = 256;
 
 #[repr(C, align(16))]
 struct AlignedBytes<const N: usize> {
@@ -83,6 +85,7 @@ pub struct PackStore {
     packs_dir: PathBuf,
     active: Mutex<ActivePack>,
     index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
+    pack_file_cache: Cache<u64, Arc<File>>,
     max_pack_size_bytes: u64,
 }
 
@@ -138,6 +141,9 @@ impl PackStore {
                 size_bytes,
             }),
             index_cache: Cache::builder().max_capacity(index_cache_capacity).build(),
+            pack_file_cache: Cache::builder()
+                .max_capacity(PACK_FILE_CACHE_CAPACITY)
+                .build(),
             max_pack_size_bytes,
         };
 
@@ -299,8 +305,7 @@ impl PackStore {
         }
 
         let path = self.pack_path(pack_id);
-        let file = File::open(&path)
-            .with_context(|| format!("failed to open pack file {}", path.display()))?;
+        let file = self.open_pack_file(pack_id)?;
 
         let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
         file.read_exact_at(raw_header.as_mut_slice(), index.offset)
@@ -693,8 +698,23 @@ impl PackStore {
         let _ = self
             .index_cache
             .invalidate_entries_if(move |(cached_pack_id, _), _| *cached_pack_id == pack_id);
+        self.pack_file_cache.invalidate(&pack_id);
         self.prime_index_cache(pack_id)?;
         Ok(())
+    }
+
+    fn open_pack_file(&self, pack_id: u64) -> Result<Arc<File>> {
+        if let Some(file) = self.pack_file_cache.get(&pack_id) {
+            return Ok(file);
+        }
+
+        let path = self.pack_path(pack_id);
+        let file = Arc::new(
+            File::open(&path)
+                .with_context(|| format!("failed to open pack file {}", path.display()))?,
+        );
+        self.pack_file_cache.insert(pack_id, Arc::clone(&file));
+        Ok(file)
     }
 
     fn lookup_index_entry(

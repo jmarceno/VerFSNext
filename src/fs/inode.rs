@@ -44,14 +44,47 @@ impl FsCore {
         self.ensure_inode_vault_access(&inode, context)?;
         Ok(inode)
     }
-    pub(crate) fn lookup_dirent(&self, parent: u64, name: &str) -> Result<Option<DirentRecord>> {
-        self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(dirent_key(parent, name.as_bytes()))? else {
-                return Ok(None);
+    pub(crate) fn lookup_inode_with_vault_access(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> Result<InodeRecord> {
+        let (parent_inode, inode) = self.meta.read_txn(|txn| {
+            let Some(parent_raw) = txn.get(inode_key(parent))? else {
+                return Err(anyhow_errno(
+                    Errno::ENOENT,
+                    format!("lookup: parent inode {} not found", parent),
+                ));
             };
-            let dirent: DirentRecord = decode_rkyv(&raw)?;
-            Ok(Some(dirent))
-        })
+            let parent_inode: InodeRecord = decode_rkyv(&parent_raw)?;
+
+            let ino = if name == "." {
+                parent
+            } else if name == ".." {
+                parent_inode.parent
+            } else {
+                let Some(dirent_raw) = txn.get(dirent_key(parent, name.as_bytes()))? else {
+                    return Err(anyhow_errno(
+                        Errno::ENOENT,
+                        format!("lookup: {} not found under inode {}", name, parent),
+                    ));
+                };
+                let dirent: DirentRecord = decode_rkyv(&dirent_raw)?;
+                dirent.ino
+            };
+
+            let Some(inode_raw) = txn.get(inode_key(ino))? else {
+                return Err(anyhow_errno(
+                    Errno::ENOENT,
+                    format!("lookup: inode {} not found", ino),
+                ));
+            };
+            let inode: InodeRecord = decode_rkyv(&inode_raw)?;
+            Ok((parent_inode, inode))
+        })?;
+        self.ensure_inode_vault_access(&parent_inode, "lookup")?;
+        self.ensure_inode_vault_access(&inode, "lookup")?;
+        Ok(inode)
     }
     pub(crate) fn ensure_dirent_target(
         txn: &surrealkv::Transaction,
@@ -178,10 +211,7 @@ impl FsCore {
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-        txn.set(
-            dirent_key_bytes,
-            encode_rkyv(&DirentRecord { ino, kind })?,
-        )?;
+        txn.set(dirent_key_bytes, encode_rkyv(&DirentRecord { ino, kind })?)?;
         txn.set(next_inode_key, (ino + 1).to_le_bytes().to_vec())?;
 
         if kind == INODE_KIND_DIR {

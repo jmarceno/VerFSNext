@@ -96,21 +96,29 @@ impl FsCore {
         extent: ExtentRecord,
         vault_encrypted: bool,
     ) -> Result<Vec<u8>> {
+        let payload = self.load_extent_payload(extent, vault_encrypted)?;
+        let mut payload = payload.as_ref().clone();
+        if payload.len() < BLOCK_SIZE {
+            payload.resize(BLOCK_SIZE, 0);
+        }
+        if payload.len() > BLOCK_SIZE {
+            payload.truncate(BLOCK_SIZE);
+        }
+        Ok(payload)
+    }
+    pub(crate) fn load_extent_payload(
+        &self,
+        extent: ExtentRecord,
+        vault_encrypted: bool,
+    ) -> Result<Arc<Vec<u8>>> {
         if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
-            let mut payload = cached.as_ref().clone();
-            if payload.len() < BLOCK_SIZE {
-                payload.resize(BLOCK_SIZE, 0);
-            }
-            if payload.len() > BLOCK_SIZE {
-                payload.truncate(BLOCK_SIZE);
-            }
-            return Ok(payload);
+            return Ok(cached);
         }
         self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let chunk = self.load_chunk_record(extent.chunk_hash)?;
-        let mut payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+        let payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
             if !vault_encrypted {
                 return Err(anyhow_errno(
                     Errno::EIO,
@@ -157,14 +165,9 @@ impl FsCore {
                 chunk.uncompressed_len,
             )?
         };
+        let payload = Arc::new(payload);
         self.chunk_data_cache
-            .insert(extent.chunk_hash, Arc::new(payload.clone()));
-        if payload.len() < BLOCK_SIZE {
-            payload.resize(BLOCK_SIZE, 0);
-        }
-        if payload.len() > BLOCK_SIZE {
-            payload.truncate(BLOCK_SIZE);
-        }
+            .insert(extent.chunk_hash, Arc::clone(&payload));
         Ok(payload)
     }
     // This is conservative and done late on purpose. Change it may require larger refactors.

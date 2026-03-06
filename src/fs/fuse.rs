@@ -19,35 +19,12 @@ impl VirtualFs for VerFs {
         parent: INum,
         name: &str,
     ) -> AsyncFusexResult<(Duration, FileAttr, u64)> {
-        let parent_inode = self
-            .core
-            .load_inode_with_vault_access(parent, "lookup")
-            .map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
-
-        let ino = if name == "." {
-            parent
-        } else if name == ".." {
-            parent_inode.parent
-        } else {
-            let Some(dirent) = self
-                .core
-                .lookup_dirent(parent, name)
-                .map_err(map_anyhow_to_fuse)?
-            else {
-                return build_error_result_from_errno(
-                    Errno::ENOENT,
-                    format!("lookup: {} not found under inode {}", name, parent),
-                );
-            };
-            dirent.ino
-        };
-
         let inode = self
             .core
-            .load_inode_with_vault_access(ino, "lookup")
+            .lookup_inode_with_vault_access(parent, name)
             .map_err(map_anyhow_to_fuse)?;
 
         let attr = self.core.file_attr_from_inode(&inode);
@@ -275,7 +252,8 @@ impl VirtualFs for VerFs {
                 let (sec, nsec) = system_time_to_parts(now);
                 inode.ctime_sec = sec;
                 inode.ctime_nsec = nsec;
-                let defer_final_delete = inode.nlink <= 1 && self.core.open_file_count(inode.ino) > 0;
+                let defer_final_delete =
+                    inode.nlink <= 1 && self.core.open_file_count(inode.ino) > 0;
                 let _removed_inode =
                     FsCore::remove_name_from_inode_in_txn(txn, &mut inode, defer_final_delete)?;
                 Ok(())
@@ -564,7 +542,8 @@ impl VirtualFs for VerFs {
                         ));
                     }
                     if target_is_dir {
-                        let _pruned = FsCore::prune_orphan_dirents_in_dir_txn(txn, target_inode.ino)?;
+                        let _pruned =
+                            FsCore::prune_orphan_dirents_in_dir_txn(txn, target_inode.ino)?;
                     }
                     if target_is_dir && !FsCore::is_dir_empty(txn, target_inode.ino)? {
                         return Err(anyhow_errno(
@@ -725,108 +704,39 @@ impl VirtualFs for VerFs {
             self.core.chunk_meta_cache.insert(*hash, chunk.clone());
         }
 
-        let mut out = Vec::with_capacity((read_end - offset) as usize);
+        let initial_buf_len = buf.len();
+        buf.reserve((read_end - offset) as usize);
         for block_idx in start_block..=end_block {
-            let mut block = vec![0_u8; BLOCK_SIZE];
+            let block_start = block_idx * BLOCK_SIZE as u64;
+            let from = offset.max(block_start) as usize - block_start as usize;
+            let to = read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
             if let Some(extent) = extents.get(&block_idx) {
-                let Some(chunk) = chunks.get(&extent.chunk_hash) else {
+                if !chunks.contains_key(&extent.chunk_hash) {
                     return build_error_result_from_errno(
                         Errno::EIO,
                         format!("missing chunk metadata for block {}", block_idx),
                     );
-                };
-                let mut payload =
-                    if let Some(cached) = self.core.chunk_data_cache.get(&extent.chunk_hash) {
-                        self.core
-                            .chunk_data_cache_hits
-                            .fetch_add(1, Ordering::Relaxed);
-                        cached.as_ref().clone()
-                    } else {
-                        self.core
-                            .chunk_data_cache_misses
-                            .fetch_add(1, Ordering::Relaxed);
-                        let bytes = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
-                            if !FsCore::inode_is_vault(&inode) {
-                                return build_error_result_from_errno(
-                                    Errno::EIO,
-                                    "encrypted chunk mapped outside vault inode".to_owned(),
-                                );
-                            }
-                            let (encrypted, index) = self
-                                .core
-                                .packs
-                                .read_chunk_payload_with_index(
-                                    chunk.pack_id,
-                                    extent.chunk_hash,
-                                    chunk.codec,
-                                    chunk.uncompressed_len,
-                                    chunk.compressed_len,
-                                )
-                                .map_err(map_anyhow_to_fuse)?;
-                            self.core.validate_pack_payload_crc32(
-                                chunk.pack_id,
-                                extent.chunk_hash,
-                                index.payload_crc32,
-                                &encrypted,
-                            );
-                            let folder_key =
-                                self.core.current_vault_key().map_err(map_anyhow_to_fuse)?;
-                            let compressed =
-                                decrypt_chunk_payload(&folder_key, &chunk.nonce, &encrypted)
-                                    .map_err(map_anyhow_to_fuse)?;
-                            crate::data::compress::decompress_chunk(
-                                chunk.codec,
-                                &compressed,
-                                chunk.uncompressed_len,
-                            )
-                            .map_err(map_anyhow_to_fuse)?
-                        } else {
-                            let (compressed, index) = self
-                                .core
-                                .packs
-                                .read_chunk_payload_with_index(
-                                    chunk.pack_id,
-                                    extent.chunk_hash,
-                                    chunk.codec,
-                                    chunk.uncompressed_len,
-                                    chunk.compressed_len,
-                                )
-                                .map_err(map_anyhow_to_fuse)?;
-                            self.core.validate_pack_payload_crc32(
-                                chunk.pack_id,
-                                extent.chunk_hash,
-                                index.payload_crc32,
-                                &compressed,
-                            );
-                            crate::data::compress::decompress_chunk(
-                                chunk.codec,
-                                &compressed,
-                                chunk.uncompressed_len,
-                            )
-                            .map_err(map_anyhow_to_fuse)?
-                        };
-                        self.core
-                            .chunk_data_cache
-                            .insert(extent.chunk_hash, Arc::new(bytes.clone()));
-                        bytes
-                    };
-                if payload.len() < BLOCK_SIZE {
-                    payload.resize(BLOCK_SIZE, 0);
                 }
-                if payload.len() > BLOCK_SIZE {
-                    payload.truncate(BLOCK_SIZE);
+
+                let payload = self
+                    .core
+                    .load_extent_payload(*extent, FsCore::inode_is_vault(&inode))
+                    .map_err(map_anyhow_to_fuse)?;
+                let payload_len = payload.len().min(BLOCK_SIZE);
+                let available_end = payload_len.min(to);
+                if available_end > from {
+                    buf.extend_from_slice(&payload[from..available_end]);
                 }
-                block = payload;
+                if to > available_end {
+                    buf.resize(buf.len() + (to - available_end), 0);
+                }
+                continue;
             }
 
-            let block_start = block_idx * BLOCK_SIZE as u64;
-            let from = offset.max(block_start) as usize - block_start as usize;
-            let to = read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
-            out.extend_from_slice(&block[from..to]);
+            buf.resize(buf.len() + (to - from), 0);
         }
 
-        let read_len = out.len();
-        buf.extend_from_slice(&out);
+        let read_len = buf.len() - initial_buf_len;
         self.core
             .read_bytes_total
             .fetch_add(read_len as u64, Ordering::Relaxed);
