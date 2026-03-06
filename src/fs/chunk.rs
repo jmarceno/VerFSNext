@@ -167,6 +167,7 @@ impl FsCore {
         }
         Ok(payload)
     }
+    // This is conservative and done late on purpose. Change it may require larger refactors.
     pub(crate) fn stage_chunk_if_missing(
         &self,
         chunk_hash: [u8; 16],
