@@ -376,7 +376,6 @@ case "$ACTION" in
     build_binary
     install_binary
     restart_if_active
-    ensure_control_socket_permissions
     ;;
   *)
     echo "unknown command: $ACTION" >&2
