@@ -1,1 +1,3 @@
 {"type":"config","name":"Improved Read Speeds","metricName":"summary_total","metricUnit":"ms","bestDirection":"lower"}
+{"run":1,"commit":"19fff04","metric":1136.6,"metrics":{"sm_write_dura":143.8,"sm_read":35.1,"lg_write_dura":124.2,"lg_read":24.3,"sync_barrier":803.9},"status":"keep","description":"Baseline run on autoresearch branch (fast benchmark). summary_total=1136.6ms.","timestamp":1777664608298,"segment":0,"confidence":null}
+{"run":2,"commit":"19fff04","metric":1173.9,"metrics":{"sm_write_dura":124.4,"sm_read":35,"lg_write_dura":52.7,"lg_read":25.6,"sync_barrier":930.5},"status":"discard","description":"Baseline re-run #2. summary_total=1173.9ms (worse, within noise).","timestamp":1777664866503,"segment":0,"confidence":null}
