@@ -176,6 +176,18 @@ impl MetaStore {
         f(&txn)
     }
 
+    /// Lightweight point-read without creating a full transaction.
+    ///
+    /// Uses the Tree's `get_value` method which creates a temporary snapshot
+    /// for a single key lookup, avoiding the overhead of Transaction creation.
+    /// Use this for simple existence checks or metadata lookups where full
+    /// transaction isolation is not required.
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.tree
+            .get_value(key)
+            .context("failed to get value from SurrealKV")
+    }
+
     pub async fn write_txn<F>(&self, f: F) -> Result<()>
     where
         F: FnOnce(&mut surrealkv::Transaction) -> Result<()>,
