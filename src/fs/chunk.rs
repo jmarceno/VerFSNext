@@ -182,6 +182,13 @@ impl FsCore {
             return Ok(false);
         }
 
+        // Fast-path: check the in-memory chunk meta cache before falling back
+        // to a SurrealKV read transaction. This avoids an expensive point-read
+        // snapshot for chunks whose metadata is already resident (e.g. dedup hits).
+        if self.chunk_meta_cache.contains_key(&chunk_hash) {
+            return Ok(false);
+        }
+
         let exists = self
             .meta
             .read_txn(|txn| Ok(txn.get(chunk_key(&chunk_hash))?.is_some()))?;
