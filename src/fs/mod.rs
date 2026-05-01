@@ -209,6 +209,9 @@ struct FsCore {
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
     file_handles: Mutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
+    /// Persistent read-plan cache keyed by (ino, data_version).
+    /// Survives across file close/reopen, unlike the fh-keyed cache.
+    file_read_plan_inode_cache: Cache<(u64, u64), Arc<SmallFileReadPlan>>,
     notifier: ParkingRwLock<Option<Arc<SessionNotifier>>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
@@ -298,6 +301,9 @@ impl VerFs {
             dir_handles: Mutex::new(HashMap::new()),
             file_handles: Mutex::new(HashMap::new()),
             file_read_plan_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
+            file_read_plan_inode_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
             notifier: ParkingRwLock::new(None),
@@ -599,7 +605,15 @@ impl FsCore {
         if state.inode_data_version != inode_data_version {
             return Ok(None);
         }
-        Ok(self.file_read_plan_cache.get(&fh).map(|plan| plan.as_ref().clone()))
+        // Check file-handle-keyed cache first (fastest)
+        if let Some(plan) = self.file_read_plan_cache.get(&fh) {
+            return Ok(Some(plan.as_ref().clone()));
+        }
+        // Fall back to persistent inode-keyed cache (survives close/reopen)
+        Ok(self
+            .file_read_plan_inode_cache
+            .get(&(ino, inode_data_version))
+            .map(|plan| plan.as_ref().clone()))
     }
 
     async fn store_small_file_read_plan(
@@ -628,7 +642,11 @@ impl FsCore {
         state.inode_data_version = inode_data_version;
         drop(handles);
         if let Some(plan) = small_file_read_plan {
-            self.file_read_plan_cache.insert(fh, Arc::new(plan));
+            let arc = Arc::new(plan);
+            self.file_read_plan_cache.insert(fh, Arc::clone(&arc));
+            // Also insert into persistent inode-keyed cache
+            self.file_read_plan_inode_cache
+                .insert((ino, inode_data_version), arc);
         } else {
             self.file_read_plan_cache.invalidate(&fh);
         }
