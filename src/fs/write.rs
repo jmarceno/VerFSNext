@@ -37,6 +37,7 @@ impl FsCore {
 
         self.commit_prepared_write(op.ino, &mut inode, &plan)
             .await?;
+        self.invalidate_inode_cache(op.ino);
         self.bump_inode_data_version(op.ino).await;
         self.mark_mutation();
         self.invalidate_inode_attr_best_effort(op.ino);
@@ -308,6 +309,7 @@ impl FsCore {
                 Ok(())
             })
             .await?;
+        self.invalidate_inode_cache(ino);
         self.mark_mutation();
         self.bump_inode_data_version(ino).await;
         self.invalidate_inode_attr_best_effort(ino);
