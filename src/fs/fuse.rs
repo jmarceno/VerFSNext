@@ -696,7 +696,7 @@ impl VirtualFs for VerFs {
             self.core.increment_open_file_count(ino);
         }
         let fh = self.core.new_handle();
-        let inode_data_version = self.core.inode_data_version(ino).await;
+        let inode_data_version = self.core.inode_data_version(ino);
         self.core
             .register_file_handle(fh, ino, inode_data_version)
             .await;
@@ -746,7 +746,7 @@ impl VirtualFs for VerFs {
 
         const HANDLE_READ_PLAN_MAX_BLOCKS: u64 = 4;
         if inode.size <= BLOCK_SIZE as u64 * HANDLE_READ_PLAN_MAX_BLOCKS {
-            let current_version = self.core.inode_data_version(ino).await;
+            let current_version = self.core.inode_data_version(ino);
             let mut plan = self
                 .core
                 .get_small_file_read_plan(fh, ino, current_version)
@@ -1267,7 +1267,7 @@ impl VirtualFs for VerFs {
         self.core.invalidate_inode_attr_best_effort(inode.ino);
         self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
-        let inode_data_version = self.core.inode_data_version(inode.ino).await;
+        let inode_data_version = self.core.inode_data_version(inode.ino);
         self.core
             .register_file_handle(fh, inode.ino, inode_data_version)
             .await;

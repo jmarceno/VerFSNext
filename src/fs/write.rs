@@ -14,7 +14,7 @@ struct PreparedWritePlan {
 
 impl FsCore {
     pub(crate) async fn apply_single_write(&self, op: WriteOp) -> Result<()> {
-        let prepared_version = self.inode_data_version(op.ino).await;
+        let prepared_version = self.inode_data_version(op.ino);
         let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
         self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
         if op.data.is_empty() {
@@ -28,7 +28,7 @@ impl FsCore {
 
         let mut inode = self.load_inode_or_errno(op.ino, "write")?;
         self.ensure_write_target_inode(op.ino, &inode)?;
-        let current_version = self.inode_data_version(op.ino).await;
+        let current_version = self.inode_data_version(op.ino);
         if current_version != prepared_version {
             // The inode data changed while this write was being prepared (e.g., truncate).
             // Re-prepare against the latest state while we hold the inode lock.
@@ -38,7 +38,7 @@ impl FsCore {
         self.commit_prepared_write(op.ino, &mut inode, &plan)
             .await?;
         self.invalidate_inode_cache(op.ino);
-        self.bump_inode_data_version(op.ino).await;
+        self.bump_inode_data_version(op.ino);
         self.mark_mutation();
         self.invalidate_inode_attr_best_effort(op.ino);
 
@@ -311,7 +311,7 @@ impl FsCore {
             .await?;
         self.invalidate_inode_cache(ino);
         self.mark_mutation();
-        self.bump_inode_data_version(ino).await;
+        self.bump_inode_data_version(ino);
         self.invalidate_inode_attr_best_effort(ino);
 
         Ok(inode)

@@ -203,7 +203,7 @@ struct FsCore {
     writes_since_last_drain: AtomicU64,
     write_lock: AsyncRwLock<()>,
     inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
-    inode_data_versions: Mutex<HashMap<u64, u64>>,
+    inode_data_versions: ParkingMutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
@@ -295,7 +295,7 @@ impl VerFs {
             writes_since_last_drain: AtomicU64::new(0),
             write_lock: AsyncRwLock::new(()),
             inode_write_locks: Mutex::new(HashMap::new()),
-            inode_data_versions: Mutex::new(HashMap::new()),
+            inode_data_versions: ParkingMutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
@@ -474,13 +474,13 @@ impl FsCore {
         if let Some(dirent) = self.dirent_cache.get(&key) {
             return Ok(dirent);
         }
-        let dirent = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(dirent_key(parent, name))? else {
-                return Ok(None);
-            };
-            let dirent: DirentRecord = decode_rkyv(&raw)?;
-            Ok(Some(dirent))
-        })?;
+        let dirent = match self.meta.get_value(&dirent_key(parent, name))? {
+            Some(raw) => {
+                let d: DirentRecord = decode_rkyv(&raw)?;
+                Some(d)
+            }
+            None => None,
+        };
         self.dirent_cache.insert(key, dirent.clone());
         Ok(dirent)
     }
@@ -510,13 +510,13 @@ impl FsCore {
         lock
     }
 
-    async fn inode_data_version(&self, ino: u64) -> u64 {
-        let mut versions = self.inode_data_versions.lock().await;
+    fn inode_data_version(&self, ino: u64) -> u64 {
+        let mut versions = self.inode_data_versions.lock();
         *versions.entry(ino).or_insert(0)
     }
 
-    async fn bump_inode_data_version(&self, ino: u64) {
-        let mut versions = self.inode_data_versions.lock().await;
+    fn bump_inode_data_version(&self, ino: u64) {
+        let mut versions = self.inode_data_versions.lock();
         let entry = versions.entry(ino).or_insert(0);
         *entry = entry.saturating_add(1);
     }
