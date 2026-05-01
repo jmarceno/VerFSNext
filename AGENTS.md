@@ -39,9 +39,13 @@ VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-1
 ## Update SurrealKV Architecture Documentation after any change to SurrealKV code
 - [SurrealKV Architecture](vendor/surrealkv/docs/ARCHITECTURE.md)
 
+## When working on issues/bugs, consult our Bug Fix history to better undertand impact and possible regressions
+- [Bug fix history](docs/bug-fix-history.md)
+- Always update this document after solving a bug or an issue
+
 DO NOT CREATE NEW TESTS IF YOU ARE NOT EXPLICITLY ASKED TO DO SO.
-DO NOT PRESERVE BACKWARD COMPATIBILITY IF NOT EXPLICITLY ASKED TO DO SO.
 DO NOT COMMENT OUT OR KEEP LEGACY CODE IN THE CODEBASE, IF YOU NEED TO CHANGE SOMETHING, CHANGE IT AND REMOVE THE OLD CODE.
 DO NOT USE PIP, ALWAYS USE UV AND GIVE INSTRUCTIONS ON HOW TO USE IT.
 DO NOT ADD FALLBACKS
 DO NOT WRITE DEFENSIVE CODE
+DO NOT SWALLOW ERRORS, ALWAYS MAKE THEM EXPLICIT AND LOG THEM
