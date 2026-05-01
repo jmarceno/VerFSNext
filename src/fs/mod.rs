@@ -207,7 +207,7 @@ struct FsCore {
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: Mutex<HashMap<u64, DirHandleState>>,
-    file_handles: Mutex<HashMap<u64, FileHandleState>>,
+    file_handles: ParkingMutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
     /// Persistent read-plan cache keyed by (ino, data_version).
     /// Survives across file close/reopen, unlike the fh-keyed cache.
@@ -299,7 +299,7 @@ impl VerFs {
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
             dir_handles: Mutex::new(HashMap::new()),
-            file_handles: Mutex::new(HashMap::new()),
+            file_handles: ParkingMutex::new(HashMap::new()),
             file_read_plan_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
@@ -548,8 +548,8 @@ impl FsCore {
         self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
     }
 
-    async fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {
-        let mut handles = self.file_handles.lock().await;
+    fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {
+        let mut handles = self.file_handles.lock();
         handles.insert(
             fh,
             FileHandleState {
@@ -560,8 +560,8 @@ impl FsCore {
         self.file_read_plan_cache.invalidate(&fh);
     }
 
-    async fn validate_file_handle(&self, fh: u64, ino: u64) -> Result<()> {
-        let handles = self.file_handles.lock().await;
+    fn validate_file_handle(&self, fh: u64, ino: u64) -> Result<()> {
+        let handles = self.file_handles.lock();
         let Some(state) = handles.get(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -580,13 +580,13 @@ impl FsCore {
         Ok(())
     }
 
-    async fn get_small_file_read_plan(
+    fn get_small_file_read_plan(
         &self,
         fh: u64,
         ino: u64,
         inode_data_version: u64,
     ) -> Result<Option<SmallFileReadPlan>> {
-        let handles = self.file_handles.lock().await;
+        let handles = self.file_handles.lock();
         let Some(state) = handles.get(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -616,14 +616,14 @@ impl FsCore {
             .map(|plan| plan.as_ref().clone()))
     }
 
-    async fn store_small_file_read_plan(
+    fn store_small_file_read_plan(
         &self,
         fh: u64,
         ino: u64,
         inode_data_version: u64,
         small_file_read_plan: Option<SmallFileReadPlan>,
     ) -> Result<()> {
-        let mut handles = self.file_handles.lock().await;
+        let mut handles = self.file_handles.lock();
         let Some(state) = handles.get_mut(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -653,8 +653,8 @@ impl FsCore {
         Ok(())
     }
 
-    async fn unregister_file_handle(&self, fh: u64) {
-        let mut handles = self.file_handles.lock().await;
+    fn unregister_file_handle(&self, fh: u64) {
+        let mut handles = self.file_handles.lock();
         handles.remove(&fh);
         drop(handles);
         self.file_read_plan_cache.invalidate(&fh);

@@ -698,8 +698,7 @@ impl VirtualFs for VerFs {
         let fh = self.core.new_handle();
         let inode_data_version = self.core.inode_data_version(ino);
         self.core
-            .register_file_handle(fh, ino, inode_data_version)
-            .await;
+            .register_file_handle(fh, ino, inode_data_version);
         Ok(fh)
     }
 
@@ -714,7 +713,6 @@ impl VirtualFs for VerFs {
         self.core.mark_activity();
         self.core
             .validate_file_handle(fh, ino)
-            .await
             .map_err(map_anyhow_to_fuse)?;
         // Skip the drain if no writes have been enqueued since the last one.
         // This avoids an async channel round-trip when the batcher is known-empty,
@@ -750,7 +748,6 @@ impl VirtualFs for VerFs {
             let mut plan = self
                 .core
                 .get_small_file_read_plan(fh, ino, current_version)
-                .await
                 .map_err(map_anyhow_to_fuse)?;
 
             if plan.is_none() {
@@ -796,7 +793,6 @@ impl VirtualFs for VerFs {
                         current_version,
                         Some(built_plan.clone()),
                     )
-                    .await
                     .map_err(map_anyhow_to_fuse)?;
                 plan = Some(built_plan);
             }
@@ -847,7 +843,6 @@ impl VirtualFs for VerFs {
                 }
                 self.core
                     .store_small_file_read_plan(fh, ino, current_version, None)
-                    .await
                     .map_err(map_anyhow_to_fuse)?;
             }
 
@@ -888,7 +883,6 @@ impl VirtualFs for VerFs {
 
             self.core
                 .store_small_file_read_plan(fh, ino, current_version, Some(rebuilt_plan.clone()))
-                .await
                 .map_err(map_anyhow_to_fuse)?;
 
             for (hash, chunk) in rebuilt_plan.chunks.iter() {
@@ -1079,7 +1073,7 @@ impl VirtualFs for VerFs {
                 .map_err(map_anyhow_to_fuse)?;
         }
         self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
-        self.core.unregister_file_handle(fh).await;
+        self.core.unregister_file_handle(fh);
         {
             let _open_guard = self.core.write_lock.read().await;
             self.core.decrement_open_file_count(ino);
@@ -1269,8 +1263,7 @@ impl VirtualFs for VerFs {
         let fh = self.core.new_handle();
         let inode_data_version = self.core.inode_data_version(inode.ino);
         self.core
-            .register_file_handle(fh, inode.ino, inode_data_version)
-            .await;
+            .register_file_handle(fh, inode.ino, inode_data_version);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
