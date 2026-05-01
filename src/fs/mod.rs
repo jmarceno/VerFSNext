@@ -206,7 +206,7 @@ struct FsCore {
     inode_data_versions: ParkingMutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
-    dir_handles: Mutex<HashMap<u64, DirHandleState>>,
+    dir_handles: ParkingMutex<HashMap<u64, DirHandleState>>,
     file_handles: ParkingMutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
     /// Persistent read-plan cache keyed by (ino, data_version).
@@ -298,7 +298,7 @@ impl VerFs {
             inode_data_versions: ParkingMutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
-            dir_handles: Mutex::new(HashMap::new()),
+            dir_handles: ParkingMutex::new(HashMap::new()),
             file_handles: ParkingMutex::new(HashMap::new()),
             file_read_plan_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)

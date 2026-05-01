@@ -1109,7 +1109,7 @@ impl VirtualFs for VerFs {
             );
         }
         let fh = self.core.new_handle();
-        let mut dir_handles = self.core.dir_handles.lock().await;
+        let mut dir_handles = self.core.dir_handles.lock();
         dir_handles.insert(
             fh,
             DirHandleState {
@@ -1140,7 +1140,7 @@ impl VirtualFs for VerFs {
         }
 
         {
-            let dir_handles = self.core.dir_handles.lock().await;
+            let dir_handles = self.core.dir_handles.lock();
             if let Some(state) = dir_handles.get(&fh) {
                 if state.ino != ino {
                     return build_error_result_from_errno(
@@ -1159,7 +1159,7 @@ impl VirtualFs for VerFs {
             .build_dir_snapshot(ino, &inode)
             .map_err(map_anyhow_to_fuse)?;
         {
-            let mut dir_handles = self.core.dir_handles.lock().await;
+            let mut dir_handles = self.core.dir_handles.lock();
             if let Some(state) = dir_handles.get_mut(&fh) {
                 if state.ino != ino {
                     return build_error_result_from_errno(
@@ -1180,7 +1180,7 @@ impl VirtualFs for VerFs {
     }
 
     async fn releasedir(&self, _ino: u64, fh: u64, _flags: u32) -> AsyncFusexResult<()> {
-        let mut dir_handles = self.core.dir_handles.lock().await;
+        let mut dir_handles = self.core.dir_handles.lock();
         dir_handles.remove(&fh);
         Ok(())
     }
