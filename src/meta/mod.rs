@@ -201,13 +201,12 @@ impl MetaStore {
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeRecord>> {
-        self.read_txn(|txn| {
-            let Some(raw) = txn.get(inode_key(ino))? else {
-                return Ok(None);
-            };
-            let inode: InodeRecord = decode_rkyv(&raw)?;
-            Ok(Some(inode))
-        })
+        // Use lightweight point-read instead of full transaction for simple lookup
+        let Some(raw) = self.get_value(&inode_key(ino))? else {
+            return Ok(None);
+        };
+        let inode: InodeRecord = decode_rkyv(&raw)?;
+        Ok(Some(inode))
     }
 
     pub fn get_u64_sys(&self, name: &str) -> Result<u64> {
