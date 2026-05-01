@@ -186,6 +186,10 @@ impl FsCore {
         // to a SurrealKV read. This avoids an expensive point-read snapshot
         // for chunks whose metadata is already resident (e.g. dedup hits).
         if self.chunk_meta_cache.contains_key(&chunk_hash) {
+            // Warm data cache even on dedup hit: the block data is available
+            // and will be useful for future reads.
+            self.chunk_data_cache
+                .insert(chunk_hash, Arc::new(data.to_vec()));
             return Ok(false);
         }
 
@@ -197,6 +201,10 @@ impl FsCore {
             .get_value(&chunk_key(&chunk_hash))?
             .is_some();
         if exists {
+            // Warm data cache on dedup hit: insert the available block data
+            // so future reads of this chunk skip pack I/O + decompression.
+            self.chunk_data_cache
+                .insert(chunk_hash, Arc::new(data.to_vec()));
             return Ok(false);
         }
 
