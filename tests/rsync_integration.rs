@@ -1063,3 +1063,232 @@ fn invalidation_sensitive_hardlink_visibility_with_entry_ttl() -> Result<()> {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+/// Benchmark copying files with the same profile as the ComfyUI install at
+/// `/mnt/verfs/comfyui/`. That dataset has three tiers:
+///
+///   Tier       Files   Size     Profile
+///   ────────────────────────────────────────
+///   comfy-env  72K      9 GB    Python venv: many tiny files <64KB
+///   ComfyUI    14K    2+ GB     App code: mostly <16KB
+///   models    110     14 GB     Model weights: 124 MB – 3.4 GB
+///
+/// We downsample to ~500 small files (23 MB) + 2 large files (192 MB) so the
+/// benchmark finishes in ~10 s but still exercises the same I/O patterns.
+///
+/// **Durability measurement** – every file is individually `fsync`'d through
+/// FUSE (triggers `batcher.drain()` + `sync_cycle()`), and a system-wide
+/// `sync()` acts as a final barrier.  All timing is wall-clock.
+#[test]
+fn bench_comfyui_profile() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "dd",
+        "sync",
+        "sha256sum",
+        "python3",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("mount dir")?;
+    fs::create_dir_all(&data_dir).context("data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\n\
+         sync_interval_ms = 1000\nbatch_max_blocks = 3000\n\
+         batch_flush_interval_ms = 250\n\
+         fuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), &config).context("config")?;
+
+    // ── Seed content ──────────────────────────────────────────────────────
+    // Deterministic high-entropy block so dedup does not collapse our writes.
+    let seed_file = root.join("seed.bin");
+    let mut sf = File::create(&seed_file).context("seed file")?;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut block = vec![0u8; 1024 * 1024];
+    for _ in 0..256 {
+        for byte in &mut block {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 56) as u8;
+        }
+        sf.write_all(&block).context("seed chunk")?;
+    }
+    drop(sf);
+    let seed_s = seed_file.to_string_lossy();
+
+    // ── Launch daemon ─────────────────────────────────────────────────────
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let mnt_s = mount_point.to_string_lossy();
+
+    // ── Benchmark script ───────────────────────────────────────────────────
+    let script = format!(
+        r#"set -euo pipefail
+SEED={seed_s}
+MNT={mnt_s}
+
+phase() {{
+    local name="$1" start="$2" end="$3"
+    echo "BENCH:$name:$(( end - start ))"
+}}
+
+# ---- Phase 1: small files (comfy-env profile) -------------------------------
+# 100 packages x 5 files each, sizes mimicking a Python venv:
+#   tier-1  35 %    <1 KB      (config / __init__)
+#   tier-2  50 %    1-64 KB    (source modules)
+#   tier-3  15 %   64 KB-1 MB  (compiled extensions / data)
+
+SITE="$MNT/lib/python3.13/site-packages"
+BINDIR="$MNT/bin"
+mkdir -p "$SITE" "$BINDIR"
+
+p1_start=$(date +%s%N)
+
+for pkg in $(seq 1 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    mkdir -p "$pdir"
+    for slot in 0 1 2 3 4; do
+        idx=$(( (pkg - 1) * 5 + slot + 1 ))
+        if [ "$idx" -le 175 ]; then
+            size=$(( 128 + (idx * 7) % 896 ))
+        elif [ "$idx" -le 425 ]; then
+            size=$(( 1024 + (idx * 13) % 64512 ))
+        else
+            size=$(( 65536 + (idx * 17) % 720896 ))
+        fi
+        fname="mod_$(printf '%02d' "$slot").py"
+        [ "$slot" -eq 0 ] && fname="__init__.py"
+        dd if="$SEED" bs=1024 count=$(( size / 1024 + 1 )) 2>/dev/null \
+            | dd bs=1 count="$size" of="$pdir/$fname" conv=fsync 2>/dev/null
+    done
+done
+
+for i in $(seq 1 10); do
+    sz=$(( 256 + (i * 11) % 768 ))
+    dd if="$SEED" bs=1024 count=1 2>/dev/null \
+        | dd bs=1 count="$sz" of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+done
+
+p1_end=$(date +%s%N)
+phase "sm_write_dura" "$p1_start" "$p1_end"
+
+# ---- Phase 2: read small files back ----------------------------------------
+p2_start=$(date +%s%N)
+find "$SITE" -type f -exec sha256sum {{}} + > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p2_end=$(date +%s%N)
+phase "sm_read" "$p2_start" "$p2_end"
+
+# ---- Phase 3: large files (model profile) -----------------------------------
+# 64 MB checkpoint-like + 128 MB diffusion-model-like
+MODELS="$MNT/models"
+mkdir -p "$MODELS"
+
+p3_start=$(date +%s%N)
+dd if="$SEED" bs=1M count=64 of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
+dd if="$SEED" bs=1M skip=64 count=128 of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+p3_end=$(date +%s%N)
+phase "lg_write_dura" "$p3_start" "$p3_end"
+
+# ---- Phase 4: read large files back -----------------------------------------
+p4_start=$(date +%s%N)
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+p4_end=$(date +%s%N)
+phase "lg_read" "$p4_start" "$p4_end"
+
+# ---- Phase 5: final durability barrier (system-wide sync) -------------------
+p5_start=$(date +%s%N)
+sync
+p5_end=$(date +%s%N)
+phase "sync_barrier" "$p5_start" "$p5_end"
+
+echo "---"
+echo "BENCH:summary_total:$(( p5_end - p1_start ))"
+"#,
+    );
+
+    let out = run_cmd(300, Some(&root), "bash", &["-c", &script])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    for line in stdout.lines() {
+        if line.starts_with("BENCH:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let name = parts[1];
+                let ns: u128 = parts[2].parse().unwrap_or(0);
+                let ms = ns as f64 / 1_000_000.0;
+                println!("  {name:20}  {ms:>8.1} ms");
+            }
+        }
+    }
+
+    // Sanity checks
+    let sm_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "-path",
+        "*/lib/python*",
+    ])?;
+    let sm_count = String::from_utf8_lossy(&sm_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(
+        sm_count == 500,
+        "expected 500 small files, got {}",
+        sm_count
+    );
+
+    let lg_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "-path",
+        "*/models/*",
+    ])?;
+    let lg_count = String::from_utf8_lossy(&lg_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(lg_count == 2, "expected 2 large files, got {}", lg_count);
+
+    for path in &["models/checkpoint.bin", "models/diffusion.bin"] {
+        let stat_out = run_cmd(
+            30,
+            None,
+            "stat",
+            &["-c", "%s", &format!("{}/{}", mnt_s, path)],
+        )?;
+        let size: u64 = String::from_utf8_lossy(&stat_out.stdout)
+            .trim()
+            .parse()
+            .context("stat size")?;
+        anyhow::ensure!(size > 0, "{} is empty", path);
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

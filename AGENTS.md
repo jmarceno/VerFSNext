@@ -13,6 +13,8 @@ This migration path must be documented in the migration guide and must be run au
 
 ## Commands
 - Build: `cargo build --release`
+- Run benchmark: `VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test bench_comfyui_profile --test rsync_integration -- --nocapture`
+  - Only on Linux with FUSE; requires `mountpoint`, `fusermount`, `bash`, `dd`, `sync`, `sha256sum`, `python3`
 
 ## Testing Policy
 - Prefer writing integration tests over unit tests and always use OS commands when dealing with the filesystem, never write tests that interact with the internal API of the system.

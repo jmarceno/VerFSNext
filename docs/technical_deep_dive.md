@@ -266,6 +266,29 @@ The repository now includes a Phase 5 implementation on top of the existing full
 4. Each rewritten index is written to a temporary file and atomically renamed into place.
 5. After all indexes are rewritten, VerFS writes the migration marker and initializes `SYS:pack_crc32_read_errors` if it does not already exist.
 
+## Benchmark: ComfyUI Profile (`bench_comfyui_profile`)
+
+Mirrors the I/O profile of a typical ComfyUI installation folder (72K small files in a Python venv + 110 large model files):
+
+| Phase | Files | Total Data | What It Measures |
+|-------|-------|-----------|------------------|
+| `sm_write_dura` | 510 small (1 KB – 1 MB) | ~23 MB | Write + fsync through FUSE |
+| `sm_read` | 510 small | ~23 MB | Sequential readback + sha256sum |
+| `lg_write_dura` | 2 (64 MB + 128 MB) | 192 MB | Large sequential write + fsync |
+| `lg_read` | 2 | 192 MB | Large file readback + sha256sum |
+| `sync_barrier` | — | — | System-wide `sync()` final barrier |
+
+**Key design for accurate measurement:**
+- Each file is written with `dd conv=fsync`, which triggers `batcher.drain()` + `sync_cycle()` through FUSE — guaranteeing data is on disk before the timer stops.
+- A system-wide `sync()` at the end acts as a final barrier against kernel writeback caching.
+- File sizes are deterministic (index-based formulas) and content uses a seeded LCG so dedup cannot collapse payloads.
+
+**Run:**
+```
+VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test bench_comfyui_profile --test rsync_integration -- --nocapture
+```
+Requires FUSE + Linux + `mountpoint`, `fusermount`, `bash`, `dd`, `sync`, `sha256sum`, `python3`.
+
 ## Validation Run
 
 Executed after write-path concurrency/pipeline changes:
