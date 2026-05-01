@@ -716,10 +716,16 @@ impl VirtualFs for VerFs {
             .validate_file_handle(fh, ino)
             .await
             .map_err(map_anyhow_to_fuse)?;
-        self.batcher
-            .drain()
-            .await
-            .map_err(map_anyhow_to_fuse)?;
+        // Skip the drain if no writes have been enqueued since the last one.
+        // This avoids an async channel round-trip when the batcher is known-empty,
+        // which is the common case for read-mostly workloads.
+        if !self.core.can_skip_drain() {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+            self.core.mark_drained();
+        }
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "read")
@@ -1032,6 +1038,8 @@ impl VirtualFs for VerFs {
             offset: offset as u64,
             data: data.to_vec(),
         };
+
+        self.core.mark_write_enqueued();
 
         if (flags & FUSE_WRITE_CACHE) != 0 {
             self.batcher

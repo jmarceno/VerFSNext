@@ -200,6 +200,7 @@ struct FsCore {
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
+    writes_since_last_drain: AtomicU64,
     write_lock: AsyncRwLock<()>,
     inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
     inode_data_versions: Mutex<HashMap<u64, u64>>,
@@ -288,6 +289,7 @@ impl VerFs {
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
+            writes_since_last_drain: AtomicU64::new(0),
             write_lock: AsyncRwLock::new(()),
             inode_write_locks: Mutex::new(HashMap::new()),
             inode_data_versions: Mutex::new(HashMap::new()),
@@ -978,6 +980,21 @@ impl FsCore {
             chunk_cache_entries,
             approx_cache_memory_bytes,
         })
+    }
+
+    /// Increment the writes-since-last-drain counter.
+    pub(crate) fn mark_write_enqueued(&self) {
+        self.writes_since_last_drain.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check if the batcher drain can be skipped (no writes since last drain).
+    pub(crate) fn can_skip_drain(&self) -> bool {
+        self.writes_since_last_drain.load(Ordering::Relaxed) == 0
+    }
+
+    /// Mark that a drain has been completed, resetting the counter.
+    pub(crate) fn mark_drained(&self) {
+        self.writes_since_last_drain.store(0, Ordering::Relaxed);
     }
 }
 
