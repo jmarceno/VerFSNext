@@ -200,6 +200,17 @@ impl MetaStore {
         txn.commit().await.context("failed to commit transaction")
     }
 
+    /// Begin a write transaction with deferred commit.
+    /// Caller must call `commit_write_txn()` when done.
+    pub fn begin_write(&self) -> Result<surrealkv::Transaction> {
+        self.tree.begin().context("failed to start write transaction")
+    }
+
+    /// Commit a write transaction started with `begin_write()`.
+    pub async fn commit_write_txn(&self, txn: &mut surrealkv::Transaction) -> Result<()> {
+        txn.commit().await.context("failed to commit transaction")
+    }
+
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeRecord>> {
         // Use lightweight point-read instead of full transaction for simple lookup
         let Some(raw) = self.get_value(&inode_key(ino))? else {

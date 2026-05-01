@@ -1,6 +1,5 @@
 use super::*;
 use crate::fs::FsCore;
-use futures::stream::{FuturesUnordered, StreamExt};
 
 struct PreparedWritePlan {
     write_end: u64,
@@ -13,52 +12,6 @@ struct PreparedWritePlan {
 }
 
 impl FsCore {
-    pub(crate) async fn apply_single_write(&self, op: WriteOp) -> Result<()> {
-        let prepared_version = self.inode_data_version(op.ino);
-        let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
-        self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
-        if op.data.is_empty() {
-            return Ok(());
-        }
-        let mut plan = self.prepare_write_plan(&op, &inode_snapshot).await?;
-
-        let _mutation_guard = self.write_lock.read().await;
-        let inode_lock = self.inode_write_lock(op.ino).await;
-        let _inode_guard = inode_lock.lock().await;
-
-        let mut inode = self.load_inode_or_errno(op.ino, "write")?;
-        self.ensure_write_target_inode(op.ino, &inode)?;
-        let current_version = self.inode_data_version(op.ino);
-        if current_version != prepared_version {
-            // The inode data changed while this write was being prepared (e.g., truncate).
-            // Re-prepare against the latest state while we hold the inode lock.
-            plan = self.prepare_write_plan(&op, &inode).await?;
-        }
-
-        self.commit_prepared_write(op.ino, &mut inode, &plan)
-            .await?;
-        self.invalidate_inode_cache(op.ino);
-        self.bump_inode_data_version(op.ino);
-        self.mark_mutation();
-        self.invalidate_inode_attr_best_effort(op.ino);
-
-        self.dedup_hits
-            .fetch_add(plan.dedup_hits, Ordering::Relaxed);
-        self.dedup_misses
-            .fetch_add(plan.dedup_misses, Ordering::Relaxed);
-        self.write_bytes_total
-            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
-        debug!(
-            ino = op.ino,
-            offset = op.offset,
-            bytes = op.data.len(),
-            cdc_chunks = plan.cdc_chunk_count,
-            dedup_hits = plan.dedup_hits,
-            dedup_misses = plan.dedup_misses,
-            "write completed through streaming dedup/compress pipeline"
-        );
-        Ok(())
-    }
     fn ensure_write_target_inode(&self, ino: u64, inode: &InodeRecord) -> Result<()> {
         self.ensure_inode_vault_access(inode, "write")?;
         if inode.kind != INODE_KIND_FILE {
@@ -171,33 +124,6 @@ impl FsCore {
             ref_deltas,
             new_chunk_records,
         })
-    }
-    async fn commit_prepared_write(
-        &self,
-        ino: u64,
-        inode: &mut InodeRecord,
-        plan: &PreparedWritePlan,
-    ) -> Result<()> {
-        let now = SystemTime::now();
-        let (sec, nsec) = system_time_to_parts(now);
-        inode.size = inode.size.max(plan.write_end);
-        inode.mtime_sec = sec;
-        inode.mtime_nsec = nsec;
-        inode.ctime_sec = sec;
-        inode.ctime_nsec = nsec;
-
-        self.meta
-            .write_txn(|txn| {
-                for (block_idx, hash) in plan.extent_updates.iter().copied() {
-                    let extent = ExtentRecord { chunk_hash: hash };
-                    txn.set(extent_key(ino, block_idx), encode_rkyv(&extent)?)?;
-                }
-
-                FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunk_records)?;
-                txn.set(inode_key(ino), encode_rkyv(inode)?)?;
-                Ok(())
-            })
-            .await
     }
     pub(crate) async fn truncate_file_locked(
         &self,
@@ -333,6 +259,84 @@ impl FsCore {
         }
         request.typ == libc::F_WRLCK as u32 || existing.typ == libc::F_WRLCK as u32
     }
+
+    /// Like commit_prepared_write but writes into an existing SurrealKV
+    /// transaction instead of creating a new one. Allows batching multiple
+    /// metadata commits into a single transaction.
+    fn commit_prepared_write_in_txn(
+        &self,
+        ino: u64,
+        inode: &mut InodeRecord,
+        plan: &PreparedWritePlan,
+        txn: &mut surrealkv::Transaction,
+    ) -> Result<()> {
+        let now = SystemTime::now();
+        let (sec, nsec) = system_time_to_parts(now);
+        inode.size = inode.size.max(plan.write_end);
+        inode.mtime_sec = sec;
+        inode.mtime_nsec = nsec;
+        inode.ctime_sec = sec;
+        inode.ctime_nsec = nsec;
+
+        for (block_idx, hash) in plan.extent_updates.iter().copied() {
+            let extent = ExtentRecord { chunk_hash: hash };
+            txn.set(extent_key(ino, block_idx), encode_rkyv(&extent)?)?;
+        }
+
+        FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunk_records)?;
+        txn.set(inode_key(ino), encode_rkyv(inode)?)?;
+        Ok(())
+    }
+
+    /// Like apply_single_write but writes into an existing transaction.
+    /// Multiple calls share one transaction for batched metadata commits.
+    pub(crate) async fn apply_single_write_in_txn(
+        &self,
+        op: WriteOp,
+        txn: &mut surrealkv::Transaction,
+    ) -> Result<()> {
+        let prepared_version = self.inode_data_version(op.ino);
+        let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
+        self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
+        if op.data.is_empty() {
+            return Ok(());
+        }
+        let mut plan = self.prepare_write_plan(&op, &inode_snapshot).await?;
+
+        let _mutation_guard = self.write_lock.read().await;
+        let inode_lock = self.inode_write_lock(op.ino).await;
+        let _inode_guard = inode_lock.lock().await;
+
+        let mut inode = self.load_inode_or_errno(op.ino, "write")?;
+        self.ensure_write_target_inode(op.ino, &inode)?;
+        let current_version = self.inode_data_version(op.ino);
+        if current_version != prepared_version {
+            plan = self.prepare_write_plan(&op, &inode).await?;
+        }
+
+        self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn)?;
+        self.invalidate_inode_cache(op.ino);
+        self.bump_inode_data_version(op.ino);
+        self.mark_mutation();
+        self.invalidate_inode_attr_best_effort(op.ino);
+
+        self.dedup_hits
+            .fetch_add(plan.dedup_hits, Ordering::Relaxed);
+        self.dedup_misses
+            .fetch_add(plan.dedup_misses, Ordering::Relaxed);
+        self.write_bytes_total
+            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
+        debug!(
+            ino = op.ino,
+            offset = op.offset,
+            bytes = op.data.len(),
+            cdc_chunks = plan.cdc_chunk_count,
+            dedup_hits = plan.dedup_hits,
+            dedup_misses = plan.dedup_misses,
+            "write completed through streaming dedup/compress pipeline"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -363,21 +367,20 @@ impl WriteApply for FsCore {
                 .push((group_op, indices));
         }
 
+        // Share a single SurrealKV write transaction across all inode groups.
+        // This merges many small metadata commits into one, reducing WAL write
+        // and fsync overhead significantly for batched writes.
         let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
-        let mut pending = FuturesUnordered::new();
-        for inode_groups in by_inode.into_values() {
-            pending.push(async move {
-                let mut inode_results = Vec::with_capacity(inode_groups.len());
-                for (group_op, indices) in inode_groups {
-                    let group_result = self.apply_single_write(group_op).await;
-                    inode_results.push((indices, group_result));
-                }
-                inode_results
-            });
-        }
 
-        while let Some(inode_results) = pending.next().await {
-            for (indices, group_result) in inode_results {
+        let batched_txn = match self.meta.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => return (0..original_len).map(|_| Err(anyhow!(format!("{:#}", e)))).collect(),
+        };
+        let mut batched_txn = batched_txn;
+
+        for inode_groups in by_inode.into_values() {
+            for (group_op, indices) in inode_groups {
+                let group_result = self.apply_single_write_in_txn(group_op, &mut batched_txn).await;
                 for idx in indices {
                     out[idx] = Some(match &group_result {
                         Ok(()) => Ok(()),
@@ -385,6 +388,14 @@ impl WriteApply for FsCore {
                     });
                 }
             }
+        }
+
+        // Single commit for all accumulated metadata writes
+        if let Err(e) = self.meta.commit_write_txn(&mut batched_txn).await {
+            let msg = format!("{:#}", e);
+            return out.into_iter().map(|r| {
+                r.unwrap_or_else(|| Err(anyhow!(msg.clone())))
+            }).collect();
         }
 
         debug!(
