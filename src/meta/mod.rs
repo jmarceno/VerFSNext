@@ -210,22 +210,20 @@ impl MetaStore {
     }
 
     pub fn get_u64_sys(&self, name: &str) -> Result<u64> {
-        self.read_txn(|txn| {
-            let key = sys_key(name);
-            let raw = txn
-                .get(key)?
-                .with_context(|| format!("missing system key SYS:{}", name))?;
-            if raw.len() != 8 {
-                anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
-            }
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(&raw);
-            Ok(u64::from_le_bytes(bytes))
-        })
+        let key = sys_key(name);
+        let raw = self
+            .get_value(&key)?
+            .with_context(|| format!("missing system key SYS:{}", name))?;
+        if raw.len() != 8 {
+            anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
+        }
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&raw);
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn get_sys(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.read_txn(|txn| txn.get(sys_key(name)).context("failed reading SYS key"))
+        self.get_value(&sys_key(name)).context("failed reading SYS key")
     }
 
     pub fn flush_wal(&self, sync: bool) -> Result<()> {
