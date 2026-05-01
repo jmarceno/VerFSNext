@@ -1,4 +1,12 @@
-# AGENTS.md - VerFS3
+# AGENTS.md - VerFSNext
+
+## Architecture
+VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-128 hashed) in zstd-seekable packs, with a KV-only metadata layer. Chunks are deduplicated and compressed in-line, and persisted to packs.Space is reclaimed by a GC when the system is idle.
+### Features
+    - Deduplication - in-line
+    - Compression - in-line
+    - Snapshots - Snapshots can be seem and interacted through the .snapshots folder at root
+    - Encrypted .vault folder at root
 
 # IMPORTANT NOTICE ABOUT COMPATIBILITY
 We are now in production and any change that breaks compatibility with previous versions must provide a one time migration path.
@@ -22,13 +30,6 @@ This migration path must be documented in the migration guide and must be run au
 - Run focused tests on small changes.
 - Don't write tests for what the type system already guarantees.
 
-## Architecture
-VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-128 hashed) in zstd-seekable packs, with a KV-only metadata layer. Chunks are deduplicated and compressed in-line, and persisted to packs.Space is reclaimed by a GC when the system is idle.
-### Features
-    - Deduplication - in-line
-    - Compression - in-line
-    - Snapshots - Snapshots can be seem and interacted through the .snapshots folder at root
-    - Encrypted .vault folder at root
 ### Code Organization
 - **VENDOR**: code under `vendor/` has been hard forked and you must treat as our own code, making any needed fixes and modifications.
 
