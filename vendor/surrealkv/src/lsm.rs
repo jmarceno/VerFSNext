@@ -1659,6 +1659,39 @@ impl Tree {
         Ok(txn)
     }
 
+    /// Lightweight point-read without creating a full transaction.
+    ///
+    /// Creates a temporary snapshot at the current sequence number, performs
+    /// a single key lookup, and returns the value. This avoids the overhead
+    /// of maintaining a Transaction object with write_set and mode checking.
+    ///
+    /// Use this for simple metadata lookups where transaction isolation is
+    /// not required (e.g., checking if a chunk exists in the metadata store).
+    pub fn get_value<K>(&self, key: K) -> Result<Option<Vec<u8>>>
+    where
+        K: IntoBytes,
+    {
+        let key_bytes = key.into_bytes();
+        if key_bytes.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Create a temporary snapshot at the current sequence number.
+        // This provides a consistent point-in-time view without the overhead
+        // of a full Transaction.
+        let snapshot = Snapshot::new(Arc::clone(&self.core), self.core.seq_num());
+
+        // Perform the lookup through the snapshot
+        match snapshot.get(&key_bytes)? {
+            Some(val) => {
+                // Resolve the value reference through VLog if needed
+                let resolved_value = self.core.resolve_value(&val.0)?;
+                Ok(Some(resolved_value))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Appends an atomic merge delta for a counter key.
     ///
     /// Counter deltas are fixed-width little-endian i64 values.

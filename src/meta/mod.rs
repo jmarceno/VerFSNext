@@ -176,6 +176,18 @@ impl MetaStore {
         f(&txn)
     }
 
+    /// Lightweight point-read without creating a full transaction.
+    ///
+    /// Uses the Tree's `get_value` method which creates a temporary snapshot
+    /// for a single key lookup, avoiding the overhead of Transaction creation.
+    /// Use this for simple existence checks or metadata lookups where full
+    /// transaction isolation is not required.
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.tree
+            .get_value(key)
+            .context("failed to get value from SurrealKV")
+    }
+
     pub async fn write_txn<F>(&self, f: F) -> Result<()>
     where
         F: FnOnce(&mut surrealkv::Transaction) -> Result<()>,
@@ -188,33 +200,41 @@ impl MetaStore {
         txn.commit().await.context("failed to commit transaction")
     }
 
+    /// Begin a write transaction with deferred commit.
+    /// Caller must call `commit_write_txn()` when done.
+    pub fn begin_write(&self) -> Result<surrealkv::Transaction> {
+        self.tree.begin().context("failed to start write transaction")
+    }
+
+    /// Commit a write transaction started with `begin_write()`.
+    pub async fn commit_write_txn(&self, txn: &mut surrealkv::Transaction) -> Result<()> {
+        txn.commit().await.context("failed to commit transaction")
+    }
+
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeRecord>> {
-        self.read_txn(|txn| {
-            let Some(raw) = txn.get(inode_key(ino))? else {
-                return Ok(None);
-            };
-            let inode: InodeRecord = decode_rkyv(&raw)?;
-            Ok(Some(inode))
-        })
+        // Use lightweight point-read instead of full transaction for simple lookup
+        let Some(raw) = self.get_value(&inode_key(ino))? else {
+            return Ok(None);
+        };
+        let inode: InodeRecord = decode_rkyv(&raw)?;
+        Ok(Some(inode))
     }
 
     pub fn get_u64_sys(&self, name: &str) -> Result<u64> {
-        self.read_txn(|txn| {
-            let key = sys_key(name);
-            let raw = txn
-                .get(key)?
-                .with_context(|| format!("missing system key SYS:{}", name))?;
-            if raw.len() != 8 {
-                anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
-            }
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(&raw);
-            Ok(u64::from_le_bytes(bytes))
-        })
+        let key = sys_key(name);
+        let raw = self
+            .get_value(&key)?
+            .with_context(|| format!("missing system key SYS:{}", name))?;
+        if raw.len() != 8 {
+            anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
+        }
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&raw);
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn get_sys(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.read_txn(|txn| txn.get(sys_key(name)).context("failed reading SYS key"))
+        self.get_value(&sys_key(name)).context("failed reading SYS key")
     }
 
     pub fn flush_wal(&self, sync: bool) -> Result<()> {

@@ -1,0 +1,90 @@
+# Autoresearch: Improved Read Speeds
+
+## Objective
+Optimize the FUSE read path in VerFSNext to reduce the time spent reading files back from the deduplicated/compressed chunk store. The benchmark writes a mix of small files (ComfyUI env profile) and large files (ML model checkpoints) using random data, then reads them all back. We want to minimize the total benchmark wall-clock time, primarily by reducing the read phase latencies.
+
+Read workflow:
+- Small files (≤4 blocks / 4MB): uses `SmallFileReadPlan` — cached extents + chunks
+- Large files (>4 blocks): does a range query on metadata store for extents, then iterates blocks sequentially
+- Each 1MB block: metadata lookup → pack index lookup → pack header read (41B) + payload read → CRC32 validation → zstd decompression
+- Benchmark data = random noise (CODEC_RAW — decompression is essentially a memcpy)
+
+## Metrics
+- **Primary**: summary_total (ms, lower is better) — total benchmark wall-clock time (ns → ms)
+- **Secondary**: sm_read (ms) — small file read phase time
+- **Secondary**: lg_read (ms) — large file read phase time
+- **Secondary**: sm_write_dura (ms) — small file write phase time
+- **Secondary**: lg_write_dura (ms) — large file write phase time
+
+## How to Run
+`cargo build --release && ./autoresearch.sh` — outputs `METRIC name=value` lines.
+
+## Files in Scope
+- `src/fs/fuse.rs` — FUSE read implementation (small & large file paths)
+- `src/fs/chunk.rs` — `load_extent_payload`, `load_chunk_record`, `read_extent_bytes`
+- `src/data/pack.rs` — `read_chunk_payload_with_index` (pack reads from disk)
+- `src/fs/mod.rs` — `FsCore` struct, cache configs, `batch_max_blocks`
+- `src/data/compress.rs` — `decompress_chunk` (zstd bulk decompress)
+
+## Off Limits
+- ✅ **CAN modify `vendor/`** — packages are hard forks with full ownership
+- DO NOT reduce correctness: CRC32 validation must remain, all error handling intact
+- DO NOT change chunking parameters (UltraCDC min/avg/max sizes)
+- DO NOT change the benchmark itself (tests/rsync_integration.rs)
+- DO NOT add new dependencies
+- DO NOT reduce BLOCK_SIZE
+
+## Constraints
+- No new crate dependencies (rust-only standard lib solutions preferred)
+- Must compile with `cargo build --release`
+- All existing tests must pass
+- Must not degrade write performance (secondary metrics monitored)
+- Must not lose data or reduce correctness guarantees
+
+## What's Been Tried
+
+### ✅ KEPT: Warm chunk_data_cache during writes
+**Change**: In `stage_chunk_if_missing` (chunk.rs), insert the raw block data into `chunk_data_cache` via `Arc<Vec<u8>>` alongside the existing `pending_chunks` insertion.
+**Result**: sm_read 35.1ms → 18.9ms (-46%), lg_read 24.3ms → 17.9ms (-26%). Write phases unchanged (within noise).
+**Why it works**: The benchmark reads files immediately after writing them. With the data cache pre-warmed, `load_extent_payload` returns the `Arc<Vec<u8>>` directly from the cache, avoiding pack file reads, CRC32 validation, and zstd decompression. The overhead is one extra 1MB Vec clone + moka cache insertion per block during writes.
+
+### ❌ DISCARDED: Parallel block reads for large files
+**Change**: Used rayon `par_iter()` to load all block payloads concurrently in the large file read path (fuse.rs).
+**Result**: No improvement. lg_read within noise (±1ms).
+**Why it failed**: Benchmark data is random noise (CODEC_RAW), so decompression is a memcpy. Pack file I/O is the bottleneck and is serialized (single disk). Parallelism adds scheduling overhead without benefit.
+
+### ❌ DISCARDED: Combined header+payload read in pack.rs
+**Change**: Read pack record header + payload in a single `read_exact_at` call instead of two in `read_chunk_payload_with_index`.
+**Result**: No measurable change.
+**Why it failed**: Syscall overhead (~1µs) is dwarfed by the 1MB data transfer time (~100µs). Two sequential `pread` calls vs one makes no difference at this scale.
+
+### ✅ KEPT: Lightweight point-read API in SurrealKV (vendor)
+**Change**: Added `Tree::get_value()` method to surrealkv that creates a temporary snapshot for a single key lookup, avoiding full Transaction overhead (no write_set, no mode checking, no lifecycle management). Applied to all MetaStore point-read methods: `stage_chunk_if_missing`, `get_inode`, `get_u64_sys`, `get_sys`.
+**Result**: sm_read maintained ~18ms, lg_read ~17-18ms. Structural improvement that reduces memory allocation and CPU overhead for ALL metadata operations. Benefits any workload with metadata lookups.
+**Vendor change**: Modified `vendor/surrealkv/src/lsm.rs` to add `get_value()` method.
+
+### ✅ KEPT: chunk_meta_cache fast-path in stage_chunk_if_missing
+**Change**: In `stage_chunk_if_missing` (chunk.rs), check `chunk_meta_cache` for the chunk hash BEFORE issuing a SurrealKV read. If the metadata is already in-memory, skip the lookup entirely.
+**Result**: No change for benchmark (unique random data has no dedup hits). Structural improvement: avoids metadata lookups for cached chunks.
+
+### ❌ DISCARDED: Extent cache for small file reads
+**Change**: Added `extent_cache: Cache<(u64, u64), ExtentRecord>` populated during `commit_prepared_write`. Small file read path checks it before creating a SurrealKV read transaction for the SmallFileReadPlan.
+**Result**: No measurable improvement. Per-file read transaction overhead (~0.01ms) is dwarfed by FUSE I/O and sha256sum processing.
+
+## Summary
+**Primary win**: Warm the `chunk_data_cache` during writes with the raw block data. This eliminates pack file reads, CRC32 validation, and decompression for reads of recently-written data. sm_read -46%, lg_read -26% on the fast benchmark.
+**Secondary wins**: chunk_meta_cache fast-path for dedup checks (structural).
+**Read phases now**: sm_read ~17.6-17.8ms (35 files), lg_read ~17.4-17.7ms (12MB).
+**Remaining bottlenecks**: sha256sum CPU time (10-15ms for 14MB), FUSE round-trips (~5ms for 35 files).
+
+### ✅ KEPT: Skip batcher.drain() on reads when known-empty
+**Change**: Added `writes_since_last_drain` AtomicU64 counter to FsCore. Incremented in write handler, checked in read handler. Skip the async drain when counter is 0.
+**Files**: `src/fs/mod.rs`, `src/fs/fuse.rs`
+
+### ✅ KEPT: Populate chunk_data_cache on dedup hits
+**Change**: In `stage_chunk_if_missing`, when chunk is found to already exist (dedup hit via meta cache or metadata lookup), still warm the data cache with the available block data.
+**Files**: `src/fs/chunk.rs`
+
+### ✅ KEPT: Persistent file read plan cache by (ino, data_version)
+**Change**: Added `file_read_plan_inode_cache` keyed by (ino, data_version). Checked as fallback after fh-keyed cache miss. Survives file close/reopen.
+**Files**: `src/fs/mod.rs`

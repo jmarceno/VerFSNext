@@ -200,14 +200,18 @@ struct FsCore {
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
+    writes_since_last_drain: AtomicU64,
     write_lock: AsyncRwLock<()>,
     inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
-    inode_data_versions: Mutex<HashMap<u64, u64>>,
+    inode_data_versions: ParkingMutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
     file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
-    dir_handles: Mutex<HashMap<u64, DirHandleState>>,
-    file_handles: Mutex<HashMap<u64, FileHandleState>>,
+    dir_handles: ParkingMutex<HashMap<u64, DirHandleState>>,
+    file_handles: ParkingMutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
+    /// Persistent read-plan cache keyed by (ino, data_version).
+    /// Survives across file close/reopen, unlike the fh-keyed cache.
+    file_read_plan_inode_cache: Cache<(u64, u64), Arc<SmallFileReadPlan>>,
     notifier: ParkingRwLock<Option<Arc<SessionNotifier>>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
@@ -288,14 +292,18 @@ impl VerFs {
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
+            writes_since_last_drain: AtomicU64::new(0),
             write_lock: AsyncRwLock::new(()),
             inode_write_locks: Mutex::new(HashMap::new()),
-            inode_data_versions: Mutex::new(HashMap::new()),
+            inode_data_versions: ParkingMutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: Mutex::new(HashMap::new()),
-            dir_handles: Mutex::new(HashMap::new()),
-            file_handles: Mutex::new(HashMap::new()),
+            dir_handles: ParkingMutex::new(HashMap::new()),
+            file_handles: ParkingMutex::new(HashMap::new()),
             file_read_plan_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
+            file_read_plan_inode_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
             notifier: ParkingRwLock::new(None),
@@ -466,13 +474,13 @@ impl FsCore {
         if let Some(dirent) = self.dirent_cache.get(&key) {
             return Ok(dirent);
         }
-        let dirent = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(dirent_key(parent, name))? else {
-                return Ok(None);
-            };
-            let dirent: DirentRecord = decode_rkyv(&raw)?;
-            Ok(Some(dirent))
-        })?;
+        let dirent = match self.meta.get_value(&dirent_key(parent, name))? {
+            Some(raw) => {
+                let d: DirentRecord = decode_rkyv(&raw)?;
+                Some(d)
+            }
+            None => None,
+        };
         self.dirent_cache.insert(key, dirent.clone());
         Ok(dirent)
     }
@@ -502,13 +510,13 @@ impl FsCore {
         lock
     }
 
-    async fn inode_data_version(&self, ino: u64) -> u64 {
-        let mut versions = self.inode_data_versions.lock().await;
+    fn inode_data_version(&self, ino: u64) -> u64 {
+        let mut versions = self.inode_data_versions.lock();
         *versions.entry(ino).or_insert(0)
     }
 
-    async fn bump_inode_data_version(&self, ino: u64) {
-        let mut versions = self.inode_data_versions.lock().await;
+    fn bump_inode_data_version(&self, ino: u64) {
+        let mut versions = self.inode_data_versions.lock();
         let entry = versions.entry(ino).or_insert(0);
         *entry = entry.saturating_add(1);
     }
@@ -540,8 +548,8 @@ impl FsCore {
         self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
     }
 
-    async fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {
-        let mut handles = self.file_handles.lock().await;
+    fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {
+        let mut handles = self.file_handles.lock();
         handles.insert(
             fh,
             FileHandleState {
@@ -552,8 +560,8 @@ impl FsCore {
         self.file_read_plan_cache.invalidate(&fh);
     }
 
-    async fn validate_file_handle(&self, fh: u64, ino: u64) -> Result<()> {
-        let handles = self.file_handles.lock().await;
+    fn validate_file_handle(&self, fh: u64, ino: u64) -> Result<()> {
+        let handles = self.file_handles.lock();
         let Some(state) = handles.get(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -572,13 +580,13 @@ impl FsCore {
         Ok(())
     }
 
-    async fn get_small_file_read_plan(
+    fn get_small_file_read_plan(
         &self,
         fh: u64,
         ino: u64,
         inode_data_version: u64,
     ) -> Result<Option<SmallFileReadPlan>> {
-        let handles = self.file_handles.lock().await;
+        let handles = self.file_handles.lock();
         let Some(state) = handles.get(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -597,17 +605,25 @@ impl FsCore {
         if state.inode_data_version != inode_data_version {
             return Ok(None);
         }
-        Ok(self.file_read_plan_cache.get(&fh).map(|plan| plan.as_ref().clone()))
+        // Check file-handle-keyed cache first (fastest)
+        if let Some(plan) = self.file_read_plan_cache.get(&fh) {
+            return Ok(Some(plan.as_ref().clone()));
+        }
+        // Fall back to persistent inode-keyed cache (survives close/reopen)
+        Ok(self
+            .file_read_plan_inode_cache
+            .get(&(ino, inode_data_version))
+            .map(|plan| plan.as_ref().clone()))
     }
 
-    async fn store_small_file_read_plan(
+    fn store_small_file_read_plan(
         &self,
         fh: u64,
         ino: u64,
         inode_data_version: u64,
         small_file_read_plan: Option<SmallFileReadPlan>,
     ) -> Result<()> {
-        let mut handles = self.file_handles.lock().await;
+        let mut handles = self.file_handles.lock();
         let Some(state) = handles.get_mut(&fh) else {
             return Err(anyhow_errno(
                 Errno::EBADF,
@@ -626,15 +642,19 @@ impl FsCore {
         state.inode_data_version = inode_data_version;
         drop(handles);
         if let Some(plan) = small_file_read_plan {
-            self.file_read_plan_cache.insert(fh, Arc::new(plan));
+            let arc = Arc::new(plan);
+            self.file_read_plan_cache.insert(fh, Arc::clone(&arc));
+            // Also insert into persistent inode-keyed cache
+            self.file_read_plan_inode_cache
+                .insert((ino, inode_data_version), arc);
         } else {
             self.file_read_plan_cache.invalidate(&fh);
         }
         Ok(())
     }
 
-    async fn unregister_file_handle(&self, fh: u64) {
-        let mut handles = self.file_handles.lock().await;
+    fn unregister_file_handle(&self, fh: u64) {
+        let mut handles = self.file_handles.lock();
         handles.remove(&fh);
         drop(handles);
         self.file_read_plan_cache.invalidate(&fh);
@@ -978,6 +998,21 @@ impl FsCore {
             chunk_cache_entries,
             approx_cache_memory_bytes,
         })
+    }
+
+    /// Increment the writes-since-last-drain counter.
+    pub(crate) fn mark_write_enqueued(&self) {
+        self.writes_since_last_drain.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check if the batcher drain can be skipped (no writes since last drain).
+    pub(crate) fn can_skip_drain(&self) -> bool {
+        self.writes_since_last_drain.load(Ordering::Relaxed) == 0
+    }
+
+    /// Mark that a drain has been completed, resetting the counter.
+    pub(crate) fn mark_drained(&self) {
+        self.writes_since_last_drain.store(0, Ordering::Relaxed);
     }
 }
 

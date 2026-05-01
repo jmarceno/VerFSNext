@@ -742,6 +742,7 @@ impl PackStore {
                     let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
                     if hash == expected_hash {
                         found = Some(entry);
+                        break;
                     }
                     cursor = cursor
                         .checked_add(INDEX_ENTRY_LEN_U64)

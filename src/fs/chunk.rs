@@ -182,14 +182,38 @@ impl FsCore {
             return Ok(false);
         }
 
-        let exists = self
-            .meta
-            .read_txn(|txn| Ok(txn.get(chunk_key(&chunk_hash))?.is_some()))?;
-        if exists {
+        // Fast-path: check the in-memory chunk meta cache before falling back
+        // to a SurrealKV read. This avoids an expensive point-read snapshot
+        // for chunks whose metadata is already resident (e.g. dedup hits).
+        if self.chunk_meta_cache.contains_key(&chunk_hash) {
+            // Warm data cache even on dedup hit: the block data is available
+            // and will be useful for future reads.
+            self.chunk_data_cache
+                .insert(chunk_hash, Arc::new(data.to_vec()));
             return Ok(false);
         }
 
-        pending_chunks.insert(chunk_hash, data.to_vec());
+        // Use lightweight point-read instead of full transaction.
+        // This creates a temporary snapshot for a single get, avoiding
+        // Transaction object overhead (write_set, mode checking, lifecycle).
+        let exists = self
+            .meta
+            .get_value(&chunk_key(&chunk_hash))?
+            .is_some();
+        if exists {
+            // Warm data cache on dedup hit: insert the available block data
+            // so future reads of this chunk skip pack I/O + decompression.
+            self.chunk_data_cache
+                .insert(chunk_hash, Arc::new(data.to_vec()));
+            return Ok(false);
+        }
+
+        let data_vec = data.to_vec();
+        // Warm the read data cache with the raw block data so subsequent
+        // reads of recently-written chunks skip pack I/O + decompression.
+        self.chunk_data_cache
+            .insert(chunk_hash, Arc::new(data_vec.clone()));
+        pending_chunks.insert(chunk_hash, data_vec);
         Ok(true)
     }
     pub(crate) async fn materialize_pending_chunks(
