@@ -12,11 +12,7 @@
 
 . **Avoid batcher.drain() on every read** — Add a flag/timestamp to skip the drain channel round-trip when the batcher is known-empty. The fsync handler already drains before returning, so subsequent reads don't need another drain. Requires careful correctness reasoning.
 
-. **File read plan caching by (ino, data_version)** — Currently plans are cached by file handle (fh). If the file is closed and reopened, the plan is rebuilt. Keying by (ino, data_version) would avoid this. Small benefit for reopen-heavy workloads.
-
 . **Smaller logical blocks for tiny files** — The 1MB block size causes massive read amplification for tiny files (e.g., 128B file stored as 1MB block, 8000x amplification). A future redesign could store sub-block files inline in the metadata or use variable-size extents. Architectural change, not a quick optimization.
-
-. **Reduce read transaction overhead for small files** — Each small file read creates a SurrealKV read transaction to build the SmallFileReadPlan. Adding a point-read method to MetaStore (without full transaction) could reduce this overhead.
 
 ## Session Summary (2026-05-01)
 **Primary win**: Data cache warm during writes. sm_read 35.1ms → 18.9ms (-46%), lg_read 24.3ms → 17.9ms (-26%). 

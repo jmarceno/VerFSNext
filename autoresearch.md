@@ -74,5 +74,17 @@ Read workflow:
 ## Summary
 **Primary win**: Warm the `chunk_data_cache` during writes with the raw block data. This eliminates pack file reads, CRC32 validation, and decompression for reads of recently-written data. sm_read -46%, lg_read -26% on the fast benchmark.
 **Secondary wins**: chunk_meta_cache fast-path for dedup checks (structural).
-**Read phases now**: sm_read ~18-19ms (35 files), lg_read ~18ms (12MB). Further improvements limited by FUSE context-switch overhead and sha256sum processing time.
-**Remaining bottlenecks**: sha256sum CPU time (10-15ms for 14MB), FUSE round-trips (~5ms for 35 files), metadata transaction overhead (~2ms for 35 files).
+**Read phases now**: sm_read ~17.6-17.8ms (35 files), lg_read ~17.4-17.7ms (12MB).
+**Remaining bottlenecks**: sha256sum CPU time (10-15ms for 14MB), FUSE round-trips (~5ms for 35 files).
+
+### ✅ KEPT: Skip batcher.drain() on reads when known-empty
+**Change**: Added `writes_since_last_drain` AtomicU64 counter to FsCore. Incremented in write handler, checked in read handler. Skip the async drain when counter is 0.
+**Files**: `src/fs/mod.rs`, `src/fs/fuse.rs`
+
+### ✅ KEPT: Populate chunk_data_cache on dedup hits
+**Change**: In `stage_chunk_if_missing`, when chunk is found to already exist (dedup hit via meta cache or metadata lookup), still warm the data cache with the available block data.
+**Files**: `src/fs/chunk.rs`
+
+### ✅ KEPT: Persistent file read plan cache by (ino, data_version)
+**Change**: Added `file_read_plan_inode_cache` keyed by (ino, data_version). Checked as fallback after fh-keyed cache miss. Survives file close/reopen.
+**Files**: `src/fs/mod.rs`
