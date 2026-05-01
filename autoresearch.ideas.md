@@ -2,6 +2,7 @@
 
 ## Implemented
 - ✅ **Warm chunk_data_cache during writes** — Insert raw block data into the data cache in `stage_chunk_if_missing`. sm_read -46%, lg_read -26%.
+- ✅ **chunk_meta_cache fast-path** — Check meta cache before SurrealKV transaction in `stage_chunk_if_missing` to avoid point-read snapshots for cached entries.
 
 ## Deferred / Future Ideas
 
@@ -16,3 +17,9 @@
 . **Smaller logical blocks for tiny files** — The 1MB block size causes massive read amplification for tiny files (e.g., 128B file stored as 1MB block, 8000x amplification). A future redesign could store sub-block files inline in the metadata or use variable-size extents. Architectural change, not a quick optimization.
 
 . **Reduce read transaction overhead for small files** — Each small file read creates a SurrealKV read transaction to build the SmallFileReadPlan. Adding a point-read method to MetaStore (without full transaction) could reduce this overhead.
+
+## Session Summary (2026-05-01)
+**Primary win**: Data cache warm during writes. sm_read 35.1ms → 18.9ms (-46%), lg_read 24.3ms → 17.9ms (-26%). 
+**Structural improvements**: chunk_meta_cache fast-path for dedup checks.
+**Dead ends**: parallel block reads, combined header+payload reads, extent cache for plan building.
+**Current bottleneck**: Reads are now limited by sha256sum CPU time (10-15ms) + FUSE round-trips (~5ms). Further gains would require reducing FUSE overhead or the number of round-trips.

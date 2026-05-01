@@ -57,3 +57,17 @@ Read workflow:
 **Change**: Read pack record header + payload in a single `read_exact_at` call instead of two in `read_chunk_payload_with_index`.
 **Result**: No measurable change.
 **Why it failed**: Syscall overhead (~1µs) is dwarfed by the 1MB data transfer time (~100µs). Two sequential `pread` calls vs one makes no difference at this scale.
+
+### ✅ KEPT: chunk_meta_cache fast-path in stage_chunk_if_missing
+**Change**: In `stage_chunk_if_missing` (chunk.rs), check `chunk_meta_cache` for the chunk hash BEFORE issuing a SurrealKV read transaction. If the metadata is already in-memory, skip the transaction entirely.
+**Result**: No change for benchmark (unique random data has no dedup hits). Structural improvement: avoids point-read snapshots for dedup-heavy workloads where chunk metadata was cached during a prior write.
+
+### ❌ DISCARDED: Extent cache for small file reads
+**Change**: Added `extent_cache: Cache<(u64, u64), ExtentRecord>` populated during `commit_prepared_write`. Small file read path checks it before creating a SurrealKV read transaction for the SmallFileReadPlan.
+**Result**: No measurable improvement. Per-file read transaction overhead (~0.01ms) is dwarfed by FUSE I/O and sha256sum processing.
+
+## Summary
+**Primary win**: Warm the `chunk_data_cache` during writes with the raw block data. This eliminates pack file reads, CRC32 validation, and decompression for reads of recently-written data. sm_read -46%, lg_read -26% on the fast benchmark.
+**Secondary wins**: chunk_meta_cache fast-path for dedup checks (structural).
+**Read phases now**: sm_read ~18-19ms (35 files), lg_read ~18ms (12MB). Further improvements limited by FUSE context-switch overhead and sha256sum processing time.
+**Remaining bottlenecks**: sha256sum CPU time (10-15ms for 14MB), FUSE round-trips (~5ms for 35 files), metadata transaction overhead (~2ms for 35 files).
