@@ -28,7 +28,9 @@ impl FsCore {
         inode: &InodeRecord,
         context: &'static str,
     ) -> Result<()> {
-        if self.vault_locked() && FsCore::inode_is_vault(inode) {
+        // Check inode flags first (no &self needed) to avoid vault RwLock
+        // for non-vault files, which is the common case.
+        if FsCore::inode_is_vault(inode) && self.vault_locked() {
             return Err(anyhow_errno(
                 Errno::ENOENT,
                 format!("{context}: vault is locked"),
