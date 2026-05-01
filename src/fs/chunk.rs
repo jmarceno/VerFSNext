@@ -189,7 +189,12 @@ impl FsCore {
             return Ok(false);
         }
 
-        pending_chunks.insert(chunk_hash, data.to_vec());
+        let data_vec = data.to_vec();
+        // Warm the read data cache with the raw block data so subsequent
+        // reads of recently-written chunks skip pack I/O + decompression.
+        self.chunk_data_cache
+            .insert(chunk_hash, Arc::new(data_vec.clone()));
+        pending_chunks.insert(chunk_hash, data_vec);
         Ok(true)
     }
     pub(crate) async fn materialize_pending_chunks(
