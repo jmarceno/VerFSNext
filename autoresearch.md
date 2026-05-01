@@ -42,5 +42,18 @@ Read workflow:
 - Must not lose data or reduce correctness guarantees
 
 ## What's Been Tried
-*(To be updated as experiments progress)*
-- Baseline: initial fast benchmark run establishes baseline times.
+
+### ✅ KEPT: Warm chunk_data_cache during writes
+**Change**: In `stage_chunk_if_missing` (chunk.rs), insert the raw block data into `chunk_data_cache` via `Arc<Vec<u8>>` alongside the existing `pending_chunks` insertion.
+**Result**: sm_read 35.1ms → 18.9ms (-46%), lg_read 24.3ms → 17.9ms (-26%). Write phases unchanged (within noise).
+**Why it works**: The benchmark reads files immediately after writing them. With the data cache pre-warmed, `load_extent_payload` returns the `Arc<Vec<u8>>` directly from the cache, avoiding pack file reads, CRC32 validation, and zstd decompression. The overhead is one extra 1MB Vec clone + moka cache insertion per block during writes.
+
+### ❌ DISCARDED: Parallel block reads for large files
+**Change**: Used rayon `par_iter()` to load all block payloads concurrently in the large file read path (fuse.rs).
+**Result**: No improvement. lg_read within noise (±1ms).
+**Why it failed**: Benchmark data is random noise (CODEC_RAW), so decompression is a memcpy. Pack file I/O is the bottleneck and is serialized (single disk). Parallelism adds scheduling overhead without benefit.
+
+### ❌ DISCARDED: Combined header+payload read in pack.rs
+**Change**: Read pack record header + payload in a single `read_exact_at` call instead of two in `read_chunk_payload_with_index`.
+**Result**: No measurable change.
+**Why it failed**: Syscall overhead (~1µs) is dwarfed by the 1MB data transfer time (~100µs). Two sequential `pread` calls vs one makes no difference at this scale.
