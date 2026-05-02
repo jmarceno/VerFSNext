@@ -115,8 +115,11 @@ where
             >,
         >,
 {
+    // Use .into() instead of .to_vec() to avoid copying the encoded bytes.
+    // AlignedVec implements From<AlignedVec> for Vec<u8>, which extracts
+    // the inner Vec without reallocation.
     rkyv::to_bytes::<rkyv::rancor::Error>(value)
-        .map(|bytes| bytes.to_vec())
+        .map(|bytes| bytes.into())
         .context("rkyv encode failed")
 }
 
