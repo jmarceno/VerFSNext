@@ -23,7 +23,7 @@ fn default_metadata_cache_capacity_entries() -> u64 {
 }
 
 fn default_chunk_cache_capacity_mb() -> u64 {
-    1024
+    640
 }
 
 fn default_pack_index_cache_capacity_entries() -> u64 {

@@ -44,7 +44,7 @@ const RECORD_HEADER_LEN: usize = size_of::<ArchivedPackRecordHeader>();
 const RECORD_HEADER_LEN_U64: u64 = RECORD_HEADER_LEN as u64;
 const INDEX_ENTRY_LEN: usize = size_of::<ArchivedPackIndexRecord>();
 const INDEX_ENTRY_LEN_U64: u64 = INDEX_ENTRY_LEN as u64;
-const PACK_FILE_CACHE_CAPACITY: u64 = 256;
+const PACK_FILE_CACHE_CAPACITY: u64 = 128;
 
 #[repr(C, align(16))]
 struct AlignedBytes<const N: usize> {
