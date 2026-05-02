@@ -27,7 +27,7 @@ impl Default for MountConfig {
 }
 
 fn build_fusermount_options(config: &MountConfig) -> String {
-    let options = vec![
+    let options = [
         "nosuid".to_owned(),
         "nodev".to_owned(),
         "allow_other".to_owned(),

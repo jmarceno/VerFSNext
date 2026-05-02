@@ -10,6 +10,14 @@ use std::{mem, slice};
 ///
 /// [`FuseAbiData`] can be implemented for DSTs but there is no way to construct
 /// a custom DST reference.
+///
+/// # Safety
+///
+/// This trait is unsafe because it enables transmuting byte slices to structured types.
+/// Implementors must ensure:
+/// - The type has a stable memory layout compatible with FUSE ABI
+/// - The type is not a ZST (zero-sized type)
+/// - The type can be safely transmuted from a properly sized byte slice
 pub unsafe trait FuseAbiData {}
 
 /// # Safety

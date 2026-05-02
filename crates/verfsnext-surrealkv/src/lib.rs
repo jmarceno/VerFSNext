@@ -656,7 +656,7 @@ impl Options {
             )));
         }
 
-        if self.bloom_bits_per_key_per_level.iter().any(|&b| b == 0) {
+        if self.bloom_bits_per_key_per_level.contains(&0) {
             return Err(Error::InvalidArgument(
                 "bloom_bits_per_key_per_level values must be > 0".to_string(),
             ));

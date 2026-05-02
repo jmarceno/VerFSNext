@@ -1060,8 +1060,8 @@ pub struct FuseInitOut {
     /// Alignment padding
     #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
     pub unused: [u32; 9],
-    ///
     #[cfg(feature = "abi-7-28")]
+    /// Maximum number of pages
     pub max_pages: u16,
     #[cfg(feature = "abi-7-28")]
     /// Alignment padding

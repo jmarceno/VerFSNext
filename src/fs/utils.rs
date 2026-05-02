@@ -54,6 +54,7 @@ pub(crate) fn scan_range_pairs<'a>(
         Some(Ok((key, value)))
     }))
 }
+#[allow(clippy::type_complexity)]
 pub(crate) fn scan_range_pairs_limited(
     txn: &verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
@@ -98,7 +99,7 @@ pub(crate) fn read_process_rss_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     for line in status.lines() {
         if let Some(bytes) = parse_proc_kib_line(line, "VmRSS:") {
-            return Ok(bytes?);
+            return bytes;
         }
     }
     Ok(0)

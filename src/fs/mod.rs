@@ -58,8 +58,8 @@ use crate::vault::{
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE as u32;
-const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE as u32;
+const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
+const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE;
 
 pub mod chunk;
 pub mod fuse;
@@ -464,7 +464,7 @@ impl FsCore {
             return Ok(inode);
         }
         let inode = self.meta.get_inode(ino)?;
-        self.inode_cache.insert(ino, inode.clone());
+        self.inode_cache.insert(ino, inode);
         Ok(inode)
     }
 
@@ -480,7 +480,7 @@ impl FsCore {
             }
             None => None,
         };
-        self.dirent_cache.insert(key, dirent.clone());
+        self.dirent_cache.insert(key, dirent);
         Ok(dirent)
     }
 

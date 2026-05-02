@@ -74,7 +74,7 @@ impl<'a> SnapshotManager<'a> {
                 let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
 
                 let snap_root_ino = allocate_inode(&mut next_inode)?;
-                let mut snap_root = root.clone();
+                let mut snap_root = root;
                 snap_root.ino = snap_root_ino;
                 snap_root.parent = snapshots_dir;
                 snap_root.flags |= INODE_FLAG_READONLY;
@@ -223,7 +223,7 @@ fn clone_dir_children(
 
         let src_inode = load_inode(txn, dirent.ino, "snapshot clone source")?;
         let dst_ino = allocate_inode(next_inode)?;
-        let mut dst_inode = src_inode.clone();
+        let mut dst_inode = src_inode;
         dst_inode.ino = dst_ino;
         dst_inode.parent = dst_dir_ino;
         dst_inode.flags |= INODE_FLAG_READONLY;

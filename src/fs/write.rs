@@ -161,7 +161,7 @@ impl FsCore {
 
         if new_size < old_size {
             let block_size = BLOCK_SIZE as u64;
-            let has_boundary = new_size > 0 && (new_size % block_size) != 0;
+            let has_boundary = new_size > 0 && !new_size.is_multiple_of(block_size);
             let boundary_block = new_size / block_size;
             let keep_block_start = if has_boundary {
                 boundary_block + 1

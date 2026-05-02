@@ -388,12 +388,9 @@ impl Snapshot {
         let mut accumulated_delta: i128 = 0;
         let mut has_merge = false;
 
-        loop {
-            let Some((internal_key, encoded_value)) =
-                self.get_latest_point_entry_at_or_below(key, max_seq)?
-            else {
-                break;
-            };
+        while let Some((internal_key, encoded_value)) =
+            self.get_latest_point_entry_at_or_below(key, max_seq)?
+        {
 
             if let Some(range_seq) = range_delete_seq {
                 if internal_key.seq_num() < range_seq {

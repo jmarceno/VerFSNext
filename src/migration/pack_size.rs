@@ -153,7 +153,7 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     println!("Updating metadata to point chunks to rewritten packs...");
     meta.write_txn(|txn| {
         for plan in plans.iter() {
-            let mut updated = plan.chunk.clone();
+            let mut updated = plan.chunk;
             updated.pack_id = plan.new_pack_id;
             txn.set(chunk_key(&plan.hash), encode_rkyv(&updated)?)?;
         }
@@ -355,19 +355,10 @@ fn parse_pack_id_from_filename(name: &str) -> Option<u64> {
     if !name.starts_with("pack-") {
         return None;
     }
-    let number = if let Some(n) = name
+    let number = name
         .strip_prefix("pack-")
         .and_then(|n| n.strip_suffix(".vpk"))
-    {
-        n
-    } else if let Some(n) = name
-        .strip_prefix("pack-")
-        .and_then(|n| n.strip_suffix(".idx"))
-    {
-        n
-    } else {
-        return None;
-    };
+        .or_else(|| name.strip_prefix("pack-").and_then(|n| n.strip_suffix(".idx")))?;
     number.parse::<u64>().ok()
 }
 

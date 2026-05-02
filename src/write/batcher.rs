@@ -260,7 +260,7 @@ async fn apply_queued_batch(
         return;
     }
 
-    for (entry, result) in batch.into_iter().zip(results.into_iter()) {
+    for (entry, result) in batch.into_iter().zip(results) {
         match result {
             Ok(()) => {
                 if let Some(done) = entry.done {

@@ -257,7 +257,7 @@ impl FsCore {
                 }
             };
             self.chunk_meta_cache
-                .insert(ready_chunk.hash, chunk.clone());
+                .insert(ready_chunk.hash, chunk);
             out.insert(ready_chunk.hash, chunk);
         }
 

@@ -803,7 +803,7 @@ impl VirtualFs for VerFs {
             if let Some(ref plan) = plan {
                 if plan.file_size == inode.size {
                     for (hash, chunk) in plan.chunks.iter() {
-                        self.core.chunk_meta_cache.insert(*hash, chunk.clone());
+                        self.core.chunk_meta_cache.insert(*hash, *chunk);
                     }
                     let start_block = offset / BLOCK_SIZE as u64;
                     let end_block = (read_end - 1) / BLOCK_SIZE as u64;
@@ -886,7 +886,7 @@ impl VirtualFs for VerFs {
                 .map_err(map_anyhow_to_fuse)?;
 
             for (hash, chunk) in rebuilt_plan.chunks.iter() {
-                self.core.chunk_meta_cache.insert(*hash, chunk.clone());
+                self.core.chunk_meta_cache.insert(*hash, *chunk);
             }
             let start_block = offset / BLOCK_SIZE as u64;
             let end_block = (read_end - 1) / BLOCK_SIZE as u64;
@@ -970,7 +970,7 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
 
         for (hash, chunk) in chunks.iter() {
-            self.core.chunk_meta_cache.insert(*hash, chunk.clone());
+            self.core.chunk_meta_cache.insert(*hash, *chunk);
         }
 
         let initial_buf_len = buf.len();

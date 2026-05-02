@@ -682,7 +682,7 @@ impl<'a> ReplyDirectoryPlus<'a> {
         let direntplus_bytes = unsafe { fuse_dir_ent_plus_in_raw(&direntplus) };
         self.data.extend_from_slice(direntplus_bytes);
         self.data.extend_from_slice(name_bytes);
-        self.data.extend(std::iter::repeat(0).take(padlen));
+        self.data.extend(std::iter::repeat_n(0, padlen));
         false
     }
 
@@ -741,7 +741,7 @@ impl<'a> ReplyDirectory<'a> {
         self.data.extend_from_slice(name_bytes);
 
         // write zero padding
-        self.data.extend(std::iter::repeat(0).take(padlen));
+        self.data.extend(std::iter::repeat_n(0, padlen));
 
         false
     }
