@@ -1055,7 +1055,14 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "flush")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)
+        if !self.core.can_skip_drain() {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+            self.core.mark_drained();
+        }
+        Ok(())
     }
 
     async fn release(
@@ -1072,7 +1079,13 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "release")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        if !self.core.can_skip_drain() {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+            self.core.mark_drained();
+        }
         self.core.unregister_file_handle(fh);
         {
             let _open_guard = self.core.write_lock.read().await;
