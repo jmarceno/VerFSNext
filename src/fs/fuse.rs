@@ -1090,7 +1090,16 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsync")
             .map_err(map_anyhow_to_fuse)?;
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        // Only drain if there are pending writes, avoiding an async channel
+        // round-trip + tokio task wakeup when the batcher is known-empty.
+        // Same optimization as the read handler.
+        if !self.core.can_skip_drain() {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+            self.core.mark_drained();
+        }
         self.core
             .sync_cycle(!datasync)
             .await
