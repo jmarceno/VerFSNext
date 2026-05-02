@@ -1077,8 +1077,21 @@ fn invalidation_sensitive_hardlink_visibility_with_entry_ttl() -> Result<()> {
 /// benchmark finishes in ~10 s but still exercises the same I/O patterns.
 ///
 /// **Durability measurement** – every file is individually `fsync`'d through
-/// FUSE (triggers `batcher.drain()` + `sync_cycle()`), and a system-wide
-/// `sync()` acts as a final barrier.  All timing is wall-clock.
+/// Heavy ComfyUI-like profile benchmark.
+///
+/// Phases (all with UNIQUE content per file, no dedup collapsing):
+///   1. sm_write_dura  — Write 3000 small files (~274 MB unique) to a site-packages layout
+///   2. sm_read_seq    — Sequential read (hot cache)
+///   3. lg_write_dura  — Write 3 large models (768+384+192 = 1344 MB unique) — evicts small chunks
+///   4. sm_read_rnd    — Random-order read of small files (COLD — chunks evicted by phase 3)
+///   5. lg_read_seq    — Sequential large-file read (hot chunks)
+///   6. lg_read_rev    — Reverse-order large-file read (defeats sequential readahead)
+///   7. mod_write_dura — Overwrite 750 files with NEW unique content
+///   8. mod_read       — Read modified files
+///   9. sync_barrier   — system-wide sync
+///
+/// Total unique data written: ~1.7 GB (exceeds default 1 GB chunk cache).
+/// Timing is wall-clock via `date +%s%N` inside the FUSE mount.
 #[test]
 fn bench_comfyui_profile() -> Result<()> {
     if std::env::consts::OS != "linux" {
@@ -1096,7 +1109,7 @@ fn bench_comfyui_profile() -> Result<()> {
         "dd",
         "sync",
         "sha256sum",
-        "python3",
+        "shuf",
     ] {
         if require_tool(tool).is_err() {
             return Ok(());
@@ -1120,12 +1133,12 @@ fn bench_comfyui_profile() -> Result<()> {
     fs::write(root.join("config.toml"), &config).context("config")?;
 
     // ── Seed content ──────────────────────────────────────────────────────
-    // Deterministic high-entropy block so dedup does not collapse our writes.
+    // 2 GB deterministic high-entropy seed so every file can use unique data.
     let seed_file = root.join("seed.bin");
     let mut sf = File::create(&seed_file).context("seed file")?;
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut block = vec![0u8; 1024 * 1024];
-    for _ in 0..256 {
+    for _ in 0..2048 {
         for byte in &mut block {
             state = state
                 .wrapping_mul(6364136223846793005)
@@ -1144,6 +1157,13 @@ fn bench_comfyui_profile() -> Result<()> {
     let mnt_s = mount_point.to_string_lossy();
 
     // ── Benchmark script ───────────────────────────────────────────────────
+    // Heavier, cache-defeating workload:
+    //   - 3000 small files with UNIQUE content (different seed offsets, no dedup)
+    //   - 3 large model files totaling ~1.3 GB of unique data
+    //   - Random-order & reverse-order reads to defeat OS page cache + FUSE cache
+    //   - Overwrite phase (750 modified files with NEW unique content)
+    //   - Total unique data written exceeds default 1 GB chunk cache
+    //   - Phase ordering guarantees small file chunks are evicted before cold read
     let script = format!(
         r#"set -euo pipefail
 SEED={seed_s}
@@ -1154,83 +1174,142 @@ phase() {{
     echo "BENCH:$name:$(( end - start ))"
 }}
 
-# ---- Phase 1: small files (comfy-env profile) -------------------------------
-# 100 packages x 5 files each, sizes mimicking a Python venv:
-#   tier-1  35 %    <1 KB      (config / __init__)
-#   tier-2  50 %    1-64 KB    (source modules)
-#   tier-3  15 %   64 KB-1 MB  (compiled extensions / data)
-
 SITE="$MNT/lib/python3.13/site-packages"
 BINDIR="$MNT/bin"
-mkdir -p "$SITE" "$BINDIR"
+MODELS="$MNT/models"
+mkdir -p "$SITE" "$BINDIR" "$MODELS"
+
+# ---- Phase 1: Write small files with UNIQUE content --------------------------
+# 300 packages x 10 files = 3000 files
+# Each file reads from a unique, non-overlapping seed offset so no dedup occurs.
+# Tier breakdown:
+#   tier-1  35%: 1050 files, <1 KB (config / __init__)
+#   tier-2  50%: 1500 files, 1-64 KB (source modules)
+#   tier-3  15%: 450 files, 64 KB-1 MB (compiled extensions / data)
 
 p1_start=$(date +%s%N)
+cumulative_kb=0
 
-for pkg in $(seq 1 100); do
+for pkg in $(seq 1 300); do
     pdir="$SITE/package_$(printf '%04d' "$pkg")"
     mkdir -p "$pdir"
-    for slot in 0 1 2 3 4; do
-        idx=$(( (pkg - 1) * 5 + slot + 1 ))
-        if [ "$idx" -le 175 ]; then
-            size=$(( 128 + (idx * 7) % 896 ))
-        elif [ "$idx" -le 425 ]; then
-            size=$(( 1024 + (idx * 13) % 64512 ))
+    for slot in 0 1 2 3 4 5 6 7 8 9; do
+        idx=$(( (pkg - 1) * 10 + slot + 1 ))
+        if [ "$idx" -le 1050 ]; then
+            # tier-1: <1 KB → round to 1 KB
+            size_kb=1
+        elif [ "$idx" -le 2550 ]; then
+            # tier-2: 1-64 KB
+            size_bytes=$(( 1024 + (idx * 13) % 64512 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
         else
-            size=$(( 65536 + (idx * 17) % 720896 ))
+            # tier-3: 64 KB-1 MB
+            size_bytes=$(( 65536 + (idx * 17) % 983040 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
         fi
         fname="mod_$(printf '%02d' "$slot").py"
         [ "$slot" -eq 0 ] && fname="__init__.py"
-        # OPTIMIZED: Write entire file in one operation using exact size as block size
-        dd if="$SEED" bs="$size" count=1 of="$pdir/$fname" conv=fsync 2>/dev/null
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        cumulative_kb=$(( cumulative_kb + size_kb ))
     done
 done
 
-for i in $(seq 1 10); do
-    sz=$(( 256 + (i * 11) % 768 ))
-    # OPTIMIZED: Write entire file in one operation using exact size as block size
-    dd if="$SEED" bs="$sz" count=1 of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+# Bin scripts (20 small scripts with unique content)
+for i in $(seq 1 20); do
+    size_kb=$(( 1 + (i * 11) % 15 ))
+    dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+    cumulative_kb=$(( cumulative_kb + size_kb ))
 done
 
 p1_end=$(date +%s%N)
 phase "sm_write_dura" "$p1_start" "$p1_end"
 
-# ---- Phase 2: read small files back ----------------------------------------
+# ---- Phase 2: Read small files sequentially (HOT cache) ----------------------
 p2_start=$(date +%s%N)
 find "$SITE" -type f -exec sha256sum {{}} + > /dev/null
 sha256sum "$BINDIR"/* > /dev/null
 p2_end=$(date +%s%N)
-phase "sm_read" "$p2_start" "$p2_end"
+phase "sm_read_seq" "$p2_start" "$p2_end"
 
-# ---- Phase 3: large files (model profile) -----------------------------------
-# 64 MB checkpoint-like + 128 MB diffusion-model-like
-MODELS="$MNT/models"
-mkdir -p "$MODELS"
-
+# ---- Phase 3: Large files with UNIQUE content (EVICTS small file chunks) -----
+# 768 MB checkpoint + 384 MB diffusion + 192 MB vae = 1344 MB total
+# Reads from unique seed regions well past the small-file data.
+# This write overflows the default 1 GB chunk cache, evicting small-file chunks.
 p3_start=$(date +%s%N)
-dd if="$SEED" bs=1M count=64 of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
-dd if="$SEED" bs=1M skip=64 count=128 of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=400
+dd if="$SEED" bs=1M count=768 skip=$lgb_mb of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 768 ))
+dd if="$SEED" bs=1M count=384 skip=$lgb_mb of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 384 ))
+dd if="$SEED" bs=1M count=192 skip=$lgb_mb of="$MODELS/vae.bin" conv=fsync 2>/dev/null
 p3_end=$(date +%s%N)
 phase "lg_write_dura" "$p3_start" "$p3_end"
 
-# ---- Phase 4: read large files back -----------------------------------------
+# ---- Phase 4: Read small files in random order (COLD - chunks evicted) -------
+# The large file write evicted small file chunks from cache.
+# shuf randomizes access order, defeating any remaining OS page cache.
 p4_start=$(date +%s%N)
+find "$SITE" -type f -print0 | shuf -z | xargs -0 -n1 sha256sum > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p4_end=$(date +%s%N)
+phase "sm_read_rnd" "$p4_start" "$p4_end"
+
+# ---- Phase 5: Read large files sequentially (HOT chunks) ---------------------
+p5_start=$(date +%s%N)
 sha256sum "$MODELS/checkpoint.bin" > /dev/null
 sha256sum "$MODELS/diffusion.bin" > /dev/null
-p4_end=$(date +%s%N)
-phase "lg_read" "$p4_start" "$p4_end"
-
-# ---- Phase 5: final durability barrier (system-wide sync) -------------------
-p5_start=$(date +%s%N)
-sync
+sha256sum "$MODELS/vae.bin" > /dev/null
 p5_end=$(date +%s%N)
-phase "sync_barrier" "$p5_start" "$p5_end"
+phase "lg_read_seq" "$p5_start" "$p5_end"
+
+# ---- Phase 6: Read large files in REVERSE order (defeats seq readahead) ------
+p6_start=$(date +%s%N)
+sha256sum "$MODELS/vae.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+p6_end=$(date +%s%N)
+phase "lg_read_rev" "$p6_start" "$p6_end"
+
+# ---- Phase 7: Overwrite 50% of small files with NEW unique content ------------
+# Every other package (150 of 300), 5 files each = 750 modified files.
+# Reads from seeds at offset well past all prior regions.
+p7_start=$(date +%s%N)
+ovw_kb=$(( cumulative_kb + 4096 ))
+for pkg in $(seq 2 2 300); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    for slot in 5 6 7 8 9; do
+        idx=$(( (pkg - 1) * 10 + slot + 1 ))
+        size_bytes=$(( 2048 + (idx * 23) % 64512 ))
+        size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fname="mod_$(printf '%02d' "$slot").py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$ovw_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        ovw_kb=$(( ovw_kb + size_kb ))
+    done
+done
+p7_end=$(date +%s%N)
+phase "mod_write_dura" "$p7_start" "$p7_end"
+
+# ---- Phase 8: Read modified files --------------------------------------------
+p8_start=$(date +%s%N)
+for pkg in $(seq 2 2 300); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    sha256sum "$pdir"/* > /dev/null
+done
+p8_end=$(date +%s%N)
+phase "mod_read" "$p8_start" "$p8_end"
+
+# ---- Phase 9: Final durability barrier (system-wide sync) ---------------------
+p9_start=$(date +%s%N)
+sync
+p9_end=$(date +%s%N)
+phase "sync_barrier" "$p9_start" "$p9_end"
 
 echo "---"
-echo "BENCH:summary_total:$(( p5_end - p1_start ))"
+echo "BENCH:summary_total:$(( p9_end - p1_start ))"
 "#,
     );
 
-    let out = run_cmd(300, Some(&root), "bash", &["-c", &script])?;
+    let out = run_cmd(900, Some(&root), "bash", &["-c", &script])?;
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     for line in stdout.lines() {
@@ -1257,8 +1336,8 @@ echo "BENCH:summary_total:$(( p5_end - p1_start ))"
         .lines()
         .count();
     anyhow::ensure!(
-        sm_count == 500,
-        "expected 500 small files, got {}",
+        sm_count == 3020,
+        "expected 3020 small files (3000 pkg + 20 bin), got {}",
         sm_count
     );
 
@@ -1272,9 +1351,9 @@ echo "BENCH:summary_total:$(( p5_end - p1_start ))"
     let lg_count = String::from_utf8_lossy(&lg_lines.stdout)
         .lines()
         .count();
-    anyhow::ensure!(lg_count == 2, "expected 2 large files, got {}", lg_count);
+    anyhow::ensure!(lg_count == 3, "expected 3 large files, got {}", lg_count);
 
-    for path in &["models/checkpoint.bin", "models/diffusion.bin"] {
+    for path in &["models/checkpoint.bin", "models/diffusion.bin", "models/vae.bin"] {
         let stat_out = run_cmd(
             30,
             None,
@@ -1293,9 +1372,10 @@ echo "BENCH:summary_total:$(( p5_end - p1_start ))"
     Ok(())
 }
 
-/// Minimal/fast version of bench_comfyui_profile for quick iteration.
-/// Uses only 30 small files and 2 tiny "large" files (~5MB total).
-/// Same structure but optimized dd commands (no bs=1).
+/// Scaled-down version of bench_comfyui_profile for quick iteration.
+/// 600 small files (~50 MB) + 3 large files (128+64+32 = 224 MB) + overwrite/rnd phases.
+/// Same cache-defeating structure (unique content, random/reverse reads).
+/// Total unique data: ~300 MB.
 #[test]
 fn bench_comfyui_profile_fast() -> Result<()> {
     if std::env::consts::OS != "linux" {
@@ -1313,6 +1393,7 @@ fn bench_comfyui_profile_fast() -> Result<()> {
         "dd",
         "sync",
         "sha256sum",
+        "shuf",
     ] {
         if require_tool(tool).is_err() {
             return Ok(());
@@ -1340,7 +1421,7 @@ fn bench_comfyui_profile_fast() -> Result<()> {
     let mut sf = File::create(&seed_file).context("seed file")?;
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut block = vec![0u8; 1024 * 1024];
-    for _ in 0..256 {
+    for _ in 0..384 {
         for byte in &mut block {
             state = state
                 .wrapping_mul(6364136223846793005)
@@ -1358,7 +1439,9 @@ fn bench_comfyui_profile_fast() -> Result<()> {
 
     let mnt_s = mount_point.to_string_lossy();
 
-    // Benchmark script - OPTIMIZED dd commands (no bs=1!)
+    // ── Benchmark script ───────────────────────────────────────────────────
+    // Scaled-down but same structure as the full benchmark.
+    // 600 small files with unique content + 3 large files (224 MB total) + overwrite/reverse.
     let script = format!(
         r#"set -euo pipefail
 SEED={seed_s}
@@ -1371,71 +1454,121 @@ phase() {{
 
 SITE="$MNT/lib/python3.13/site-packages"
 BINDIR="$MNT/bin"
-mkdir -p "$SITE" "$BINDIR"
+MODELS="$MNT/models"
+mkdir -p "$SITE" "$BINDIR" "$MODELS"
 
+# ---- Phase 1: Small files with unique content ----
 p1_start=$(date +%s%N)
+cumulative_kb=0
 
-# 10 packages x 3 files each (30 files total) - FAST!
-for pkg in $(seq 1 10); do
+for pkg in $(seq 1 100); do
     pdir="$SITE/package_$(printf '%04d' "$pkg")"
     mkdir -p "$pdir"
-    for slot in 0 1 2; do
-        idx=$(( (pkg - 1) * 3 + slot + 1 ))
-        if [ "$idx" -le 10 ]; then
-            size=$(( 128 + (idx * 7) % 896 ))
-        elif [ "$idx" -le 25 ]; then
-            size=$(( 1024 + (idx * 13) % 64512 ))
+    for slot in 0 1 2 3 4 5; do
+        idx=$(( (pkg - 1) * 6 + slot + 1 ))
+        if [ "$idx" -le 210 ]; then
+            size_kb=1
+        elif [ "$idx" -le 510 ]; then
+            size_bytes=$(( 1024 + (idx * 13) % 16384 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
         else
-            size=$(( 65536 + (idx * 17) % 720896 ))
+            size_bytes=$(( 32768 + (idx * 17) % 229376 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
         fi
         fname="mod_$(printf '%02d' "$slot").py"
         [ "$slot" -eq 0 ] && fname="__init__.py"
-        # OPTIMIZED: Use exact size as block size (one write per file!)
-        dd if="$SEED" bs="$size" count=1 of="$pdir/$fname" conv=fsync 2>/dev/null
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        cumulative_kb=$(( cumulative_kb + size_kb ))
     done
 done
 
-for i in $(seq 1 5); do
-    sz=$(( 256 + (i * 11) % 768 ))
-    dd if="$SEED" bs="$sz" count=1 of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+for i in $(seq 1 10); do
+    size_kb=$(( 1 + (i * 7) % 10 ))
+    dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+    cumulative_kb=$(( cumulative_kb + size_kb ))
 done
 
 p1_end=$(date +%s%N)
 phase "sm_write_dura" "$p1_start" "$p1_end"
 
+# ---- Phase 2: Read small files sequentially (HOT) ----
 p2_start=$(date +%s%N)
 find "$SITE" -type f -exec sha256sum {{}} + > /dev/null
 sha256sum "$BINDIR"/* > /dev/null
 p2_end=$(date +%s%N)
-phase "sm_read" "$p2_start" "$p2_end"
+phase "sm_read_seq" "$p2_start" "$p2_end"
 
-# Smaller "large" files for speed
-MODELS="$MNT/models"
-mkdir -p "$MODELS"
-
+# ---- Phase 3: Large files (unique content, evicts small chunks) ----
 p3_start=$(date +%s%N)
-dd if="$SEED" bs=1M count=4 of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
-dd if="$SEED" bs=1M skip=4 count=8 of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=100
+dd if="$SEED" bs=1M count=128 skip=$lgb_mb of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 128 ))
+dd if="$SEED" bs=1M count=64 skip=$lgb_mb of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 64 ))
+dd if="$SEED" bs=1M count=32 skip=$lgb_mb of="$MODELS/vae.bin" conv=fsync 2>/dev/null
 p3_end=$(date +%s%N)
 phase "lg_write_dura" "$p3_start" "$p3_end"
 
+# ---- Phase 4: Read small files in random order (COLD) ----
 p4_start=$(date +%s%N)
+find "$SITE" -type f -print0 | shuf -z | xargs -0 -n1 sha256sum > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p4_end=$(date +%s%N)
+phase "sm_read_rnd" "$p4_start" "$p4_end"
+
+# ---- Phase 5: Read large files sequentially ----
+p5_start=$(date +%s%N)
 sha256sum "$MODELS/checkpoint.bin" > /dev/null
 sha256sum "$MODELS/diffusion.bin" > /dev/null
-p4_end=$(date +%s%N)
-phase "lg_read" "$p4_start" "$p4_end"
-
-p5_start=$(date +%s%N)
-sync
+sha256sum "$MODELS/vae.bin" > /dev/null
 p5_end=$(date +%s%N)
-phase "sync_barrier" "$p5_start" "$p5_end"
+phase "lg_read_seq" "$p5_start" "$p5_end"
+
+# ---- Phase 6: Read large files in REVERSE order ----
+p6_start=$(date +%s%N)
+sha256sum "$MODELS/vae.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+p6_end=$(date +%s%N)
+phase "lg_read_rev" "$p6_start" "$p6_end"
+
+# ---- Phase 7: Overwrite 50% of small files ----
+p7_start=$(date +%s%N)
+ovw_kb=$(( cumulative_kb + 512 ))
+for pkg in $(seq 2 2 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    for slot in 3 4 5; do
+        size_bytes=$(( 2048 + (pkg * 17) % 16384 ))
+        size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fname="mod_$(printf '%02d' "$slot").py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$ovw_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        ovw_kb=$(( ovw_kb + size_kb ))
+    done
+done
+p7_end=$(date +%s%N)
+phase "mod_write_dura" "$p7_start" "$p7_end"
+
+# ---- Phase 8: Read modified files ----
+p8_start=$(date +%s%N)
+for pkg in $(seq 2 2 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    sha256sum "$pdir"/* > /dev/null
+done
+p8_end=$(date +%s%N)
+phase "mod_read" "$p8_start" "$p8_end"
+
+# ---- Phase 9: Sync barrier ----
+p9_start=$(date +%s%N)
+sync
+p9_end=$(date +%s%N)
+phase "sync_barrier" "$p9_start" "$p9_end"
 
 echo "---"
-echo "BENCH:summary_total:$(( p5_end - p1_start ))"
+echo "BENCH:summary_total:$(( p9_end - p1_start ))"
 "#,
     );
 
-    let out = run_cmd(120, Some(&root), "bash", &["-c", &script])?;
+    let out = run_cmd(600, Some(&root), "bash", &["-c", &script])?;
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     for line in stdout.lines() {
@@ -1462,8 +1595,8 @@ echo "BENCH:summary_total:$(( p5_end - p1_start ))"
         .lines()
         .count();
     anyhow::ensure!(
-        sm_count == 30,
-        "expected 30 small files, got {}",
+        sm_count == 610,
+        "expected 610 small files (600 pkg + 10 bin), got {}",
         sm_count
     );
 
@@ -1477,9 +1610,9 @@ echo "BENCH:summary_total:$(( p5_end - p1_start ))"
     let lg_count = String::from_utf8_lossy(&lg_lines.stdout)
         .lines()
         .count();
-    anyhow::ensure!(lg_count == 2, "expected 2 large files, got {}", lg_count);
+    anyhow::ensure!(lg_count == 3, "expected 3 large files, got {}", lg_count);
 
-    for path in &["models/checkpoint.bin", "models/diffusion.bin"] {
+    for path in &["models/checkpoint.bin", "models/diffusion.bin", "models/vae.bin"] {
         let stat_out = run_cmd(
             30,
             None,
