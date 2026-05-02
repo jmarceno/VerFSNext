@@ -156,6 +156,17 @@ pub(crate) fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
     let merged_end = existing_end.max(incoming_end);
     let merged_len = merged_end.saturating_sub(merged_start) as usize;
 
+    // Fast path: incoming immediately follows existing (sequential append).
+    // Avoid allocating a new merged buffer — just extend the existing Vec.
+    // This eliminates O(n²) memory copies for sequential writes (e.g. dd bs=1M
+    // coalesced into hundreds of 1MB blocks).
+    if incoming_start == existing_end {
+        existing.data.extend_from_slice(&incoming.data);
+        return;
+    }
+
+    // Fast path: incoming is fully within existing (same start, same or smaller size).
+    // Just overwrite the overlapping portion of the existing buffer.
     if merged_start == existing_start && merged_len == existing.data.len() {
         let dst_start = (incoming_start.saturating_sub(merged_start)) as usize;
         let dst_end = dst_start.saturating_add(incoming.data.len());
@@ -163,6 +174,8 @@ pub(crate) fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
         return;
     }
 
+    // General case: allocate new merged buffer (for overlapping writes with
+    // different starting offsets, or non-contiguous writes).
     let mut merged = vec![0_u8; merged_len];
     let existing_dst_start = (existing_start.saturating_sub(merged_start)) as usize;
     let existing_dst_end = existing_dst_start.saturating_add(existing.data.len());
