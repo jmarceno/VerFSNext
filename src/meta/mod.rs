@@ -20,7 +20,7 @@ impl MetaStore {
     pub async fn open(path: &Path) -> Result<Self> {
         let tree = TreeBuilder::new()
             .with_path(path.to_path_buf())
-            .with_max_memtable_size(32 * 1024 * 1024)
+            .with_max_memtable_size(128 * 1024 * 1024)
             .with_flush_on_close(true)
             .build()
             .context("failed to open SurrealKV tree")?;
