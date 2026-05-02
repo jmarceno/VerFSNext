@@ -323,10 +323,6 @@ impl FsCore {
         }
 
         self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn)?;
-        self.invalidate_inode_cache(op.ino);
-        self.bump_inode_data_version(op.ino);
-        self.mark_mutation();
-        self.invalidate_inode_attr_best_effort(op.ino);
 
         self.dedup_hits
             .fetch_add(plan.dedup_hits, Ordering::Relaxed);
@@ -379,29 +375,96 @@ impl WriteApply for FsCore {
         // and fsync overhead significantly for batched writes.
         let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
 
-        let batched_txn = match self.meta.begin_write() {
-            Ok(txn) => txn,
-            Err(e) => return (0..original_len).map(|_| Err(anyhow!(format!("{:#}", e)))).collect(),
-        };
-        let mut batched_txn = batched_txn;
+        // Retry loop: SurrealKV write-write conflicts can occur when the CREATE
+        // handler's write_txn commits concurrently with this batch. Both modify
+        // the same inode_key, causing a TransactionWriteConflict. We retry the
+        // entire batch on conflict — the seq_num advances after the concurrent
+        // create's commit, so the next attempt sees a start_seq after the conflict.
+        //
+        // We collect the ops upfront via iter() so we can retry without consuming
+        // the map, and clone WriteOps for each attempt.
+        let inode_keys: Vec<u64> = by_inode.keys().copied().collect();
+        let max_retries = 3;
+        let mut committed = false;
+        for attempt in 0..max_retries {
+            let mut batched_txn = match self.meta.begin_write() {
+                Ok(txn) => txn,
+                Err(e) => return (0..original_len).map(|_| Err(anyhow!(format!("{:#}", e)))).collect(),
+            };
 
-        for inode_groups in by_inode.into_values() {
-            for (group_op, indices) in inode_groups {
-                let group_result = self.apply_single_write_in_txn(group_op, &mut batched_txn).await;
-                for idx in indices {
-                    out[idx] = Some(match &group_result {
-                        Ok(()) => Ok(()),
-                        Err(err) => Err(anyhow!(err.to_string())),
-                    });
+            // Reset out on each attempt so failed attempts don't leak Ok results
+            for slot in out.iter_mut() {
+                *slot = None;
+            }
+            let mut affected_inodes: Vec<u64> = Vec::new();
+            let mut group_failed = false;
+            for ino in &inode_keys {
+                let Some(groups) = by_inode.get(ino) else {
+                    continue;
+                };
+                for (group_op, indices) in groups {
+                    let group_result = self.apply_single_write_in_txn(
+                        group_op.clone(),
+                        &mut batched_txn,
+                    ).await;
+                    for idx in indices {
+                        out[*idx] = Some(match &group_result {
+                            Ok(()) => Ok(()),
+                            Err(err) => Err(anyhow!(err.to_string())),
+                        });
+                    }
+                    if group_result.is_ok() {
+                        if !affected_inodes.contains(ino) {
+                            affected_inodes.push(*ino);
+                        }
+                    } else {
+                        group_failed = true;
+                    }
+                }
+            }
+
+            if group_failed {
+                batched_txn.rollback();
+                if attempt + 1 < max_retries {
+                    continue;
+                }
+                return out.into_iter().map(|r| {
+                    r.unwrap_or_else(|| Err(anyhow!("apply_single_write failed")))
+                }).collect();
+            }
+
+            let commit_result = self.meta.commit_write_txn(&mut batched_txn).await;
+            match commit_result {
+                Ok(()) => {
+                    committed = true;
+                    // CRITICAL: Invalidate caches and bump versions AFTER the metadata
+                    // transaction is committed. Doing this before the commit creates a
+                    // window where concurrent readers see the new data version but load
+                    // stale inodes/extents from uncommitted SurrealKV state.
+                    for ino in &affected_inodes {
+                        self.invalidate_inode_cache(*ino);
+                        self.bump_inode_data_version(*ino);
+                        self.mark_mutation();
+                        self.invalidate_inode_attr_best_effort(*ino);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{:#}", e);
+                    if attempt + 1 < max_retries && err_str.contains("write conflict") {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    return out.into_iter().map(|r| {
+                        r.unwrap_or_else(|| Err(anyhow!(err_str.clone())))
+                    }).collect();
                 }
             }
         }
 
-        // Single commit for all accumulated metadata writes
-        if let Err(e) = self.meta.commit_write_txn(&mut batched_txn).await {
-            let msg = format!("{:#}", e);
-            return out.into_iter().map(|r| {
-                r.unwrap_or_else(|| Err(anyhow!(msg.clone())))
+        if !committed {
+            return out.into_iter().map(|_| {
+                Err(anyhow!("write batch failed after {} retries", max_retries))
             }).collect();
         }
 

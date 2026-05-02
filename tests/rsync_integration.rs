@@ -696,9 +696,124 @@ fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);
-
     Ok(())
 }
+
+/// Regression test for B002: git clone data corruption
+///
+/// Clones the ComfyUI-Manager repository (~155 MiB, 29851 objects) onto the
+/// FUSE mount. The clone must complete successfully without any inflate errors
+/// or corruption. This test specifically stresses the write-read coherency
+/// path under heavy concurrent write+read workload typical of git clone.
+///
+/// Requires: `git`, network access to github.com
+#[test]
+fn git_clone_comfyui_manager_regression() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "git",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_size_mb = 1024\nbatch_flush_interval_ms = 100\nfuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), &config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    // Diagnostic: write a small file and read it back
+    let diag_path = mount_point.join("diag.txt");
+    let diag_content = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n";
+    fs::write(&diag_path, diag_content).context("diagnostic write failed")?;
+    let read_back = fs::read_to_string(&diag_path).context("diagnostic read failed")?;
+    if read_back != diag_content {
+        let daemon_stderr = fs::read_to_string(root.join("daemon.stderr.log")).unwrap_or_default();
+        bail!(
+            "DIAGNOSTIC FAILED: wrote {} bytes, read back {} bytes\n\
+             wrote: {:?}\nread:   {:?}\n\
+             daemon stderr:\n{}",
+            diag_content.len(),
+            read_back.len(),
+            diag_content,
+            read_back,
+            daemon_stderr,
+        );
+    }
+    eprintln!("DIAGNOSTIC PASSED: wrote {} bytes, read back {} bytes OK", diag_content.len(), read_back.len());
+
+    // Clone the ComfyUI-Manager repo with shallow depth=1 for speed.
+    // The full repo has 29851 objects (~155 MiB) which exercises the
+    // write-read coherency path with many small+large pack file writes.
+    let output = run_cmd_raw(
+        600,
+        Some(&mount_point),
+        "git",
+        &[
+            "-c", "protocol.version=2",
+            "clone",
+            "--depth=1",
+            "https://github.com/ltdrdata/ComfyUI-Manager",
+        ],
+    )?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let daemon_stderr = fs::read_to_string(root.join("daemon.stderr.log")).unwrap_or_default();
+        bail!(
+            "git clone failed — possible data corruption\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}\n\ndaemon stderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr,
+            daemon_stderr,
+        );
+    }
+
+    let cloned = mount_point.join("ComfyUI-Manager");
+    let fsck_output = run_cmd_raw(
+        120,
+        Some(&cloned),
+        "git",
+        &["fsck", "--no-dangling"],
+    )?;
+    if !fsck_output.status.success() {
+        let stdout = String::from_utf8_lossy(&fsck_output.stdout);
+        let stderr = String::from_utf8_lossy(&fsck_output.stderr);
+        bail!(
+            "git fsck detected corruption in cloned repo\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            fsck_output.status.code(),
+            stdout,
+            stderr,
+        );
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
 
 #[test]
 fn rsync_large_file_rollover_multpack_persists() -> Result<()> {

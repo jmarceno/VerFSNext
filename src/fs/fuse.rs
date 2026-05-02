@@ -714,15 +714,11 @@ impl VirtualFs for VerFs {
         self.core
             .validate_file_handle(fh, ino)
             .map_err(map_anyhow_to_fuse)?;
-        // Skip the drain if no writes have been enqueued since the last one.
-        // This avoids an async channel round-trip when the batcher is known-empty,
-        // which is the common case for read-mostly workloads.
-        if !self.core.can_skip_drain() {
+        if self.batcher.pending_write_count() > 0 {
             self.batcher
                 .drain()
                 .await
                 .map_err(map_anyhow_to_fuse)?;
-            self.core.mark_drained();
         }
         let inode = self
             .core
@@ -756,6 +752,10 @@ impl VirtualFs for VerFs {
                 } else {
                     (inode.size - 1) / BLOCK_SIZE as u64
                 };
+                tracing::warn!(
+                    "BUILD_PLAN ino={} fh={} offset={} size={} version={} inode_size={} end_block={}",
+                    ino, fh, offset, size, current_version, inode.size, end_block
+                );
                 let built_plan = self
                     .core
                     .meta
@@ -764,6 +764,7 @@ impl VirtualFs for VerFs {
                         let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
                         for block_idx in 0..=end_block {
                             let Some(raw_extent) = txn.get(extent_key(ino, block_idx))? else {
+                                tracing::warn!("BUILD_PLAN no_extent ino={} block={}", ino, block_idx);
                                 continue;
                             };
                             let extent: ExtentRecord = decode_rkyv(&raw_extent)?;
@@ -772,6 +773,7 @@ impl VirtualFs for VerFs {
                                 chunks.entry(extent.chunk_hash)
                             {
                                 let Some(raw_chunk) = txn.get(chunk_key(&extent.chunk_hash))? else {
+                                    tracing::warn!("BUILD_PLAN no_chunk ino={} hash={:x?}", ino, extent.chunk_hash);
                                     continue;
                                 };
                                 let chunk: ChunkRecord = decode_rkyv(&raw_chunk)?;
@@ -785,6 +787,10 @@ impl VirtualFs for VerFs {
                         })
                     })
                     .map_err(map_anyhow_to_fuse)?;
+                tracing::warn!(
+                    "BUILD_PLAN_DONE ino={} fh={} extents={} chunks={} file_size={}",
+                    ino, fh, built_plan.extents.len(), built_plan.chunks.len(), built_plan.file_size
+                );
 
                 self.core
                     .store_small_file_read_plan(
@@ -1033,19 +1039,18 @@ impl VirtualFs for VerFs {
             data: data.to_vec(),
         };
 
-        self.core.mark_write_enqueued();
-
         if (flags & FUSE_WRITE_CACHE) != 0 {
             self.batcher
                 .enqueue(op, write_bytes)
                 .await
-                .map_err(map_anyhow_to_fuse)
+                .map_err(map_anyhow_to_fuse)?;
         } else {
             self.batcher
                 .enqueue_and_wait(op, write_bytes)
                 .await
-                .map_err(map_anyhow_to_fuse)
+                .map_err(map_anyhow_to_fuse)?;
         }
+        Ok(())
     }
 
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
@@ -1055,12 +1060,11 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "flush")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        if !self.core.can_skip_drain() {
+        if self.batcher.pending_write_count() > 0 {
             self.batcher
                 .drain()
                 .await
                 .map_err(map_anyhow_to_fuse)?;
-            self.core.mark_drained();
         }
         Ok(())
     }
@@ -1079,12 +1083,11 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "release")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        if !self.core.can_skip_drain() {
+        if self.batcher.pending_write_count() > 0 {
             self.batcher
                 .drain()
                 .await
                 .map_err(map_anyhow_to_fuse)?;
-            self.core.mark_drained();
         }
         self.core.unregister_file_handle(fh);
         {
@@ -1103,15 +1106,11 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsync")
             .map_err(map_anyhow_to_fuse)?;
-        // Only drain if there are pending writes, avoiding an async channel
-        // round-trip + tokio task wakeup when the batcher is known-empty.
-        // Same optimization as the read handler.
-        if !self.core.can_skip_drain() {
+        if self.batcher.pending_write_count() > 0 {
             self.batcher
                 .drain()
                 .await
                 .map_err(map_anyhow_to_fuse)?;
-            self.core.mark_drained();
         }
         self.core
             .sync_cycle(!datasync)
@@ -1213,12 +1212,11 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsyncdir")
             .map_err(map_anyhow_to_fuse)?;
-        if !self.core.can_skip_drain() {
+        if self.batcher.pending_write_count() > 0 {
             self.batcher
                 .drain()
                 .await
                 .map_err(map_anyhow_to_fuse)?;
-            self.core.mark_drained();
         }
         self.core
             .sync_cycle(!datasync)

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,18 @@ pub struct WriteBatcher {
     tx: mpsc::Sender<QueueMessage>,
     ingest_worker: Mutex<Option<JoinHandle<()>>>,
     apply_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Tracks the number of fire-and-forget writes enqueued since the last drain.
+    /// Incremented atomically after each enqueue, reset after each drain completes.
+    /// Used by readers to decide whether a drain is necessary before reading.
+    pending_count: Arc<AtomicU64>,
+}
+
+impl WriteBatcher {
+    /// Returns the number of fire-and-forget writes enqueued since the last drain.
+    /// A return value of 0 means no writes are pending and the drain can be skipped.
+    pub fn pending_write_count(&self) -> u64 {
+        self.pending_count.load(Ordering::Acquire)
+    }
 }
 
 impl WriteBatcher {
@@ -127,10 +140,12 @@ impl WriteBatcher {
             drop(apply_tx);
         });
 
+        let pending_count = Arc::new(AtomicU64::new(0));
         Self {
             tx,
             ingest_worker: Mutex::new(Some(ingest_handle)),
             apply_worker: Mutex::new(Some(apply_handle)),
+            pending_count,
         }
     }
 
@@ -142,7 +157,9 @@ impl WriteBatcher {
                 done: None,
             }))
             .await
-            .map_err(|_| anyhow!("write batcher is closed"))
+            .map_err(|_| anyhow!("write batcher is closed"))?;
+        self.pending_count.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     pub async fn enqueue_and_wait(&self, op: WriteOp, bytes: usize) -> Result<()> {
@@ -167,9 +184,11 @@ impl WriteBatcher {
             .send(QueueMessage::Drain(done_tx))
             .await
             .map_err(|_| anyhow!("write batcher is closed"))?;
-        done_rx
+        let result = done_rx
             .await
-            .map_err(|_| anyhow!("write batcher worker exited before drain reply"))?
+            .map_err(|_| anyhow!("write batcher worker exited before drain reply"))?;
+        self.pending_count.store(0, Ordering::Release);
+        result
     }
 
     pub async fn shutdown(&self) -> Result<()> {
