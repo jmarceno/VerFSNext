@@ -1324,13 +1324,18 @@ echo "BENCH:summary_total:$(( p9_end - p1_start ))"
         }
     }
 
-    // Sanity checks
+    // Sanity checks: count all small files (pkg files under lib/python + bin scripts)
     let sm_lines = run_cmd(30, None, "find", &[
         mnt_s.as_ref(),
         "-type",
         "f",
+        "(",
         "-path",
         "*/lib/python*",
+        "-o",
+        "-path",
+        "*/bin/*",
+        ")",
     ])?;
     let sm_count = String::from_utf8_lossy(&sm_lines.stdout)
         .lines()
@@ -1588,8 +1593,13 @@ echo "BENCH:summary_total:$(( p9_end - p1_start ))"
         mnt_s.as_ref(),
         "-type",
         "f",
+        "(",
         "-path",
         "*/lib/python*",
+        "-o",
+        "-path",
+        "*/bin/*",
+        ")",
     ])?;
     let sm_count = String::from_utf8_lossy(&sm_lines.stdout)
         .lines()
