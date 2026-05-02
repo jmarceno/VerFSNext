@@ -1,15 +1,26 @@
 # Autoresearch Ideas (VerFSNext)
 
+## Tried / Dead Ends
+- **Skip SurrealKV range scan for inode.size==0**: No improvement. Range scan overhead for empty extents is negligible.
+- **Point reads for single-block extent scans (meta.get_value)**: No improvement vs range iterator.
+- **Share Arc<Vec<u8>> between chunk_data_cache and pending_chunks**: Saves 1 copy per chunk but within noise (~0.3%).
+- **Vec<u8> ownership in stage_chunk_if_missing**: Avoids one copy per new chunk but within noise (~1%).
+
+## Remaining Bottleneck Analysis
+The benchmark's sm_write_dura (~45s) is dominated by:
+1. **FUSE message round-trips**: ~267,000 writes at ~50µs each = ~13s
+2. **dd process creation**: 3000 fork+exec at ~3ms each = ~9s
+3. **fsync amplification**: conv=fsync per file triggers sync_cycle
+4. **VerFSNext data processing**: ~17s (hash, compress, pack write, SurrealKV)
+
+Only item 4 is within VerFSNext's control. The other three are benchmark overhead.
+
 ## Deferred / Promising Ideas
 
-- **Pack format optimization**: The current PackRecordHeader has 3 reserved bytes + 4 magic bytes. Could we combine magic + reserved into fewer bytes to reduce per-record overhead?
-- **Index cache warming during pack rotation**: When rotating packs, the index cache is primed linearly. Could parallel warm with rayon speed this up?
-- **Reduce rkyv encoding/decoding overhead**: rkyv's access/check pattern has overhead. For hot paths (extent lookups), hand-rolled packed struct reads might be faster.
-- **Batch decompression**: When reading many chunks for a large file read, decompress them in parallel with rayon instead of sequentially.
-- **Async pack I/O**: Use `tokio::fs` for pack reads to overlap I/O with decompression.
-- **Tune write coalescing**: The write batcher coalesces adjacent writes. Could larger coalescing windows reduce metadata commits?
-- **UltraCDC chunker tuning**: The 64KB feed buffer in `ultracdc_chunk_count` is hardcoded. Making it larger could reduce chunker overhead for the (pointless) chunk counting call.
-- **Remove redundant chunk counting**: `ultracdc_chunk_count` is called on write data but the result is only used for logging (debug!). Could skip it.
-- **Pluggable hash function**: XXH3-128 is fast but maybe XXH3-64 is enough if we accept slightly higher collision risk? (probably not worth the risk per correctness requirements)
-- **Lazy decompression in cache**: Store zstd-compressed data in the chunk data cache instead of decompressed data, decompress on use. Saves memory at cost of CPU.
-- **Skip zero-fill for new blocks**: When writing to a region past EOF with no old extents, the block is zero-filled then immediately overwritten. The zero-fill is wasted work.
+- **Batch SurrealKV commits across writes**: Currently each file's write + fsync forces a commit. If we could defer metadata for bulk operations...
+- **Reduce pack I/O during reads**: For cold reads, decompression dominates. Could pre-decompress or use faster decompression (zstd level 1 for speed, but increases size).
+- **Parallelize block hash loop**: For large writes, hash blocks in parallel with rayon. Currently hash is serial (fast, ~1µs/MB).
+- **Zero-copy FUSE writes**: Avoid `data.to_vec()` in FUSE write handler by using the kernel buffer directly. Requires async-fusex changes.
+- **Lighter write coalescing**: Currently coalesces by inode then sequential. Could also coalesce across inodes at the same block-level for metadata sharing.
+- **SurrealKV tuning**: Increase memtable size, reduce WAL overhead for batch writes.
+- **Remove unnecessary header validation in pack reads**: `read_chunk_payload_with_index` reads + validates the pack header on every read, but the index entry already contains the same info. This adds an extra pread per read. Savings: ~3000 * (header read + decode + validate) for cold reads.

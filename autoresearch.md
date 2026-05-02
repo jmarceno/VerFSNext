@@ -57,7 +57,29 @@ VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test bench_comfyui_profile --test rsync_integr
 - Tests must pass: file counts (3020 small files, 3 large), file sizes > 0 for large files
 
 ## What's Been Tried
-*(Initial session — nothing yet)*
+
+### 1. Fast-path for full-block new writes (KEPT)
+**Change**: In `prepare_write_plan`, when a write covers an entire block with no old extent, hash the write data slice directly instead of zero-filling a 1MB buffer and copying into it.
+**Result**: **-29%** total time (130,744 → 92,543 ms). lg_write_dura dropped 64% (54s → 20s) because large model files (`dd bs=1M`) write exactly one full block per FUSE message, all new extents.
+**Files**: `src/fs/write.rs` — restructured block processing loop
+
+### 2. Remove redundant chunk counting (KEPT as part of #1)
+**Change**: Removed `ultracdc_chunk_count` call from `prepare_write_plan` and the `cdc_chunk_count` field from `PreparedWritePlan`. The chunk count was only used in a `debug!()` log message.
+**Files**: `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/mod.rs`
+
+### 3-6. Discarded experiments (all within noise)
+- Skip SurrealKV range scan when inode.size==0 — no improvement
+- Point reads for single-block extent scans — no improvement
+- Arc<Vec<u8>> sharing between cache and pending_chunks — no improvement
+- Vec<u8> ownership in stage_chunk_if_missing — no improvement
+
+### Key insight
+After micro-optimizations, sm_write_dura remains at ~45s. Based on analysis:
+- ~13s from FUSE message round-trip overhead (267,000+ messages for 3000 files via `dd bs=1024`)
+- ~9s from `dd` process creation (fork+exec per file)
+- ~6s from fsync overhead (conv=fsync triggers sync_cycle per file)
+- ~17s from data processing + SurrealKV operations
+Only the last category is within VerFSNext's control. The first three are inherent to the benchmark's structure.
 
 ## Ideas Backlog
 See `autoresearch.ideas.md` for deferred/promising ideas.
