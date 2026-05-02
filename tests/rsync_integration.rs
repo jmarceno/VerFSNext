@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +13,22 @@ use anyhow::{bail, Context, Result};
 struct MountDaemon {
     mount_point: PathBuf,
     child: Option<Child>,
+    peak_rss_bytes: Arc<AtomicU64>,
+    _mem_monitor: Option<thread::JoinHandle<()>>,
+}
+
+fn read_pid_rss_bytes(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{}/status", pid);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    for line in contents.lines() {
+        if line.starts_with("VmRSS:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u64>().ok().map(|kb| kb * 1024);
+            }
+        }
+    }
+    None
 }
 
 impl MountDaemon {
@@ -30,10 +48,39 @@ impl MountDaemon {
             .spawn()
             .context("failed to start verfsnext daemon")?;
 
+        let pid = child.id();
+        let peak_rss = Arc::new(AtomicU64::new(0));
+        let peak_rss_clone = Arc::clone(&peak_rss);
+
+        let monitor = thread::spawn(move || {
+            loop {
+                if let Some(rss) = read_pid_rss_bytes(pid) {
+                    let current_peak = peak_rss_clone.load(Ordering::Relaxed);
+                    if rss > current_peak {
+                        peak_rss_clone.store(rss, Ordering::Relaxed);
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
         Ok(Self {
             mount_point,
             child: Some(child),
+            peak_rss_bytes: peak_rss,
+            _mem_monitor: Some(monitor),
         })
+    }
+
+    fn peak_rss_bytes(&self) -> u64 {
+        // Also check current RSS one more time before returning
+        if let Some(child) = &self.child {
+            if let Some(current) = read_pid_rss_bytes(child.id()) {
+                let peak = self.peak_rss_bytes.load(Ordering::Relaxed);
+                return peak.max(current);
+            }
+        }
+        self.peak_rss_bytes.load(Ordering::Relaxed)
     }
 
     fn wait_until_mounted(&self, timeout: Duration) -> Result<()> {
@@ -1635,6 +1682,12 @@ echo "BENCH:summary_total:$(( p9_end - p1_start ))"
             .context("stat size")?;
         anyhow::ensure!(size > 0, "{} is empty", path);
     }
+
+    // Report memory metrics
+    let peak_rss = daemon.peak_rss_bytes();
+    let peak_rss_mb = peak_rss as f64 / (1024.0 * 1024.0);
+    println!("  {:20}  {:>8.1} MB", "peak_rss", peak_rss_mb);
+    println!("METRIC peak_rss_mb={:.2}", peak_rss_mb);
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);
