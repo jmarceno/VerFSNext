@@ -32,7 +32,7 @@ This migration path must be documented in the migration guide and must be run au
 - Don't write tests for what the type system already guarantees.
 
 ### Code Organization
-- **VENDOR**: code under `vendor/` has been hard forked and you must treat as our own code, making any needed fixes and modifications.
+- **VENDOR**: code under `crates/` are hard-forked internal packages that are part of the project. Treat them as our own code, making any needed fixes and modifications.
 
 ## Reference Documentation (create if it does not exist)
 - [VerFS Technical Deep Dive](docs/technical_deep_dive.md)
@@ -41,7 +41,7 @@ This migration path must be documented in the migration guide and must be run au
 - [VerFS Technical Deep Dive](docs/technical_deep_dive.md)
 
 ## Update SurrealKV Architecture Documentation after any change to SurrealKV code
-- [SurrealKV Architecture](vendor/surrealkv/docs/ARCHITECTURE.md)
+- [SurrealKV Architecture](crates/verfsnext-surrealkv/docs/ARCHITECTURE.md)
 
 ## When working on issues/bugs, consult our Bug Fix history to better undertand impact and possible regressions
 - [Bug fix history](docs/bug-fix-history.md)

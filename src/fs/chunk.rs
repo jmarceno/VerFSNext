@@ -264,7 +264,7 @@ impl FsCore {
         Ok(out)
     }
     pub(crate) fn apply_ref_deltas_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         ref_deltas: &HashMap<[u8; 16], i64>,
         new_chunk_records: &HashMap<[u8; 16], ChunkRecord>,
     ) -> Result<()> {
@@ -308,7 +308,7 @@ impl FsCore {
         Some(u64::from_be_bytes(bytes))
     }
     pub(crate) fn decrement_chunk_refcounts_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         hashes: &[[u8; 16]],
     ) -> Result<()> {
         if hashes.is_empty() {

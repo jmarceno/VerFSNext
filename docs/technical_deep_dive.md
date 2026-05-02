@@ -4,8 +4,8 @@
 
 The repository now includes a Phase 5 implementation on top of the existing full FUSE surface and prior data-plane/snapshot/GC work:
 
-- FUSE runtime via `vendor/async-fusex`
-- Metadata runtime via `vendor/surrealkv`
+- FUSE runtime via `crates/verfsnext-async-fusex`
+- Metadata runtime via `crates/verfsnext-surrealkv`
   - WAL batches, SSTable table metadata, and partitioned top-level index payloads are archived with `rkyv` and validated at decode boundaries
 - Two-stage write batching pipeline:
   - ingest stage batches by byte threshold or flush interval
@@ -110,12 +110,12 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - apply worker preserves batch order, applies each batch, and resolves per-write completion channels
   - `drain` and `shutdown` are implemented as ordered barriers in the apply queue
 
-- `vendor/async-fusex/src/fuse_fs.rs`
+- `crates/verfsnext-async-fusex/src/fuse_fs.rs`
   - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
   - `readdir` now stops filling once the reply buffer is full, matching `readdirplus` behavior and preserving correct continuation semantics
   - entry responses now carry separate entry TTL and attr TTL values end-to-end
 
-- `vendor/async-fusex/src/session.rs`
+- `crates/verfsnext-async-fusex/src/session.rs`
   - exposes `Session::notifier()` returning a cloneable session notifier handle
   - notifier supports kernel invalidations for inode attrs and directory entries (`invalidate_inode`, `invalidate_entry`)
   - notify writes are serialized through a mutex-protected FUSE device clone and use FUSE notify message framing with `unique = 0`

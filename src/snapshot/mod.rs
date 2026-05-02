@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use nix::errno::Errno;
-use surrealkv::LSMIterator;
+use verfsnext_surrealkv::LSMIterator;
 
 use crate::meta::MetaStore;
 use crate::types::{
@@ -165,7 +165,7 @@ fn validate_snapshot_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_snapshots_dir_ino(txn: &surrealkv::Transaction) -> Result<u64> {
+fn load_snapshots_dir_ino(txn: &verfsnext_surrealkv::Transaction) -> Result<u64> {
     let Some(raw) = txn.get(dirent_key(ROOT_INODE, SNAPSHOTS_DIR_NAME.as_bytes()))? else {
         return Err(anyhow_errno(
             Errno::EIO,
@@ -176,7 +176,7 @@ fn load_snapshots_dir_ino(txn: &surrealkv::Transaction) -> Result<u64> {
     Ok(dirent.ino)
 }
 
-fn read_next_inode(txn: &surrealkv::Transaction) -> Result<u64> {
+fn read_next_inode(txn: &verfsnext_surrealkv::Transaction) -> Result<u64> {
     let raw = txn
         .get(sys_key("next_inode"))?
         .context("missing SYS:next_inode")?;
@@ -197,7 +197,7 @@ fn allocate_inode(next_inode: &mut u64) -> Result<u64> {
     Ok(ino)
 }
 
-fn load_inode(txn: &surrealkv::Transaction, ino: u64, ctx: &str) -> Result<InodeRecord> {
+fn load_inode(txn: &verfsnext_surrealkv::Transaction, ino: u64, ctx: &str) -> Result<InodeRecord> {
     let Some(raw) = txn.get(inode_key(ino))? else {
         return Err(anyhow_errno(
             Errno::ENOENT,
@@ -208,7 +208,7 @@ fn load_inode(txn: &surrealkv::Transaction, ino: u64, ctx: &str) -> Result<Inode
 }
 
 fn clone_dir_children(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     src_dir_ino: u64,
     dst_dir_ino: u64,
     next_inode: &mut u64,
@@ -258,7 +258,7 @@ fn clone_dir_children(
 }
 
 fn list_dirents(
-    txn: &surrealkv::Transaction,
+    txn: &verfsnext_surrealkv::Transaction,
     dir_ino: u64,
 ) -> Result<Vec<(Vec<u8>, DirentRecord)>> {
     let mut out = Vec::new();
@@ -275,7 +275,7 @@ fn list_dirents(
     Ok(out)
 }
 
-fn clone_xattrs(txn: &mut surrealkv::Transaction, src_ino: u64, dst_ino: u64) -> Result<()> {
+fn clone_xattrs(txn: &mut verfsnext_surrealkv::Transaction, src_ino: u64, dst_ino: u64) -> Result<()> {
     let prefix = xattr_prefix(src_ino);
     let end = prefix_end(&prefix);
     let pairs = scan_range_pairs(txn, prefix, end)?.collect::<Result<Vec<_>>>()?;
@@ -289,7 +289,7 @@ fn clone_xattrs(txn: &mut surrealkv::Transaction, src_ino: u64, dst_ino: u64) ->
 }
 
 fn clone_file_extents(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     src_ino: u64,
     dst_ino: u64,
     ref_deltas: &mut HashMap<[u8; 16], i64>,
@@ -308,7 +308,7 @@ fn clone_file_extents(
 }
 
 fn remove_snapshot_subtree(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     ino: u64,
     ref_deltas: &mut HashMap<[u8; 16], i64>,
 ) -> Result<()> {
@@ -352,7 +352,7 @@ fn remove_snapshot_subtree(
 }
 
 fn apply_ref_deltas_in_txn(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     ref_deltas: &HashMap<[u8; 16], i64>,
 ) -> Result<()> {
     for (hash, delta) in ref_deltas {
@@ -391,7 +391,7 @@ fn apply_ref_deltas_in_txn(
 }
 
 fn scan_range_pairs<'a>(
-    txn: &'a surrealkv::Transaction,
+    txn: &'a verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
 ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {

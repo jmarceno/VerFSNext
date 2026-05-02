@@ -276,7 +276,7 @@ impl FsCore {
         ino: u64,
         inode: &mut InodeRecord,
         plan: &PreparedWritePlan,
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
     ) -> Result<()> {
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
@@ -301,7 +301,7 @@ impl FsCore {
     pub(crate) async fn apply_single_write_in_txn(
         &self,
         op: WriteOp,
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
     ) -> Result<()> {
         let prepared_version = self.inode_data_version(op.ino);
         let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;

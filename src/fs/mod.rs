@@ -6,14 +6,14 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use async_fusex::error::{AsyncFusexError, AsyncFusexResult};
-use async_fusex::session::SessionNotifier;
-use async_fusex::fs_util::{
+use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
+use verfsnext_async_fusex::session::SessionNotifier;
+use verfsnext_async_fusex::fs_util::{
     build_error_result_from_errno, CreateParam, FileAttr, FileLockParam, INum, RenameParam,
     SetAttrParam, StatFsParam,
 };
-use async_fusex::protocol::FUSE_WRITE_CACHE;
-use async_fusex::{DirEntry, FileType, VirtualFs};
+use verfsnext_async_fusex::protocol::FUSE_WRITE_CACHE;
+use verfsnext_async_fusex::{DirEntry, FileType, VirtualFs};
 use async_trait::async_trait;
 use moka::sync::Cache;
 use nix::errno::Errno;
@@ -22,7 +22,7 @@ use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
-use surrealkv::LSMIterator;
+use verfsnext_surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
@@ -747,7 +747,7 @@ impl FsCore {
     }
 
     fn accumulate_namespace_logical_size(
-        txn: &surrealkv::Transaction,
+        txn: &verfsnext_surrealkv::Transaction,
         start_ino: u64,
         seen_inodes: &mut HashSet<u64>,
     ) -> Result<u64> {

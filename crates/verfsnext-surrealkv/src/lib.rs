@@ -361,7 +361,7 @@ impl Options {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::Options;
+    /// use verfsnext_surrealkv::Options;
     ///
     /// let opts = Options::new().without_compression();
     /// ```
@@ -377,7 +377,7 @@ impl Options {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::{Options, CompressionType};
+    /// use verfsnext_surrealkv::{Options, CompressionType};
     ///
     /// let opts = Options::new()
     ///     .with_compression_per_level(vec![
@@ -398,7 +398,7 @@ impl Options {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::Options;
+    /// use verfsnext_surrealkv::Options;
     ///
     /// let opts = Options::new().with_l0_no_compression();
     /// ```
@@ -474,7 +474,7 @@ impl Options {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::TreeBuilder;
+    /// use verfsnext_surrealkv::TreeBuilder;
     ///
     /// let tree = TreeBuilder::new()
     ///     .with_path("./data".into())

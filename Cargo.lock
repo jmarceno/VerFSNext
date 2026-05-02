@@ -118,29 +118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-fusex"
-version = "0.1.0"
-dependencies = [
- "aligned-utils",
- "anyhow",
- "async-trait",
- "better-as",
- "clippy-utilities",
- "crossbeam-channel",
- "crossbeam-utils",
- "futures",
- "libc",
- "memchr",
- "nix",
- "serde",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "walkdir",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,34 +1348,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "surrealkv"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "bytecheck",
- "byteorder",
- "bytes",
- "crc32fast",
- "crossbeam-skiplist",
- "fastrand",
- "fs2",
- "guardian",
- "integer-encoding",
- "log",
- "lz4_flex",
- "parking_lot",
- "quick_cache",
- "rand 0.9.2",
- "rkyv",
- "snap",
- "tempdir",
- "tempfile",
- "test-log",
- "tokio",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.116"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1707,7 +1656,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
- "async-fusex",
  "async-trait",
  "bytecheck",
  "chacha20poly1305",
@@ -1721,15 +1669,67 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
- "surrealkv",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "verfsnext-async-fusex",
+ "verfsnext-surrealkv",
  "xxhash-rust",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "verfsnext-async-fusex"
+version = "0.1.0"
+dependencies = [
+ "aligned-utils",
+ "anyhow",
+ "async-trait",
+ "better-as",
+ "clippy-utilities",
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "futures",
+ "libc",
+ "memchr",
+ "nix",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "verfsnext-surrealkv"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bytecheck",
+ "byteorder",
+ "bytes",
+ "crc32fast",
+ "crossbeam-skiplist",
+ "fastrand",
+ "fs2",
+ "guardian",
+ "integer-encoding",
+ "log",
+ "lz4_flex",
+ "parking_lot",
+ "quick_cache",
+ "rand 0.9.2",
+ "rkyv",
+ "snap",
+ "tempdir",
+ "tempfile",
+ "test-log",
+ "tokio",
 ]
 
 [[package]]

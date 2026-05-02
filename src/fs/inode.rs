@@ -73,7 +73,7 @@ impl FsCore {
         Ok(inode)
     }
     pub(crate) fn ensure_dirent_target(
-        txn: &surrealkv::Transaction,
+        txn: &verfsnext_surrealkv::Transaction,
         parent: u64,
         name: &str,
         context: &'static str,
@@ -90,7 +90,7 @@ impl FsCore {
         decode_rkyv(&raw)
     }
     pub(crate) fn ensure_parent_dir_writable_in_txn(
-        txn: &surrealkv::Transaction,
+        txn: &verfsnext_surrealkv::Transaction,
         parent: u64,
         context: &'static str,
     ) -> Result<InodeRecord> {
@@ -111,7 +111,7 @@ impl FsCore {
         Ok(parent_inode)
     }
     pub(crate) fn create_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         parent: INum,
         name: &str,
         kind: u8,
@@ -221,7 +221,7 @@ impl FsCore {
         Ok(())
     }
     pub(crate) fn remove_inode_payload_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         inode: &InodeRecord,
     ) -> Result<()> {
         let extent_prefix_bytes = extent_prefix(inode.ino);
@@ -253,7 +253,7 @@ impl FsCore {
         Ok(())
     }
     pub(crate) fn remove_name_from_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         inode: &mut InodeRecord,
         defer_final_delete: bool,
     ) -> Result<bool> {
@@ -296,7 +296,7 @@ impl FsCore {
         self.invalidate_inode_cache(ino);
         Ok(())
     }
-    pub(crate) fn is_dir_empty(txn: &surrealkv::Transaction, ino: u64) -> Result<bool> {
+    pub(crate) fn is_dir_empty(txn: &verfsnext_surrealkv::Transaction, ino: u64) -> Result<bool> {
         let prefix = dirent_prefix(ino);
         let end = prefix_end(&prefix);
         let mut iter = txn.range(prefix, end)?;
@@ -304,7 +304,7 @@ impl FsCore {
         Ok(!not_empty)
     }
     pub(crate) fn prune_orphan_dirents_in_dir_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         ino: u64,
     ) -> Result<u64> {
         let prefix = dirent_prefix(ino);
@@ -321,7 +321,7 @@ impl FsCore {
         Ok(removed)
     }
     pub(crate) fn touch_parent_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         parent_ino: u64,
         nlink_delta: i32,
         sec: i64,

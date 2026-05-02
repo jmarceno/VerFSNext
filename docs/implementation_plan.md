@@ -4,8 +4,8 @@
 
 This document defines the implementation plan for a Linux userspace filesystem with these hard constraints:
 
-1. FUSE binding must be from `vendor/async-fusex`.
-2. Metadata KV must be from `vendor/surrealkv`.
+1. FUSE binding must be from `crates/verfsnext-async-fusex`.
+2. Metadata KV must be from `crates/verfsnext-surrealkv`.
 3. Phase 1 features: COW, snapshots, inline dedup (UltraCDC + XXH3-128), inline compression (zstd + rayon), caching with moka.
 4. Phase 2 feature: `.vault` data encryption only using XChaCha20-Poly1305 + Argon2id + envelope encryption workflow.
 5. All FUSE operations supported by vendored async-fusex must be implemented and usable in first prototype (no exceptions).

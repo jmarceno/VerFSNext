@@ -1,8 +1,8 @@
 [workspace]
 members = [
     ".",
-    "vendor/async-fusex",
-    "vendor/surrealkv",
+    "crates/verfsnext-async-fusex",
+    "crates/verfsnext-surrealkv",
 ]
 resolver = "2"
 
@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.97"
 argon2 = "0.5.3"
-async-fusex = { path = "vendor/async-fusex" }
+verfsnext-async-fusex = { path = "crates/verfsnext-async-fusex" }
 async-trait = "0.1.88"
 bytecheck = "0.8.2"
 chacha20poly1305 = "0.10.1"
@@ -32,7 +32,7 @@ rayon = "1.11.0"
 rkyv = { version = "0.8.15" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-surrealkv = { path = "vendor/surrealkv" }
+verfsnext-surrealkv = { path = "crates/verfsnext-surrealkv" }
 tokio = { version = "1.44.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.14"
 toml = "0.9.8"

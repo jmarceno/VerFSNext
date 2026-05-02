@@ -2038,7 +2038,7 @@ impl TreeBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::TreeBuilder;
+    /// use verfsnext_surrealkv::TreeBuilder;
     ///
     /// let tree = TreeBuilder::new()
     ///     .with_path("./data".into())
@@ -2104,7 +2104,7 @@ impl TreeBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use surrealkv::TreeBuilder;
+    /// use verfsnext_surrealkv::TreeBuilder;
     ///
     /// let tree = TreeBuilder::new()
     ///     .with_path("./data".into())

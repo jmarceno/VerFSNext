@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use nix::unistd::{getgid, getuid};
-use surrealkv::{Mode, Tree, TreeBuilder};
+use verfsnext_surrealkv::{Mode, Tree, TreeBuilder};
 
 use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
@@ -167,7 +167,7 @@ impl MetaStore {
 
     pub fn read_txn<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&surrealkv::Transaction) -> Result<R>,
+        F: FnOnce(&verfsnext_surrealkv::Transaction) -> Result<R>,
     {
         let txn = self
             .tree
@@ -190,7 +190,7 @@ impl MetaStore {
 
     pub async fn write_txn<F>(&self, f: F) -> Result<()>
     where
-        F: FnOnce(&mut surrealkv::Transaction) -> Result<()>,
+        F: FnOnce(&mut verfsnext_surrealkv::Transaction) -> Result<()>,
     {
         let mut txn = self
             .tree
@@ -202,12 +202,12 @@ impl MetaStore {
 
     /// Begin a write transaction with deferred commit.
     /// Caller must call `commit_write_txn()` when done.
-    pub fn begin_write(&self) -> Result<surrealkv::Transaction> {
+    pub fn begin_write(&self) -> Result<verfsnext_surrealkv::Transaction> {
         self.tree.begin().context("failed to start write transaction")
     }
 
     /// Commit a write transaction started with `begin_write()`.
-    pub async fn commit_write_txn(&self, txn: &mut surrealkv::Transaction) -> Result<()> {
+    pub async fn commit_write_txn(&self, txn: &mut verfsnext_surrealkv::Transaction) -> Result<()> {
         txn.commit().await.context("failed to commit transaction")
     }
 

@@ -32,7 +32,7 @@ pub(crate) fn anyhow_errno(message_errno: Errno, message: impl Into<String>) -> 
     anyhow::Error::new(message_errno).context(message.into())
 }
 pub(crate) fn scan_range_pairs<'a>(
-    txn: &'a surrealkv::Transaction,
+    txn: &'a verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
 ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {
@@ -55,7 +55,7 @@ pub(crate) fn scan_range_pairs<'a>(
     }))
 }
 pub(crate) fn scan_range_pairs_limited(
-    txn: &surrealkv::Transaction,
+    txn: &verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
     limit: usize,
@@ -212,7 +212,7 @@ async fn bench_scan_range_pairs_baseline() -> Result<()> {
         .unwrap()
         .as_nanos();
     let db_path = std::env::temp_dir().join(format!("verfs_bench_scan_{}", t));
-    let tree = surrealkv::TreeBuilder::new()
+    let tree = verfsnext_surrealkv::TreeBuilder::new()
         .with_path(db_path.clone())
         .build()?;
 
@@ -224,7 +224,7 @@ async fn bench_scan_range_pairs_baseline() -> Result<()> {
     }
     txn.commit().await?;
 
-    let txn = tree.begin_with_mode(surrealkv::Mode::ReadOnly)?;
+    let txn = tree.begin_with_mode(verfsnext_surrealkv::Mode::ReadOnly)?;
     let start_time = std::time::Instant::now();
     let res =
         scan_range_pairs(&txn, b"KEY_".to_vec(), b"KEY_a".to_vec())?.collect::<Result<Vec<_>>>()?;

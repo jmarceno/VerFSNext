@@ -11,7 +11,7 @@ This plan covers two related tracks:
 
 ## Current Implementation Status
 
-- Invalidation notifier support is implemented in `vendor/async-fusex` and wired into VerFS post-commit mutation paths.
+- Invalidation notifier support is implemented in `crates/verfsnext-async-fusex` and wired into VerFS post-commit mutation paths.
 - `read` now receives `fh`, and handle-local read plans are implemented for small files.
 - Committed metadata caches (inode + dirent) are implemented with bounded `moka` caches and mutation-time invalidation.
 - `fuse_attr_ttl_ms` and `fuse_entry_ttl_ms` are live config knobs; defaults are now non-zero (150ms each) and are automatically clamped to zero if invalidation notifier wiring is unavailable at mount time.
@@ -38,7 +38,7 @@ For cargo-like workloads, these metadata round-trips often dominate the actual f
 
 ## High-Level Delivery Order
 
-1. Add invalidate-notify support to `vendor/async-fusex`.
+1. Add invalidate-notify support to `crates/verfsnext-async-fusex`.
 2. Wire VerFS namespace and inode invalidations to committed mutations.
 3. Raise attr TTL first.
 4. Raise entry TTL after namespace invalidation is proven correct.
@@ -54,7 +54,7 @@ Expose the kernel notification primitives needed to invalidate cached dentries a
 
 ### Required API Surface
 
-Add session-level methods in `vendor/async-fusex` for:
+Add session-level methods in `crates/verfsnext-async-fusex` for:
 
 - `invalidate_inode(ino, off, len)`
 - `invalidate_entry(parent, name)`
@@ -370,7 +370,7 @@ The system must remain correct after remount even if a notification was never se
 
 ## Concrete File-Level Work List
 
-### `vendor/async-fusex`
+### `crates/verfsnext-async-fusex`
 
 - add invalidate notify primitives to session/channel layer
 - expose safe filesystem-facing API

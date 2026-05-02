@@ -21,11 +21,11 @@ This document provides a comprehensive overview of the internal design, data flo
 
 ## Workspace Integration
 
-SurrealKV is now wired as a workspace member in VerFSNext and compiled from `vendor/surrealkv` directly.
+SurrealKV is now wired as a workspace member in VerFSNext and compiled from `crates/verfsnext-surrealkv` directly.
 
 ### Build Manifest
 
-- Crate manifest: `vendor/surrealkv/Cargo.toml`
+- Crate manifest: `crates/verfsnext-surrealkv/Cargo.toml`
 - Added explicit dependencies required by the current source tree:
   - `guardian` for lock guard extraction patterns used by snapshot code.
   - `lz4_flex` for WAL/SST/VLog compression paths where `CompressionType::Lz4` is selected.

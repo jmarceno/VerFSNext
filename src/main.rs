@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use async_fusex::{
+use verfsnext_async_fusex::{
     mount::MountConfig,
     session::{new_session, SessionConfig},
     FuseFs, VirtualFs,
