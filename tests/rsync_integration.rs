@@ -1124,7 +1124,7 @@ fn bench_comfyui_profile() -> Result<()> {
 
     let config = format!(
         "mount_point = \"{}\"\ndata_dir = \"{}\"\n\
-         sync_interval_ms = 1000\nbatch_max_blocks = 3000\n\
+         sync_interval_ms = 1000\nbatch_max_size_mb = 1024\n\
          batch_flush_interval_ms = 250\n\
          fuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
         mount_point.display(),
@@ -1413,7 +1413,7 @@ fn bench_comfyui_profile_fast() -> Result<()> {
 
     let config = format!(
         "mount_point = \"{}\"\ndata_dir = \"{}\"\n\
-         sync_interval_ms = 1000\nbatch_max_blocks = 3000\n\
+         sync_interval_ms = 1000\nbatch_max_size_mb = 1024\n\
          batch_flush_interval_ms = 250\n\
          fuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
         mount_point.display(),
