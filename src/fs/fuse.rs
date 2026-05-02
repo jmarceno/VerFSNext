@@ -1213,7 +1213,13 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsyncdir")
             .map_err(map_anyhow_to_fuse)?;
-        self.batcher.drain().await.map_err(map_anyhow_to_fuse)?;
+        if !self.core.can_skip_drain() {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+            self.core.mark_drained();
+        }
         self.core
             .sync_cycle(!datasync)
             .await
