@@ -2,25 +2,6 @@ use super::*;
 use crate::fs::FsCore;
 
 impl FsCore {
-    pub(crate) fn ultracdc_chunk_count(&self, data: &[u8]) -> usize {
-        if data.is_empty() {
-            return 0;
-        }
-
-        const CHUNK_FEED_BUFFER_SIZE: usize = 64 * 1024;
-
-        let mut chunker = UltraStreamChunker::new(
-            self.config.ultracdc_min_size_bytes,
-            self.config.ultracdc_avg_size_bytes,
-            self.config.ultracdc_max_size_bytes,
-        );
-        let mut count = 0_usize;
-        for piece in data.chunks(CHUNK_FEED_BUFFER_SIZE) {
-            count = count.saturating_add(chunker.feed(piece).len());
-        }
-        count.saturating_add(chunker.finish().len())
-    }
-
     pub(crate) fn validate_pack_payload_crc32(
         &self,
         pack_id: u64,

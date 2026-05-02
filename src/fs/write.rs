@@ -3,7 +3,6 @@ use crate::fs::FsCore;
 
 struct PreparedWritePlan {
     write_end: u64,
-    cdc_chunk_count: usize,
     dedup_hits: u64,
     dedup_misses: u64,
     extent_updates: Vec<(u64, [u8; 16])>,
@@ -31,7 +30,6 @@ impl FsCore {
             .offset
             .checked_add(op.data.len() as u64)
             .ok_or_else(|| anyhow_errno(Errno::EOVERFLOW, "write offset overflow"))?;
-        let cdc_chunk_count = self.ultracdc_chunk_count(&op.data);
         let start_block = op.offset / BLOCK_SIZE as u64;
         let end_block = (write_end - 1) / BLOCK_SIZE as u64;
         let touched_blocks = (end_block - start_block + 1) as usize;
@@ -70,12 +68,6 @@ impl FsCore {
         let mut dedup_misses = 0_u64;
 
         for block_idx in start_block..=end_block {
-            let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
-                self.read_extent_bytes(*extent, FsCore::inode_is_vault(inode))?
-            } else {
-                vec![0_u8; BLOCK_SIZE]
-            };
-
             let block_start = block_idx * BLOCK_SIZE as u64;
             let copy_from = op.offset.max(block_start);
             let copy_until = write_end.min(block_start + BLOCK_SIZE as u64);
@@ -83,9 +75,26 @@ impl FsCore {
             let src_end = (copy_until - op.offset) as usize;
             let dst_start = (copy_from - block_start) as usize;
             let dst_end = dst_start + (src_end - src_start);
-            block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
+            let is_full_block = dst_start == 0 && dst_end == BLOCK_SIZE;
 
-            let new_hash = FsCore::hash_for_inode(inode, &block_data);
+            // Fast path: when writing to a new block with no old extent and the write
+            // covers the full block, we can hash the write data slice directly,
+            // skipping the zero-fill allocation and copy.
+            let has_old_extent = old_extents.contains_key(&block_idx);
+            let (new_hash, block_data) = if !has_old_extent && is_full_block {
+                let write_slice = &op.data[src_start..src_end];
+                let hash = FsCore::hash_for_inode(inode, write_slice);
+                (hash, write_slice.to_vec())
+            } else {
+                let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
+                    self.read_extent_bytes(*extent, FsCore::inode_is_vault(inode))?
+                } else {
+                    vec![0_u8; BLOCK_SIZE]
+                };
+                block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
+                let hash = FsCore::hash_for_inode(inode, &block_data);
+                (hash, block_data)
+            };
             let old_hash = old_extents.get(&block_idx).map(|extent| extent.chunk_hash);
 
             if old_hash == Some(new_hash) {
@@ -117,7 +126,6 @@ impl FsCore {
 
         Ok(PreparedWritePlan {
             write_end,
-            cdc_chunk_count,
             dedup_hits,
             dedup_misses,
             extent_updates,
@@ -330,7 +338,6 @@ impl FsCore {
             ino = op.ino,
             offset = op.offset,
             bytes = op.data.len(),
-            cdc_chunks = plan.cdc_chunk_count,
             dedup_hits = plan.dedup_hits,
             dedup_misses = plan.dedup_misses,
             "write completed through streaming dedup/compress pipeline"

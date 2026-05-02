@@ -28,7 +28,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::config::Config;
-use crate::data::chunker::UltraStreamChunker;
 use crate::data::compress::{compress_parallel, PendingChunk};
 use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
