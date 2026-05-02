@@ -216,37 +216,45 @@ impl FsCore {
             .map_err(|e| anyhow!("compression task failed: {}", e))??;
         let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
-            let (payload, disk_compressed_len, payload_crc32, nonce, flags) = if encrypt_for_vault {
+            let chunk = if encrypt_for_vault {
                 let folder_key = self.current_vault_key()?;
                 let (ciphertext, nonce) =
                     encrypt_chunk_payload(&folder_key, &ready_chunk.chunk.compressed)?;
-                let clen = ciphertext.len() as u32;
-                let crc32 = crc32c::crc32c(&ciphertext);
-                (ciphertext, clen, crc32, nonce, CHUNK_FLAG_ENCRYPTED)
+                let disk_compressed_len = ciphertext.len() as u32;
+                let payload_crc32 = crc32c::crc32c(&ciphertext);
+                let pack_id = self.packs.append_chunk_with_crc32(
+                    ready_chunk.hash,
+                    ready_chunk.chunk.codec,
+                    ready_chunk.chunk.uncompressed_len,
+                    &ciphertext,
+                    payload_crc32,
+                )?;
+                ChunkRecord {
+                    refcount: 0,
+                    pack_id,
+                    codec: ready_chunk.chunk.codec,
+                    flags: CHUNK_FLAG_ENCRYPTED,
+                    nonce,
+                    uncompressed_len: ready_chunk.chunk.uncompressed_len,
+                    compressed_len: disk_compressed_len,
+                }
             } else {
-                (
-                    ready_chunk.chunk.compressed.clone(),
-                    ready_chunk.chunk.compressed_len,
+                let pack_id = self.packs.append_chunk_with_crc32(
+                    ready_chunk.hash,
+                    ready_chunk.chunk.codec,
+                    ready_chunk.chunk.uncompressed_len,
+                    &ready_chunk.chunk.compressed,
                     ready_chunk.chunk.payload_crc32,
-                    [0_u8; 24],
-                    0,
-                )
-            };
-            let pack_id = self.packs.append_chunk_with_crc32(
-                ready_chunk.hash,
-                ready_chunk.chunk.codec,
-                ready_chunk.chunk.uncompressed_len,
-                &payload,
-                payload_crc32,
-            )?;
-            let chunk = ChunkRecord {
-                refcount: 0,
-                pack_id,
-                codec: ready_chunk.chunk.codec,
-                flags,
-                nonce,
-                uncompressed_len: ready_chunk.chunk.uncompressed_len,
-                compressed_len: disk_compressed_len,
+                )?;
+                ChunkRecord {
+                    refcount: 0,
+                    pack_id,
+                    codec: ready_chunk.chunk.codec,
+                    flags: 0,
+                    nonce: [0_u8; 24],
+                    uncompressed_len: ready_chunk.chunk.uncompressed_len,
+                    compressed_len: ready_chunk.chunk.compressed_len,
+                }
             };
             self.chunk_meta_cache
                 .insert(ready_chunk.hash, chunk.clone());
