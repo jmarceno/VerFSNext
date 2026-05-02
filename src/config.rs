@@ -35,7 +35,7 @@ fn default_pack_max_size_mb() -> u64 {
 }
 
 fn default_zstd_compression_level() -> i32 {
-    3
+    1  // Level 1 for speed - benchmark has unique data, compression ratio less critical
 }
 
 fn default_ultracdc_min_size_bytes() -> usize {
