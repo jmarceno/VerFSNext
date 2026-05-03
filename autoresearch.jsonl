@@ -1,0 +1,1 @@
+{"type":"config","name":"Optimize VerFSNext write speed while preserving read/consistency/dedup","metricName":"summary_total_ms","metricUnit":"ms","bestDirection":"lower"}
