@@ -250,17 +250,22 @@ fn take_pending_error(pending_error: &mut Option<anyhow::Error>) -> Result<()> {
 
 async fn apply_queued_batch(
     sink: &Arc<dyn WriteApply>,
-    batch: Vec<QueuedWrite>,
+    mut batch: Vec<QueuedWrite>,
     pending_error: &mut Option<anyhow::Error>,
 ) {
     if batch.is_empty() {
         return;
     }
 
-    let ops = batch
-        .iter()
-        .map(|entry| entry.op.clone())
-        .collect::<Vec<_>>();
+    // Extract WriteOps without cloning the data Vec — take ownership instead.
+    let ops: Vec<WriteOp> = batch
+        .iter_mut()
+        .map(|entry| WriteOp {
+            ino: entry.op.ino,
+            offset: entry.op.offset,
+            data: std::mem::take(&mut entry.op.data),
+        })
+        .collect();
     let results = sink.apply_batch(ops).await;
 
     if results.len() != batch.len() {
