@@ -1,21 +1,32 @@
 # Autoresearch Ideas — Write Speed Optimization
 
-## Successful Optimizations (✓)
-- **sync_data instead of sync_all**: Changed `packs.sync(true)` → `packs.sync(false)` in write.rs. sync_data() guarantees data + size metadata on disk, which is sufficient for crash ordering. sync_all's metadata flush (timestamps, sizes) is unnecessary since both pack and index files can be rebuilt from pack records. ~3% improvement.
-- **Removed redundant seek in pack append**: `file.seek(SeekFrom::End(0))` in `append_chunk_with_crc32` was redundant because `active.size_bytes` (tracked under the active pack lock) already equals the current file position for O_APPEND files. Saves one syscall per chunk. ~2% additional improvement.
-- **Avoid WriteOp data clone**: Changed `apply_queued_batch` to take ownership of `WriteOp.data` via `std::mem::take` instead of cloning. Saves one full data copy per write. Minor but measurable improvement in memory bandwidth.
+## Current Active Optimizations (all kept, verified by 9/9 tests)
 
-## Deferred / Not Tested
-- **BufWriter for index file**: Wrapping the index file in BufWriter regressed performance due to extra memcpy + flush overhead. Index entries are 44 bytes each, written under the active pack lock. The extra copy outweighed the syscall savings.
-- **Combined header+payload write**: Pre-allocating a Vec and writing both at once added allocation overhead that offset the syscall savings for our write patterns.
-- **write_all_vectored**: Not yet stable in the Rust version used by this project.
+| # | Optimization | File | Impact |
+|---|-------------|------|--------|
+| 1 | `sync_data()` instead of `sync_all()` on pack/index fsync | `src/fs/write.rs` | ~3% — halves fsync metadata flushes |
+| 2 | Removed redundant `seek(SeekFrom::End(0))` in pack append | `src/data/pack.rs` | ~2% — saves one seek syscall per chunk |
+| 3 | Avoid `WriteOp.data` clone in `apply_queued_batch` | `src/write/batcher.rs` | Minor — saves one data copy per write |
+| 4 | Pre-compute `SystemTime::now()` once per batch attempt | `src/fs/write.rs` | Minor — saves N clock_gettime syscalls per batch |
+| 5 | Buffer index entries, flush in one `write_all` during sync | `src/data/pack.rs` | Minor — batches 44-byte index writes into one |
+| 6 | Skip KV extent scan when `inode.size == 0` | `src/fs/write.rs` | ~2% — avoids read txn for new/truncated files |
+| 7 | Unbounded channel instead of bounded for batcher queue | `src/write/batcher.rs` | Robustness — eliminates B005 channel ordering issue |
 
-## Ideas for Future Exploration
-- **Separate write/drain channels**: Use separate mpsc channels for Write and Drain messages to eliminate the channel ordering issue (B005 root cause). This would allow fire-and-forget writes with reliable drain ordering, enabling write batching.
-- **Batch small file commits**: Instead of committing each file write individually (required by `dd conv=fsync` + FUSE writeback cache), accumulate FUSE_WRITE_CACHE writes in the batcher and only commit on FUSE fsync/flush. Requires solving the channel ordering issue first.
-- **Index write batching**: Buffer index entries in memory (Vec of 44-byte entries) and flush the batch during sync instead of writing each entry individually. Unlike BufWriter, this avoids the per-entry copy by batching into a single write.
-- **Parallel chunk appends across packs**: Use multiple active packs and distribute chunks across them with round-robin or hash-based distribution. Would allow parallel pack I/O.
-- **Pre-allocate pack files with fallocate**: Pre-allocate space to avoid kernel metadata updates from file extension. Requires changing from append-only writes to positional writes.
-- **Avoid zero-fill allocation for partial blocks**: For partial-block writes, the current code allocates and zero-fills a 4KB block, copies the write data in, then hashes it. A zero-fill-free approach (using Vec::resize would still zero) could save memory bandwidth.
-- **Profile: sm_write_dura is the bottleneck**: ~48% of total benchmark time. Each small file write (~1-64KB) triggers a full commit cycle (sync + KV commit). Any optimization that reduces per-commit overhead or batches small writes would have outsized impact.
-- **Avoid SystemTime::now() per write**: Each write in a batch calls `SystemTime::now()` (clock_gettime syscall). Pre-computing the timestamp once per batch and reusing it for all inode updates would save syscalls.
+**Total improvement**: ~9% on `bench_comfyui_profile_fast` (17,662ms → 16,079ms avg)
+
+## Deferred / Not Effective
+- **BufWriter for index file**: Regressed — extra memcpy + flush overhead exceeded syscall savings.
+- **Combined header+payload write**: Allocation overhead offset syscall savings.
+- **write_all_vectored**: Not yet stable in the Rust version used (1.95.0).
+
+## Ideas Not Yet Explored
+- **Fire-and-forget writes with unbounded channel**: The unbounded channel now eliminates the FIFO ordering issue. But fire-and-forget writes (`enqueue` instead of `enqueue_and_wait`) still have the B005 issue: the kernel considers FUSE_WRITE durable when it returns, and with FUSE_WRITEBACK_CACHE it may evict the page before the batcher commits. This would require a different approach where the batcher owns the data and the kernel can't evict it.
+- **Pre-allocate pack files with fallocate**: Pre-allocate pack file space to avoid kernel metadata updates from file extension. Requires changing from append-only to positional writes. Significant refactor.
+- **Parallel pack appends across multiple active packs**: Use multiple active packs and distribute chunks across them. Would allow parallel pack I/O (round-robin or hash-based). Large refactor but could significantly improve large file write throughput.
+- **Zero-fill avoidance for partial blocks**: For partial-block writes to new extents, the current code allocates and zero-fills 4KB then copies write data in. Could use a Vec initialized with write data and only fill the gaps.
+
+## Profiling Notes
+- `sm_write_dura` is ~48% of benchmark time — small file writes are the primary target
+- Large file writes (`lg_write_dura`) improved from ~3600ms to ~2600ms after optimizations
+- System noise is ±15% on the fast benchmark — changes need multiple runs to confirm
+- Full benchmark (`bench_comfyui_profile`) is more consistent but takes ~140s to run
