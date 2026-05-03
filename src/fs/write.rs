@@ -453,7 +453,7 @@ impl WriteApply for FsCore {
                 }).collect();
             }
 
-            if let Err(e) = self.packs.sync(true) {
+            if let Err(e) = self.packs.sync(false) {
                 tracing::warn!("pack sync before commit failed (attempt {}): {}", attempt, e);
             }
             let commit_result = self.meta.commit_write_txn(&mut batched_txn).await;
