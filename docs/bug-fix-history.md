@@ -137,3 +137,64 @@ The `invalidate_inode_cache`, `bump_inode_data_version`, `mark_mutation`, and `i
 - `src/fs/write.rs` — retry on write conflict, move post-commit invalidation after commit, collect records and insert cache after commit
 - `src/fs/chunk.rs` — remove cache insertion from `materialize_pending_chunks` (moved to post-commit in write.rs), keep `stage_chunk_if_missing` fast (no KV lookup)
 - `tests/rsync_integration.rs` — `git_clone_comfyui_manager_regression` test
+
+## B005 - FUSE Writeback Cache Fire-and-Forget Data Loss Window - May 03 2026
+
+### Root Cause
+
+With FUSE writeback cache enabled (default in `crates/verfsnext-async-fusex/src/session.rs:97`), the kernel caches `write()` data in its page cache and asynchronously flushes dirty pages via `FUSE_WRITE` requests with the `FUSE_WRITE_CACHE` flag. The FUSE write handler used `enqueue()` (fire-and-forget), which returned to the kernel **before** the batcher committed the data to SurrealKV and the pack file.
+
+This created a window where:
+
+1. Git writes pack data via `write()` → kernel page cache (dirty)
+2. Kernel asynchronously flushes dirty page → `FUSE_WRITE` with `WRITE_CACHE` flag
+3. FUSE handler calls `enqueue()` → returns immediately (data NOT committed)
+4. Kernel considers write complete, may evict the page from its cache
+5. Subsequent `read()` → kernel page cache miss → `FUSE_READ` sent
+6. FUSE read handler drains batcher → but the fire-and-forget write may have been assigned a seq number but not yet reached the ingest worker's channel
+7. Read returns stale metadata → git reads corrupt pack data → `inflate: data stream error`
+
+The fundamental issue: the kernel's writeback pipeline and the batcher's commit pipeline are unsynchronized. The kernel considers the write durable when FUSE responds, but the batcher may not have committed the data yet.
+
+**Why the existing drain did not prevent this**: The drain mechanism sends a `Drain` message through the same bounded channel as `Write` messages. When the channel buffer is congested (high writeback load), `enqueue().await` may suspend waiting for capacity. A concurrently arriving `Drain` message can enter the channel before the suspended `Write`, breaking the FIFO ordering guarantee that the drain relies on.
+
+### Fixed: Synchronous Write Completion with Immediate Batch Flush
+
+**Core fix**: All writes now use `enqueue_and_wait()` regardless of the `FUSE_WRITE_CACHE` flag. This guarantees the FUSE handler does not return to the kernel until the batcher has committed the data to SurrealKV and the pack file. The kernel's writeback pipeline is naturally synchronized: it sends `FUSE_WRITE`, waits for the response (now only after commit), and only then considers the page clean.
+
+**Performance critical optimization**: `enqueue_and_wait()` creates a `oneshot` channel (`done_tx`) attached to the write. The batcher's ingest worker now detects writes with a `done` channel and **immediately dispatches the pending batch** instead of waiting for the timer (500ms) or size threshold (1024MB). This reduces the commit wait from up to 500ms to just the commit time (~2ms).
+
+```
+enqueue_and_wait flow (original, slow):
+  Write → Channel → Ingest worker queues → Timer (500ms) → Dispatch → Commit (~2ms) → Response
+                                                                  ↑ wait up to 500ms!
+
+enqueue_and_wait flow (optimized):
+  Write(done) → Channel → Ingest worker detects done → Immediate dispatch → Commit (~2ms) → Response
+                                                                ↑ wait ~2ms only!
+```
+
+### Additional Fixes
+
+- **`src/fs/write.rs`**: `packs.sync(true)` called **before** `commit_write_txn()`, ensuring pack data is on disk before extent pointers are visible to concurrent readers.
+- **`src/fs/fuse.rs`**: Unconditional `drain()` in `read()` and `rename()` handlers (removed `pending_write_count() > 0` conditionals) as a safety net for any writes that might bypass the synchronous path.
+- **`crates/verfsnext-async-fusex/src/session.rs`**: `FUSE_WRITEBACK_CACHE` remains **enabled** — the fix handles the consistency issue without disabling kernel caching.
+
+### Performance
+
+Full clone of `ComfyUI-Manager` (29851 objects, ~155 MiB):
+- **Baseline** (no TTL, zero cache): 25s (original B001 fix)
+- **Before fix** (release, 150ms TTL): 33% pass rate, ~8-9s on failure (early abort)
+- **After fix** (release, 150ms TTL): 100% pass rate, 28-32s for full clone
+
+The ~20% regression vs baseline is caused by the `packs.sync(true)` fsync before each batch commit. Without the sync, the original code synced after commit, creating a window where metadata pointed to unsynced data.
+
+### Regression Test Updated
+
+`git_clone_comfyui_manager_regression` now uses a **full clone** (removed `--depth=1`) to exercise the write-read coherency path with 29851 objects (~155 MiB). Full clone triggers the race condition that shallow clones avoid.
+
+### Affected Files
+- `src/fs/fuse.rs` — all writes use `enqueue_and_wait()`, unconditional drain in read/rename
+- `src/write/batcher.rs` — immediate batch flush for writes with `done` channel
+- `src/fs/write.rs` — `packs.sync(true)` before `commit_write_txn()`
+- `tests/rsync_integration.rs` — full clone (no `--depth=1`)

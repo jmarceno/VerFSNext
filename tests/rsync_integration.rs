@@ -763,9 +763,10 @@ fn git_clone_comfyui_manager_regression() -> Result<()> {
     }
     eprintln!("DIAGNOSTIC PASSED: wrote {} bytes, read back {} bytes OK", diag_content.len(), read_back.len());
 
-    // Clone the ComfyUI-Manager repo with shallow depth=1 for speed.
+    // Clone the ComfyUI-Manager repo with full checkout (no --depth=1).
     // The full repo has 29851 objects (~155 MiB) which exercises the
     // write-read coherency path with many small+large pack file writes.
+    // Full clone triggers the race condition that shallow clones avoid.
     let output = run_cmd_raw(
         600,
         Some(&mount_point),
@@ -773,7 +774,6 @@ fn git_clone_comfyui_manager_regression() -> Result<()> {
         &[
             "-c", "protocol.version=2",
             "clone",
-            "--depth=1",
             "https://github.com/ltdrdata/ComfyUI-Manager",
         ],
     )?;

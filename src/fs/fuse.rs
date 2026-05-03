@@ -714,12 +714,10 @@ impl VirtualFs for VerFs {
         self.core
             .validate_file_handle(fh, ino)
             .map_err(map_anyhow_to_fuse)?;
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
+        self.batcher
+            .drain()
+            .await
+            .map_err(map_anyhow_to_fuse)?;
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "read")
@@ -1039,17 +1037,14 @@ impl VirtualFs for VerFs {
             data: data.to_vec(),
         };
 
-        if (flags & FUSE_WRITE_CACHE) != 0 {
-            self.batcher
-                .enqueue(op, write_bytes)
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        } else {
-            self.batcher
-                .enqueue_and_wait(op, write_bytes)
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
+        // Always use enqueue_and_wait. Cached writes (FUSE_WRITE_CACHE) need
+        // synchronous completion so the kernel's writeback flush returns only
+        // after data is committed. The batcher flushes immediately on sync
+        // writes (done channel present), so the wait is just the commit time.
+        self.batcher
+            .enqueue_and_wait(op, write_bytes)
+            .await
+            .map_err(map_anyhow_to_fuse)?;
         Ok(())
     }
 

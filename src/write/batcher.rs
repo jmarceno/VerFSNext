@@ -97,9 +97,10 @@ impl WriteBatcher {
                     maybe_msg = rx.recv() => {
                         match maybe_msg {
                             Some(QueueMessage::Write(msg)) => {
+                                let needs_immediate_flush = msg.done.is_some();
                                 pending_bytes = pending_bytes.saturating_add(msg.bytes);
                                 pending.push(msg);
-                                if pending_bytes >= max_size_bytes {
+                                if needs_immediate_flush || pending_bytes >= max_size_bytes {
                                     dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
                                 }
                             }
