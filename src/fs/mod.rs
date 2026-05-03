@@ -315,7 +315,6 @@ impl VerFs {
             write_sink,
             config.batch_max_size_mb.saturating_mul(1024 * 1024),
             Duration::from_millis(config.batch_flush_interval_ms),
-            2048,
         );
         let sync_service =
             SyncService::start(sync_target, Duration::from_millis(config.sync_interval_ms));

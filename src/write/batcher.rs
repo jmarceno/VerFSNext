@@ -39,7 +39,7 @@ enum ApplyMessage {
 }
 
 pub struct WriteBatcher {
-    tx: mpsc::Sender<QueueMessage>,
+    tx: mpsc::UnboundedSender<QueueMessage>,
     ingest_worker: Mutex<Option<JoinHandle<()>>>,
     apply_worker: Mutex<Option<JoinHandle<()>>>,
     /// Tracks the number of fire-and-forget writes enqueued since the last drain.
@@ -61,9 +61,12 @@ impl WriteBatcher {
         sink: Arc<dyn WriteApply>,
         max_size_bytes: usize,
         flush_interval: Duration,
-        queue_capacity: usize,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<QueueMessage>(queue_capacity);
+        // Use an unbounded channel so Write and Drain messages are never reordered.
+        // A bounded channel could cause a Drain to overtake a suspended Write
+        // when the channel is full, breaking the FIFO ordering that the drain
+        // mechanism relies on for read-after-write coherency.
+        let (tx, mut rx) = mpsc::unbounded_channel::<QueueMessage>();
         let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyMessage>();
 
         let apply_sink = Arc::clone(&sink);
@@ -157,7 +160,6 @@ impl WriteBatcher {
                 bytes,
                 done: None,
             }))
-            .await
             .map_err(|_| anyhow!("write batcher is closed"))?;
         self.pending_count.fetch_add(1, Ordering::Release);
         Ok(())
@@ -171,7 +173,6 @@ impl WriteBatcher {
                 bytes,
                 done: Some(done_tx),
             }))
-            .await
             .map_err(|_| anyhow!("write batcher is closed"))?;
 
         done_rx
@@ -183,7 +184,6 @@ impl WriteBatcher {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(QueueMessage::Drain(done_tx))
-            .await
             .map_err(|_| anyhow!("write batcher is closed"))?;
         let result = done_rx
             .await
@@ -196,7 +196,6 @@ impl WriteBatcher {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(QueueMessage::Shutdown(done_tx))
-            .await
             .map_err(|_| anyhow!("write batcher is closed"))?;
         let flush_result = done_rx
             .await
