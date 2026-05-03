@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -203,11 +203,7 @@ impl PackStore {
             .size_bytes
             .checked_add(record_len)
             .context("active pack size overflow")?;
-        let file = &mut active.file;
-
-        let record_offset = file
-            .seek(SeekFrom::End(0))
-            .context("failed to seek to pack end")?;
+        let record_offset = active.size_bytes;
         let compressed_len = compressed_data.len() as u32;
         let header = PackRecordHeader {
             magic: RECORD_MAGIC,
@@ -219,6 +215,9 @@ impl PackStore {
         };
         let header_bytes = Self::encode_pack_header(&header)?;
 
+        // Write header and payload separately. The seek was removed (size_bytes
+        // is already known), so we save one syscall per chunk already.
+        let file = &mut active.file;
         file.write_all(&header_bytes)
             .context("failed to write pack record header")?;
         file.write_all(compressed_data)
