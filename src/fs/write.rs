@@ -35,29 +35,35 @@ impl FsCore {
         let end_block = (write_end - 1) / BLOCK_SIZE as u64;
         let touched_blocks = (end_block - start_block + 1) as usize;
 
-        let old_extents = self.meta.read_txn(|txn| {
-            let mut map = HashMap::<u64, ExtentRecord>::new();
-            let start_key = extent_key(op.ino, start_block);
-            let end_key = end_block
-                .checked_add(1)
-                .map(|end| extent_key(op.ino, end))
-                .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
+        // Fast path: files with size == 0 have no extents. Skip the KV range scan.
+        // This applies to newly created files and files truncated to zero.
+        let old_extents = if inode.size == 0 {
+            HashMap::new()
+        } else {
+            self.meta.read_txn(|txn| {
+                let mut map = HashMap::<u64, ExtentRecord>::new();
+                let start_key = extent_key(op.ino, start_block);
+                let end_key = end_block
+                    .checked_add(1)
+                    .map(|end| extent_key(op.ino, end))
+                    .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
 
-            let mut iter = txn.range(start_key, end_key)?;
-            let mut valid = iter.seek_first()?;
-            while valid {
-                let key = iter.key().user_key();
-                if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
-                    if block_idx >= start_block && block_idx <= end_block {
-                        let val = iter.value()?;
-                        let extent: ExtentRecord = decode_rkyv(&val)?;
-                        map.insert(block_idx, extent);
+                let mut iter = txn.range(start_key, end_key)?;
+                let mut valid = iter.seek_first()?;
+                while valid {
+                    let key = iter.key().user_key();
+                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
+                        if block_idx >= start_block && block_idx <= end_block {
+                            let val = iter.value()?;
+                            let extent: ExtentRecord = decode_rkyv(&val)?;
+                            map.insert(block_idx, extent);
+                        }
                     }
+                    valid = iter.next()?;
                 }
-                valid = iter.next()?;
-            }
-            Ok(map)
-        })?;
+                Ok(map)
+            })?
+        };
 
         self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
 
