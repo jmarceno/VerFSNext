@@ -281,14 +281,14 @@ impl FsCore {
         inode: &mut InodeRecord,
         plan: &PreparedWritePlan,
         txn: &mut verfsnext_surrealkv::Transaction,
+        mtime_sec: i64,
+        mtime_nsec: u32,
     ) -> Result<()> {
-        let now = SystemTime::now();
-        let (sec, nsec) = system_time_to_parts(now);
         inode.size = inode.size.max(plan.write_end);
-        inode.mtime_sec = sec;
-        inode.mtime_nsec = nsec;
-        inode.ctime_sec = sec;
-        inode.ctime_nsec = nsec;
+        inode.mtime_sec = mtime_sec;
+        inode.mtime_nsec = mtime_nsec;
+        inode.ctime_sec = mtime_sec;
+        inode.ctime_nsec = mtime_nsec;
 
         for (block_idx, hash) in plan.extent_updates.iter().copied() {
             let extent = ExtentRecord { chunk_hash: hash };
@@ -308,6 +308,8 @@ impl FsCore {
         op: WriteOp,
         txn: &mut verfsnext_surrealkv::Transaction,
         known_new_hashes: &mut HashSet<[u8; 16]>,
+        mtime_sec: i64,
+        mtime_nsec: u32,
     ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
         let prepared_version = self.inode_data_version(op.ino);
         let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
@@ -334,7 +336,7 @@ impl FsCore {
             }
         }
 
-        self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn)?;
+        self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn, mtime_sec, mtime_nsec)?;
 
         self.dedup_hits
             .fetch_add(plan.dedup_hits, Ordering::Relaxed);
@@ -413,6 +415,10 @@ impl WriteApply for FsCore {
             let mut affected_inodes: Vec<u64> = Vec::new();
             let mut group_failed = false;
             let mut batch_new_records: HashMap<[u8; 16], ChunkRecord> = HashMap::new();
+            // Compute the timestamp once per batch attempt and reuse it for
+            // all inode updates. Avoids redundant clock_gettime syscalls.
+            let batch_now = SystemTime::now();
+            let (mtime_sec, mtime_nsec) = system_time_to_parts(batch_now);
             for ino in &inode_keys {
                 let Some(groups) = by_inode.get(ino) else {
                     continue;
@@ -422,6 +428,8 @@ impl WriteApply for FsCore {
                         group_op.clone(),
                         &mut batched_txn,
                         &mut known_new_hashes,
+                        mtime_sec,
+                        mtime_nsec,
                     ).await;
                     match &group_result {
                         Ok(records) => {
