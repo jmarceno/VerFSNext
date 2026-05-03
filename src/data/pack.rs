@@ -79,6 +79,10 @@ struct ActivePack {
     file: File,
     index_file: File,
     size_bytes: u64,
+    /// Buffer of index entries not yet written to disk.
+    /// Flushed to index_file during sync() or rotate_active_pack().
+    /// Reading works correctly because index_cache is updated immediately.
+    pending_index: Vec<([u8; 16], PackIndexEntry)>,
 }
 
 pub struct PackStore {
@@ -139,6 +143,7 @@ impl PackStore {
                 file,
                 index_file,
                 size_bytes,
+                pending_index: Vec::new(),
             }),
             index_cache: Cache::builder().max_capacity(index_cache_capacity).build(),
             pack_file_cache: Cache::builder()
@@ -230,8 +235,10 @@ impl PackStore {
             compressed_len,
             payload_crc32,
         };
-        Self::append_index_record(&mut active.index_file, chunk_hash, index)?;
-
+        // Buffer the index entry instead of writing it immediately.
+        // Index entries are flushed to disk in a single write during sync().
+        // The index_cache is updated immediately so reads are still correct.
+        active.pending_index.push((chunk_hash, index));
         self.index_cache.insert((active.pack_id, chunk_hash), index);
         active.size_bytes = next_size;
 
@@ -378,7 +385,9 @@ impl PackStore {
     }
 
     pub fn sync(&self, full: bool) -> Result<()> {
-        let active = self.active.lock();
+        let mut active = self.active.lock();
+        // Flush buffered index entries to disk before syncing.
+        Self::flush_pending_index(&mut active)?;
         if full {
             active
                 .file
@@ -398,6 +407,31 @@ impl PackStore {
                 .sync_data()
                 .context("failed to sync_data active pack index")
         }
+    }
+
+    /// Write all buffered index entries to the index file in a single batch.
+    fn flush_pending_index(active: &mut ActivePack) -> Result<()> {
+        if active.pending_index.is_empty() {
+            return Ok(());
+        }
+        // Pre-encode all entries into one contiguous buffer.
+        let mut buf = Vec::with_capacity(active.pending_index.len() * INDEX_ENTRY_LEN);
+        for (hash, entry) in &active.pending_index {
+            let record = PackIndexRecord {
+                hash: *hash,
+                offset: entry.offset,
+                codec: entry.codec,
+                reserved: RECORD_RESERVED,
+                uncompressed_len: entry.uncompressed_len,
+                compressed_len: entry.compressed_len,
+                payload_crc32: entry.payload_crc32,
+            };
+            let raw = Self::encode_index_record(&record)?;
+            buf.extend_from_slice(&raw);
+        }
+        active.index_file.write_all(&buf).context("failed to flush buffered index entries")?;
+        active.pending_index.clear();
+        Ok(())
     }
 
     pub fn active_pack_id(&self) -> u64 {
@@ -479,6 +513,8 @@ impl PackStore {
     }
 
     fn rotate_active_pack(&self, active: &mut ActivePack) -> Result<()> {
+        // Flush buffered index entries before rotating to a new pack.
+        Self::flush_pending_index(active)?;
         active
             .file
             .sync_data()
@@ -535,6 +571,7 @@ impl PackStore {
             active.file = next_file;
             active.index_file = next_index_file;
             active.size_bytes = next_size;
+            active.pending_index = Vec::new();
             return Ok(());
         }
     }
