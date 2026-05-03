@@ -121,15 +121,19 @@ When the batch retried after a write conflict, `stage_chunk_if_missing` found th
 2. A fresh SurrealKV transaction is created on retry, which sees a `start_seq` after the concurrent create handler's commit
 3. A `tokio::task::yield_now()` is issued to ensure the concurrent handler's commit propagates
 
-### Fixed: SurrealKV-Verified Dedup in stage_chunk_if_missing
+### Fixed: Move Cache Insertion After Commit
 
-`stage_chunk_if_missing` now always checks SurrealKV for chunk existence before treating a hash as a dedup hit, rather than trusting the in-memory `chunk_meta_cache` alone. This prevents stale cache entries from aborted transactions being treated as valid dedup hits on retry. The cache is still warmed on verified hits to maintain read performance.
+The root cause of the stale cache problem was that `materialize_pending_chunks` inserted into `chunk_meta_cache` before `commit_write_txn`. On retry, these uncommitted cache entries were treated as dedup hits, skipping re-materialization and leaving chunk records missing from KV.
+
+**Fix: `materialize_pending_chunks` no longer inserts into `chunk_meta_cache`.** Instead, `apply_batch` collects the new chunk records from all writes and inserts them into the cache **after** `commit_write_txn` succeeds. This guarantees that the cache never contains entries from aborted transactions, and `stage_chunk_if_missing` can safely use the fast cache-only path without a SurrealKV verification.
+
+A `known_new_hashes: HashSet<[u8; 16]>` tracks which hashes were confirmed as "new" in the first attempt, so retries skip redundant SurrealKV lookups and directly re-stage the chunks (the compressed data was already written to packs in the first attempt).
 
 ### Fixed: Move Version Bump After Metadata Commit
 
 The `invalidate_inode_cache`, `bump_inode_data_version`, `mark_mutation`, and `invalidate_inode_attr_best_effort` calls were moved from inside `apply_single_write_in_txn` (which runs before `commit_write_txn`) to after `commit_write_txn` in `apply_batch`. This ensures concurrent readers that observe the new data version always find fresh metadata in SurrealKV.
 
 ### Affected Files
-- `src/fs/write.rs` — retry on write conflict, move post-commit invalidation after commit
-- `src/fs/chunk.rs` — verify dedup against SurrealKV, don't trust cache alone
+- `src/fs/write.rs` — retry on write conflict, move post-commit invalidation after commit, collect records and insert cache after commit
+- `src/fs/chunk.rs` — remove cache insertion from `materialize_pending_chunks` (moved to post-commit in write.rs), keep `stage_chunk_if_missing` fast (no KV lookup)
 - `tests/rsync_integration.rs` — `git_clone_comfyui_manager_regression` test

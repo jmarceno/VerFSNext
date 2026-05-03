@@ -158,31 +158,27 @@ impl FsCore {
         data: &[u8],
         checked_hashes: &mut HashSet<[u8; 16]>,
         pending_chunks: &mut HashMap<[u8; 16], Vec<u8>>,
+        known_new_hashes: &HashSet<[u8; 16]>,
     ) -> Result<bool> {
         if !checked_hashes.insert(chunk_hash) {
             return Ok(false);
         }
 
-        // Check SurrealKV first. The in-memory cache may contain entries from
-        // an aborted transaction (e.g. after a write-conflict retry), so we
-        // cannot trust it alone — we must verify the chunk actually exists in
-        // committed metadata before treating it as a dedup hit.
-        let exists = self
-            .meta
-            .get_value(&chunk_key(&chunk_hash))?
-            .is_some();
-        if exists {
-            // Warm the in-memory cache and data cache on dedup hit.
-            self.chunk_meta_cache
-                .insert(chunk_hash, self.load_chunk_record(chunk_hash)?);
+        if known_new_hashes.contains(&chunk_hash) {
+            let data_vec = data.to_vec();
+            self.chunk_data_cache
+                .insert(chunk_hash, Arc::new(data_vec.clone()));
+            pending_chunks.insert(chunk_hash, data_vec);
+            return Ok(true);
+        }
+
+        if self.chunk_meta_cache.get(&chunk_hash).is_some() {
             self.chunk_data_cache
                 .insert(chunk_hash, Arc::new(data.to_vec()));
             return Ok(false);
         }
 
         let data_vec = data.to_vec();
-        // Warm the read data cache with the raw block data so subsequent
-        // reads of recently-written chunks skip pack I/O + decompression.
         self.chunk_data_cache
             .insert(chunk_hash, Arc::new(data_vec.clone()));
         pending_chunks.insert(chunk_hash, data_vec);
@@ -247,8 +243,6 @@ impl FsCore {
                     compressed_len: ready_chunk.chunk.compressed_len,
                 }
             };
-            self.chunk_meta_cache
-                .insert(ready_chunk.hash, chunk);
             out.insert(ready_chunk.hash, chunk);
         }
 

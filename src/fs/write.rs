@@ -25,6 +25,7 @@ impl FsCore {
         &self,
         op: &WriteOp,
         inode: &InodeRecord,
+        known_new_hashes: &HashSet<[u8; 16]>,
     ) -> Result<PreparedWritePlan> {
         let write_end = op
             .offset
@@ -112,6 +113,7 @@ impl FsCore {
                 &block_data,
                 &mut checked_hashes,
                 &mut pending_chunks,
+                known_new_hashes,
             )?;
             if staged_new {
                 dedup_misses = dedup_misses.saturating_add(1);
@@ -199,11 +201,13 @@ impl FsCore {
                         extent_updates.push((block_idx, new_hash));
                         *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
                         *ref_deltas.entry(new_hash).or_insert(0) += 1;
+                        let no_known_new = HashSet::new();
                         self.stage_chunk_if_missing(
                             new_hash,
                             &block_data,
                             &mut checked_hashes,
                             &mut pending_chunks,
+                            &no_known_new,
                         )?;
                     }
                     continue;
@@ -298,18 +302,23 @@ impl FsCore {
 
     /// Like apply_single_write but writes into an existing transaction.
     /// Multiple calls share one transaction for batched metadata commits.
+    /// Returns the set of new chunk records that were materialized for this write.
     pub(crate) async fn apply_single_write_in_txn(
         &self,
         op: WriteOp,
         txn: &mut verfsnext_surrealkv::Transaction,
-    ) -> Result<()> {
+        known_new_hashes: &mut HashSet<[u8; 16]>,
+    ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
         let prepared_version = self.inode_data_version(op.ino);
         let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
         self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
         if op.data.is_empty() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
-        let mut plan = self.prepare_write_plan(&op, &inode_snapshot).await?;
+        let mut plan = self.prepare_write_plan(&op, &inode_snapshot, known_new_hashes).await?;
+        for hash in plan.new_chunk_records.keys() {
+            known_new_hashes.insert(*hash);
+        }
 
         let _mutation_guard = self.write_lock.read().await;
         let inode_lock = self.inode_write_lock(op.ino).await;
@@ -319,7 +328,10 @@ impl FsCore {
         self.ensure_write_target_inode(op.ino, &inode)?;
         let current_version = self.inode_data_version(op.ino);
         if current_version != prepared_version {
-            plan = self.prepare_write_plan(&op, &inode).await?;
+            plan = self.prepare_write_plan(&op, &inode, known_new_hashes).await?;
+            for hash in plan.new_chunk_records.keys() {
+                known_new_hashes.insert(*hash);
+            }
         }
 
         self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn)?;
@@ -338,7 +350,8 @@ impl FsCore {
             dedup_misses = plan.dedup_misses,
             "write completed through streaming dedup/compress pipeline"
         );
-        Ok(())
+
+        Ok(plan.new_chunk_records)
     }
 }
 
@@ -386,6 +399,7 @@ impl WriteApply for FsCore {
         let inode_keys: Vec<u64> = by_inode.keys().copied().collect();
         let max_retries = 3;
         let mut committed = false;
+        let mut known_new_hashes = HashSet::new();
         for attempt in 0..max_retries {
             let mut batched_txn = match self.meta.begin_write() {
                 Ok(txn) => txn,
@@ -398,6 +412,7 @@ impl WriteApply for FsCore {
             }
             let mut affected_inodes: Vec<u64> = Vec::new();
             let mut group_failed = false;
+            let mut batch_new_records: HashMap<[u8; 16], ChunkRecord> = HashMap::new();
             for ino in &inode_keys {
                 let Some(groups) = by_inode.get(ino) else {
                     continue;
@@ -406,19 +421,24 @@ impl WriteApply for FsCore {
                     let group_result = self.apply_single_write_in_txn(
                         group_op.clone(),
                         &mut batched_txn,
+                        &mut known_new_hashes,
                     ).await;
-                    for idx in indices {
-                        out[*idx] = Some(match &group_result {
-                            Ok(()) => Ok(()),
-                            Err(err) => Err(anyhow!(err.to_string())),
-                        });
-                    }
-                    if group_result.is_ok() {
-                        if !affected_inodes.contains(ino) {
-                            affected_inodes.push(*ino);
+                    match &group_result {
+                        Ok(records) => {
+                            batch_new_records.extend(records.iter().map(|(k, v)| (*k, *v)));
+                            for idx in indices {
+                                out[*idx] = Some(Ok(()));
+                            }
+                            if !affected_inodes.contains(ino) {
+                                affected_inodes.push(*ino);
+                            }
                         }
-                    } else {
-                        group_failed = true;
+                        Err(err) => {
+                            for idx in indices {
+                                out[*idx] = Some(Err(anyhow!(err.to_string())));
+                            }
+                            group_failed = true;
+                        }
                     }
                 }
             }
@@ -437,16 +457,20 @@ impl WriteApply for FsCore {
             match commit_result {
                 Ok(()) => {
                     committed = true;
-                    // CRITICAL: Invalidate caches and bump versions AFTER the metadata
-                    // transaction is committed. Doing this before the commit creates a
-                    // window where concurrent readers see the new data version but load
-                    // stale inodes/extents from uncommitted SurrealKV state.
+                    // CRITICAL: Insert committed chunk records into cache and
+                    // invalidate inode caches AFTER the metadata transaction is
+                    // committed. Doing both before the commit creates windows
+                    // where concurrent readers observe inconsistent state.
+                    for (hash, record) in &batch_new_records {
+                        self.chunk_meta_cache.insert(*hash, *record);
+                    }
                     for ino in &affected_inodes {
                         self.invalidate_inode_cache(*ino);
                         self.bump_inode_data_version(*ino);
                         self.mark_mutation();
                         self.invalidate_inode_attr_best_effort(*ino);
                     }
+                    known_new_hashes.clear();
                     break;
                 }
                 Err(e) => {
