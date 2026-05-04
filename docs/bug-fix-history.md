@@ -198,3 +198,24 @@ The ~20% regression vs baseline is caused by the `packs.sync(true)` fsync before
 - `src/write/batcher.rs` — immediate batch flush for writes with `done` channel
 - `src/fs/write.rs` — `packs.sync(true)` before `commit_write_txn()`
 - `tests/rsync_integration.rs` — full clone (no `--depth=1`)
+
+## B004 - Root and .vault Directory Permissions/Ownership - May 04 2026
+
+### Root Cause
+
+Two permission/ownership issues:
+
+1. **Root inode (`src/meta/mod.rs:39`)**: Created with `PERM_DIRECTORY_DEFAULT` (0o755), preventing unprivileged users from writing to the mount root. Should be 0o777 for easy multi-user access.
+
+2. **`.vault` directory (`src/fs/vault.rs:125-126`)**: Created with `uid: root_inode.uid, gid: root_inode.gid`, inheriting the root inode's ownership instead of the `verfs crypt -c` caller's uid/gid. If a different user mounted the filesystem and another ran `crypt -c`, they couldn't unlock the vault.
+
+### Fixed
+
+1. Introduced `PERM_DIRECTORY_ROOT: u16 = 0o777` in `src/types/mod.rs` and used it for the root inode in `src/meta/mod.rs:39`. The `.snapshots` directory retains `PERM_DIRECTORY_DEFAULT` (0o755) since it is read-only by design.
+
+2. `.vault` inode now uses `nix::unistd::getuid().as_raw()` and `nix::unistd::getgid().as_raw()` instead of `root_inode.uid` / `root_inode.gid`, ensuring the `.vault` directory is owned by the user who runs `verfs crypt -c`.
+
+### Affected Files
+- `src/types/mod.rs` — add `PERM_DIRECTORY_ROOT` (0o777)
+- `src/meta/mod.rs` — import and use `PERM_DIRECTORY_ROOT` for root inode
+- `src/fs/vault.rs` — use `getuid()/getgid()` instead of `root_inode.uid/gid`

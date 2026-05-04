@@ -7,8 +7,8 @@ use verfsnext_surrealkv::{Mode, Tree, TreeBuilder};
 
 use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
-    InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, PERM_DIRECTORY_DEFAULT, ROOT_INODE,
-    SNAPSHOTS_DIR_NAME,
+    InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, PERM_DIRECTORY_DEFAULT, PERM_DIRECTORY_ROOT,
+    ROOT_INODE, SNAPSHOTS_DIR_NAME,
 };
 use crate::vault::{SYS_VAULT_POLICY, SYS_VAULT_STATE, VAULT_STATE_LOCKED};
 
@@ -36,7 +36,7 @@ impl MetaStore {
             ino: ROOT_INODE,
             parent: ROOT_INODE,
             kind: INODE_KIND_DIR,
-            perm: PERM_DIRECTORY_DEFAULT,
+            perm: PERM_DIRECTORY_ROOT,
             uid: getuid().as_raw(),
             gid: getgid().as_raw(),
             nlink: 2,
