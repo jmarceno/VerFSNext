@@ -121,7 +121,18 @@ pub fn write_key_file(path: &Path, material: &[u8; 32]) -> Result<()> {
         .write(true)
         .truncate(true)
         .open(path)
-        .with_context(|| format!("failed to open key file {}", path.display()))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                anyhow::anyhow!(
+                    "permission denied writing key file to {}: \
+                     the daemon runs as a different system user. \
+                     Use a path writable by the daemon process (e.g. under data_dir)",
+                    path.display()
+                )
+            } else {
+                anyhow::anyhow!("failed to open key file {}: {e}", path.display())
+            }
+        })?;
     file.write_all(material)
         .with_context(|| format!("failed to write key file {}", path.display()))?;
     #[cfg(unix)]
