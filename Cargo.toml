@@ -41,3 +41,12 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zeroize = "1.8.1"
 zstd = "0.13.3"
+
+# Save disk space: do not generate debug info for dev builds.
+# Cargo only applies a top-level `debug` setting to the workspace's own crates,
+# so the `package."*"` override is required to also strip dependencies.
+[profile.dev]
+debug = false
+
+[profile.dev.package."*"]
+debug = false
