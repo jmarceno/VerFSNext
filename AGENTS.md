@@ -53,3 +53,17 @@ DO NOT USE PIP, ALWAYS USE UV AND GIVE INSTRUCTIONS ON HOW TO USE IT.
 DO NOT ADD FALLBACKS
 DO NOT WRITE DEFENSIVE CODE
 DO NOT SWALLOW ERRORS, ALWAYS MAKE THEM EXPLICIT AND LOG THEM
+
+
+## Remote Rust builds
+
+Compile with `cargo remote` instead of a local `cargo build`, `cargo test`, or `cargo clippy`. One command syncs the sources, builds on the shared builder, and copies back only the finished executable into `target/<profile>/`. Crates, incremental files, and the rest of `target/` stay on the builder.
+
+```bash
+cargo remote -- build --release
+cargo remote -- test
+cargo remote -- clippy --all-targets -- -D warnings
+```
+
+`cargo fmt` stays local. Dotfiles are not synced; pass `-h` only when the build needs them. Pass `-c <path-under-target>` only when you explicitly want a different file copied back.
+
