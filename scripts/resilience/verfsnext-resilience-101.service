@@ -1,0 +1,17 @@
+[Unit]
+Description=Detached three-hour VerFSNext resilience run in LXC 101
+After=pve-guests.service
+Wants=pve-guests.service
+ConditionPathExists=/etc/pve/lxc/101.conf
+
+[Service]
+Type=simple
+EnvironmentFile=/var/lib/verfsnext-resilience/101/release.env
+ExecStart=/usr/bin/python3 ${RESILIENCE_RELEASE}/supervisor.py --ct 101 --root /var/lib/verfsnext-resilience/101 --guest-script ${RESILIENCE_GUEST} --hours 3 --interval 120
+Restart=no
+TimeoutStopSec=100
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

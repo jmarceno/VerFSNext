@@ -340,3 +340,43 @@ The mount daemon only handled SIGINT (`tokio::signal::ctrl_c`). Any SIGTERM (a p
 ### Affected Files
 - `src/lib.rs` — SIGTERM handling in `run_mount`
 
+## B010 - Busy Root Unmount and False Resilience Corruption Alarm - Oct 08 2026
+
+### Root Cause
+
+Root used normal `umount`, which fails with `EBUSY` when workload files remain
+open. `Session::drop` logged the error and closed the FUSE connection while the
+daemon returned success, leaving a disconnected mount. B009's final sync did run
+in the observed incident. Separately, Python 3.13 `Path.rglob` suppressed the
+disconnected mount's scan error and returned an empty manifest. The resilience
+supervisor interpreted that observation as deleted files and froze the guest
+before checking the recovered filesystem. Independent strict verification of
+the preserved copy passed for 206 objects.
+
+### Fix
+
+- Root now uses `umount2(MNT_DETACH)`, matching the existing non-root lazy detach.
+- The session run loop borrows its session; normal shutdown keeps the mount alive
+  through final filesystem sync, then explicitly unmounts through a fallible API.
+  Signal, control-task, sync and unmount failures are logged and make the command
+  return failure. Abandoned sessions retain ownership-based startup cleanup;
+  explicit unmount errors are not retried by `Drop`.
+- The harness uses strict traversal, durable fault windows, explicit errno/path/
+  operation observations and post-recovery verification. Completed hash or
+  namespace mismatches remain failures. Only declared connection outages are
+  classified as expected; `EIO` is not generally accepted.
+- Release paths are immutable per revision, worker errors carry their actual
+  cycle, and preflight/endurance progress and timestamps remain distinct.
+
+### Compatibility and Validation
+
+No persisted format, CLI or control-protocol change; no migration is required.
+Validation uses the existing remote Rust suite, held-file SIGTERM reproduction
+and six LXC fault scenarios before a fresh three-hour endurance run. Results and
+binary/source hashes are retained in the deployed run's evidence and provenance.
+
+### Affected Files
+
+- `src/lib.rs`
+- `crates/verfsnext-async-fusex/src/mount.rs`, `src/session.rs`
+- `scripts/resilience/`, `docs/resilience-test.md`

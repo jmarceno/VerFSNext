@@ -1,0 +1,16 @@
+[Unit]
+Description=VerFSNext daemon for isolated reliability testing
+After=local-fs.target
+
+[Service]
+Type=simple
+Environment=RUST_BACKTRACE=full
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/verfsnext --config /etc/verfsnext-soak.toml mount
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=no
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target

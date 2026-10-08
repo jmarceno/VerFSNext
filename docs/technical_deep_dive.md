@@ -328,3 +328,25 @@ Executed after write-path concurrency/pipeline changes:
 - `cargo test --release`
 
 Build completed successfully in this repository state.
+
+## Detached reliability validation
+
+The OS-level harness in `scripts/resilience/` runs on a dedicated Proxmox LXC,
+with an external persistent supervisor, fsynced expected manifests, SHA-256 checks,
+concurrent readers, interrupted copies, daemon and container failures, snapshots,
+vault data, and idle GC windows. It freezes the test guest and preserves diagnostics
+on failure. See [Detached LXC resilience test](resilience-test.md) for its durability
+oracle, deployed resource limits, evidence, operating commands, and coverage limits.
+
+Normal mount shutdown retains the FUSE session while draining writes and syncing
+packs and metadata, then explicitly detaches the mount. Root uses `MNT_DETACH`,
+consistent with non-root `fusermount -uz`, so open descriptors do not leave a stale
+mount through `EBUSY`. Failures in signal handling, control-task completion, final
+sync or unmount propagate to the daemon's exit status. An explicitly attempted
+unmount relinquishes session ownership and is never retried in its destructor.
+
+The reliability oracle uses strict filesystem traversal and records connection
+errors separately from complete content mismatches. Every recovered mount is
+verified against its external durable checkpoint before fault observations are
+classified. Per-revision source paths and saved provenance preserve the exact
+code behind each traceback. See B010 in [Bug fix history](bug-fix-history.md).

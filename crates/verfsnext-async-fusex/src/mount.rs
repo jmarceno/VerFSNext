@@ -70,14 +70,8 @@ pub async fn umount(short_path: &Path) -> anyhow::Result<()> {
         let mntpnt = mount_path.as_os_str();
 
         if unistd::geteuid().is_root() {
-            // Direct un-mount
-            nix::mount::umount(&mount_path).context(format!(
-                // nix::mount::umount2(
-                //     &mount_path,
-                //     nix::mount::MntFlags::MNT_FORCE,
-                // ).context(format!(
-                "failed to un-mount FUSE, path={mount_path:?}",
-            ))
+            nix::mount::umount2(&mount_path, nix::mount::MntFlags::MNT_DETACH)
+                .context(format!("failed to un-mount FUSE, path={mount_path:?}",))
         } else {
             // Use fusermount to un-mount
             let umount_handle = Command::new("fusermount")
@@ -159,7 +153,10 @@ async fn fuser_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result
         } else {
             ""
         };
-        anyhow::bail!("fusermount failed to mount {mount_point:?}: {}{hint}", stderr.trim());
+        anyhow::bail!(
+            "fusermount failed to mount {mount_point:?}: {}{hint}",
+            stderr.trim()
+        );
     }
     info!(
         "fusermount path={:?} to FUSE device successfully!",

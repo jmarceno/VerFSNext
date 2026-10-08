@@ -24,15 +24,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use verfsnext_async_fusex::{
     mount::MountConfig,
     session::{new_session, SessionConfig},
     FuseFs, VirtualFs,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::control::{is_daemon_reachable, send_control_request, ControlRequest, ControlResponse};
@@ -129,9 +129,7 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
 
     let cancel = CancellationToken::new();
     let cancel_for_signal = cancel.clone();
-    let fs_for_signal = fs.clone();
     let crc32_shutdown_reported = Arc::new(AtomicBool::new(false));
-    let crc32_shutdown_reported_for_signal = crc32_shutdown_reported.clone();
     let control_socket_path = config.control_socket_path();
     let control_listener = bind_control_socket(&control_socket_path)?;
     info!(path = %control_socket_path.display(), "control socket listening");
@@ -149,34 +147,18 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
     // gets the same final sync as Ctrl+C.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
-    tokio::spawn(async move {
-        let signal_name = tokio::select! {
-            res = tokio::signal::ctrl_c() => match res {
-                Ok(()) => "SIGINT",
-                Err(err) => {
-                    error!(error = %err, "failed to listen for SIGINT; only SIGTERM triggers graceful shutdown");
-                    sigterm.recv().await;
-                    "SIGTERM"
-                }
-            },
-            _ = sigterm.recv() => "SIGTERM",
+    let signal_task = tokio::spawn(async move {
+        let signal_result = tokio::select! {
+            res = tokio::signal::ctrl_c() => res.context("failed to listen for SIGINT").map(|()| "SIGINT"),
+            res = sigterm.recv() => res.context("SIGTERM signal stream closed").map(|()| "SIGTERM"),
+            _ = cancel_for_signal.cancelled() => return Ok(()),
         };
-        info!("{signal_name} received, starting graceful shutdown");
-        eprintln!("{signal_name} received, starting graceful shutdown");
-        if fs_for_signal.is_gc_in_progress() {
-            info!("Garbage collection is currently in progress, shutdown might take a while");
-            eprintln!("Garbage collection is currently in progress, shutdown might take a while");
-        }
-        if let Err(err) = fs_for_signal.graceful_shutdown().await {
-            error!(error = %err, "graceful shutdown failed during {signal_name} handling");
-        } else {
-            announce_crc32_shutdown(
-                &fs_for_signal,
-                crc32_session_start_total,
-                &crc32_shutdown_reported_for_signal,
-            );
+        if let Ok(signal_name) = &signal_result {
+            info!("{signal_name} received, starting graceful shutdown");
+            eprintln!("{signal_name} received, starting graceful shutdown");
         }
         cancel_for_signal.cancel();
+        signal_result.map(|_| ())
     });
 
     info!(
@@ -193,17 +175,40 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
 
     let run_result = session.run(cancel.clone()).await;
     cancel.cancel();
-    if let Err(join_err) = control_server.await {
-        error!(error = %join_err, "control socket task join failed");
+    let signal_result = signal_task
+        .await
+        .context("signal task join failed")
+        .and_then(|result| result);
+    let control_result = control_server
+        .await
+        .context("control socket task join failed")
+        .and_then(|result| result);
+    if fs.is_gc_in_progress() {
+        info!("Garbage collection is currently in progress, shutdown might take a while");
+        eprintln!("Garbage collection is currently in progress, shutdown might take a while");
     }
-
-    if let Err(err) = fs.graceful_shutdown().await {
-        error!(error = %err, "graceful shutdown after run loop failed");
-    } else {
+    let shutdown_result = fs.graceful_shutdown().await;
+    if shutdown_result.is_ok() {
         announce_crc32_shutdown(&fs, crc32_session_start_total, &crc32_shutdown_reported);
     }
-
-    run_result.context("FUSE run loop failed")
+    let unmount_result = session.unmount().await;
+    let mut failures = Vec::new();
+    for (stage, result) in [
+        ("FUSE run loop", run_result),
+        ("signal handling", signal_result),
+        ("control socket task", control_result),
+        ("final filesystem sync", shutdown_result),
+        ("FUSE unmount", unmount_result),
+    ] {
+        if let Err(err) = result {
+            error!(stage, error = %err, "mount shutdown failed");
+            failures.push(format!("{stage}: {err:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        bail!(failures.join("; "));
+    }
+    Ok(())
 }
 
 async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<()> {
@@ -232,7 +237,8 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
         }
         "crypt" => match parse_crypt_cmd(&args[1..])? {
             CryptCommand::Create { password, key_path } => {
-                let key_file = control::create_vault(&config, &password, key_path.as_deref()).await?;
+                let key_file =
+                    control::create_vault(&config, &password, key_path.as_deref()).await?;
                 println!("{}", key_file.display());
             }
             CryptCommand::Unlock { password, key_file } => {
@@ -1032,7 +1038,10 @@ async fn run_gc_offline_command(config: &Config, cmd: &GcCommand) -> Result<()> 
 
 fn print_offline_gc_report(report: &OfflineGcReport) {
     println!("offline gc discard rebuild complete");
-    println!("zero_ref_records_deleted={}", report.zero_ref_records_deleted);
+    println!(
+        "zero_ref_records_deleted={}",
+        report.zero_ref_records_deleted
+    );
     println!("packs_scanned={}", report.packs_scanned);
     println!(
         "pack_index_entries_scanned={}",

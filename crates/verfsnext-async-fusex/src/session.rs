@@ -1,8 +1,8 @@
 //! The implementation of FUSE session
 
 use std::fs::File;
-use std::io::{IoSlice, Write};
 use std::io::Read;
+use std::io::{IoSlice, Write};
 use std::mem;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
@@ -49,8 +49,8 @@ use super::protocol::{
 };
 #[cfg(feature = "abi-7-12")]
 use super::protocol::{
-    FuseNotifyCode::{FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE}, FuseNotifyInvalEntryOut,
-    FuseNotifyInvalINodeOut,
+    FuseNotifyCode::{FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE},
+    FuseNotifyInvalEntryOut, FuseNotifyInvalINodeOut,
 };
 use super::{mount, FuseFs};
 use crate::abi_marker;
@@ -176,7 +176,10 @@ impl SessionNotifier {
     pub fn invalidate_inode(&self, ino: u64, off: i64, len: i64) -> nix::Result<usize> {
         let payload = FuseNotifyInvalINodeOut { ino, off, len };
         #[allow(clippy::as_conversions)]
-        self.send_notify(FUSE_NOTIFY_INVAL_INODE as i32, &[abi_marker::as_abi_bytes(&payload)])
+        self.send_notify(
+            FUSE_NOTIFY_INVAL_INODE as i32,
+            &[abi_marker::as_abi_bytes(&payload)],
+        )
     }
 
     #[cfg(not(feature = "abi-7-12"))]
@@ -373,11 +376,10 @@ pub struct Session<F: FileSystem + Send + Sync + 'static> {
     /// Kernel FUSE protocol version
     proto_version: AtomicCell<ProtoVersion>,
     /// Mount path (relative)
-    mount_path: PathBuf,
+    mount_path: Option<PathBuf>,
     /// The underlying FUSE file system
     filesystem: Arc<F>,
     session_config: SessionConfig,
-    // fuse_request_spawn_handle: GcHandle,
 }
 pub async fn new_session(
     mount_path: &Path,
@@ -391,7 +393,7 @@ pub async fn new_session(
     Ok(Session {
         fuse_fd: Arc::new(FuseFd(fuse_fd)),
         proto_version: AtomicCell::new(ProtoVersion::UNSPECIFIED),
-        mount_path: mount_path.to_owned(),
+        mount_path: Some(mount_path.to_owned()),
         filesystem: Arc::new(fs),
         session_config,
     })
@@ -403,30 +405,34 @@ struct FuseFd(RawFd);
 
 impl Drop for FuseFd {
     fn drop(&mut self) {
-        println!("Dropping FUSE fd {}", self.0);
-        unistd::close(self.0).ok();
+        if let Err(err) = unistd::close(self.0) {
+            error!(fd = self.0, error = %err, "failed to close FUSE descriptor");
+        }
     }
 }
 
 impl<F: FileSystem + Send + Sync + 'static> Drop for Session<F> {
     fn drop(&mut self) {
-        println!("Dropping FUSE session");
-        futures::executor::block_on(async {
-            let mount_path = &self.mount_path;
-            let res = mount::umount(mount_path).await;
-            println!("umount result: {:?}", res);
-            match res {
-                Ok(..) => info!("Session::drop() successfully umount {:?}", mount_path),
-                Err(e) => error!(
-                    "Session::drop() failed to umount {:?}, the error is: {}",
-                    mount_path, e,
-                ),
-            };
-        });
+        if let Some(mount_path) = self.mount_path.take() {
+            // A session abandoned before explicit shutdown still owns its mount.
+            let result = futures::executor::block_on(mount::umount(&mount_path));
+            if let Err(err) = result {
+                error!(path = %mount_path.display(), error = %err,
+                       "failed to unmount abandoned FUSE session");
+            }
+        }
     }
 }
 
 impl<F: FileSystem + Send + Sync + 'static> Session<F> {
+    /// Detach the mount after the filesystem has completed its final sync.
+    pub async fn unmount(mut self) -> anyhow::Result<()> {
+        let mount_path = self.mount_path.take().expect("session owns its mount");
+        mount::umount(&mount_path).await?;
+        info!(path = %mount_path.display(), "FUSE mount detached");
+        Ok(())
+    }
+
     /// Get FUSE device fd
     #[inline]
     pub fn dev_fd(&self) -> RawFd {
@@ -448,7 +454,7 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
 
     /// Run the FUSE session
     #[allow(clippy::arithmetic_side_effects, clippy::pattern_type_mismatch)] // The `select!` macro will generate code that goes against these rules.
-    pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
+    pub async fn run(&self, token: CancellationToken) -> anyhow::Result<()> {
         // For recycling the buffers used by process_fuse_request.
         let (pool_sender, pool_receiver) = self
             .setup_buffer_pool()
@@ -458,7 +464,6 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
         for _ in 0..MAX_FUSE_READER {
             let pool_tx = pool_sender.clone();
             let pool_rx = pool_receiver.clone();
-            // let gc_handle = self.fuse_request_spawn_handle.clone();
             let handle = Handle::current();
             let fs = Arc::clone(&self.filesystem);
             let protocol_version = self.proto_version.load();
