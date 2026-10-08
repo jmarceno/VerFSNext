@@ -306,9 +306,9 @@ def observe_error(action, error):
         error.errno == errno.ENOTCONN or
         (error.errno == errno.ENOENT and not attached and error.filename is not None
          and Path(error.filename).is_relative_to(MOUNT)))
-    unavailable_copy = isinstance(error, CopyFailure) and error.returncode == 23 and (
+    unavailable_copy = isinstance(error, CopyFailure) and error.returncode in (11, 23) and (
         'Transport endpoint is not connected' in error.stderr or
-        ('No such file or directory' in error.stderr and not attached))
+        ('No such file or directory' in error.stderr and str(MOUNT) in error.stderr and not attached))
     expected_outage = (
         action in ('reader', 'worker', 'background')
         and window.get('cycle') == CURRENT_CYCLE

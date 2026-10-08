@@ -130,6 +130,8 @@ Scan, stat, read and xattr errors propagate instead of producing partial manifes
 Connection loss is classified as an injected outage only for the matching cycle
 inside its declared fault interval. `ENOENT` requires the FUSE mount to be detached
 and the missing path to lie below its mountpoint; `EIO` is never broadly accepted.
+Rsync file-I/O exits 11/23 require an explicit connection-loss message, or a
+missing destination under a detached mount, within that same fault interval.
 Completed content/metadata mismatches always fail, even if recovery reads pass.
 Recovery verification runs before observations are judged, including after a
 supervisor/Proxmox restart, preserving the distinction between an unavailable
