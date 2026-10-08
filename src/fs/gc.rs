@@ -115,8 +115,8 @@ impl FsCore {
 
             self.meta
                 .write_txn(|txn| {
-                    if let Some(cursor) = next_cursor {
-                        txn.set(sys_key("gc.scan_cursor"), cursor)?;
+                    if let Some(cursor) = &next_cursor {
+                        txn.set(sys_key("gc.scan_cursor"), cursor.clone())?;
                     } else {
                         txn.delete(sys_key("gc.scan_cursor"))?;
                         txn.set(sys_key("gc.phase"), 1_u64.to_le_bytes().to_vec())?;
@@ -167,12 +167,10 @@ impl FsCore {
             let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
             let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
             if meets_bytes || meets_percent {
-                let live_hashes = self.live_hashes_for_pack(*pack_id)?;
                 if !self.gc_idle_window_open() {
                     return Ok(());
                 }
-                self.packs
-                    .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
+                self.rewrite_pack_durably(*pack_id)?;
                 rewritten_pack = Some(*pack_id);
                 break;
             }
@@ -353,9 +351,7 @@ impl FsCore {
             let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
             let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
             if meets_bytes || meets_percent {
-                let live_hashes = self.live_hashes_for_pack(*pack_id)?;
-                self.packs
-                    .rewrite_pack_with_live_hashes(*pack_id, &live_hashes)?;
+                self.rewrite_pack_durably(*pack_id)?;
                 rewritten_pack = Some(*pack_id);
                 break;
             }
@@ -383,6 +379,15 @@ impl FsCore {
             self.switch_to_scan_phase().await?;
             Ok(false)
         }
+    }
+    /// Drops the dead records of `pack_id`. Every metadata commit up to now
+    /// (unlinks, truncates, the scan-phase deletes) is made durable first:
+    /// otherwise a power loss could roll metadata back to a state that still
+    /// references chunks the rewritten pack no longer holds.
+    fn rewrite_pack_durably(&self, pack_id: u64) -> Result<()> {
+        self.meta.flush_wal(true)?;
+        let live_hashes = self.live_hashes_for_pack(pack_id)?;
+        self.packs.rewrite_pack_with_live_hashes(pack_id, &live_hashes)
     }
     pub(crate) async fn switch_to_scan_phase(&self) -> Result<()> {
         self.meta
@@ -512,6 +517,8 @@ impl FsCore {
             .store(current, Ordering::Relaxed);
         Ok(())
     }
+    /// Hashes whose chunk record still points at `pack_id`, whatever their
+    /// refcount.
     pub(crate) fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {
         self.meta.read_txn(|txn| {
             let mut out = HashSet::new();
@@ -523,7 +530,10 @@ impl FsCore {
                     continue;
                 }
                 let chunk: ChunkRecord = decode_rkyv(&value)?;
-                if chunk.pack_id != pack_id || chunk.refcount == 0 {
+                // Zero-ref records are kept: a writer can still dedup against a
+                // chunk until the scan phase deletes its record, so only chunks
+                // without metadata are safe to drop.
+                if chunk.pack_id != pack_id {
                     continue;
                 }
                 let mut hash = [0_u8; 16];

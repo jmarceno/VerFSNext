@@ -219,3 +219,51 @@ Two permission/ownership issues:
 - `src/types/mod.rs` — add `PERM_DIRECTORY_ROOT` (0o777)
 - `src/meta/mod.rs` — import and use `PERM_DIRECTORY_ROOT` for root inode
 - `src/fs/vault.rs` — use `getuid()/getgid()` instead of `root_inode.uid/gid`
+
+## B006 - Delayed Data Corruption from Lost Metadata Updates and Unsafe GC - Oct 08 2026
+
+### Symptom
+
+Files that had been written correctly became unreadable (EIO, `missing chunk metadata`, `missing pack index entry`) or showed wrong/truncated content weeks after they were written. Nothing failed at write time; the damage surfaced only after GC had run on the affected packs.
+
+### Root Cause
+
+1. **Lost updates in SurrealKV commits** (`crates/verfsnext-surrealkv/src/transaction.rs`): `Transaction::commit()` validated write-write conflicts *before* taking the `write_admission` lock that serializes commits. Two transactions that wrote the same key could both pass validation and then both commit; the second silently overwrote the first. Chunk refcounts are read-modify-write counters touched concurrently by the write batcher, truncate, unlink/rename/release cleanup, snapshots and GC, so every lost update shifted a refcount. An under-counted chunk eventually reached refcount 0 while still referenced by extents, GC deleted its record and rewrote its pack without it, and every file referencing that chunk was destroyed. Inode records were affected the same way (e.g. a `setattr` reverting a size committed by a write). The memtable-history check also ran under different locks than the key check, so a background flush could hide a conflicting write.
+2. **Read-modify-write outside the committing transaction** (`src/fs/fuse.rs`, `src/fs/write.rs`): `setattr` wrote back an inode loaded from the cache before its transaction; `truncate_file_locked` computed extent deletions and refcount deltas from a separate read transaction; the write path loaded the inode from the cache. Changes committed between the read and the transaction start were invisible to conflict detection and were overwritten (lost size changes, double refcount decrements).
+3. **Same inode twice in one batch transaction** (`src/fs/write.rs`): every group was planned from committed state, so a second group for the same inode in the same transaction was planned without the first one: its bytes in a shared block were lost, the inode size could go backwards, and the old chunk of a block was decremented twice.
+4. **Silent acknowledgement of rolled-back writes** (`src/fs/write.rs`): when a group failed on the last retry, `apply_batch` returned `Ok` for the other groups of the batch although their transaction had been rolled back. With the FUSE writeback cache this is silent data loss.
+5. **Dedup trusted the in-memory chunk cache** (`src/fs/chunk.rs`): the cache can still hold a chunk GC has deleted (reads repopulate it), so a write could reference a chunk without metadata; on cache misses existing chunks were appended again, creating duplicate pack copies (for vault chunks with a different nonce than the committed record).
+6. **GC pack rewrite** (`src/fs/gc.rs`, `src/data/pack.rs`):
+   - only chunks with `refcount > 0` survived, so a writer that deduped against a zero-ref chunk while the pack was being rewritten referenced data that was then dropped;
+   - the WAL was not fsynced before the destructive rewrite, so a power loss could roll metadata back to a state referencing chunks already removed from the pack;
+   - the two renames (pack, then index) were not crash-safe; a crash in between left a new pack with an old index (reads fail with hash mismatch and the index is not rebuilt because it exists);
+   - concurrent readers could pair an index offset from one pack generation with the file of the other;
+   - dead index-cache entries were never invalidated (`invalidate_entries_if` fails without `support_invalidation_closures` and the error was discarded);
+   - the first copy of a duplicated hash was kept instead of the copy the index points at, and payloads were re-checksummed without being verified, hiding bit rot.
+7. **Pack append tearing** (`src/data/pack.rs`): a failed append (e.g. `ENOSPC`) left a partial record while `size_bytes` was not advanced, so every later record in that pack got a wrong offset in its index entry; a failed index flush left a partial entry that misaligned all later entries; a torn tail after a crash made the pack unparseable for sequential scanners once new records were appended after it.
+8. **Unlinked file data freed while still open** (`src/fs/inode.rs`): `cleanup_unlinked_inode_if_closed` ran on every `release` without checking the open-handle count.
+9. **Swallowed pack sync error** before the metadata commit, allowing metadata to point at unsynced pack data.
+
+### Fixed
+
+- SurrealKV: conflict validation runs under `write_admission`, and the memtable-history check is done under the same memtable locks as the key checks (`check_keys_conflict`).
+- `MetaStore::write_txn` re-runs the closure on `TransactionWriteConflict` / `TransactionRetry` (closure is `FnMut`, up to `MAX_COMMIT_ATTEMPTS`); `is_retryable_commit_error` matches the typed error instead of a string.
+- `setattr` applies attribute changes to the inode read inside its transaction and invalidates the inode cache after the commit.
+- Truncate stages everything (inode, extents, boundary chunk) in one transaction, syncs packs before committing new chunks, and retries on conflicts.
+- The write path reads the inode and old extents through the batch transaction; batches are split into rounds with at most one group per inode; a failing group is reported failed and the rest are re-staged on a fresh transaction; commits are retried on conflicts; a pack sync failure fails the batch.
+- Dedup decisions read the chunk record through the committing transaction (`stage_chunk_if_missing`), so GC deletes and concurrent creators surface as conflicts.
+- GC keeps every chunk that still has a record (any refcount), fsyncs the WAL before rewriting, keeps every indexed copy of a live hash in order, verifies each copied payload against its index CRC32 (aborts on mismatch), swaps files crash-safely (remove old index, rename pack, rename index, fsync the directory after each step), holds an exclusive swap lock that readers share, and invalidates the cache entries of every old index entry.
+- Pack append and index flush roll back partial writes; startup truncates an incomplete record at the end of the active pack and removes an index that no longer matches it (rebuilt from the pack).
+- Index-file lookups use the most recent entry for a hash, matching the cache.
+- Unlinked inodes are cleaned up only once their open-handle count reaches zero.
+- Refcount underflows and decrements of missing chunks are logged as errors.
+
+### Assessing Existing Damage
+
+`verfsnext stats` reports chunk refcount mismatches, extents referencing missing chunk records, and orphan extents. Data already removed by GC cannot be recovered by this fix. Under-counted refcounts that have not yet reached zero remain wrong until recomputed; until then they are protected only while they stay above zero.
+
+### Affected Files
+- `crates/verfsnext-surrealkv/src/transaction.rs`, `crates/verfsnext-surrealkv/src/lsm.rs`
+- `src/meta/mod.rs`
+- `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`, `src/fs/inode.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`
+- `src/data/pack.rs`

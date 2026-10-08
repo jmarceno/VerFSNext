@@ -25,7 +25,7 @@ impl FsCore {
         &self,
         op: &WriteOp,
         inode: &InodeRecord,
-        known_new_hashes: &HashSet<[u8; 16]>,
+        txn: &verfsnext_surrealkv::Transaction,
     ) -> Result<PreparedWritePlan> {
         let write_end = op
             .offset
@@ -40,29 +40,27 @@ impl FsCore {
         let old_extents = if inode.size == 0 {
             HashMap::new()
         } else {
-            self.meta.read_txn(|txn| {
-                let mut map = HashMap::<u64, ExtentRecord>::new();
-                let start_key = extent_key(op.ino, start_block);
-                let end_key = end_block
-                    .checked_add(1)
-                    .map(|end| extent_key(op.ino, end))
-                    .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
+            let mut map = HashMap::<u64, ExtentRecord>::new();
+            let start_key = extent_key(op.ino, start_block);
+            let end_key = end_block
+                .checked_add(1)
+                .map(|end| extent_key(op.ino, end))
+                .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
 
-                let mut iter = txn.range(start_key, end_key)?;
-                let mut valid = iter.seek_first()?;
-                while valid {
-                    let key = iter.key().user_key();
-                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
-                        if block_idx >= start_block && block_idx <= end_block {
-                            let val = iter.value()?;
-                            let extent: ExtentRecord = decode_rkyv(&val)?;
-                            map.insert(block_idx, extent);
-                        }
+            let mut iter = txn.range(start_key, end_key)?;
+            let mut valid = iter.seek_first()?;
+            while valid {
+                let key = iter.key().user_key();
+                if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
+                    if block_idx >= start_block && block_idx <= end_block {
+                        let val = iter.value()?;
+                        let extent: ExtentRecord = decode_rkyv(&val)?;
+                        map.insert(block_idx, extent);
                     }
-                    valid = iter.next()?;
                 }
-                Ok(map)
-            })?
+                valid = iter.next()?;
+            }
+            map
         };
 
         self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
@@ -115,11 +113,11 @@ impl FsCore {
             }
 
             let staged_new = self.stage_chunk_if_missing(
+                txn,
                 new_hash,
                 &block_data,
                 &mut checked_hashes,
                 &mut pending_chunks,
-                known_new_hashes,
             )?;
             if staged_new {
                 dedup_misses = dedup_misses.saturating_add(1);
@@ -146,7 +144,47 @@ impl FsCore {
         ino: u64,
         new_size: u64,
     ) -> Result<InodeRecord> {
-        let mut inode = self.load_inode_or_errno(ino, "truncate")?;
+        let mut attempt = 1;
+        loop {
+            let mut txn = self.meta.begin_write()?;
+            let (inode, staged) = self.stage_truncate_in_txn(ino, new_size, &mut txn).await?;
+            let Some(new_chunk_records) = staged else {
+                return Ok(inode);
+            };
+            match self.meta.commit_write_txn(&mut txn).await {
+                Ok(()) => {
+                    for (hash, record) in &new_chunk_records {
+                        self.chunk_meta_cache.insert(*hash, *record);
+                    }
+                    self.invalidate_inode_cache(ino);
+                    self.mark_mutation();
+                    self.bump_inode_data_version(ino);
+                    self.invalidate_inode_attr_best_effort(ino);
+                    return Ok(inode);
+                }
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(ino, attempt, error = %format!("{err:#}"), "retrying truncate after metadata conflict");
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Stages a truncate of `ino` to `new_size` into `txn`. Returns `None`
+    /// instead of the new chunk records when the size is already `new_size`.
+    ///
+    /// The inode and its extents are read through `txn` itself so that the
+    /// refcount deltas are computed from exactly the state the commit is
+    /// validated against.
+    async fn stage_truncate_in_txn(
+        &self,
+        ino: u64,
+        new_size: u64,
+        txn: &mut verfsnext_surrealkv::Transaction,
+    ) -> Result<(InodeRecord, Option<HashMap<[u8; 16], ChunkRecord>>)> {
+        let mut inode = FsCore::load_inode_in_txn(txn, ino, "truncate")?;
         self.ensure_inode_vault_access(&inode, "truncate")?;
         if inode.kind != INODE_KIND_FILE {
             return Err(anyhow_errno(
@@ -157,7 +195,7 @@ impl FsCore {
         FsCore::ensure_inode_writable(&inode, "truncate")?;
 
         if new_size == inode.size {
-            return Ok(inode);
+            return Ok((inode, None));
         }
 
         let old_size = inode.size;
@@ -177,7 +215,7 @@ impl FsCore {
                 new_size.div_ceil(block_size)
             };
 
-            let extents = self.meta.read_txn(|txn| {
+            let extents = {
                 let prefix = extent_prefix(ino);
                 let end = prefix_end(&prefix);
                 let mut out = Vec::<(u64, [u8; 16], Vec<u8>)>::new();
@@ -189,8 +227,8 @@ impl FsCore {
                     let extent: ExtentRecord = decode_rkyv(&value)?;
                     out.push((block_idx, extent.chunk_hash, key));
                 }
-                Ok(out)
-            })?;
+                out
+            };
 
             self.prefetch_chunk_meta(extents.iter().map(|(_, hash, _)| *hash))?;
 
@@ -207,13 +245,12 @@ impl FsCore {
                         extent_updates.push((block_idx, new_hash));
                         *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
                         *ref_deltas.entry(new_hash).or_insert(0) += 1;
-                        let no_known_new = HashSet::new();
                         self.stage_chunk_if_missing(
+                            txn,
                             new_hash,
                             &block_data,
                             &mut checked_hashes,
                             &mut pending_chunks,
-                            &no_known_new,
                         )?;
                     }
                     continue;
@@ -237,28 +274,22 @@ impl FsCore {
         inode.ctime_sec = sec;
         inode.ctime_nsec = nsec;
 
-        self.meta
-            .write_txn(|txn| {
-                for key in extent_deletes {
-                    txn.delete(key)?;
-                }
-                for (block_idx, hash) in extent_updates {
-                    txn.set(
-                        extent_key(ino, block_idx),
-                        encode_rkyv(&ExtentRecord { chunk_hash: hash })?,
-                    )?;
-                }
-                FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
-                txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-                Ok(())
-            })
-            .await?;
-        self.invalidate_inode_cache(ino);
-        self.mark_mutation();
-        self.bump_inode_data_version(ino);
-        self.invalidate_inode_attr_best_effort(ino);
+        for key in extent_deletes {
+            txn.delete(key)?;
+        }
+        for (block_idx, hash) in extent_updates {
+            txn.set(
+                extent_key(ino, block_idx),
+                encode_rkyv(&ExtentRecord { chunk_hash: hash })?,
+            )?;
+        }
+        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
+        txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
 
-        Ok(inode)
+        if !new_chunk_records.is_empty() {
+            self.packs.sync(false)?;
+        }
+        Ok((inode, Some(new_chunk_records)))
     }
     pub(crate) fn lock_type_valid(typ: u32) -> bool {
         typ == libc::F_RDLCK as u32 || typ == libc::F_WRLCK as u32 || typ == libc::F_UNLCK as u32
@@ -306,42 +337,31 @@ impl FsCore {
         Ok(())
     }
 
-    /// Like apply_single_write but writes into an existing transaction.
-    /// Multiple calls share one transaction for batched metadata commits.
-    /// Returns the set of new chunk records that were materialized for this write.
+    /// Stages one coalesced write into the shared batch transaction and
+    /// returns the chunk records it created.
+    ///
+    /// The inode and old extents are read through `txn`. Everything the plan
+    /// depends on is therefore either part of the transaction snapshot or
+    /// rewritten by it (inode key, touched extents, chunk refcounts), so a
+    /// concurrent change makes the commit fail with a conflict instead of
+    /// being silently overwritten.
     pub(crate) async fn apply_single_write_in_txn(
         &self,
         op: WriteOp,
         txn: &mut verfsnext_surrealkv::Transaction,
-        known_new_hashes: &mut HashSet<[u8; 16]>,
         mtime_sec: i64,
         mtime_nsec: u32,
     ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
-        let prepared_version = self.inode_data_version(op.ino);
-        let inode_snapshot = self.load_inode_or_errno(op.ino, "write")?;
-        self.ensure_write_target_inode(op.ino, &inode_snapshot)?;
+        let mut inode = FsCore::load_inode_in_txn(txn, op.ino, "write")?;
+        self.ensure_write_target_inode(op.ino, &inode)?;
         if op.data.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut plan = self.prepare_write_plan(&op, &inode_snapshot, known_new_hashes).await?;
-        for hash in plan.new_chunk_records.keys() {
-            known_new_hashes.insert(*hash);
-        }
+        let plan = self.prepare_write_plan(&op, &inode, txn).await?;
 
         let _mutation_guard = self.write_lock.read().await;
         let inode_lock = self.inode_write_lock(op.ino).await;
         let _inode_guard = inode_lock.lock().await;
-
-        let mut inode = self.load_inode_or_errno(op.ino, "write")?;
-        self.ensure_write_target_inode(op.ino, &inode)?;
-        let current_version = self.inode_data_version(op.ino);
-        if current_version != prepared_version {
-            plan = self.prepare_write_plan(&op, &inode, known_new_hashes).await?;
-            for hash in plan.new_chunk_records.keys() {
-                known_new_hashes.insert(*hash);
-            }
-        }
-
         self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn, mtime_sec, mtime_nsec)?;
 
         self.dedup_hits
@@ -383,130 +403,34 @@ impl WriteApply for FsCore {
             groups.push((op, vec![idx]));
         }
 
+        // A write is planned from the committed state of its inode (size and
+        // old extents), so two groups for the same inode must never share a
+        // transaction: the second would be planned without the first and
+        // overwrite its blocks, inode size and refcount deltas. Split the
+        // groups into rounds where each inode appears at most once, keeping
+        // per-inode order, and commit the rounds one after another.
         let mut by_inode = HashMap::<u64, Vec<(WriteOp, Vec<usize>)>>::new();
+        let mut inode_order = Vec::<u64>::new();
         for (group_op, indices) in groups {
-            by_inode
-                .entry(group_op.ino)
-                .or_default()
-                .push((group_op, indices));
+            let entry = by_inode.entry(group_op.ino).or_default();
+            if entry.is_empty() {
+                inode_order.push(group_op.ino);
+            }
+            entry.push((group_op, indices));
+        }
+        let round_count = by_inode.values().map(Vec::len).max().unwrap_or(0);
+        let mut rounds = (0..round_count).map(|_| Vec::new()).collect::<Vec<_>>();
+        for ino in &inode_order {
+            if let Some(inode_groups) = by_inode.remove(ino) {
+                for (round, group) in inode_groups.into_iter().enumerate() {
+                    rounds[round].push(group);
+                }
+            }
         }
 
-        // Share a single SurrealKV write transaction across all inode groups.
-        // This merges many small metadata commits into one, reducing WAL write
-        // and fsync overhead significantly for batched writes.
         let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
-
-        // Retry loop: SurrealKV write-write conflicts can occur when the CREATE
-        // handler's write_txn commits concurrently with this batch. Both modify
-        // the same inode_key, causing a TransactionWriteConflict. We retry the
-        // entire batch on conflict — the seq_num advances after the concurrent
-        // create's commit, so the next attempt sees a start_seq after the conflict.
-        //
-        // We collect the ops upfront via iter() so we can retry without consuming
-        // the map, and clone WriteOps for each attempt.
-        let inode_keys: Vec<u64> = by_inode.keys().copied().collect();
-        let max_retries = 3;
-        let mut committed = false;
-        let mut known_new_hashes = HashSet::new();
-        for attempt in 0..max_retries {
-            let mut batched_txn = match self.meta.begin_write() {
-                Ok(txn) => txn,
-                Err(e) => return (0..original_len).map(|_| Err(anyhow!(format!("{:#}", e)))).collect(),
-            };
-
-            // Reset out on each attempt so failed attempts don't leak Ok results
-            for slot in out.iter_mut() {
-                *slot = None;
-            }
-            let mut affected_inodes: Vec<u64> = Vec::new();
-            let mut group_failed = false;
-            let mut batch_new_records: HashMap<[u8; 16], ChunkRecord> = HashMap::new();
-            // Compute the timestamp once per batch attempt and reuse it for
-            // all inode updates. Avoids redundant clock_gettime syscalls.
-            let batch_now = SystemTime::now();
-            let (mtime_sec, mtime_nsec) = system_time_to_parts(batch_now);
-            for ino in &inode_keys {
-                let Some(groups) = by_inode.get(ino) else {
-                    continue;
-                };
-                for (group_op, indices) in groups {
-                    let group_result = self.apply_single_write_in_txn(
-                        group_op.clone(),
-                        &mut batched_txn,
-                        &mut known_new_hashes,
-                        mtime_sec,
-                        mtime_nsec,
-                    ).await;
-                    match &group_result {
-                        Ok(records) => {
-                            batch_new_records.extend(records.iter().map(|(k, v)| (*k, *v)));
-                            for idx in indices {
-                                out[*idx] = Some(Ok(()));
-                            }
-                            if !affected_inodes.contains(ino) {
-                                affected_inodes.push(*ino);
-                            }
-                        }
-                        Err(err) => {
-                            for idx in indices {
-                                out[*idx] = Some(Err(anyhow!(err.to_string())));
-                            }
-                            group_failed = true;
-                        }
-                    }
-                }
-            }
-
-            if group_failed {
-                batched_txn.rollback();
-                if attempt + 1 < max_retries {
-                    continue;
-                }
-                return out.into_iter().map(|r| {
-                    r.unwrap_or_else(|| Err(anyhow!("apply_single_write failed")))
-                }).collect();
-            }
-
-            if let Err(e) = self.packs.sync(false) {
-                tracing::warn!("pack sync before commit failed (attempt {}): {}", attempt, e);
-            }
-            let commit_result = self.meta.commit_write_txn(&mut batched_txn).await;
-            match commit_result {
-                Ok(()) => {
-                    committed = true;
-                    // CRITICAL: Insert committed chunk records into cache and
-                    // invalidate inode caches AFTER the metadata transaction is
-                    // committed. Doing both before the commit creates windows
-                    // where concurrent readers observe inconsistent state.
-                    for (hash, record) in &batch_new_records {
-                        self.chunk_meta_cache.insert(*hash, *record);
-                    }
-                    for ino in &affected_inodes {
-                        self.invalidate_inode_cache(*ino);
-                        self.bump_inode_data_version(*ino);
-                        self.mark_mutation();
-                        self.invalidate_inode_attr_best_effort(*ino);
-                    }
-                    known_new_hashes.clear();
-                    break;
-                }
-                Err(e) => {
-                    let err_str = format!("{:#}", e);
-                    if attempt + 1 < max_retries && err_str.contains("write conflict") {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    return out.into_iter().map(|r| {
-                        r.unwrap_or_else(|| Err(anyhow!(err_str.clone())))
-                    }).collect();
-                }
-            }
-        }
-
-        if !committed {
-            return out.into_iter().map(|_| {
-                Err(anyhow!("write batch failed after {} retries", max_retries))
-            }).collect();
+        for round in rounds {
+            self.apply_write_round(round, &mut out).await;
         }
 
         debug!(
@@ -517,5 +441,119 @@ impl WriteApply for FsCore {
         out.into_iter()
             .map(|item| item.unwrap_or_else(|| Err(anyhow!("missing write result for queued op"))))
             .collect()
+    }
+}
+
+impl FsCore {
+    /// Stages and commits one round of write groups (at most one group per
+    /// inode) in a single metadata transaction, filling `out` for every op.
+    ///
+    /// A group that fails to stage is reported as failed and the remaining
+    /// groups are re-staged on a fresh transaction, so a write is acknowledged
+    /// only when the transaction that contains it has committed. Commits that
+    /// lose a race with a concurrent transaction are re-planned and retried.
+    async fn apply_write_round(
+        &self,
+        mut pending: Vec<(WriteOp, Vec<usize>)>,
+        out: &mut [Option<Result<()>>],
+    ) {
+        let mut attempt = 1;
+        while !pending.is_empty() {
+            let mut txn = match self.meta.begin_write() {
+                Ok(txn) => txn,
+                Err(err) => {
+                    FsCore::fail_write_groups(&pending, &err, out);
+                    return;
+                }
+            };
+
+            // Compute the timestamp once per attempt and reuse it for all
+            // inode updates. Avoids redundant clock_gettime syscalls.
+            let (mtime_sec, mtime_nsec) = system_time_to_parts(SystemTime::now());
+            let mut new_records = HashMap::<[u8; 16], ChunkRecord>::new();
+            let mut failed_group = None;
+            for (position, (group_op, _)) in pending.iter().enumerate() {
+                match self
+                    .apply_single_write_in_txn(group_op.clone(), &mut txn, mtime_sec, mtime_nsec)
+                    .await
+                {
+                    Ok(records) => new_records.extend(records),
+                    Err(err) => {
+                        failed_group = Some((position, err));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((position, err)) = failed_group {
+                txn.rollback();
+                let (group_op, indices) = pending.remove(position);
+                tracing::error!(
+                    ino = group_op.ino,
+                    offset = group_op.offset,
+                    bytes = group_op.data.len(),
+                    error = %format!("{err:#}"),
+                    "write group failed to stage; re-staging the rest of its batch"
+                );
+                let mut indices = indices.into_iter();
+                if let Some(first) = indices.next() {
+                    for idx in indices {
+                        out[idx] = Some(Err(anyhow!("{err:#}")));
+                    }
+                    out[first] = Some(Err(err));
+                }
+                continue;
+            }
+
+            // Pack payloads must be durable before metadata can point at them.
+            if let Err(err) = self.packs.sync(false) {
+                let err = err.context("pack sync before metadata commit failed");
+                tracing::error!(error = %format!("{err:#}"), "write batch not committed");
+                FsCore::fail_write_groups(&pending, &err, out);
+                return;
+            }
+
+            match self.meta.commit_write_txn(&mut txn).await {
+                Ok(()) => {
+                    // Caches are updated only after the commit so concurrent
+                    // readers never observe uncommitted state.
+                    for (hash, record) in &new_records {
+                        self.chunk_meta_cache.insert(*hash, *record);
+                    }
+                    for (group_op, indices) in &pending {
+                        self.invalidate_inode_cache(group_op.ino);
+                        self.bump_inode_data_version(group_op.ino);
+                        self.mark_mutation();
+                        self.invalidate_inode_attr_best_effort(group_op.ino);
+                        for idx in indices {
+                            out[*idx] = Some(Ok(()));
+                        }
+                    }
+                    return;
+                }
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(attempt, error = %format!("{err:#}"), "retrying write batch after metadata conflict");
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => {
+                    tracing::error!(error = %format!("{err:#}"), "write batch commit failed");
+                    FsCore::fail_write_groups(&pending, &err, out);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn fail_write_groups(
+        groups: &[(WriteOp, Vec<usize>)],
+        err: &anyhow::Error,
+        out: &mut [Option<Result<()>>],
+    ) {
+        for (_, indices) in groups {
+            for idx in indices {
+                out[*idx] = Some(Err(anyhow!("{err:#}")));
+            }
+        }
     }
 }

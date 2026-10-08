@@ -32,7 +32,7 @@ use crate::data::compress::{compress_parallel, PendingChunk};
 use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
-use crate::meta::MetaStore;
+use crate::meta::{is_retryable_commit_error, MetaStore, MAX_COMMIT_ATTEMPTS};
 use crate::migration::pack_index_crc32::{
     ensure_pack_index_crc32_compat, SYS_PACK_CRC32_READ_ERRORS,
 };

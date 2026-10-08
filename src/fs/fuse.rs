@@ -84,40 +84,42 @@ impl VirtualFs for VerFs {
         };
         FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
 
-        if let Some(mode) = param.mode {
-            inode.perm = (mode & MODE_PERM_MASK) as u16;
-        }
-        if let Some(uid) = param.u_id {
-            inode.uid = uid;
-        }
-        if let Some(gid) = param.g_id {
-            inode.gid = gid;
-        }
-        if let Some(atime) = param.a_time {
-            let (sec, nsec) = system_time_to_parts(atime);
-            inode.atime_sec = sec;
-            inode.atime_nsec = nsec;
-        }
-        if let Some(mtime) = param.m_time {
-            let (sec, nsec) = system_time_to_parts(mtime);
-            inode.mtime_sec = sec;
-            inode.mtime_nsec = nsec;
-        }
-
-        let now = SystemTime::now();
-        let (sec, nsec) = system_time_to_parts(now);
-        inode.ctime_sec = sec;
-        inode.ctime_nsec = nsec;
-
-        self.core.invalidate_inode_cache(ino);
+        // The attribute update is applied to the inode as read inside the
+        // transaction: writing back a copy loaded earlier would revert any
+        // size or attribute change committed in between.
         self.core
             .meta
             .write_txn(|txn| {
-                txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
+                let mut current = FsCore::load_inode_in_txn(txn, ino, "setattr")?;
+                if let Some(mode) = param.mode {
+                    current.perm = (mode & MODE_PERM_MASK) as u16;
+                }
+                if let Some(uid) = param.u_id {
+                    current.uid = uid;
+                }
+                if let Some(gid) = param.g_id {
+                    current.gid = gid;
+                }
+                if let Some(atime) = param.a_time {
+                    let (sec, nsec) = system_time_to_parts(atime);
+                    current.atime_sec = sec;
+                    current.atime_nsec = nsec;
+                }
+                if let Some(mtime) = param.m_time {
+                    let (sec, nsec) = system_time_to_parts(mtime);
+                    current.mtime_sec = sec;
+                    current.mtime_nsec = nsec;
+                }
+                let (sec, nsec) = system_time_to_parts(SystemTime::now());
+                current.ctime_sec = sec;
+                current.ctime_nsec = nsec;
+                txn.set(inode_key(ino), encode_rkyv(&current)?)?;
+                inode = current;
                 Ok(())
             })
             .await
             .map_err(map_anyhow_to_fuse)?;
+        self.core.invalidate_inode_cache(ino);
         self.core.mark_mutation();
         self.core.invalidate_inode_attr_best_effort(ino);
 

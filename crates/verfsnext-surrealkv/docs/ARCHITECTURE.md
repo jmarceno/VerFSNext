@@ -103,6 +103,14 @@ SurrealKV supports three LSM-native mutation types for counter workloads, optimi
 - Implementation: existence check and write are executed under write-admission lock, then persisted through the normal WAL/memtable path.
 - Existence check consults the latest visible state (memtable + immutable + SST path) before assigning the winning write.
 
+### Transaction Commit Conflict Validation
+
+- `Transaction::commit()` takes the write-admission lock **before** validating write-write conflicts and keeps it until the batch is applied to the memtable and published (`commit_without_admission`).
+- Validation and commit are therefore one atomic step: a transaction that writes a key committed by another transaction after its `start_seq_num` always gets `TransactionWriteConflict`.
+- Previously validation ran before the admission lock. Two transactions writing the same key could both pass validation and then both commit, silently losing one update (read-modify-write counters such as VerFS chunk refcounts drifted).
+- `check_keys_conflict` evaluates the memtable-history requirement (`start_seq_num` must not precede the earliest sequence still held by the active or immutable memtables, otherwise `TransactionRetry`) under the same memtable read locks as the per-key checks, so a background flush cannot drop an immutable memtable between the two steps.
+- Callers must treat both `TransactionWriteConflict` and `TransactionRetry` as "re-run the whole transaction on a fresh snapshot".
+
 ### Range Deletion
 
 - API: `Tree::delete_range(start, end)` and transaction-level `delete_range(...)`.
@@ -592,7 +600,7 @@ The Oracle is responsible for:
 - **Sequence number allocation**: Atomically incrementing the global sequence counter for each commit
 - **Conflict detection**: Tracking which keys were written at which sequence numbers to detect write-write conflicts
 
-When two transactions both modify the same key, the Oracle ensures only one can commit. The first to call commit wins; the second receives a conflict error and must retry.
+When two transactions both modify the same key, only one can commit. Conflict validation runs under the write-admission lock together with the commit itself (see "Transaction Commit Conflict Validation"), so the first to commit wins and the second receives `TransactionWriteConflict` and must retry.
 
 ### Version Retention
 

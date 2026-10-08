@@ -12,6 +12,21 @@ use crate::types::{
 };
 use crate::vault::{SYS_VAULT_POLICY, SYS_VAULT_STATE, VAULT_STATE_LOCKED};
 
+/// Upper bound on commit attempts for one logical metadata update.
+pub const MAX_COMMIT_ATTEMPTS: u32 = 16;
+
+/// True when a commit failed only because a concurrent transaction won the
+/// race, so re-running the whole transaction on fresh state is correct.
+pub fn is_retryable_commit_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<verfsnext_surrealkv::Error>(),
+            Some(verfsnext_surrealkv::Error::TransactionWriteConflict)
+                | Some(verfsnext_surrealkv::Error::TransactionRetry)
+        )
+    })
+}
+
 pub struct MetaStore {
     tree: Tree,
 }
@@ -188,16 +203,33 @@ impl MetaStore {
             .context("failed to get value from SurrealKV")
     }
 
-    pub async fn write_txn<F>(&self, f: F) -> Result<()>
+    /// Runs `f` in a write transaction and commits it.
+    ///
+    /// SurrealKV transactions are optimistic: a commit fails when another
+    /// transaction wrote one of our keys after we started. In that case `f` is
+    /// run again on a fresh transaction, so it must derive everything it writes
+    /// from what it reads through `txn` and must not have other side effects.
+    pub async fn write_txn<F>(&self, mut f: F) -> Result<()>
     where
-        F: FnOnce(&mut verfsnext_surrealkv::Transaction) -> Result<()>,
+        F: FnMut(&mut verfsnext_surrealkv::Transaction) -> Result<()>,
     {
-        let mut txn = self
-            .tree
-            .begin()
-            .context("failed to start write transaction")?;
-        f(&mut txn)?;
-        txn.commit().await.context("failed to commit transaction")
+        let mut attempt = 1;
+        loop {
+            let mut txn = self
+                .tree
+                .begin()
+                .context("failed to start write transaction")?;
+            f(&mut txn)?;
+            let result = self.commit_write_txn(&mut txn).await;
+            match result {
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(attempt, error = %format!("{err:#}"), "retrying metadata transaction");
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Begin a write transaction with deferred commit.

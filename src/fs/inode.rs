@@ -35,6 +35,21 @@ impl FsCore {
             )
         })
     }
+    /// Reads an inode through `txn`, so a commit of that transaction fails
+    /// if the inode changed after the transaction started.
+    pub(crate) fn load_inode_in_txn(
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+        context: &'static str,
+    ) -> Result<InodeRecord> {
+        let Some(raw) = txn.get(inode_key(ino))? else {
+            return Err(anyhow_errno(
+                Errno::ENOENT,
+                format!("{}: inode {} not found", context, ino),
+            ));
+        };
+        decode_rkyv(&raw)
+    }
     pub(crate) fn load_inode_with_vault_access(
         &self,
         ino: u64,
@@ -279,6 +294,10 @@ impl FsCore {
     }
     pub(crate) async fn cleanup_unlinked_inode_if_closed(&self, ino: u64) -> Result<()> {
         let _guard = self.write_lock.write().await;
+        // An unlinked file keeps its data until the last handle is released.
+        if self.open_file_count(ino) > 0 {
+            return Ok(());
+        }
         self.meta
             .write_txn(|txn| {
                 let Some(raw) = txn.get(inode_key(ino))? else {

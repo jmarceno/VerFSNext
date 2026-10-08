@@ -151,36 +151,34 @@ impl FsCore {
             .insert(extent.chunk_hash, Arc::clone(&payload));
         Ok(payload)
     }
-    // This is conservative and done late on purpose. Change it may require larger refactors.
+    /// Decides whether `chunk_hash` must be stored as a new chunk.
+    ///
+    /// The decision is taken against `txn`, the transaction that will commit
+    /// the refcount change. A chunk that GC deletes, or that another writer
+    /// creates, after `txn` started then makes the commit fail with a write
+    /// conflict instead of leaving an extent that points at missing metadata
+    /// or a second record for the same hash. The in-memory chunk metadata
+    /// cache is never used for this decision because it can hold entries for
+    /// chunks GC has already deleted.
     pub(crate) fn stage_chunk_if_missing(
         &self,
+        txn: &verfsnext_surrealkv::Transaction,
         chunk_hash: [u8; 16],
         data: &[u8],
         checked_hashes: &mut HashSet<[u8; 16]>,
         pending_chunks: &mut HashMap<[u8; 16], Vec<u8>>,
-        known_new_hashes: &HashSet<[u8; 16]>,
     ) -> Result<bool> {
         if !checked_hashes.insert(chunk_hash) {
-            return Ok(false);
-        }
-
-        if known_new_hashes.contains(&chunk_hash) {
-            let data_vec = data.to_vec();
-            self.chunk_data_cache
-                .insert(chunk_hash, Arc::new(data_vec.clone()));
-            pending_chunks.insert(chunk_hash, data_vec);
-            return Ok(true);
-        }
-
-        if self.chunk_meta_cache.get(&chunk_hash).is_some() {
-            self.chunk_data_cache
-                .insert(chunk_hash, Arc::new(data.to_vec()));
             return Ok(false);
         }
 
         let data_vec = data.to_vec();
         self.chunk_data_cache
             .insert(chunk_hash, Arc::new(data_vec.clone()));
+        if txn.get(chunk_key(&chunk_hash))?.is_some() {
+            return Ok(false);
+        }
+
         pending_chunks.insert(chunk_hash, data_vec);
         Ok(true)
     }
@@ -264,12 +262,25 @@ impl FsCore {
             if let Some(raw) = txn.get(key.clone())? {
                 let mut chunk: ChunkRecord = decode_rkyv(&raw)?;
                 let next_ref = chunk.refcount as i64 + delta;
+                if next_ref < 0 {
+                    tracing::error!(
+                        chunk_hash = ?hash,
+                        refcount = chunk.refcount,
+                        delta,
+                        "chunk refcount underflow: metadata refcounts are inconsistent, clamping to zero"
+                    );
+                }
                 chunk.refcount = next_ref.max(0) as u64;
                 txn.set(key, encode_rkyv(&chunk)?)?;
                 continue;
             }
 
-            if delta <= 0 {
+            if delta < 0 {
+                tracing::error!(
+                    chunk_hash = ?hash,
+                    delta,
+                    "refcount decrement for a chunk without metadata: metadata refcounts are inconsistent"
+                );
                 continue;
             }
 

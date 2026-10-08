@@ -888,6 +888,12 @@ impl Transaction {
             return Ok(());
         }
 
+        // Conflict validation and the commit must be one atomic step with
+        // respect to other committers. Validating before taking the admission
+        // lock lets two transactions that write the same key both pass
+        // validation and then both commit, silently losing one update.
+        let _write_guard = self.core.write_admission.lock().await;
+
         // This checks if any key in our write set was modified after we started.
         self.validate_write_conflicts()?;
 
@@ -919,7 +925,7 @@ impl Transaction {
 
         // Write the batch to storage
         let should_sync = self.durability == Durability::Immediate;
-        self.core.commit(batch, should_sync).await?;
+        self.core.commit_without_admission(batch, should_sync).await?;
 
         // Mark the transaction as closed
         self.closed = true;
@@ -929,15 +935,6 @@ impl Transaction {
     /// Validates that no key in our write set was modified after we started.
     /// Only checks memtables - returns TransactionRetry if history insufficient.
     fn validate_write_conflicts(&self) -> Result<()> {
-        // Early check: is memtable history sufficient?
-        // If our transaction started before the oldest memtable was created,
-        // we can't reliably check for conflicts (data may have been flushed to SST).
-        let earliest_memtable_seq = self.core.inner.get_earliest_memtable_seq()?;
-        if self.start_seq_num < earliest_memtable_seq {
-            return Err(Error::TransactionRetry);
-        }
-
-        // Check all keys in one batch
         self.core.inner.check_keys_conflict(
             self.write_set.keys().map(|k| k.as_slice()),
             self.start_seq_num,

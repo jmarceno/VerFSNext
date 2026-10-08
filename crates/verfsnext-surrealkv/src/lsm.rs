@@ -204,29 +204,31 @@ impl CoreInner {
         })
     }
 
-    /// Get the earliest sequence number across all memtables.
-    /// Any key with seq >= this value is guaranteed to be in memtables.
-    /// Keys modified with seq < this value may have been flushed to SST.
-    pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
-        // Check immutable memtables - the first (oldest by table_id) has the earliest seq
-        let immutables = self.immutable_memtables.read()?;
-        if let Some(oldest) = immutables.first() {
-            return Ok(oldest.memtable.earliest_seq());
-        }
-        drop(immutables);
-
-        // No immutables - use active memtable
-        let memtable = self.active_memtable.read()?;
-        Ok(memtable.earliest_seq())
-    }
-
+    /// Checks whether any of `keys` was written after `start_seq`.
+    ///
+    /// Only memtables are consulted. If the transaction started before the
+    /// oldest memtable still held in memory, writes it must be checked against
+    /// may already live only in SSTs, so `TransactionRetry` is returned.
+    ///
+    /// The history check and the key checks run under the same memtable locks:
+    /// otherwise a background flush could drop an immutable memtable between
+    /// the two steps and hide a conflicting write.
     pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
     where
         I: Iterator<Item = &'a [u8]>,
     {
-        // Acquire locks once for all keys - this is the key optimization
+        // Lock order matches memtable rotation: active, then immutables.
         let memtable = self.active_memtable.read()?;
         let immutables = self.immutable_memtables.read()?;
+
+        // Immutable memtables are ordered by table_id, the first is the oldest.
+        let earliest_memtable_seq = match immutables.first() {
+            Some(oldest) => oldest.memtable.earliest_seq(),
+            None => memtable.earliest_seq(),
+        };
+        if start_seq < earliest_memtable_seq {
+            return Err(Error::TransactionRetry);
+        }
 
         for key in keys {
             // Check active memtable first (most recent writes)

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::mem::size_of;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use moka::sync::Cache;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::data::compress::decompress_chunk;
@@ -88,9 +88,20 @@ struct ActivePack {
 pub struct PackStore {
     packs_dir: PathBuf,
     active: Mutex<ActivePack>,
+    /// Held shared by readers for the whole index-lookup-plus-payload-read
+    /// sequence and exclusively while GC swaps a rewritten pack into place, so
+    /// a reader never pairs an offset from one pack generation with the file
+    /// of another.
+    swap_lock: RwLock<()>,
     index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
     pack_file_cache: Cache<u64, Arc<File>>,
     max_pack_size_bytes: u64,
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("failed to sync directory {}", dir.display()))
 }
 
 impl PackStore {
@@ -115,6 +126,8 @@ impl PackStore {
             .map(|existing_max| existing_max.max(active_pack_id))
             .unwrap_or(active_pack_id);
 
+        Self::repair_active_pack_tail(packs_dir, resolved_active_pack_id)?;
+
         let path = Self::pack_path_impl(packs_dir, resolved_active_pack_id);
         let index_path = Self::index_path_impl(packs_dir, resolved_active_pack_id);
         let file = OpenOptions::new()
@@ -138,6 +151,7 @@ impl PackStore {
 
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
+            swap_lock: RwLock::new(()),
             active: Mutex::new(ActivePack {
                 pack_id: resolved_active_pack_id,
                 file,
@@ -223,10 +237,26 @@ impl PackStore {
         // Write header and payload separately. The seek was removed (size_bytes
         // is already known), so we save one syscall per chunk already.
         let file = &mut active.file;
-        file.write_all(&header_bytes)
-            .context("failed to write pack record header")?;
-        file.write_all(compressed_data)
-            .context("failed to write pack record payload")?;
+        if let Err(err) = file
+            .write_all(&header_bytes)
+            .and_then(|()| file.write_all(compressed_data))
+        {
+            // A partial record (e.g. ENOSPC) would shift every later record
+            // away from the offset recorded in its index entry, so cut the
+            // pack back to the last complete record before reporting.
+            if let Err(rollback_err) = file.set_len(record_offset) {
+                active.size_bytes = file
+                    .metadata()
+                    .context("failed to stat active pack after failed rollback")?
+                    .len();
+                bail!(
+                    "failed to append pack record ({err}) and failed to truncate the partial record ({rollback_err}); pack {} now has a torn record at offset {}",
+                    active.pack_id,
+                    record_offset
+                );
+            }
+            return Err(err).context("failed to append pack record");
+        }
 
         let index = PackIndexEntry {
             offset: record_offset,
@@ -272,6 +302,7 @@ impl PackStore {
         expected_uncompressed_len: u32,
         expected_compressed_len: u32,
     ) -> Result<(Vec<u8>, PackIndexEntry)> {
+        let _swap_guard = self.swap_lock.read();
         let index = self
             .lookup_index_entry(pack_id, expected_hash)?
             .with_context(|| {
@@ -429,7 +460,20 @@ impl PackStore {
             let raw = Self::encode_index_record(&record)?;
             buf.extend_from_slice(&raw);
         }
-        active.index_file.write_all(&buf).context("failed to flush buffered index entries")?;
+        let index_len = active
+            .index_file
+            .metadata()
+            .context("failed to stat active pack index")?
+            .len();
+        if let Err(err) = active.index_file.write_all(&buf) {
+            // Keep the index aligned to whole entries; the pending entries stay
+            // buffered and are written again by the next flush.
+            active
+                .index_file
+                .set_len(index_len)
+                .with_context(|| format!("failed to roll back partial index write ({err})"))?;
+            return Err(err).context("failed to flush buffered index entries");
+        }
         active.pending_index.clear();
         Ok(())
     }
@@ -445,12 +489,111 @@ impl PackStore {
     }
 
     pub fn read_index_entries(&self, pack_id: u64) -> Result<Vec<([u8; 16], PackIndexEntry)>> {
-        let path = self.index_path(pack_id);
+        Self::read_index_entries_at(&self.index_path(pack_id))
+    }
+
+    /// Restores the append invariants of the active pack after an unclean stop.
+    ///
+    /// A record cut short at the end of the pack was never committed, because
+    /// payloads are synced before metadata points at them, so it is truncated.
+    /// Left in place, the next append would land after the fragment and every
+    /// later record would be unreachable for the sequential scanners (GC
+    /// rewrite, index rebuild). When the index no longer matches the repaired
+    /// pack (torn entry or entry past the end), it is removed so that startup
+    /// rebuilds it from the pack.
+    fn repair_active_pack_tail(packs_dir: &Path, pack_id: u64) -> Result<()> {
+        let path = Self::pack_path_impl(packs_dir, pack_id);
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to open active pack {}", path.display()));
+            }
+        };
+        let pack_len = file
+            .metadata()
+            .with_context(|| format!("failed to stat active pack {}", path.display()))?
+            .len();
+
+        let mut valid_end = 0_u64;
+        while pack_len - valid_end >= RECORD_HEADER_LEN_U64 {
+            let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
+            file.read_exact_at(raw_header.as_mut_slice(), valid_end)
+                .with_context(|| format!("failed to scan active pack {}", path.display()))?;
+            let header = Self::decode_pack_header(raw_header.as_slice())?;
+            if header.magic != RECORD_MAGIC {
+                bail!(
+                    "corrupt pack record magic at offset {} in {}",
+                    valid_end,
+                    path.display()
+                );
+            }
+            let record_end = valid_end
+                .checked_add(RECORD_HEADER_LEN_U64)
+                .and_then(|v| v.checked_add(header.compressed_len as u64))
+                .context("pack offset overflow while scanning active pack")?;
+            if record_end > pack_len {
+                break;
+            }
+            valid_end = record_end;
+        }
+
+        if valid_end < pack_len {
+            tracing::warn!(
+                pack = %path.display(),
+                pack_len,
+                valid_end,
+                "truncating incomplete record at the end of the active pack"
+            );
+            file.set_len(valid_end)
+                .with_context(|| format!("failed to truncate active pack {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync active pack {}", path.display()))?;
+        }
+
+        let index_path = Self::index_path_impl(packs_dir, pack_id);
+        let index_len = match std::fs::metadata(&index_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to stat pack index {}", index_path.display())
+                });
+            }
+        };
+        let index_matches_pack = index_len.is_multiple_of(INDEX_ENTRY_LEN_U64)
+            && Self::read_index_entries_at(&index_path)?
+                .iter()
+                .all(|(_, entry)| {
+                    entry
+                        .offset
+                        .checked_add(RECORD_HEADER_LEN_U64)
+                        .and_then(|v| v.checked_add(entry.compressed_len as u64))
+                        .is_some_and(|end| end <= valid_end)
+                });
+        if !index_matches_pack {
+            tracing::warn!(
+                index = %index_path.display(),
+                index_len,
+                "active pack index does not match the pack; it will be rebuilt from the pack"
+            );
+            std::fs::remove_file(&index_path).with_context(|| {
+                format!("failed to remove stale pack index {}", index_path.display())
+            })?;
+            if let Some(dir) = index_path.parent() {
+                sync_dir(dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_index_entries_at(path: &Path) -> Result<Vec<([u8; 16], PackIndexEntry)>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
 
-        let file = File::open(&path)
+        let file = File::open(path)
             .with_context(|| format!("failed to open pack index file {}", path.display()))?;
         let mut cursor = 0_u64;
         let mut out = Vec::new();
@@ -588,6 +731,19 @@ impl PackStore {
         Ok(size)
     }
 
+    /// Rewrites a non-active pack keeping only records of `live_hashes`.
+    ///
+    /// Every copy of a live hash that the pack index references is kept in its
+    /// original order, so readers resolve exactly the same copy afterwards
+    /// (duplicate copies of one hash can differ, e.g. vault ciphertext sealed
+    /// with different nonces). Records the index does not reference were never
+    /// readable and are dropped. Each kept payload is verified against its
+    /// index CRC32 and the rewrite aborts on any mismatch instead of carrying
+    /// damaged data forward under a fresh checksum.
+    ///
+    /// The swap is crash-safe: the old index is removed before the new pack is
+    /// renamed into place, so a crash between the renames leaves a pack without
+    /// an index, which startup rebuilds from the pack itself.
     pub fn rewrite_pack_with_live_hashes(
         &self,
         pack_id: u64,
@@ -602,6 +758,22 @@ impl PackStore {
             return Ok(());
         }
         let src_idx_path = self.index_path(pack_id);
+        let src_entries = self.read_index_entries(pack_id)?;
+        let indexed_by_offset = src_entries
+            .iter()
+            .map(|(hash, entry)| (entry.offset, (*hash, *entry)))
+            .collect::<HashMap<_, _>>();
+        let indexed_hashes = src_entries
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect::<HashSet<_>>();
+        for hash in live_hashes.difference(&indexed_hashes) {
+            tracing::error!(
+                pack_id,
+                chunk_hash = ?hash,
+                "live chunk has no entry in its pack index and cannot be read"
+            );
+        }
 
         let tmp_pack_path = src_pack_path.with_extension("vpk.rewrite");
         let tmp_idx_path = src_idx_path.with_extension("idx.rewrite");
@@ -626,7 +798,7 @@ impl PackStore {
 
         let mut cursor = 0_u64;
         let mut new_offset = 0_u64;
-        let mut seen = HashSet::<[u8; 16]>::new();
+        let mut kept_offsets = HashSet::<u64>::new();
         loop {
             let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
             match src_file.read_exact_at(raw_header.as_mut_slice(), cursor) {
@@ -649,7 +821,22 @@ impl PackStore {
                         .checked_add(clen as u64)
                         .context("record length overflow while rewriting pack")?;
 
-                    if live_hashes.contains(&hash) && seen.insert(hash) {
+                    let indexed = indexed_by_offset
+                        .get(&cursor)
+                        .filter(|_| live_hashes.contains(&hash))
+                        .copied();
+                    if let Some((indexed_hash, entry)) = indexed {
+                        if indexed_hash != hash
+                            || entry.codec != codec
+                            || entry.uncompressed_len != ulen
+                            || entry.compressed_len != clen
+                        {
+                            bail!(
+                                "pack index entry at offset {} in {} does not match the record header",
+                                cursor,
+                                src_pack_path.display()
+                            );
+                        }
                         let mut payload = vec![0_u8; clen as usize];
                         src_file
                             .read_exact_at(&mut payload, cursor + RECORD_HEADER_LEN_U64)
@@ -659,6 +846,17 @@ impl PackStore {
                                     src_pack_path.display()
                                 )
                             })?;
+                        let payload_crc32 = crc32c::crc32c(&payload);
+                        if payload_crc32 != entry.payload_crc32 {
+                            bail!(
+                                "pack payload crc32 mismatch for chunk {:x?} at offset {} in {}: index {}, payload {}; refusing to rewrite pack",
+                                hash,
+                                cursor,
+                                src_pack_path.display(),
+                                entry.payload_crc32,
+                                payload_crc32
+                            );
+                        }
 
                         dst_file.write_all(raw_header.as_slice()).with_context(|| {
                             format!(
@@ -680,9 +878,10 @@ impl PackStore {
                                 codec,
                                 uncompressed_len: ulen,
                                 compressed_len: clen,
-                                payload_crc32: crc32c::crc32c(&payload),
+                                payload_crc32,
                             },
                         )?;
+                        kept_offsets.insert(cursor);
                         new_offset = new_offset
                             .checked_add(record_len)
                             .context("destination offset overflow during pack rewrite")?;
@@ -704,6 +903,17 @@ impl PackStore {
             }
         }
 
+        for (hash, entry) in src_entries.iter() {
+            if live_hashes.contains(hash) && !kept_offsets.contains(&entry.offset) {
+                bail!(
+                    "pack index entry for live chunk {:x?} at offset {} does not point at a record in {}; refusing to rewrite pack",
+                    hash,
+                    entry.offset,
+                    src_pack_path.display()
+                );
+            }
+        }
+
         dst_file.sync_all().with_context(|| {
             format!("failed to sync rewritten pack {}", tmp_pack_path.display())
         })?;
@@ -716,6 +926,20 @@ impl PackStore {
         drop(dst_file);
         drop(dst_index);
 
+        let pack_dir = src_pack_path
+            .parent()
+            .context("pack path has no parent directory")?;
+        let _swap_guard = self.swap_lock.write();
+        match std::fs::remove_file(&src_idx_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to remove old pack index {}", src_idx_path.display())
+                });
+            }
+        }
+        sync_dir(pack_dir)?;
         std::fs::rename(&tmp_pack_path, &src_pack_path).with_context(|| {
             format!(
                 "failed to atomically replace pack {} with {}",
@@ -723,6 +947,7 @@ impl PackStore {
                 tmp_pack_path.display()
             )
         })?;
+        sync_dir(pack_dir)?;
         std::fs::rename(&tmp_idx_path, &src_idx_path).with_context(|| {
             format!(
                 "failed to atomically replace pack index {} with {}",
@@ -730,10 +955,11 @@ impl PackStore {
                 tmp_idx_path.display()
             )
         })?;
+        sync_dir(pack_dir)?;
 
-        let _ = self
-            .index_cache
-            .invalidate_entries_if(move |(cached_pack_id, _), _| *cached_pack_id == pack_id);
+        for (hash, _) in src_entries.iter() {
+            self.index_cache.invalidate(&(pack_id, *hash));
+        }
         self.pack_file_cache.invalidate(&pack_id);
         self.prime_index_cache(pack_id)?;
         Ok(())
@@ -776,9 +1002,10 @@ impl PackStore {
             match file.read_exact_at(raw.as_mut_slice(), cursor) {
                 Ok(()) => {
                     let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
+                    // The most recent entry for a hash wins, matching both the
+                    // cache update on append and prime_index_cache.
                     if hash == expected_hash {
                         found = Some(entry);
-                        break;
                     }
                     cursor = cursor
                         .checked_add(INDEX_ENTRY_LEN_U64)

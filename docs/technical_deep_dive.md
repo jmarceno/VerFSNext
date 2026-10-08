@@ -96,13 +96,14 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - session-level FUSE invalidation notifier is installed at mount and used for best-effort post-commit invalidation dispatch
 
 - `src/fs/write.rs`
-  - `apply_batch` still coalesces adjacent writes first, then executes per-inode groups sequentially while running different inodes concurrently
-  - preserves per-inode operation order while unlocking cross-inode parallelism
-  - `apply_single_write` is now two-phase:
-    - phase 1 (outside inode lock): reads extents, assembles block payloads, hashes, dedup checks, and chunk compression/materialization
-    - phase 2 (short critical section): acquires global mutation read lock plus per-inode lock, then commits extent/refcount/inode metadata
-  - per-inode data-version counters detect races with truncation; on mismatch, write preparation is recomputed against current inode state before commit
-  - this removes chunk/compression work from the steady-state inode critical section while preserving ordered inode commits
+  - `apply_batch` coalesces adjacent writes, then splits the groups into rounds in which every inode appears at most once (per-inode order preserved); each round is staged into one SurrealKV transaction and committed before the next round starts
+  - every read a write plan depends on (inode, old extents, dedup check) goes through the batch transaction; whatever the plan depends on is either in the transaction snapshot or rewritten by it (inode key, touched extents, chunk refcounts), so concurrent changes surface as commit conflicts, after which the round is re-planned and retried
+  - a group that fails to stage is reported failed and the remaining groups are re-staged on a fresh transaction; a write is acknowledged only after the transaction containing it commits
+  - packs are synced before every metadata commit; a sync failure fails the batch
+  - truncate stages inode, extent deletions, boundary chunk and refcount deltas in one transaction with the same retry loop
+- `src/meta/mod.rs`
+  - `write_txn` takes an `FnMut` closure and re-runs it on a fresh transaction when the commit fails with `TransactionWriteConflict` or `TransactionRetry` (up to `MAX_COMMIT_ATTEMPTS`); closures must derive all writes from reads through `txn` and have no other side effects
+  - read-modify-write of metadata must always read through the committing transaction (never from caches or a separate read transaction)
 
 - `src/write/batcher.rs`
   - queue ingestion no longer blocks on `sink.apply_batch`
@@ -156,7 +157,10 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - CRC32 is computed on stored payload bytes (ciphertext for vault chunks, compressed/raw payload for non-vault chunks)
   - Supports encrypted-payload reads (`read_chunk_payload`) for vault decrypt-then-decompress flow
   - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
-  - GC pack rewrite support for non-active packs with atomic replacement and index-cache invalidation
+  - GC pack rewrite keeps every indexed copy of each hash that still has a chunk record (any refcount), verifies each payload against its index CRC32 (aborts on mismatch), and swaps files crash-safely: remove old index, rename pack, rename index, fsync the directory after each step; a crash in between leaves a pack without an index, which startup rebuilds
+  - readers hold a shared swap lock across index lookup and payload read; the rewrite holds it exclusively during the swap and cache invalidation
+  - failed appends and index flushes roll back partial writes; startup truncates an incomplete record at the end of the active pack and drops an index that no longer matches it
+  - index-file lookups use the most recent entry for a hash, matching the cache
 
 - `src/migration/pack_size.rs`
   - Compatibility guard for persisted `SYS:pack_max_size_mb`
@@ -242,7 +246,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 1. Metadata-stage GC scans for zero-ref chunks.
 2. For each candidate chunk, GC emits a CRC-protected discard record (`pack_id`, `chunk_hash128`, `block_size_bytes`, `epoch_id`).
 3. `SYS:gc.discard_checkpoint` is advanced only after `.DISCARD` append + sync.
-4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, rewrites live chunks only, and atomically swaps rewritten pack/index files.
+4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, fsyncs the metadata WAL, rewrites keeping every chunk that still has a metadata record (zero-ref records are reclaimed only after the scan stage deletes them), and swaps rewritten pack/index files crash-safely.
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
 6. Offline rebuild command (`gc offline`) rewrites `.DISCARD` from scratch by walking pack indexes pack-by-pack and marking entries as dead when the chunk metadata is missing, zero-ref, or points to a different pack; it then sets `SYS:gc.phase = 1` so the next GC work starts at the pack stage.
 7. `gc offline --run` immediately executes the pack-stage rewrite loop (no metadata scan phase), honoring the configured reclaim thresholds (`gc_pack_rewrite_min_reclaim_bytes` / `gc_pack_rewrite_min_reclaim_percent`).
