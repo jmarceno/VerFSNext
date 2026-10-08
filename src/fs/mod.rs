@@ -51,8 +51,7 @@ use crate::types::{
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
-    generate_key_file_material, read_key_file, resolve_create_key_path, unwrap_folder_key,
-    write_key_file, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_ENCRYPTED,
+    unwrap_folder_key, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_ENCRYPTED,
     SYS_VAULT_STATE, SYS_VAULT_WRAP, VAULT_STATE_LOCKED, VAULT_STATE_UNLOCKED,
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
@@ -152,6 +151,14 @@ pub struct VerFsStats {
 pub struct PackCrc32ReadErrorCounters {
     pub persisted_sys_total: u64,
     pub current_total: u64,
+}
+
+/// The user who owns a newly created `/.vault` directory: the user who asked
+/// for it, not the daemon's user.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultOwner {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -379,13 +386,14 @@ impl VerFs {
     pub async fn create_vault(
         &self,
         password: &str,
-        key_path: Option<&Path>,
-    ) -> Result<std::path::PathBuf> {
-        self.core.create_vault(password, key_path).await
+        key_material: &[u8; 32],
+        owner: VaultOwner,
+    ) -> Result<()> {
+        self.core.create_vault(password, key_material, owner).await
     }
 
-    pub async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
-        self.core.unlock_vault(password, key_file).await
+    pub async fn unlock_vault(&self, password: &str, key_material: &[u8; 32]) -> Result<()> {
+        self.core.unlock_vault(password, key_material).await
     }
 
     pub async fn lock_vault(&self) -> Result<()> {
@@ -1065,6 +1073,7 @@ mod tests {
             fuse_direct_io: false,
             fuse_fsname: "verfs_bench".to_string(),
             fuse_subtype: "verfs".to_string(),
+            fuse_allow_other: false,
             fuse_attr_ttl_ms: 0,
             fuse_entry_ttl_ms: 0,
             gc_idle_min_ms: 1000,

@@ -301,3 +301,28 @@ A chunk whose matching copy was already dropped by a GC rewrite or by a pack-siz
 - `src/data/pack.rs` — `read_chunk_with`, `read_indexed_copies`, `append_chunk_copies`; removed `read_chunk`, `read_chunk_payload`, `read_chunk_payload_with_index`, `append_chunk`
 - `src/fs/chunk.rs` — chunk loads validate each candidate copy (decrypt and decompress)
 - `src/migration/pack_size.rs` — migrates every indexed copy
+
+## B008 - Vault Ownership, Key-File Handling and Control Socket Exposure in Service Mode - Oct 08 2026
+
+### Root Cause
+
+1. **`.vault` owned by the daemon user** (`src/fs/vault.rs`): B004 set the `/.vault` owner to `getuid()/getgid()`, but when the vault is created through the control socket that code runs in the daemon. Under the systemd service (`User=verfs`) `/.vault` (mode `0700`) belonged to `verfs`, so the user who created it could not open it.
+2. **Key file written and read by the daemon** (`src/vault/mod.rs`, `src/main.rs`): the daemon wrote `verfsnext.vault.key` (mode `0600`) at a path sent by the client, so in service mode the file belonged to `verfs` and its owner could not read it, or the write failed for paths `verfs` cannot write. Unlock had the daemon open the caller's `0600` key file, which fails for the same reason. The file was also opened with `truncate(true)`, so creating a vault could overwrite an existing key file, and it was chmod-ed to `0600` only after being created with umask-default permissions. It was not fsynced.
+3. **Control socket opened to all users** (`contrib/systemd/verfsnext-service.sh`): the installer ran `chmod 666` on the socket after starting the service, so every local user could run snapshot (including delete), crypt and stats commands, defeating the daemon's `0660` + `verfs` group model.
+4. **Root directory without sticky bit** (`src/types/mod.rs`): the root inode was `0777`. With other users able to access the mount, any of them could delete or rename everyone else's top-level entries.
+
+### Fixed
+
+- The CLI performs all key-file I/O as the calling user. `crypt -c` generates the key material, writes the key file with `create_new` and mode `0600` at open time, fsyncs it and its directory, and sends the material in `vault_create`. If creation fails, the unused key file is removed. `crypt -u` reads the key file and sends the material in `vault_unlock`.
+- The daemon takes the `/.vault` owner from the control socket peer credentials (`SO_PEERCRED`). In offline metadata mode the CLI process is the owner.
+- `FsCore::create_vault` / `unlock_vault` take key material instead of paths; the daemon no longer touches key files.
+- The installer no longer changes the socket mode; access requires membership in group `verfs`.
+- `PERM_DIRECTORY_ROOT` is `0o1777`. With `default_permissions` the kernel enforces the sticky bit. This applies to newly created filesystems; no migration is provided (no existing deployments to migrate).
+
+### Compatibility
+
+The `vault_create` / `vault_unlock` control requests changed (key material instead of paths), so the CLI and the daemon must be the same version.
+
+### Affected Files
+- `src/main.rs`, `src/fs/vault.rs`, `src/fs/mod.rs`, `src/vault/mod.rs`, `src/types/mod.rs`
+- `contrib/systemd/verfsnext-service.sh`

@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::fs::{OfflineGcReport, PackCrc32ReadErrorCounters, VerFs, VerFsStats};
+use crate::fs::{OfflineGcReport, PackCrc32ReadErrorCounters, VaultOwner, VerFs, VerFsStats};
+use crate::vault::{generate_key_file_material, read_key_file, resolve_create_key_path, write_key_file};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
 use crate::permissions::set_socket_mode;
@@ -80,6 +81,7 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
                 direct_io: config.fuse_direct_io,
                 fs_name: config.fuse_fsname.clone(),
                 subtype: config.fuse_subtype.clone(),
+                allow_other: config.fuse_allow_other,
             },
         },
     )
@@ -194,9 +196,7 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
         }
         "crypt" => {
             let cmd = parse_crypt_cmd(&args[1..])?;
-            if !try_run_crypt_via_socket(&config, &cmd).await? {
-                run_crypt_via_metadata(&config, &cmd).await?;
-            }
+            run_crypt_command(&config, cmd).await?;
         }
         "pack-size-migrate" => {
             if !args[1..].is_empty() {
@@ -351,13 +351,18 @@ enum ControlRequest {
     SnapshotDelete {
         name: String,
     },
+    /// The CLI generates the key material and writes the key file itself, so
+    /// the file belongs to the caller; the daemon takes the `/.vault` owner
+    /// from the socket peer credentials.
     VaultCreate {
         password: String,
-        key_path: Option<String>,
+        key_material: [u8; 32],
     },
+    /// The CLI reads the caller's key file and sends its content, so the
+    /// daemon never opens files on behalf of the caller.
     VaultUnlock {
         password: String,
-        key_file: String,
+        key_material: [u8; 32],
     },
     VaultLock,
     Stats,
@@ -607,6 +612,9 @@ fn confirm_config_selection(selection: &ConfigSelection) -> Result<()> {
 }
 
 async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()> {
+    let peer = stream
+        .peer_cred()
+        .context("failed to read control socket peer credentials")?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -664,13 +672,19 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
                 error: err.to_string(),
             },
         },
-        ControlRequest::VaultCreate { password, key_path } => {
-            let path = key_path.map(PathBuf::from);
-            match fs.create_vault(&password, path.as_deref()).await {
-                Ok(written_path) => ControlResponse {
+        ControlRequest::VaultCreate {
+            password,
+            key_material,
+        } => {
+            let owner = VaultOwner {
+                uid: peer.uid(),
+                gid: peer.gid(),
+            };
+            match fs.create_vault(&password, &key_material, owner).await {
+                Ok(()) => ControlResponse {
                     ok: true,
                     names: Vec::new(),
-                    message: written_path.display().to_string(),
+                    message: String::new(),
                     error: String::new(),
                 },
                 Err(err) => ControlResponse {
@@ -681,8 +695,11 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
                 },
             }
         }
-        ControlRequest::VaultUnlock { password, key_file } => {
-            match fs.unlock_vault(&password, Path::new(&key_file)).await {
+        ControlRequest::VaultUnlock {
+            password,
+            key_material,
+        } => {
+            match fs.unlock_vault(&password, &key_material).await {
                 Ok(()) => ControlResponse {
                     ok: true,
                     names: Vec::new(),
@@ -797,11 +814,16 @@ async fn try_run_snapshot_via_socket(config: &Config, cmd: &SnapshotCommand) -> 
     Ok(true)
 }
 
-async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result<bool> {
+/// Sends one request to the mounted daemon. Returns `None` when no daemon is
+/// listening on the control socket.
+async fn send_control_request(
+    config: &Config,
+    req: &ControlRequest,
+) -> Result<Option<ControlResponse>> {
     let socket_path = config.control_socket_path();
     let mut stream = match UnixStream::connect(&socket_path).await {
         Ok(stream) => stream,
-        Err(err) if socket_unavailable(&err) => return Ok(false),
+        Err(err) if socket_unavailable(&err) => return Ok(None),
         Err(err) => {
             return Err(err).with_context(|| {
                 format!("failed to connect control socket {}", socket_path.display())
@@ -809,25 +831,7 @@ async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result
         }
     };
 
-    let req = match cmd {
-        CryptCommand::Create { password, key_path } => ControlRequest::VaultCreate {
-            password: password.clone(),
-            key_path: key_path
-                .as_ref()
-                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-                .map(|p| p.to_string_lossy().to_string()),
-        },
-        CryptCommand::Unlock { password, key_file } => ControlRequest::VaultUnlock {
-            password: password.clone(),
-            key_file: std::fs::canonicalize(key_file)
-                .unwrap_or_else(|_| key_file.clone())
-                .to_string_lossy()
-                .to_string(),
-        },
-        CryptCommand::Lock => ControlRequest::VaultLock,
-    };
-
-    let payload = serde_json::to_vec(&req).context("failed to encode control request")?;
+    let payload = serde_json::to_vec(req).context("failed to encode control request")?;
     stream
         .write_all(&payload)
         .await
@@ -855,10 +859,81 @@ async fn try_run_crypt_via_socket(config: &Config, cmd: &CryptCommand) -> Result
     if !resp.ok {
         bail!(resp.error);
     }
-    if !resp.message.is_empty() {
-        println!("{}", resp.message);
+    Ok(Some(resp))
+}
+
+/// Runs a crypt command. Key files are always read and written by this
+/// process, i.e. by the calling user, never by the daemon, which may run as a
+/// different system user.
+async fn run_crypt_command(config: &Config, cmd: CryptCommand) -> Result<()> {
+    match cmd {
+        CryptCommand::Create { password, key_path } => {
+            let key_file = resolve_create_key_path(key_path.as_deref())?;
+            let key_material = generate_key_file_material();
+            write_key_file(&key_file, &key_material)?;
+            if let Err(err) = create_vault_with_key(config, &password, &key_material).await {
+                // The key file only unlocks the vault this command failed to
+                // create, so it must not be left behind.
+                if let Err(remove_err) = std::fs::remove_file(&key_file) {
+                    return Err(err.context(format!(
+                        "also failed to remove the unused key file {}: {remove_err}",
+                        key_file.display()
+                    )));
+                }
+                return Err(err);
+            }
+            println!("{}", key_file.display());
+            Ok(())
+        }
+        CryptCommand::Unlock { password, key_file } => {
+            let key_material = read_key_file(&key_file)?;
+            let req = ControlRequest::VaultUnlock {
+                password,
+                key_material,
+            };
+            if send_control_request(config, &req).await?.is_none() {
+                bail!("unlock requires a mounted daemon (control socket unavailable)");
+            }
+            Ok(())
+        }
+        CryptCommand::Lock => {
+            if send_control_request(config, &ControlRequest::VaultLock)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let fs = VerFs::new(config.clone()).await?;
+            let result = fs.lock_vault().await;
+            fs.graceful_shutdown().await?;
+            result
+        }
     }
-    Ok(true)
+}
+
+/// Creates the vault through the mounted daemon, or directly in the metadata
+/// store when no daemon is running. Offline, this process is the caller, so
+/// it owns `/.vault`.
+async fn create_vault_with_key(
+    config: &Config,
+    password: &str,
+    key_material: &[u8; 32],
+) -> Result<()> {
+    let req = ControlRequest::VaultCreate {
+        password: password.to_owned(),
+        key_material: *key_material,
+    };
+    if send_control_request(config, &req).await?.is_some() {
+        return Ok(());
+    }
+    let fs = VerFs::new(config.clone()).await?;
+    let owner = VaultOwner {
+        uid: nix::unistd::getuid().as_raw(),
+        gid: nix::unistd::getgid().as_raw(),
+    };
+    let result = fs.create_vault(password, key_material, owner).await;
+    fs.graceful_shutdown().await?;
+    result
 }
 
 async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
@@ -1193,27 +1268,6 @@ async fn run_snapshot_via_metadata(config: &Config, cmd: &SnapshotCommand) -> Re
     action_result?;
     close_result?;
     Ok(())
-}
-
-async fn run_crypt_via_metadata(config: &Config, cmd: &CryptCommand) -> Result<()> {
-    let fs = VerFs::new(config.clone()).await?;
-    match cmd {
-        CryptCommand::Create { password, key_path } => {
-            let path = fs.create_vault(password, key_path.as_deref()).await?;
-            println!("{}", path.display());
-            fs.graceful_shutdown().await?;
-            Ok(())
-        }
-        CryptCommand::Unlock { .. } => {
-            fs.graceful_shutdown().await?;
-            bail!("unlock requires a mounted daemon (control socket unavailable)")
-        }
-        CryptCommand::Lock => {
-            let result = fs.lock_vault().await;
-            fs.graceful_shutdown().await?;
-            result
-        }
-    }
 }
 
 async fn run_gc_offline_command(config: &Config, cmd: &GcCommand) -> Result<()> {

@@ -41,7 +41,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Snapshot CLI first tries socket RPC; if no socket listener is available, it falls back to offline metadata mode.
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
-- Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands.
+- Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands. The systemd installer no longer widens it (it used to `chmod 666` the socket, letting every local user run control commands).
 - Startup now normalizes `<data_dir>` tree permissions to group-writable POSIX modes:
   - directories: `0770`
   - regular runtime files (packs/indices/metadata/discard): `0660`
@@ -184,6 +184,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `metadata_cache_capacity_entries`
 - `chunk_cache_capacity_mb`
 - `pack_index_cache_capacity_entries`
+- `fuse_allow_other` (default `false`): adds the `allow_other` mount option so users other than the daemon's user can access the mount. Both mount paths (`fusermount` for non-root, direct `mount(2)` for root) always pass `default_permissions`, so the kernel enforces permission bits; the filesystem does not check them in its operations. A non-root mount with `allow_other` needs `user_allow_other` in `/etc/fuse.conf`, and a failed `fusermount` returns an error (it used to panic). Before this option existed the `fusermount` path always used `allow_other` and the direct root path passed neither `allow_other` nor `default_permissions`
 - `fuse_attr_ttl_ms` and `fuse_entry_ttl_ms` are loaded from `config.toml` at mount (current defaults: 150ms each); effective runtime TTLs are zeroed automatically if kernel invalidation notifier is unavailable
 - `pack_max_size_mb`
 - `zstd_compression_level`
@@ -194,6 +195,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `fuse_direct_io`
 - `fuse_fsname`
 - `fuse_subtype`
+- `fuse_allow_other`
 - `fuse_attr_ttl_ms`
 - `fuse_entry_ttl_ms`
 - `gc_idle_min_ms`
@@ -223,15 +225,15 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 ## Vault Data Path
 
-1. `verfsnext crypt -c` generates:
-   - key file material (`verfsnext.vault.key`)
-   - random 256-bit vault folder key
-   - wrapped folder key metadata persisted under `SYS:vault.wrap`
-   - top-level `/.vault` inode+dirent (root-only reserved path)
+1. `verfsnext crypt -c`:
+   - the CLI process generates the key material and writes `verfsnext.vault.key` itself (`create_new`, mode `0600`, fsynced with its directory), so the file belongs to the calling user even when the daemon runs as another user; an existing key file is never overwritten, and the new file is removed if vault creation fails
+   - the key material is sent to the daemon in the `vault_create` control request (or used directly in offline metadata mode)
+   - the daemon generates a random 256-bit vault folder key and persists the wrapped folder key under `SYS:vault.wrap`
+   - the daemon creates the top-level `/.vault` inode+dirent (root-only reserved path), mode `0700`, owned by the requesting user: the control socket peer credentials (`SO_PEERCRED`) in mounted mode, the CLI process's uid/gid in offline mode
 2. While vault is locked:
    - `/.vault` is hidden from root `readdir`
    - `lookup` and direct inode operations against vault entries return inaccessible/not-found semantics
-3. `verfsnext crypt -u` unwraps the folder key into process memory and flips runtime state to unlocked.
+3. `verfsnext crypt -u`: the CLI reads the key file as the calling user and sends its content in the `vault_unlock` request; the daemon never opens key files. The daemon unwraps the folder key into process memory and flips runtime state to unlocked.
 4. Vault writes:
    - block payload is compressed
    - compressed bytes are encrypted with XChaCha20-Poly1305 and random 192-bit nonce

@@ -47,11 +47,15 @@ impl FsCore {
             .key()
             .ok_or_else(|| anyhow_errno(Errno::EIO, "vault key is unavailable"))
     }
+    /// Initializes the vault. `key_material` is the content of the caller's
+    /// key file; the caller writes that file itself, so it is created with the
+    /// caller's identity even when the daemon runs as another user.
     pub(crate) async fn create_vault(
         &self,
         password: &str,
-        key_path: Option<&Path>,
-    ) -> Result<std::path::PathBuf> {
+        key_material: &[u8; 32],
+        owner: VaultOwner,
+    ) -> Result<()> {
         if !self.config.vault_enabled {
             return Err(anyhow_errno(
                 Errno::EOPNOTSUPP,
@@ -64,11 +68,10 @@ impl FsCore {
             return Err(anyhow_errno(Errno::EEXIST, "vault is already initialized"));
         }
 
-        let key_material = generate_key_file_material();
         let folder_key = generate_folder_key();
         let wrap = build_wrap_record(
             password,
-            &key_material,
+            key_material,
             &folder_key,
             VaultArgon2Params {
                 mem_kib: self.config.vault_argon2_mem_kib,
@@ -76,9 +79,6 @@ impl FsCore {
                 parallelism: self.config.vault_argon2_parallelism,
             },
         )?;
-        let out_key_path = resolve_create_key_path(key_path)?;
-        write_key_file(&out_key_path, &key_material)?;
-
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
         let mut created_vault_ino: Option<u64> = None;
@@ -122,8 +122,8 @@ impl FsCore {
                     parent: ROOT_INODE,
                     kind: INODE_KIND_DIR,
                     perm: PERM_VAULT_DIRECTORY,
-                    uid: nix::unistd::getuid().as_raw(),
-                    gid: nix::unistd::getgid().as_raw(),
+                    uid: owner.uid,
+                    gid: owner.gid,
                     nlink: 2,
                     size: 0,
                     atime_sec: sec,
@@ -166,9 +166,9 @@ impl FsCore {
         if let Some(vault_ino) = created_vault_ino {
             self.invalidate_inode_attr_best_effort(vault_ino);
         }
-        Ok(out_key_path)
+        Ok(())
     }
-    pub(crate) async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
+    pub(crate) async fn unlock_vault(&self, password: &str, key_material: &[u8; 32]) -> Result<()> {
         if !self.config.vault_enabled {
             return Err(anyhow_errno(
                 Errno::EOPNOTSUPP,
@@ -182,8 +182,7 @@ impl FsCore {
             .get_sys(SYS_VAULT_WRAP)?
             .ok_or_else(|| anyhow_errno(Errno::ENOENT, "vault is not initialized"))?;
         let wrap: VaultWrapRecord = decode_rkyv(&wrap_raw)?;
-        let key_material = read_key_file(key_file)?;
-        let folder_key = unwrap_folder_key(password, &key_material, &wrap)?;
+        let folder_key = unwrap_folder_key(password, key_material, &wrap)?;
         {
             let mut vault = self.vault.write();
             if vault.unlocked() {

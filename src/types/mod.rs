@@ -23,7 +23,10 @@ pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
 pub const INODE_FLAG_VAULT_ROOT: u32 = 1 << 2;
 
-pub const PERM_DIRECTORY_ROOT: u16 = 0o777;
+/// World-writable with the sticky bit (like /tmp): with `fuse_allow_other`
+/// every user can create entries at the top level, but only the owner of an
+/// entry (or of the root) can delete or rename it.
+pub const PERM_DIRECTORY_ROOT: u16 = 0o1777;
 pub const PERM_DIRECTORY_DEFAULT: u16 = 0o755;
 pub const PERM_VAULT_DIRECTORY: u16 = 0o700;
 pub const PERM_SYMLINK_DEFAULT: u16 = 0o777;

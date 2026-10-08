@@ -66,6 +66,10 @@ fn default_fuse_subtype() -> String {
     "verfsnext".to_owned()
 }
 
+fn default_fuse_allow_other() -> bool {
+    false
+}
+
 fn default_fuse_attr_ttl_ms() -> u64 {
     150
 }
@@ -140,6 +144,8 @@ pub struct Config {
     pub fuse_fsname: String,
     #[serde(default = "default_fuse_subtype")]
     pub fuse_subtype: String,
+    #[serde(default = "default_fuse_allow_other")]
+    pub fuse_allow_other: bool,
     #[serde(default = "default_fuse_attr_ttl_ms")]
     pub fuse_attr_ttl_ms: u64,
     #[serde(default = "default_fuse_entry_ttl_ms")]
@@ -298,6 +304,7 @@ mod tests {
             fuse_direct_io: false,
             fuse_fsname: "verfsnext".to_owned(),
             fuse_subtype: "verfsnext".to_owned(),
+            fuse_allow_other: false,
             fuse_attr_ttl_ms: 0,
             fuse_entry_ttl_ms: 0,
             gc_idle_min_ms: 1,

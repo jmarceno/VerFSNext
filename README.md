@@ -33,6 +33,10 @@ VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top 
    - Optional mount behavior:
      - `fuse_direct_io = true` to bypass kernel page cache
      - `fuse_fsname`, `fuse_subtype` for filesystem labeling/identity
+     - `fuse_allow_other = true` to let other users access the mount (see below)
+
+   **Who can access the mount.** By default (`fuse_allow_other = false`) only the user running the daemon can access the mounted filesystem; the kernel rejects everyone else, root included. No root privileges are needed to run or mount in this mode: the daemon uses the system `fusermount` helper, and you only need write access to `mount_point` and `data_dir`.
+   With `fuse_allow_other = true` other users can access it too, subject to normal file permission bits, which the kernel enforces (`default_permissions` is always set). A daemon not running as root then needs `user_allow_other` in `/etc/fuse.conf` (a one-time root change); without it the mount fails with an error that says so. The filesystem root directory is mode `1777` (like `/tmp`): with this option any local user can create entries at the top level, but only an entry's owner can delete or rename it.
 
 2. Start the filesystem daemon from the repo root:
    ```bash
@@ -112,17 +116,18 @@ Stats namespace behavior:
 ```bash
 ./target/release/verfsnext crypt -c -p "your-password" -path /secure/key/dir
 ```
-- Creates `verfsnext.vault.key` in the provided directory
-- Creates `/.vault` metadata in the filesystem
+- Creates `verfsnext.vault.key` (mode `0600`) in the provided directory. The `verfsnext` command you run writes it, so it belongs to you even when the daemon runs as another user (e.g. the `verfs` service user). An existing key file is never overwritten; if creating the vault fails, the new key file is removed.
+- Creates `/.vault` metadata in the filesystem, with `/.vault` (mode `0700`) owned by the user who ran the command
 
 If `-path` is omitted, the key is created in the current working directory.
+Losing the key file means losing access to the vault: keep a copy somewhere safe.
 
 ### Unlock vault
 
 ```bash
 ./target/release/verfsnext crypt -u -p "your-password" -k /secure/key/dir/verfsnext.vault.key
 ```
-After unlock `.vault` becomes visible and accessible for normal file operations. The vault remains unlocked and usable until a lock command is issued or the daemon is restarted.
+The command reads the key file as you and sends its content to the daemon over the control socket; the daemon never opens your key file. After unlock `.vault` becomes visible and accessible for normal file operations. The vault remains unlocked and usable until a lock command is issued or the daemon is restarted.
 
 ### Lock vault
 
@@ -172,8 +177,9 @@ Notes:
    ```bash
    ./contrib/systemd/verfsnext-service.sh install
    ```
-   The installer also adds the invoking user to group `verfs` and prints a highlighted reminder that control commands require `verfs` group membership (`newgrp verfs` or re-login required).
+   The installer also adds the invoking user to group `verfs` and prints a highlighted reminder that control commands require `verfs` group membership (`newgrp verfs` or re-login required). The control socket (`<data_dir>/verfsnext.sock`) is mode `0660`, owned by `verfs:verfs`; only members of group `verfs` can run snapshot, crypt and stats commands against the service.
    The service starts with `--config /etc/verfsnext/config.toml`.
+   The service runs as user `verfs`, so the installer sets `fuse_allow_other = true` in a newly installed config and adds `user_allow_other` to `/etc/fuse.conf` when it is missing. An existing config is left as is, except that a config written before the option existed gets `fuse_allow_other = true` added (by `install` and by `update-bin`), which keeps the previous behavior. If you set it to `false`, only the `verfs` user can access the service mount.
 
 2. If already installed, update only the executable:
    ```bash

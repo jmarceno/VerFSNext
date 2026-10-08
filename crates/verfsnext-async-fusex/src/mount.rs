@@ -14,6 +14,11 @@ pub struct MountConfig {
     pub direct_io: bool,
     pub fs_name: String,
     pub subtype: String,
+    /// Let users other than the mounting user access the filesystem. When it
+    /// is off, the kernel restricts the mount to the mounting user. A
+    /// non-root mount with it on requires `user_allow_other` in
+    /// /etc/fuse.conf.
+    pub allow_other: bool,
 }
 
 impl Default for MountConfig {
@@ -22,19 +27,27 @@ impl Default for MountConfig {
             direct_io: false,
             fs_name: "verfsnext".to_owned(),
             subtype: "verfsnext".to_owned(),
+            allow_other: false,
         }
     }
 }
 
+/// Access-control options shared by both mount paths. The kernel always
+/// enforces permission bits (`default_permissions`); the filesystem does not
+/// check them itself.
+fn access_options(config: &MountConfig) -> Vec<&'static str> {
+    let mut options = vec!["default_permissions"];
+    if config.allow_other {
+        options.push("allow_other");
+    }
+    options
+}
+
 fn build_fusermount_options(config: &MountConfig) -> String {
-    let options = [
-        "nosuid".to_owned(),
-        "nodev".to_owned(),
-        "allow_other".to_owned(),
-        "default_permissions".to_owned(),
-        format!("fsname={}", config.fs_name),
-        format!("subtype={}", config.subtype),
-    ];
+    let mut options = vec!["nosuid".to_owned(), "nodev".to_owned()];
+    options.extend(access_options(config).into_iter().map(str::to_owned));
+    options.push(format!("fsname={}", config.fs_name));
+    options.push(format!("subtype={}", config.subtype));
     options.join(",")
 }
 
@@ -139,11 +152,15 @@ async fn fuser_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result
     .await?
     .context("fusermount command failed to start")?;
 
-    assert!(
-        mount_handle.status.success(),
-        "failed to run fusermount, the error is: {}",
-        String::from_utf8_lossy(&mount_handle.stderr),
-    );
+    if !mount_handle.status.success() {
+        let stderr = String::from_utf8_lossy(&mount_handle.stderr);
+        let hint = if config.allow_other && stderr.contains("user_allow_other") {
+            " (fuse_allow_other is enabled: add `user_allow_other` to /etc/fuse.conf, or set fuse_allow_other = false to restrict the mount to the mounting user)"
+        } else {
+            ""
+        };
+        anyhow::bail!("fusermount failed to mount {mount_point:?}: {}{hint}", stderr.trim());
+    }
     info!(
         "fusermount path={:?} to FUSE device successfully!",
         mount_point,
@@ -209,11 +226,12 @@ async fn direct_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Resul
             "failed to get the file stat of mount point={mount_point:?}",
         ))?;
     let opts = format!(
-        "fd={},rootmode={:o},user_id={},group_id={}",
+        "fd={},rootmode={:o},user_id={},group_id={},{}",
         dev_fd,
         mnt_sb.st_mode & SFlag::S_IFMT.bits(),
         unistd::getuid().as_raw(),
         unistd::getgid().as_raw(),
+        access_options(config).join(","),
     );
 
     debug!("direct mount opts={:?}", &opts);

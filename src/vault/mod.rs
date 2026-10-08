@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -115,33 +116,27 @@ pub fn resolve_create_key_path(path_opt: Option<&Path>) -> Result<PathBuf> {
     Ok(key_dir.join(KEY_FILE_NAME))
 }
 
+/// Writes a new key file readable only by its owner. An existing file is
+/// never overwritten: it may be the only key of an existing vault.
 pub fn write_key_file(path: &Path, material: &[u8; 32]) -> Result<()> {
     let mut file = OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
+        .mode(PERM_KEY_FILE)
         .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                anyhow::anyhow!(
-                    "permission denied writing key file to {}: \
-                     the daemon runs as a different system user. \
-                     Use a path writable by the daemon process (e.g. under data_dir)",
-                    path.display()
-                )
-            } else {
-                anyhow::anyhow!("failed to open key file {}: {e}", path.display())
-            }
-        })?;
+        .with_context(|| format!("failed to create key file {}", path.display()))?;
     file.write_all(material)
         .with_context(|| format!("failed to write key file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(PERM_KEY_FILE);
-        std::fs::set_permissions(path, perms)
-            .with_context(|| format!("failed to set key file permissions {}", path.display()))?;
-    }
+    // Losing the key file loses the vault, so it must be durable before the
+    // vault that depends on it is created.
+    file.sync_all()
+        .with_context(|| format!("failed to sync key file {}", path.display()))?;
+    let dir = path
+        .parent()
+        .with_context(|| format!("key file path {} has no parent", path.display()))?;
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("failed to sync key directory {}", dir.display()))?;
     Ok(())
 }
 

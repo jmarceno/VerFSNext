@@ -89,36 +89,6 @@ grant_caller_group_access() {
   echo "Group update applied for $caller_user. Re-login or run: newgrp $SERVICE_GROUP"
 }
 
-ensure_control_socket_permissions() {
-  local data_dir socket_path attempt
-  data_dir="$(toml_path_value data_dir "$CONFIG_FILE" || true)"
-  if [[ -z "$data_dir" ]]; then
-    echo "warning: unable to parse data_dir from $CONFIG_FILE; skipping socket permission adjustment." >&2
-    return 0
-  fi
-
-  socket_path="$data_dir/verfsnext.sock"
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo "Dry run: would ensure $socket_path is readable/writable by all users."
-    return 0
-  fi
-
-  for attempt in {1..20}; do
-    if "${SUDO[@]}" test -S "$socket_path"; then
-      break
-    fi
-    sleep 0.5
-  done
-
-  if ! "${SUDO[@]}" test -S "$socket_path"; then
-    echo "warning: control socket not found at $socket_path after service start." >&2
-    return 0
-  fi
-
-  echo "Ensuring control socket access on $socket_path..."
-  run_cmd "${SUDO[@]}" chmod 666 "$socket_path"
-}
-
 toml_path_value() {
   local key=$1
   local file=$2
@@ -170,8 +140,64 @@ install_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     run_cmd "${SUDO[@]}" install -m644 "$CONFIG_SRC" "$CONFIG_FILE"
     echo "Installed config template from $CONFIG_SRC"
+    # The service runs as $SERVICE_USER, so its mount is only usable by other
+    # users with allow_other.
+    set_config_allow_other true
   else
     run_cmd "${SUDO[@]}" chmod 644 "$CONFIG_FILE"
+  fi
+}
+
+config_allow_other_value() {
+  if ! "${SUDO[@]}" test -f "$CONFIG_FILE"; then
+    return 0
+  fi
+  "${SUDO[@]}" sed -n 's/^[[:space:]]*fuse_allow_other[[:space:]]*=[[:space:]]*\(true\|false\).*/\1/p' "$CONFIG_FILE" | head -n1
+}
+
+set_config_allow_other() {
+  local value=$1
+  local line="fuse_allow_other = $value # Let users other than the service user access the mount (needs user_allow_other in /etc/fuse.conf)."
+  if [[ $DRY_RUN -eq 0 ]] && [[ -n "$(config_allow_other_value)" ]]; then
+    run_cmd "${SUDO[@]}" sed -i "s|^[[:space:]]*fuse_allow_other[[:space:]]*=.*|$line|" "$CONFIG_FILE"
+  else
+    print_cmd "${SUDO[@]}" tee -a "$CONFIG_FILE"
+    if [[ $DRY_RUN -eq 0 ]]; then
+      printf '%s\n' "$line" | "${SUDO[@]}" tee -a "$CONFIG_FILE" >/dev/null
+    fi
+  fi
+  echo "Set fuse_allow_other = $value in $CONFIG_FILE"
+}
+
+# One-time migration for installs made before fuse_allow_other existed: those
+# mounts always used allow_other, and the option now defaults to false, which
+# would make the service mount private to $SERVICE_USER after an upgrade.
+migrate_config_allow_other() {
+  if ! "${SUDO[@]}" test -f "$CONFIG_FILE"; then
+    return 0
+  fi
+  if [[ -z "$(config_allow_other_value)" ]]; then
+    echo "Config predates fuse_allow_other; keeping the previous behavior (allow_other on)."
+    set_config_allow_other true
+  fi
+}
+
+# fusermount refuses allow_other for non-root users unless /etc/fuse.conf
+# contains user_allow_other.
+ensure_fuse_user_allow_other() {
+  local value
+  value="$(config_allow_other_value || true)"
+  if [[ "$value" != "true" ]]; then
+    echo "NOTICE: fuse_allow_other is not enabled in $CONFIG_FILE; the mount will only be accessible to user $SERVICE_USER."
+    return 0
+  fi
+  if [[ -r /etc/fuse.conf ]] && grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf; then
+    return 0
+  fi
+  echo "Enabling user_allow_other in /etc/fuse.conf (required by fuse_allow_other = true)..."
+  print_cmd "${SUDO[@]}" tee -a /etc/fuse.conf
+  if [[ $DRY_RUN -eq 0 ]]; then
+    printf 'user_allow_other\n' | "${SUDO[@]}" tee -a /etc/fuse.conf >/dev/null
   fi
 }
 
@@ -362,10 +388,11 @@ case "$ACTION" in
       run_cmd "${SUDO[@]}" usermod -a -G fuse "$SERVICE_USER"
     fi
     install_config
+    migrate_config_allow_other
+    ensure_fuse_user_allow_other
     validate_config_paths
     install_unit
     enable_and_start
-    ensure_control_socket_permissions
     echo "Done. Check status with: ${SUDO[*]} systemctl status ${SERVICE_NAME}"
     ;;
   update-bin)
@@ -375,6 +402,8 @@ case "$ACTION" in
     fi
     build_binary
     install_binary
+    migrate_config_allow_other
+    ensure_fuse_user_allow_other
     restart_if_active
     ;;
   *)
