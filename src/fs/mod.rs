@@ -156,6 +156,7 @@ pub struct PackCrc32ReadErrorCounters {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OfflineGcReport {
+    pub zero_ref_records_deleted: u64,
     pub packs_scanned: u64,
     pub pack_index_entries_scanned: u64,
     pub live_entries_found: u64,

@@ -1247,6 +1247,7 @@ async fn is_control_daemon_reachable(config: &Config) -> Result<bool> {
 
 fn print_offline_gc_report(report: &OfflineGcReport) {
     println!("offline gc discard rebuild complete");
+    println!("zero_ref_records_deleted={}", report.zero_ref_records_deleted);
     println!("packs_scanned={}", report.packs_scanned);
     println!(
         "pack_index_entries_scanned={}",

@@ -162,9 +162,9 @@ Use this when you want to rebuild `.DISCARD` from scratch (instead of relying on
 
 Notes:
 - This command must run while the daemon is stopped.
-- `gc offline --run` only runs the second GC phase (pack rewrite), because the discard list was just rebuilt.
+- `gc offline --run` then only runs the second GC phase (pack rewrite), because the discard list was just rebuilt.
 - Pack rewrite decisions still honor `gc_pack_rewrite_min_reclaim_bytes` and `gc_pack_rewrite_min_reclaim_percent` from `config.toml`.
-- **Reclaims less space than before B006.** A pack rewrite only drops chunks that no longer have a metadata record. Chunks whose refcount is 0 but whose record still exists (everything deleted since the last online GC scan) are kept, because a writer may still deduplicate against them until the online scan phase deletes their records. `gc offline --run` skips that scan phase, so after large deletions it may reclaim much less than its discard list suggests, and a pack can be rewritten while freeing little. The space is reclaimed by the online GC once the daemon has run long enough to complete a scan phase (it runs when the filesystem is idle).
+- Before rebuilding the discard list, the command deletes every chunk record whose refcount is 0 (the work of the online GC scan phase, which it otherwise skips), so `--run` reclaims chunks of files deleted since the last online scan as well. This is safe only because the daemon is stopped.
 
 ## Run As A Systemd Service
 

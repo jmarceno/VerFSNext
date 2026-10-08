@@ -258,6 +258,10 @@ Files that had been written correctly became unreadable (EIO, `missing chunk met
 - Unlinked inodes are cleaned up only once their open-handle count reaches zero.
 - Refcount underflows and decrements of missing chunks are logged as errors.
 
+### Follow-up: Offline GC Reclaim
+
+Keeping zero-ref chunks in pack rewrites made `gc offline --run` reclaim much less, because it skips the scan phase that deletes zero-ref records. The offline command now deletes all zero-ref chunk records before rebuilding the discard list (`delete_all_zero_ref_records_offline` in `src/fs/gc.rs`). This is safe offline because no writer can dedup against those chunks while the daemon is stopped. The report prints `zero_ref_records_deleted`.
+
 ### Assessing Existing Damage
 
 `verfsnext stats` reports chunk refcount mismatches, extents referencing missing chunk records, and orphan extents. Data already removed by GC cannot be recovered by this fix. Under-counted refcounts that have not yet reached zero remain wrong until recomputed; until then they are protected only while they stay above zero.

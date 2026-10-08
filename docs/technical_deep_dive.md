@@ -250,9 +250,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
 3. `SYS:gc.discard_checkpoint` is advanced only after `.DISCARD` append + sync.
 4. Pack-stage GC reads records up to checkpoint, chooses packs by reclaim byte/percent thresholds, fsyncs the metadata WAL, rewrites keeping every chunk that still has a metadata record (zero-ref records are reclaimed only after the scan stage deletes them), and swaps rewritten pack/index files crash-safely.
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
-6. Offline rebuild command (`gc offline`) rewrites `.DISCARD` from scratch by walking pack indexes pack-by-pack and marking entries as dead when the chunk metadata is missing, zero-ref, or points to a different pack; it then sets `SYS:gc.phase = 1` so the next GC work starts at the pack stage.
+6. Offline rebuild command (`gc offline`) first deletes every zero-ref chunk record (the online scan-phase work, safe because the daemon is stopped and holds no metadata lock), then rewrites `.DISCARD` from scratch by walking pack indexes pack-by-pack and marking entries as dead when the chunk metadata is missing, zero-ref, or points to a different pack; it then sets `SYS:gc.phase = 1` so the next GC work starts at the pack stage.
 7. `gc offline --run` immediately executes the pack-stage rewrite loop (no metadata scan phase), honoring the configured reclaim thresholds (`gc_pack_rewrite_min_reclaim_bytes` / `gc_pack_rewrite_min_reclaim_percent`).
-   - Since B006 the rewrite keeps every chunk that still has a metadata record, including zero-ref ones. The discard rebuild counts zero-ref entries as dead, but without a scan phase their records are not deleted, so the offline rewrite does not reclaim them: it can reclaim far less than the discard list suggests, and the reclaim thresholds may select packs that shrink only slightly. Zero-ref chunks are reclaimed by the online GC after its scan phase deletes their records.
+   - The rewrite keeps every chunk that still has a metadata record (B006). Because step 6 deleted the zero-ref records first, the offline rewrite still reclaims chunks of files deleted since the last online scan.
 
 ## Pack-Size Compatibility and Migration
 

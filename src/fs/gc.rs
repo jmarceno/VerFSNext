@@ -202,6 +202,8 @@ impl FsCore {
     pub(crate) async fn rebuild_discard_from_pack_state_offline(&self) -> Result<OfflineGcReport> {
         let _gc_guard = self.gc_lock.lock().await;
 
+        let zero_ref_records_deleted = self.delete_all_zero_ref_records_offline().await?;
+
         let discard_path = self
             .config
             .packs_dir()
@@ -210,6 +212,7 @@ impl FsCore {
         let epoch = self.next_gc_epoch().await?;
         let mut report = OfflineGcReport {
             discard_checkpoint_bytes: checkpoint,
+            zero_ref_records_deleted,
             ..OfflineGcReport::default()
         };
 
@@ -282,6 +285,75 @@ impl FsCore {
             .await?;
 
         Ok(report)
+    }
+    /// Deletes every chunk record whose refcount is 0, so the following
+    /// discard rebuild and pack rewrite reclaim those chunks too. This is the
+    /// work of the online scan phase, which the offline command skips. It is
+    /// safe only because the daemon is stopped (the metadata store lock rules
+    /// out a concurrent writer that could dedup against these chunks); each
+    /// record is re-checked inside the deleting transaction.
+    async fn delete_all_zero_ref_records_offline(&self) -> Result<u64> {
+        const BATCH: usize = 50_000;
+        let prefix = vec![crate::types::KEY_PREFIX_CHUNK];
+        let end = prefix_end(&prefix);
+        let mut start = prefix;
+        let mut deleted = 0_u64;
+        loop {
+            let (hashes, next_start) = self.meta.read_txn(|txn| {
+                let (pairs, has_more) = scan_range_pairs_limited(txn, start.clone(), end.clone(), BATCH)?;
+                let next_start = match (has_more, pairs.last()) {
+                    (true, Some((key, _))) => {
+                        let mut next = key.clone();
+                        next.push(0);
+                        Some(next)
+                    }
+                    _ => None,
+                };
+                let mut hashes = Vec::new();
+                for (key, value) in pairs {
+                    if key.len() != 17 {
+                        continue;
+                    }
+                    let chunk: ChunkRecord = decode_rkyv(&value)?;
+                    if chunk.refcount == 0 {
+                        let mut hash = [0_u8; 16];
+                        hash.copy_from_slice(&key[1..17]);
+                        hashes.push(hash);
+                    }
+                }
+                Ok((hashes, next_start))
+            })?;
+
+            if !hashes.is_empty() {
+                let mut batch_deleted = 0_u64;
+                self.meta
+                    .write_txn(|txn| {
+                        batch_deleted = 0;
+                        for hash in hashes.iter() {
+                            let key = chunk_key(hash);
+                            if let Some(raw) = txn.get(key.clone())? {
+                                let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                                if chunk.refcount == 0 {
+                                    txn.delete(key)?;
+                                    batch_deleted += 1;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                for hash in hashes.iter() {
+                    self.chunk_meta_cache.invalidate(hash);
+                    self.chunk_data_cache.invalidate(hash);
+                }
+                deleted += batch_deleted;
+            }
+
+            match next_start {
+                Some(next) => start = next,
+                None => return Ok(deleted),
+            }
+        }
     }
     pub(crate) async fn run_gc_rewrite_phase_only_offline_until_stable(
         &self,
