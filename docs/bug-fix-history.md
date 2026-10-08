@@ -267,3 +267,33 @@ Files that had been written correctly became unreadable (EIO, `missing chunk met
 - `src/meta/mod.rs`
 - `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`, `src/fs/inode.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`
 - `src/data/pack.rs`
+
+## B007 - Vault Chunks Unreadable Because of Divergent Duplicate Copies - Oct 08 2026
+
+### Root Cause
+
+A pack can hold several copies of the same chunk hash. Before B006 they were created whenever the in-memory chunk cache missed for a chunk that already existed (the chunk was appended again while the refcount went to the existing record), and on every commit retry (the chunk was materialized again). For non-vault chunks the copies are byte-identical. Vault chunks are sealed with a random nonce per append, and the chunk record stores only one nonce, so the copies differ and only one of them decrypts.
+
+Several places picked a copy without checking it against the record:
+- the index cache and `prime_index_cache` use the most recent copy, while a cache miss scanned the index file and used the first copy;
+- GC pack rewrite kept the first copy of each live hash and dropped the others;
+- the offline pack-size migration copied only the copy the index cache pointed at.
+
+When the selected copy was not the one matching the record, reads failed to decrypt (EIO, file "does not open"). When GC or migration dropped the matching copy, the chunk was lost.
+
+### Fixed
+
+- `PackStore::read_chunk_with` reads the most recent copy first and passes it to an acceptance check supplied by the caller. If the check fails, every other indexed copy of the hash in that pack is tried from newest to oldest, and the accepted copy becomes the cached entry. Vault reads accept a copy only if it authenticates (XChaCha20-Poly1305) with the record's nonce and decompresses; non-vault reads accept a copy that decompresses. A resolution is logged at error level, because it means stored data did not match its record.
+- Chunks that are already affected become readable again as long as the matching copy is still in the pack. No separate repair pass is needed.
+- GC pack rewrite keeps every indexed copy of a live hash (B006).
+- `pack-size-migrate` copies every indexed copy of each chunk, with its original CRC32, into one target pack (`PackStore::append_chunk_copies`). That pack may exceed `pack_max_size_mb` when the copies do not fit together.
+- Since B006, deduplication is decided through the committing transaction, so committed chunks are no longer appended again. The remaining sources of duplicates are retries (the committed record matches the newest copy) and two transactions creating the same new chunk concurrently (resolved by the read path).
+
+### Not Recoverable
+
+A chunk whose matching copy was already dropped by a GC rewrite or by a pack-size migration that ran before this fix cannot be recovered. Its reads fail with "no stored copy of chunk ... is usable". The backup directory left by an earlier pack-size migration still contains the original packs.
+
+### Affected Files
+- `src/data/pack.rs` — `read_chunk_with`, `read_indexed_copies`, `append_chunk_copies`; removed `read_chunk`, `read_chunk_payload`, `read_chunk_payload_with_index`, `append_chunk`
+- `src/fs/chunk.rs` — chunk loads validate each candidate copy (decrypt and decompress)
+- `src/migration/pack_size.rs` — migrates every indexed copy

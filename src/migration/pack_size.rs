@@ -128,20 +128,10 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
         max_pack_size_bytes,
     )?;
     for (idx, plan) in plans.iter_mut().enumerate() {
-        let payload = packs.read_chunk_payload(
-            plan.chunk.pack_id,
-            plan.hash,
-            plan.chunk.codec,
-            plan.chunk.uncompressed_len,
-            plan.chunk.compressed_len,
-        )?;
-        let new_pack_id = packs.append_chunk(
-            plan.hash,
-            plan.chunk.codec,
-            plan.chunk.uncompressed_len,
-            &payload,
-        )?;
-        plan.new_pack_id = new_pack_id;
+        // Every indexed copy is carried over in order: duplicate vault copies
+        // differ by nonce and cannot be told apart while the vault is locked.
+        let copies = packs.read_indexed_copies(plan.chunk.pack_id, plan.hash)?;
+        plan.new_pack_id = packs.append_chunk_copies(plan.hash, &copies)?;
         if (idx + 1) % 10_000 == 0 {
             println!("  rewritten {} chunks...", idx + 1);
         }

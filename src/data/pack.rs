@@ -11,7 +11,6 @@ use moka::sync::Cache;
 use parking_lot::{Mutex, RwLock};
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::data::compress::decompress_chunk;
 use crate::permissions::{ensure_dir, set_file_mode};
 
 const RECORD_MAGIC: [u8; 4] = *b"VPK2";
@@ -176,23 +175,6 @@ impl PackStore {
         Ok(store)
     }
 
-    pub fn append_chunk(
-        &self,
-        chunk_hash: [u8; 16],
-        codec: u8,
-        uncompressed_len: u32,
-        compressed_data: &[u8],
-    ) -> Result<u64> {
-        let payload_crc32 = crc32c::crc32c(compressed_data);
-        self.append_chunk_with_crc32(
-            chunk_hash,
-            codec,
-            uncompressed_len,
-            compressed_data,
-            payload_crc32,
-        )
-    }
-
     pub fn append_chunk_with_crc32(
         &self,
         chunk_hash: [u8; 16],
@@ -201,23 +183,62 @@ impl PackStore {
         compressed_data: &[u8],
         payload_crc32: u32,
     ) -> Result<u64> {
+        let mut active = self.active.lock();
+        self.make_room(&mut active, Self::record_len(compressed_data.len()))?;
+        Self::append_record_locked(
+            &self.index_cache,
+            &mut active,
+            chunk_hash,
+            codec,
+            uncompressed_len,
+            compressed_data,
+            payload_crc32,
+        )?;
+        Ok(active.pack_id)
+    }
+
+    /// Appends several stored copies of one chunk, in order, to a single pack
+    /// and returns its id. The copies are kept together because a chunk record
+    /// names one pack; when they do not fit together in the remaining space,
+    /// the pack is rotated first and the new pack may exceed the size target.
+    pub fn append_chunk_copies(
+        &self,
+        chunk_hash: [u8; 16],
+        copies: &[(PackIndexEntry, Vec<u8>)],
+    ) -> Result<u64> {
+        let group_len = copies
+            .iter()
+            .map(|(_, payload)| Self::record_len(payload.len()))
+            .sum::<u64>();
+        let mut active = self.active.lock();
+        self.make_room(&mut active, group_len)?;
+        for (entry, payload) in copies {
+            Self::append_record_locked(
+                &self.index_cache,
+                &mut active,
+                chunk_hash,
+                entry.codec,
+                entry.uncompressed_len,
+                payload,
+                entry.payload_crc32,
+            )?;
+        }
+        Ok(active.pack_id)
+    }
+
+    fn append_record_locked(
+        index_cache: &Cache<(u64, [u8; 16]), PackIndexEntry>,
+        active: &mut ActivePack,
+        chunk_hash: [u8; 16],
+        codec: u8,
+        uncompressed_len: u32,
+        compressed_data: &[u8],
+        payload_crc32: u32,
+    ) -> Result<()> {
         if compressed_data.len() > u32::MAX as usize {
             bail!("compressed chunk too large: {}", compressed_data.len());
         }
-        let record_len = RECORD_HEADER_LEN_U64
-            .checked_add(compressed_data.len() as u64)
-            .context("pack record length overflow")?;
-        let mut active = self.active.lock();
-        while active.size_bytes > 0 {
-            let next_size = active
-                .size_bytes
-                .checked_add(record_len)
-                .context("active pack size overflow")?;
-            if next_size <= self.max_pack_size_bytes {
-                break;
-            }
-            self.rotate_active_pack(&mut active)?;
-        }
+        let record_len = Self::record_len(compressed_data.len());
         let next_size = active
             .size_bytes
             .checked_add(record_len)
@@ -269,41 +290,34 @@ impl PackStore {
         // Index entries are flushed to disk in a single write during sync().
         // The index_cache is updated immediately so reads are still correct.
         active.pending_index.push((chunk_hash, index));
-        self.index_cache.insert((active.pack_id, chunk_hash), index);
+        index_cache.insert((active.pack_id, chunk_hash), index);
         active.size_bytes = next_size;
-
-        Ok(active.pack_id)
+        Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn read_chunk(
+    /// Reads chunk `expected_hash` from `pack_id` and returns what `accept`
+    /// produces from its stored payload.
+    ///
+    /// A pack can hold several copies of one hash: a commit retry appends the
+    /// chunk again, and older versions appended chunks that already existed.
+    /// Copies are not interchangeable when they differ (vault ciphertext is
+    /// sealed with a random nonce, and only the nonce of one copy is in the
+    /// chunk record), so `accept` decides: it must fail for a copy that does
+    /// not belong to the record, e.g. when AEAD authentication fails. The
+    /// copy the index cache points at (the most recent) is tried first, then
+    /// every other indexed copy from newest to oldest; the accepted copy
+    /// becomes the cached entry.
+    pub fn read_chunk_with<T>(
         &self,
         pack_id: u64,
         expected_hash: [u8; 16],
         expected_codec: u8,
         expected_uncompressed_len: u32,
         expected_compressed_len: u32,
-    ) -> Result<Vec<u8>> {
-        let payload = self.read_chunk_payload(
-            pack_id,
-            expected_hash,
-            expected_codec,
-            expected_uncompressed_len,
-            expected_compressed_len,
-        )?;
-        decompress_chunk(expected_codec, &payload, expected_uncompressed_len)
-    }
-
-    pub fn read_chunk_payload_with_index(
-        &self,
-        pack_id: u64,
-        expected_hash: [u8; 16],
-        expected_codec: u8,
-        expected_uncompressed_len: u32,
-        expected_compressed_len: u32,
-    ) -> Result<(Vec<u8>, PackIndexEntry)> {
+        mut accept: impl FnMut(&[u8], &PackIndexEntry) -> Result<T>,
+    ) -> Result<T> {
         let _swap_guard = self.swap_lock.read();
-        let index = self
+        let primary = self
             .lookup_index_entry(pack_id, expected_hash)?
             .with_context(|| {
                 format!(
@@ -311,7 +325,116 @@ impl PackStore {
                     pack_id, expected_hash
                 )
             })?;
+        let primary_err = match self
+            .read_indexed_copy(
+                pack_id,
+                expected_hash,
+                &primary,
+                expected_codec,
+                expected_uncompressed_len,
+                expected_compressed_len,
+            )
+            .and_then(|payload| accept(&payload, &primary))
+        {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
 
+        let mut other_copies = Self::read_index_entries_at(&self.index_path(pack_id))?
+            .into_iter()
+            .filter(|(hash, entry)| *hash == expected_hash && entry.offset != primary.offset)
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        other_copies.reverse();
+        let other_copy_count = other_copies.len();
+        for entry in other_copies {
+            let result = self
+                .read_indexed_copy(
+                    pack_id,
+                    expected_hash,
+                    &entry,
+                    expected_codec,
+                    expected_uncompressed_len,
+                    expected_compressed_len,
+                )
+                .and_then(|payload| accept(&payload, &entry));
+            match result {
+                Ok(value) => {
+                    tracing::error!(
+                        pack_id,
+                        chunk_hash = ?expected_hash,
+                        rejected_offset = primary.offset,
+                        accepted_offset = entry.offset,
+                        rejected_reason = %format!("{primary_err:#}"),
+                        "newest pack copy of chunk does not match its record; resolved to an older duplicate copy"
+                    );
+                    self.index_cache.insert((pack_id, expected_hash), entry);
+                    return Ok(value);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        pack_id,
+                        chunk_hash = ?expected_hash,
+                        offset = entry.offset,
+                        error = %format!("{err:#}"),
+                        "duplicate chunk copy rejected"
+                    );
+                }
+            }
+        }
+
+        Err(primary_err.context(format!(
+            "no stored copy of chunk {:x?} in pack {} is usable ({} other indexed copies tried)",
+            expected_hash, pack_id, other_copy_count
+        )))
+    }
+
+    /// Reads every indexed copy of `hash` in `pack_id`, in index order, without
+    /// interpreting the payloads. Used to move chunks between packs while the
+    /// vault may be locked, so that the copy matching the chunk record is
+    /// carried along whichever one it is.
+    pub fn read_indexed_copies(
+        &self,
+        pack_id: u64,
+        hash: [u8; 16],
+    ) -> Result<Vec<(PackIndexEntry, Vec<u8>)>> {
+        let _swap_guard = self.swap_lock.read();
+        let mut copies = Vec::new();
+        for (entry_hash, entry) in Self::read_index_entries_at(&self.index_path(pack_id))? {
+            if entry_hash != hash {
+                continue;
+            }
+            let payload = self.read_indexed_copy(
+                pack_id,
+                hash,
+                &entry,
+                entry.codec,
+                entry.uncompressed_len,
+                entry.compressed_len,
+            )?;
+            copies.push((entry, payload));
+        }
+        if copies.is_empty() {
+            bail!(
+                "missing pack index entry for pack {} hash {:x?}",
+                pack_id,
+                hash
+            );
+        }
+        Ok(copies)
+    }
+
+    /// Reads the payload of the record `index` points at after checking that
+    /// the index entry and the record header describe the expected chunk.
+    fn read_indexed_copy(
+        &self,
+        pack_id: u64,
+        expected_hash: [u8; 16],
+        index: &PackIndexEntry,
+        expected_codec: u8,
+        expected_uncompressed_len: u32,
+        expected_compressed_len: u32,
+    ) -> Result<Vec<u8>> {
         if index.codec != expected_codec {
             bail!(
                 "pack index codec mismatch for pack {} hash {:x?}: expected {}, got {}",
@@ -394,25 +517,26 @@ impl PackStore {
         file.read_exact_at(&mut payload, payload_offset)
             .with_context(|| format!("failed to read pack payload from {}", path.display()))?;
 
-        Ok((payload, index))
+        Ok(payload)
     }
 
-    pub fn read_chunk_payload(
-        &self,
-        pack_id: u64,
-        expected_hash: [u8; 16],
-        expected_codec: u8,
-        expected_uncompressed_len: u32,
-        expected_compressed_len: u32,
-    ) -> Result<Vec<u8>> {
-        let (payload, _) = self.read_chunk_payload_with_index(
-            pack_id,
-            expected_hash,
-            expected_codec,
-            expected_uncompressed_len,
-            expected_compressed_len,
-        )?;
-        Ok(payload)
+    /// On-disk size of a record holding `payload_len` payload bytes.
+    fn record_len(payload_len: usize) -> u64 {
+        RECORD_HEADER_LEN_U64 + payload_len as u64
+    }
+
+    fn make_room(&self, active: &mut ActivePack, bytes: u64) -> Result<()> {
+        while active.size_bytes > 0 {
+            let next_size = active
+                .size_bytes
+                .checked_add(bytes)
+                .context("active pack size overflow")?;
+            if next_size <= self.max_pack_size_bytes {
+                break;
+            }
+            self.rotate_active_pack(active)?;
+        }
+        Ok(())
     }
 
     pub fn sync(&self, full: bool) -> Result<()> {
@@ -1370,19 +1494,27 @@ mod tests {
         let hash = [7_u8; 16];
         let payload = b"verfs-pack-payload".to_vec();
         let pack_id = store
-            .append_chunk(hash, CODEC_RAW, payload.len() as u32, &payload)
+            .append_chunk_with_crc32(
+                hash,
+                CODEC_RAW,
+                payload.len() as u32,
+                &payload,
+                crc32c::crc32c(&payload),
+            )
             .expect("chunk append should succeed");
 
         let read_back = store
-            .read_chunk_payload(
+            .read_chunk_with(
                 pack_id,
                 hash,
                 CODEC_RAW,
                 payload.len() as u32,
                 payload.len() as u32,
+                |stored, _| Ok(stored.to_vec()),
             )
             .expect("chunk read should succeed");
         assert_eq!(read_back, payload);
+        store.sync(false).expect("pack sync should succeed");
 
         store
             .verify_pack_headers(pack_id)

@@ -161,6 +161,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - readers hold a shared swap lock across index lookup and payload read; the rewrite holds it exclusively during the swap and cache invalidation
   - failed appends and index flushes roll back partial writes; startup truncates an incomplete record at the end of the active pack and drops an index that no longer matches it
   - index-file lookups use the most recent entry for a hash, matching the cache
+  - a pack may hold several copies of one hash (commit retries, pre-B006 re-appends); vault copies differ because each append uses a fresh nonce. `read_chunk_with` tries the most recent copy and then the other indexed copies (newest to oldest) until the caller's acceptance check passes (vault: AEAD authentication with the record's nonce plus decompression; non-vault: decompression). The accepted copy is cached, and the resolution is logged at error level
+  - copies are never collapsed: GC rewrite and pack-size migration carry every indexed copy of a hash, in order, into the same pack (`append_chunk_copies` may exceed the pack size target to keep them together)
 
 - `src/migration/pack_size.rs`
   - Compatibility guard for persisted `SYS:pack_max_size_mb`
@@ -237,7 +239,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
    - nonce + encryption flag are persisted in chunk metadata
 5. Vault reads:
    - encrypted payload is read from pack
-   - payload is decrypted using in-memory folder key
+   - payload is decrypted using in-memory folder key and the record's nonce; if the most recent copy of the chunk in its pack fails authentication, the other indexed copies are tried (see `src/data/pack.rs`)
    - decrypted compressed bytes are decompressed and returned
 6. `verfsnext crypt -l` clears in-memory key material and invalidates vault-related caches.
 
@@ -250,6 +252,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 5. Consumed discard entries are removed via atomic discard-file rewrite and checkpoint reset to the new file length.
 6. Offline rebuild command (`gc offline`) rewrites `.DISCARD` from scratch by walking pack indexes pack-by-pack and marking entries as dead when the chunk metadata is missing, zero-ref, or points to a different pack; it then sets `SYS:gc.phase = 1` so the next GC work starts at the pack stage.
 7. `gc offline --run` immediately executes the pack-stage rewrite loop (no metadata scan phase), honoring the configured reclaim thresholds (`gc_pack_rewrite_min_reclaim_bytes` / `gc_pack_rewrite_min_reclaim_percent`).
+   - Since B006 the rewrite keeps every chunk that still has a metadata record, including zero-ref ones. The discard rebuild counts zero-ref entries as dead, but without a scan phase their records are not deleted, so the offline rewrite does not reclaim them: it can reclaim far less than the discard list suggests, and the reclaim thresholds may select packs that shrink only slightly. Zero-ref chunks are reclaimed by the online GC after its scan phase deletes their records.
 
 ## Pack-Size Compatibility and Migration
 

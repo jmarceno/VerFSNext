@@ -99,53 +99,50 @@ impl FsCore {
         self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let chunk = self.load_chunk_record(extent.chunk_hash)?;
-        let payload = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+        let folder_key = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
             if !vault_encrypted {
                 return Err(anyhow_errno(
                     Errno::EIO,
                     "encrypted chunk referenced by non-vault inode",
                 ));
             }
-            let (encrypted, index) = self.packs.read_chunk_payload_with_index(
-                chunk.pack_id,
-                extent.chunk_hash,
-                chunk.codec,
-                chunk.uncompressed_len,
-                chunk.compressed_len,
-            )?;
-            self.validate_pack_payload_crc32(
-                chunk.pack_id,
-                extent.chunk_hash,
-                index.payload_crc32,
-                &encrypted,
-            );
-            let folder_key = self.current_vault_key()?;
-            let compressed = decrypt_chunk_payload(&folder_key, &chunk.nonce, &encrypted)?;
-            crate::data::compress::decompress_chunk(
-                chunk.codec,
-                &compressed,
-                chunk.uncompressed_len,
-            )?
+            Some(self.current_vault_key()?)
         } else {
-            let (compressed, index) = self.packs.read_chunk_payload_with_index(
-                chunk.pack_id,
-                extent.chunk_hash,
-                chunk.codec,
-                chunk.uncompressed_len,
-                chunk.compressed_len,
-            )?;
-            self.validate_pack_payload_crc32(
-                chunk.pack_id,
-                extent.chunk_hash,
-                index.payload_crc32,
-                &compressed,
-            );
-            crate::data::compress::decompress_chunk(
-                chunk.codec,
-                &compressed,
-                chunk.uncompressed_len,
-            )?
+            None
         };
+        // A copy is accepted only if it authenticates with the record's nonce
+        // (vault) and decompresses to the recorded length, which is how the
+        // pack store tells duplicate copies of one hash apart.
+        let payload = self.packs.read_chunk_with(
+            chunk.pack_id,
+            extent.chunk_hash,
+            chunk.codec,
+            chunk.uncompressed_len,
+            chunk.compressed_len,
+            |stored, index| {
+                self.validate_pack_payload_crc32(
+                    chunk.pack_id,
+                    extent.chunk_hash,
+                    index.payload_crc32,
+                    stored,
+                );
+                match &folder_key {
+                    Some(key) => {
+                        let compressed = decrypt_chunk_payload(key, &chunk.nonce, stored)?;
+                        crate::data::compress::decompress_chunk(
+                            chunk.codec,
+                            &compressed,
+                            chunk.uncompressed_len,
+                        )
+                    }
+                    None => crate::data::compress::decompress_chunk(
+                        chunk.codec,
+                        stored,
+                        chunk.uncompressed_len,
+                    ),
+                }
+            },
+        )?;
         let payload = Arc::new(payload);
         self.chunk_data_cache
             .insert(extent.chunk_hash, Arc::clone(&payload));

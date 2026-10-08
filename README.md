@@ -146,6 +146,7 @@ Notes:
 - This command must run while the daemon is stopped.
 - It rewrites all packs and updates chunk metadata pack mappings.
 - Old packs are moved to a backup directory under `data_dir`; remove that backup only after validation.
+- Every stored copy of a chunk is migrated, and all copies of one chunk land in the same new pack, which may then exceed the new size target.
 
 ## Offline GC Recovery / Full Rebuild
 
@@ -163,6 +164,7 @@ Notes:
 - This command must run while the daemon is stopped.
 - `gc offline --run` only runs the second GC phase (pack rewrite), because the discard list was just rebuilt.
 - Pack rewrite decisions still honor `gc_pack_rewrite_min_reclaim_bytes` and `gc_pack_rewrite_min_reclaim_percent` from `config.toml`.
+- **Reclaims less space than before B006.** A pack rewrite only drops chunks that no longer have a metadata record. Chunks whose refcount is 0 but whose record still exists (everything deleted since the last online GC scan) are kept, because a writer may still deduplicate against them until the online scan phase deletes their records. `gc offline --run` skips that scan phase, so after large deletions it may reclaim much less than its discard list suggests, and a pack can be rewritten while freeing little. The space is reclaimed by the online GC once the daemon has run long enough to complete a scan phase (it runs when the filesystem is idle).
 
 ## Run As A Systemd Service
 
