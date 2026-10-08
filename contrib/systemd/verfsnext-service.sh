@@ -102,8 +102,8 @@ toml_path_value() {
 }
 
 build_binary() {
-  echo "Building release binary..."
-  run_cmd cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
+  echo "Building release binary (headless: no desktop app, no Qt needed)..."
+  run_cmd cargo build --release --no-default-features --manifest-path "$REPO_ROOT/Cargo.toml"
   if [[ $DRY_RUN -eq 0 && ! -x "$BIN_SRC" ]]; then
     echo "build did not produce $BIN_SRC" >&2
     exit 1

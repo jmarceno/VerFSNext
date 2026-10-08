@@ -60,12 +60,12 @@ This migration path must be documented in the migration guide and must be run au
 Compile with `cargo remote` instead of a local `cargo build`, `cargo test`, or `cargo clippy`. One command syncs the sources, builds on the shared builder, and copies back only the finished executable into `target/<profile>/`. Crates, incremental files, and the rest of `target/` stay on the builder.
 
 ```bash
-cargo remote -- build --release
-cargo remote -- test
-cargo remote -- clippy --all-targets -- -D warnings
+cargo remote -h -- build --release
+cargo remote -h -- test
+cargo remote -h -- clippy --all-targets -- -D warnings
 ```
 
-`cargo fmt` stays local. Dotfiles are not synced; pass `-h` only when the build needs them. Pass `-c <path-under-target>` only when you explicitly want a different file copied back.
+`cargo fmt` stays local. Dotfiles are not synced; pass `-h` only when the build needs them. This project needs it: `.cargo/config.toml` makes the link use `lld`, because the builder's default `mold` drops the Qt bridge (cxx-qt) symbols of the desktop app (`gui` feature, on by default). Pass `-c <path-under-target>` only when you explicitly want a different file copied back.
 
 
 The builder is already set up. Do not compile locally because a host is missing from Cargo's config. `cargo remote` does not read `~/.cargo/config.toml` for the host. That file only sets the `kache` wrapper, and a host will not be there.

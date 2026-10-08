@@ -42,6 +42,7 @@ impl MountDaemon {
             .context("failed to create daemon stderr log")?;
 
         let child = Command::new(bin)
+            .arg("mount")
             .current_dir(workdir)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))

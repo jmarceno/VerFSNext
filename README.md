@@ -25,7 +25,31 @@ VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top 
 
 ---
 
-## Mount Quickstart
+## Desktop App
+
+The easiest way to use VerFSNext. Run the binary with no arguments (double-click it, or `./target/release/verfsnext`):
+
+- **First run**: a short assistant asks whether VerFSNext should run as a background user service (recommended: starts at login, no root needed) or only while the app is open, shows the recommended settings (and lets you customize them), lets you pick the VerFSNext folder and the data folder with a folder browser, then starts it. The window closes and VerFSNext stays in the system tray. It also adds VerFSNext to your applications menu and, if you keep that option on, to your login items.
+- **Afterwards**: the app starts the filesystem and waits in the tray. Click the icon for the control center: status, space savings and every statistic, snapshots, the encrypted vault, folders and startup options, and all settings. The tray menu also opens the folder, takes a snapshot, starts/stops VerFSNext and quits.
+
+The app manages `~/.config/verfsnext/config.toml` (the same file the terminal commands find). It needs a system tray (StatusNotifierItem; GNOME needs the AppIndicator extension) and `systemctl --user` for the background service.
+
+Building the app needs Qt 6 development packages and `lld` (Debian/Ubuntu/Pop!_OS):
+
+```bash
+sudo apt install build-essential clang lld cmake pkg-config libdbus-1-dev \
+  qt6-base-dev qt6-base-dev-tools qt6-declarative-dev libqt6svg6 \
+  qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
+  qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript
+```
+
+For servers, build without the app (no Qt, D-Bus or tray libraries; a bare `verfsnext` then mounts):
+
+```bash
+cargo build --release --no-default-features
+```
+
+## Mount Quickstart (terminal)
 
 1. Set your paths in `config.toml`:
    - `mount_point`: existing mount directory (for example `/mnt/verfs`)
@@ -40,8 +64,9 @@ VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top 
 
 2. Start the filesystem daemon from the repo root:
    ```bash
-   ./target/release/verfsnext
+   ./target/release/verfsnext mount
    ```
+   (A bare `./target/release/verfsnext` opens the desktop app instead, unless it was built with `--no-default-features`.)
    Config resolution order is:
    - `./config.toml`
    - `~/.config/verfsnext/config.toml`
@@ -62,7 +87,7 @@ VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top 
    ```
 
 4. Unmount cleanly:
-   - Press `Ctrl+C` in the daemon terminal.
+   - Press `Ctrl+C` in the daemon terminal (or send it SIGTERM).
    - The process performs graceful shutdown and final sync before exit.
 
 5. If a manual unmount is needed:
@@ -173,7 +198,9 @@ Notes:
 
 ## Run As A Systemd Service
 
-1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start):
+This is the system-wide service (runs as user `verfs`, needs root to install). For a personal setup without root, use the desktop app's background user service instead.
+
+1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start). The installer builds the headless binary (`--no-default-features`), so the server needs no Qt:
    ```bash
    ./contrib/systemd/verfsnext-service.sh install
    ```

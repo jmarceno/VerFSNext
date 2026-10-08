@@ -22,6 +22,7 @@ use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+use serde::{Deserialize, Serialize};
 use verfsnext_surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
@@ -117,7 +118,7 @@ struct ZeroRefCandidate {
     block_size_bytes: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerFsStats {
     pub live_logical_size_bytes: u64,
     pub snapshots_logical_size_bytes: u64,
@@ -145,6 +146,20 @@ pub struct VerFsStats {
     pub metadata_cache_entries: u64,
     pub chunk_cache_entries: u64,
     pub approx_cache_memory_bytes: u64,
+}
+
+/// Cheap daemon state for frequent polling (the desktop app). Unlike
+/// [`VerFsStats`] it never scans metadata: every field is an atomic, a lock
+/// probe or a point lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub vault_enabled: bool,
+    pub vault_initialized: bool,
+    pub vault_locked: bool,
+    pub gc_in_progress: bool,
+    pub uptime_secs: f64,
+    pub read_bytes_total: u64,
+    pub write_bytes_total: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -422,6 +437,25 @@ impl VerFs {
 
     pub fn is_gc_in_progress(&self) -> bool {
         self.core.gc_lock.try_lock().is_err()
+    }
+
+    pub fn daemon_status(&self) -> Result<DaemonStatus> {
+        let vault_initialized = self
+            .core
+            .meta
+            .get_sys(SYS_VAULT_WRAP)?
+            .is_some_and(|raw| !raw.is_empty());
+        let elapsed_ms =
+            now_millis().saturating_sub(self.core.stats_started_ms.load(Ordering::Relaxed));
+        Ok(DaemonStatus {
+            vault_enabled: self.core.config.vault_enabled,
+            vault_initialized,
+            vault_locked: self.core.vault_locked(),
+            gc_in_progress: self.is_gc_in_progress(),
+            uptime_secs: elapsed_ms as f64 / 1000.0,
+            read_bytes_total: self.core.read_bytes_total.load(Ordering::Relaxed),
+            write_bytes_total: self.core.write_bytes_total.load(Ordering::Relaxed),
+        })
     }
 
     pub fn install_session_notifier(&self, notifier: Arc<SessionNotifier>) {

@@ -32,7 +32,15 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Global config-file CLI option:
   - `verfsnext --config <path> ...`
   - `verfsnext -c <path> ...`
+- Entry points (see "Desktop App"):
+  - bare `verfsnext` opens the desktop app (builds with the default `gui` feature); a headless build (`--no-default-features`) mounts instead
+  - `verfsnext mount` mounts with config discovery; `verfsnext --config <path>` (no command) mounts with that file
+- The crate is a library (`src/lib.rs`, `verfsnext::run`) plus a thin `src/main.rs`. cxx-qt links its generated C++ objects into every target of the package, so the Qt bridge must live in a library that all targets (including `tests/`) link.
 - Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
+  - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
+  - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate).
+  - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals). It never scans metadata, unlike `stats`.
+- The daemon shuts down gracefully (final sync, unmount) on SIGINT and on SIGTERM.
 - Auto config discovery order when `--config/-c` is not provided:
   - `./config.toml`
   - `~/.config/verfsnext/config.toml`
@@ -206,6 +214,20 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - `vault_argon2_mem_kib`
 - `vault_argon2_iters`
 - `vault_argon2_parallelism`
+
+## Desktop App
+
+Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni`); `--no-default-features` builds the headless daemon/CLI without Qt, D-Bus or tray libraries (the systemd installer does this). The UI follows the shared design of the other desktop apps (GravaAI, Lepramim, Celestial): same palette (`qml/VerfsTheme.qml`), flat `qml/` directory, every QML file listed in `build.rs`, Basic Quick Controls style, software rendering by default, QML written for Qt 6.2.
+
+- `src/gui/mod.rs` — startup: single instance (`$XDG_RUNTIME_DIR/verfsnext/app.sock`; a second launch shows the open window), waits up to 120 s for a StatusNotifier tray host, owns a 2-thread tokio runtime for control-socket requests, loads `qml/Main.qml`, QML-load watchdog.
+- `src/gui/controller.rs` — the `AppController` QObject. Invokables run on the Qt GUI thread and never block: every process spawn, socket request, metadata scan and directory listing runs on a worker thread and comes back as an `Event` drained by `tick()` (100 ms QML timer). One user-visible operation (start/stop/restart/snapshot/vault/mode switch/folder change) runs at a time (`busy`).
+- `src/gui/daemon.rs` — runs the filesystem in one of two modes. **User service**: `~/.config/systemd/user/verfsnext.service` (`ExecStart=<exe> --config <config>`, `KillSignal=SIGINT`, `TimeoutStopSec=3000`, `WantedBy=default.target`); the unit file existing is the single source of truth for the mode, and it is rewritten when the app binary moved. Installing writes, reloads and enables the unit and removes it again if systemd refuses it, before anything is stopped. **App**: the daemon is a child process (`--config <config>`, output appended to `~/.local/state/verfsnext/daemon.log`) stopped with SIGINT on quit; a daemon the app did not spawn is stopped through the control socket's peer PID (`SO_PEERCRED`). Status is probed every 2 s (control socket connect, `systemctl --user show ActiveState`, child `try_wait`, plus the cheap `status` request); a stale FUSE mount (`ENOTCONN`) is detected and repaired with `fusermount -u -z` before a start. Location checks: absolute paths, mount point and data folder not nested, mount point empty, data folder empty or existing VerFSNext data (`metadata/` + `packs/`; a folder with other files is refused because startup normalizes permissions of the whole data tree), writable parent, free space.
+- `src/gui/settings.rs` — friendly metadata (group, label, help, display unit/scale, advanced, setup-only) for every config key. Building the editor model or writing the file fails when a key has no entry, so new config options cannot silently go missing from the app. `pack_max_size_mb` and `gc_discard_filename` are setup-only (changing them later needs a migration or orphans files). Validation errors from `Config::validate` are shown with the friendly labels. The config is written atomically as commented TOML.
+- `src/gui/paths.rs` — the managed config is `~/.config/verfsnext/config.toml` (the same file CLI discovery finds); app-only preferences (last vault key file) are in `~/.config/verfsnext/desktop.toml`.
+- `src/gui/tray.rs` — status line, open folder, take snapshot, start/stop, control center, quit. Quit leaves a user service running; in app mode it stops the daemon (final sync) before exiting.
+- `src/gui/desktop.rs` — app-menu and login-autostart entries (bare executable), icon install, desktop notifications for results that arrive while no window is open.
+- First run (no config): welcome → background service or app-only → recommended settings (customizable) → mount point and data folder (in-app folder picker with New Folder) → summary → start. The window closes once the folder is mounted; the app stays in the tray.
+- Control center pages: Overview (state, space saved, dedup/compression, health, activity, memory, every `stats` field; the full stats scan refreshes on demand and at most every 30 s while the page is visible), Snapshots, Vault (create with key file / unlock / lock), Folders & Startup (move folders, service mode, login autostart, stale-mount repair), Settings (all config options, restart prompt when running).
 
 ## Metadata and Snapshot/GC Additions
 

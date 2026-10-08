@@ -326,3 +326,17 @@ The `vault_create` / `vault_unlock` control requests changed (key material inste
 ### Affected Files
 - `src/main.rs`, `src/fs/vault.rs`, `src/fs/mod.rs`, `src/vault/mod.rs`, `src/types/mod.rs`
 - `contrib/systemd/verfsnext-service.sh`
+
+## B009 - SIGTERM Killed the Daemon Without Its Final Sync - Oct 08 2026
+
+### Root Cause
+
+The mount daemon only handled SIGINT (`tokio::signal::ctrl_c`). Any SIGTERM (a plain `kill`, `timeout`, a desktop session logging out, or a systemd unit without `KillSignal=SIGINT`) used the default action and terminated the process at once: no final sync of packs and metadata WAL, and the mount was left behind as "Transport endpoint is not connected". The shipped system unit masked it with `KillSignal=SIGINT`, but the new desktop app starts the daemon as a child of the desktop session, where logout sends SIGTERM. Found while testing the desktop app: `timeout` signalled the process group and the daemon died with a stale mount.
+
+### Fix
+
+`run_mount` (`src/lib.rs`) installs a SIGTERM handler next to SIGINT; both run the same graceful shutdown (`graceful_shutdown`, CRC32 report, cancel the FUSE session). The log line names the signal received.
+
+### Affected Files
+- `src/lib.rs` — SIGTERM handling in `run_mount`
+

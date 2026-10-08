@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::permissions::ensure_dir;
 use crate::types::BLOCK_SIZE;
@@ -110,7 +110,7 @@ fn default_vault_argon2_parallelism() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mount_point: PathBuf,
     pub data_dir: PathBuf,
@@ -175,6 +175,22 @@ impl Config {
         let cfg: Self = toml::from_str(&raw).context("failed to parse config.toml")?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// A config with every optional field at its serde default, so the
+    /// defaults live in exactly one place.
+    #[cfg(feature = "gui")]
+    pub fn with_defaults(mount_point: &Path, data_dir: &Path) -> Result<Self> {
+        let mut table = toml::Table::new();
+        for (key, path) in [("mount_point", mount_point), ("data_dir", data_dir)] {
+            let text = path
+                .to_str()
+                .with_context(|| format!("{key} is not valid UTF-8: {}", path.display()))?;
+            table.insert(key.to_owned(), toml::Value::String(text.to_owned()));
+        }
+        toml::Value::Table(table)
+            .try_into()
+            .context("failed to build default config")
     }
 
     pub fn validate(&self) -> Result<()> {

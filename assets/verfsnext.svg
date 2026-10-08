@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">VerFSNext</title>
+  <desc id="desc">Three stacked teal and white folders, the front one marked with a teal V: one folder with its saved versions behind it.</desc>
+  <path fill="#2fb3a3" transform="translate(12 12)" d="M0 10Q0 2 8 2H26Q30 2 33 5L37 9H68Q76 9 76 17V52Q76 60 68 60H8Q0 60 0 52Z"/>
+  <path fill="#3fd4c1" transform="translate(24 28)" d="M0 10Q0 2 8 2H26Q30 2 33 5L37 9H68Q76 9 76 17V52Q76 60 68 60H8Q0 60 0 52Z"/>
+  <path fill="#ffffff" stroke="#2fb3a3" stroke-width="3" stroke-linejoin="round" transform="translate(36 44)" d="M0 10Q0 2 8 2H26Q30 2 33 5L37 9H68Q76 9 76 17V52Q76 60 68 60H8Q0 60 0 52Z"/>
+  <path fill="none" stroke="#2fb3a3" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" d="M59 67L74 88L89 67"/>
+</svg>
