@@ -1,38 +1,98 @@
-# VerFSNext
+<p align="center">
+  <img src="assets/verfsnext.svg" width="160" alt="VerFSNext logo: stacked folders with a V" />
+</p>
 
+<h1 align="center">VerFSNext</h1>
 
-VerFSNext is a **Copy-on-Write (COW) Linux userspace file system** built on top of **FUSE**.
+<p align="center">
+  <strong>Keep versions. Store shared content once.</strong><br />
+  A copy-on-write Linux filesystem with inline deduplication, compression, snapshots, and an encrypted vault.<br />
+  Manage it from a Qt Quick desktop app, or run it from the terminal through FUSE.
+</p>
 
-## ✨ Features
+<p align="center">
+  <a href="#why-verfsnext">Why VerFSNext</a> ·
+  <a href="#desktop-app">Desktop app</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#mount-quickstart-terminal">Terminal guide</a> ·
+  <a href="#snapshots">Snapshots</a> ·
+  <a href="#encryption-vault">Vault</a> ·
+  <a href="docs/technical_deep_dive.md">Technical guide</a>
+</p>
 
-* 📸 **Snapshots**
-  Navigable and transparently accessible through the `.snapshots` directory at the filesystem root.
-
-* 🧩 **Inline Deduplication**
-  Powered by **UltraCDC** with configurable chunk sizes.
-
-* 🗜️ **Inline Compression**
-  Uses **ZSTD** with configurable compression levels.
-
-* 🔐 **Encryption**
-  Data can be stored in a dedicated hidden folder (`.vault`) at the root.
-  Uses **Argon2id** for key derivation and **XChaCha20-Poly1305** for authenticated encryption.
+<p align="center">
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-Apache--2.0-2fb3a3" alt="Apache-2.0 license" /></a>
+  <img src="https://img.shields.io/badge/filesystem-Linux%20%2B%20FUSE-167d72" alt="Linux FUSE filesystem" />
+  <img src="https://img.shields.io/badge/desktop-Qt%20Quick-167d72" alt="Qt Quick desktop app" />
+</p>
 
 ---
-⚠️ DISCLAIMER: Althogh I've been using for my own data with no issues, this is a personal project and is not recommended for critical data. Use at your own risk.
 
----
+## Why VerFSNext
 
-## Desktop App
+Use your file manager, editor, and command-line tools as usual. VerFSNext
+mounts as a normal folder while storing its contents as deduplicated,
+compressed chunks in a separate data directory.
 
-The easiest way to use VerFSNext. Run the binary with no arguments (double-click it, or `./target/release/verfsnext`):
+| What you want | What VerFSNext gives you |
+| --- | --- |
+| **Less repeated data on disk** | Inline UltraCDC chunking identifies shared content so duplicate chunks can reuse stored data. Chunk sizes are configurable. |
+| **Compression as you write** | Zstandard compresses chunks before they reach storage, with a configurable compression level. |
+| **Earlier versions you can browse** | Create read-only snapshots and open their files through `.snapshots` at the mount root. |
+| **Private files in their own space** | The optional `.vault` namespace uses Argon2id key derivation and XChaCha20-Poly1305 authenticated encryption. It is hidden and inaccessible while locked. |
+| **A clear view of your storage** | The desktop control center shows logical size, storage used, space savings, throughput, and detailed runtime statistics. |
+| **Your choice of workflow** | A setup assistant and tray controls for your desktop; a CLI and systemd service for terminal and server use. |
 
-- **First run**: a short assistant asks whether VerFSNext should run as a background user service (recommended: starts at login, no root needed) or only while the app is open, shows the recommended settings (and lets you customize them), lets you pick the VerFSNext folder and the data folder with a folder browser, then starts it. The window closes and VerFSNext stays in the system tray. It also adds VerFSNext to your applications menu and, if you keep that option on, to your login items.
-- **Afterwards**: the app starts the filesystem and waits in the tray. Click the icon for the control center: status, space savings and every statistic, snapshots, the encrypted vault, folders and startup options, and all settings. The tray menu also opens the folder, takes a snapshot, starts/stops VerFSNext and quits.
+Space savings depend on your data: repeated content benefits from deduplication,
+and compressible content benefits from Zstandard. Background garbage collection
+reclaims eligible unused storage while the filesystem is idle.
 
-The app manages `~/.config/verfsnext/config.toml` (the same file the terminal commands find). It needs a system tray (StatusNotifierItem; GNOME needs the AppIndicator extension) and `systemctl --user` for the background service.
+> **Project status:** VerFSNext is a personal project used by its author for
+> everyday data. It is not recommended for critical data; use it at your own risk.
 
-Building the app needs Qt 6 development packages and `lld` (Debian/Ubuntu/Pop!_OS):
+## Desktop app
+
+The desktop app is included in the default build. Launch `verfsnext` with no
+arguments to open the first-run assistant or return to the system tray.
+
+### Set up once
+
+1. Choose whether VerFSNext should run as a **background user service** or
+   **only while the app is open**. The user service needs no root privileges.
+2. Review the recommended settings, or customize them.
+3. Choose the **VerFSNext folder** you will use for your files and the separate
+   **data folder** where VerFSNext stores metadata and packs.
+4. Finish setup. The filesystem starts, the window closes to the tray, and an
+   applications-menu entry is added. Login startup is optional.
+
+### Manage your filesystem visually
+
+Click the tray icon to open the control center:
+
+| Page | What you can do |
+| --- | --- |
+| **Overview** | Check whether the filesystem is running, inspect space savings and I/O statistics, open the mounted folder, and take a snapshot. |
+| **Snapshots** | Create, browse, and delete snapshots without remembering CLI commands. |
+| **Vault** | Create the encrypted vault, select its key file, unlock it, open it, and lock it again. |
+| **Folders & Startup** | Review folder locations and choose how VerFSNext starts. |
+| **Settings** | Adjust storage and resource settings; the app tells you when a restart is needed. |
+
+The tray menu also opens the folder, takes a snapshot, starts or stops the
+filesystem, and quits. Closing the control window keeps the app in the tray.
+After setup, later launches start the filesystem and wait in the tray.
+
+The app manages `~/.config/verfsnext/config.toml`, the same configuration the
+CLI can discover. A **StatusNotifierItem system tray** is required; GNOME
+needs the AppIndicator extension. Background user-service mode also requires
+`systemctl --user`.
+
+## Quick start
+
+### Build the desktop app
+
+Install Rust and the FUSE userspace tools for your distribution. The desktop
+build also needs Qt 6 development packages and `lld`. On Debian, Ubuntu, or
+Pop!_OS, the build and Qt dependencies are:
 
 ```bash
 sudo apt install build-essential clang lld cmake pkg-config libdbus-1-dev \
@@ -41,11 +101,32 @@ sudo apt install build-essential clang lld cmake pkg-config libdbus-1-dev \
   qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript
 ```
 
-For servers, build without the app (no Qt, D-Bus or tray libraries; a bare `verfsnext` then mounts):
+Then build and launch:
+
+```bash
+git clone https://github.com/jmarceno/VerFSNext.git
+cd VerFSNext
+cargo build --release
+./target/release/verfsnext
+```
+
+Follow the setup assistant and start using the mounted folder. Keep the
+executable at a stable location: desktop and service entries refer to it.
+The mounted folder is where you work with your files; the data directory
+contains VerFSNext's internal storage.
+
+### Prefer the terminal or a server?
+
+Build without the desktop app to omit Qt, D-Bus, and tray dependencies:
 
 ```bash
 cargo build --release --no-default-features
 ```
+
+Then follow the [terminal mount guide](#mount-quickstart-terminal) below.
+A bare headless binary mounts the filesystem; a bare GUI-enabled binary opens
+the desktop app. `verfsnext mount` explicitly chooses terminal mounting in
+either build.
 
 ## Mount Quickstart (terminal)
 
@@ -231,20 +312,37 @@ This is the system-wide service (runs as user `verfs`, needs root to install). F
 
 If startup fails with FUSE permission errors, verify `/dev/fuse` access and that the `fuse` group exists.
 
-# FAQ
+## FAQ
 
-## Why this exists?
+### Why does this exist?
 
-**VerFSNext** is the public release of a passion project I’ve been developing for many years.
-It started with my curiosity about high-end storage appliances back in **2011**, which led to the first Python implementation in **2015**.
+VerFSNext is the public release of a project I've been developing for years.
+It began with my curiosity about storage appliances in **2011**, followed by
+the first Python implementation in **2015**. Around **2020**, a later version
+added features including replication; that iteration is archived as
+[VerFS](https://github.com/jmarceno/VerFS).
 
-Around **2020**, I built a much more feature-rich version, including replication support. That version is archived here:
-👉 [https://github.com/jmarceno/VerFS](https://github.com/jmarceno/VerFS)
+After further iterations, VerFSNext focuses on the features that make sense
+for my daily use.
 
-After two additional iterations, this current version represents the most refined and focused evolution of the project, with only the features
-that makes sense for my daily use.  
+### Why maintain the FUSE and metadata crates in-tree?
 
-## Why vendor `async_fusex` and `surrealkv` instead of other options?
+Over the years, I've tried many metadata databases and FUSE bindings, and
+implemented metadata storage from scratch. The internal forks of
+`async_fusex` and `surrealkv` let me change the filesystem interface and
+storage engine together as the project evolves.
 
-Over the years, I’ve tried dozens of databases for metadata storage (and even implemented it from scratch), as well as nearly every FUSE binding I could find — if you can name it, I’ve probably tried it.
-Because of that, I wanted something I could modify freely, without restrictions or external constraints. This approach turned out to be the best option for that goal.
+## Documentation and development
+
+- [Technical deep dive](docs/technical_deep_dive.md) — storage layout, write and read paths, snapshots, vault, garbage collection, and the desktop architecture.
+- [Bug-fix history](docs/bug-fix-history.md) — fixes, their impact, and regression context.
+- [Resilience validation](docs/resilience-test.md) — workload and fault-injection procedures, scope, and recorded results.
+- [Configuration example](config.toml) — annotated storage, cache, FUSE, and vault settings.
+
+## License
+
+VerFSNext is released under the [Apache License 2.0](LICENSE.txt).
+
+Have an idea or found a bug? [Open an issue](https://github.com/jmarceno/VerFSNext/issues)
+with your setup, what happened, and the relevant logs. If VerFSNext is useful
+to you, a star helps other Linux users discover it.
