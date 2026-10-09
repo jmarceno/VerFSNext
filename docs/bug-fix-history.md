@@ -380,3 +380,31 @@ binary/source hashes are retained in the deployed run's evidence and provenance.
 - `src/lib.rs`
 - `crates/verfsnext-async-fusex/src/mount.rs`, `src/session.rs`
 - `scripts/resilience/`, `docs/resilience-test.md`
+
+## B011 - Pending FUSE Request Abort Misclassified by Resilience Harness - Oct 08 2026
+
+### Root Cause
+
+Cycle 38 killed the daemon as planned. A pending `os.open` of `/mnt/verfsnext`
+returned `ECONNABORTED` (103) during the recorded recovery window, while the mount
+was still attached. The harness recognized `ENOTCONN` but rejected this connection
+abort and froze the LXC after post-recovery verification had passed. Independent
+verification of a copy of the frozen data also passed for all 205 objects.
+
+### Fix
+
+Recognize `ECONNABORTED` for FUSE paths or descriptor operations, and the equivalent
+rsync diagnostic for its destination, only during a matching injected fault cycle
+and window. Connection errors with a known pathname outside the mount are rejected.
+All observations remain logged; complete integrity mismatches, `EIO`, errors outside
+the window and recovery failures still stop the run. The filesystem binary and
+persisted data format are unchanged; no migration is required.
+
+### Validation
+
+Replay the recorded cycle-38 failure and rejection cases, then run the existing
+six-scenario LXC preflight before starting a fresh detached three-hour run.
+
+### Affected Files
+
+- `scripts/resilience/guest.py`, `docs/resilience-test.md`

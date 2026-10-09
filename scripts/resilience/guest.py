@@ -303,11 +303,13 @@ def observe_error(action, error):
     attached = any(line.split()[4] == str(MOUNT)
                    for line in Path('/proc/self/mountinfo').read_text().splitlines())
     unavailable_io = isinstance(error, OSError) and (
-        error.errno == errno.ENOTCONN or
+        (error.errno in (errno.ENOTCONN, errno.ECONNABORTED)
+         and (error.filename is None or Path(error.filename).is_relative_to(MOUNT))) or
         (error.errno == errno.ENOENT and not attached and error.filename is not None
          and Path(error.filename).is_relative_to(MOUNT)))
     unavailable_copy = isinstance(error, CopyFailure) and error.returncode in (11, 23) and (
         'Transport endpoint is not connected' in error.stderr or
+        ('Software caused connection abort' in error.stderr and str(MOUNT) in error.stderr) or
         ('No such file or directory' in error.stderr and str(MOUNT) in error.stderr and not attached))
     expected_outage = (
         action in ('reader', 'worker', 'background')

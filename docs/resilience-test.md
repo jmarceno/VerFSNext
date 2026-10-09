@@ -128,9 +128,13 @@ On `pve`, the run directory contains:
 Manifest and durability traversal use strict `os.scandir` and `lstat` information.
 Scan, stat, read and xattr errors propagate instead of producing partial manifests.
 Connection loss is classified as an injected outage only for the matching cycle
-inside its declared fault interval. `ENOENT` requires the FUSE mount to be detached
+inside its declared fault interval. This includes `ENOTCONN` and `ECONNABORTED`
+on FUSE paths, or descriptor operations without a pathname. Pending requests may
+return `ECONNABORTED` when the daemon is killed, even while the mount remains attached.
+`ENOENT` requires the FUSE mount to be detached
 and the missing path to lie below its mountpoint; `EIO` is never broadly accepted.
-Rsync file-I/O exits 11/23 require an explicit connection-loss message, or a
+Rsync file-I/O exits 11/23 require an explicit connection-loss message (including
+"Software caused connection abort" naming the FUSE mount), or a
 missing destination under a detached mount, within that same fault interval.
 Completed content/metadata mismatches always fail, even if recovery reads pass.
 Recovery verification runs before observations are judged, including after a
