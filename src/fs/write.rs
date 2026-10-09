@@ -359,7 +359,6 @@ impl FsCore {
         }
         let plan = self.prepare_write_plan(&op, &inode, txn).await?;
 
-        let _mutation_guard = self.write_lock.read().await;
         let inode_lock = self.inode_write_lock(op.ino).await;
         let _inode_guard = inode_lock.lock().await;
         self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn, mtime_sec, mtime_nsec)?;
@@ -459,6 +458,11 @@ impl FsCore {
     ) {
         let mut attempt = 1;
         while !pending.is_empty() {
+            // Namespace, snapshot and vault mutations hold the write side of this
+            // gate. Holding the read side from begin to commit keeps them from
+            // committing inside the transaction, which otherwise conflicts with
+            // every retry while snapshot operations run back to back.
+            let _mutation_guard = self.write_lock.read().await;
             let mut txn = match self.meta.begin_write() {
                 Ok(txn) => txn,
                 Err(err) => {

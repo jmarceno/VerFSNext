@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 #[async_trait]
 impl VirtualFs for VerFs {
     async fn init(&self) -> AsyncFusexResult<()> {
@@ -43,10 +43,20 @@ impl VirtualFs for VerFs {
             .map_err(map_anyhow_to_fuse)?;
 
         let attr = self.core.file_attr_from_inode(&inode);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((self.core.entry_ttl(), self.core.attr_ttl(), attr, inode.generation))
     }
 
-    async fn forget(&self, _ino: u64, _nlookup: u64) {}
+    async fn forget(&self, ino: u64, nlookup: u64) {
+        if self.core.forget_kernel_lookups(ino, nlookup) > 0 {
+            return;
+        }
+        // FORGET has no reply, so a failed final delete can only be logged; the
+        // orphan index keeps the inode for the startup sweep.
+        if let Err(err) = self.core.cleanup_unlinked_inode_if_unreferenced(ino).await {
+            error!(ino, error = %format!("{err:#}"), "final delete of forgotten unlinked inode failed");
+        }
+    }
 
     async fn getattr(&self, ino: u64) -> AsyncFusexResult<(Duration, FileAttr)> {
         let inode = self
@@ -196,6 +206,7 @@ impl VirtualFs for VerFs {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created inode"))
         })?;
         self.core.invalidate_inode_attr_best_effort(inode.ino);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
@@ -242,6 +253,7 @@ impl VirtualFs for VerFs {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created directory"))
         })?;
         self.core.invalidate_inode_attr_best_effort(inode.ino);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
@@ -287,8 +299,7 @@ impl VirtualFs for VerFs {
                 let (sec, nsec) = system_time_to_parts(now);
                 inode.ctime_sec = sec;
                 inode.ctime_nsec = nsec;
-                let defer_final_delete =
-                    inode.nlink <= 1 && self.core.open_file_count(inode.ino) > 0;
+                let defer_final_delete = inode.nlink <= 1 && self.core.inode_referenced(inode.ino);
                 let _removed_inode =
                     FsCore::remove_name_from_inode_in_txn(txn, &mut inode, defer_final_delete)?;
                 Ok(())
@@ -422,6 +433,7 @@ impl VirtualFs for VerFs {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing symlink inode"))
         })?;
         self.core.invalidate_inode_attr_best_effort(inode.ino);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
@@ -612,7 +624,7 @@ impl VirtualFs for VerFs {
                     target_inode.ctime_sec = sec;
                     target_inode.ctime_nsec = nsec;
                     let defer_final_delete =
-                        target_inode.nlink <= 1 && self.core.open_file_count(target_inode.ino) > 0;
+                        target_inode.nlink <= 1 && self.core.inode_referenced(target_inode.ino);
                     let _removed_target = FsCore::remove_name_from_inode_in_txn(
                         txn,
                         &mut target_inode,
@@ -1020,10 +1032,15 @@ impl VirtualFs for VerFs {
 
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
         self.core.mark_activity();
+        // Kernel writeback discards WRITE errors apart from a per-file error flag,
+        // so every rejected write is logged here with its origin.
         let _inode = self
             .core
             .load_inode_with_vault_access(ino, "write")
-            .map_err(map_anyhow_to_fuse)?;
+            .map_err(|err| {
+                error!(ino, offset, len = data.len(), flags, error = %format!("{err:#}"), "FUSE write rejected");
+                map_anyhow_to_fuse(err)
+            })?;
         if offset < 0 {
             return build_error_result_from_errno(
                 Errno::EINVAL,
@@ -1046,7 +1063,10 @@ impl VirtualFs for VerFs {
         self.batcher
             .enqueue_and_wait(op, write_bytes)
             .await
-            .map_err(map_anyhow_to_fuse)?;
+            .map_err(|err| {
+                error!(ino, offset, len = data.len(), flags, error = %format!("{err:#}"), "FUSE write failed");
+                map_anyhow_to_fuse(err)
+            })?;
         Ok(())
     }
 
@@ -1092,7 +1112,7 @@ impl VirtualFs for VerFs {
             self.core.decrement_open_file_count(ino);
         }
         self.core
-            .cleanup_unlinked_inode_if_closed(ino)
+            .cleanup_unlinked_inode_if_unreferenced(ino)
             .await
             .map_err(map_anyhow_to_fuse)
     }
@@ -1287,6 +1307,7 @@ impl VirtualFs for VerFs {
         let inode_data_version = self.core.inode_data_version(inode.ino);
         self.core
             .register_file_handle(fh, inode.ino, inode_data_version);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
@@ -1392,6 +1413,7 @@ impl VirtualFs for VerFs {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing linked inode"))
         })?;
         self.core.invalidate_inode_attr_best_effort(inode.ino);
+        self.core.add_kernel_lookup(inode.ino);
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),

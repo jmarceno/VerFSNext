@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use verfsnext_surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::data::compress::{compress_parallel, PendingChunk};
@@ -235,6 +235,8 @@ struct FsCore {
     file_read_plan_inode_cache: Cache<(u64, u64), Arc<SmallFileReadPlan>>,
     notifier: ParkingRwLock<Option<Arc<SessionNotifier>>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
+    /// Lookup references the kernel holds per inode (entry replies minus FORGET).
+    kernel_lookups: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
 }
 
@@ -267,6 +269,12 @@ impl VerFs {
             .get_sys(SYS_VAULT_WRAP)?
             .map(|raw| !raw.is_empty())
             .unwrap_or(false);
+        // No kernel holds references before the mount, so every indexed orphan
+        // left by a crash or an unclean stop is unreachable.
+        let reclaimed_orphans = FsCore::reclaim_orphans(&meta).await?;
+        if reclaimed_orphans > 0 {
+            info!(reclaimed_orphans, "reclaimed unlinked inodes left by a previous run");
+        }
         if meta.get_sys(SYS_VAULT_STATE)?.is_none() {
             meta.write_txn(|txn| {
                 txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
@@ -328,6 +336,7 @@ impl VerFs {
                 .build(),
             notifier: ParkingRwLock::new(None),
             open_file_counts: ParkingMutex::new(HashMap::new()),
+            kernel_lookups: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
@@ -585,6 +594,32 @@ impl FsCore {
 
     fn open_file_count(&self, ino: u64) -> u64 {
         self.open_file_counts.lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    fn add_kernel_lookup(&self, ino: u64) {
+        let mut lookups = self.kernel_lookups.lock();
+        let entry = lookups.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Drops `nlookup` kernel references and returns the references left.
+    fn forget_kernel_lookups(&self, ino: u64, nlookup: u64) -> u64 {
+        let mut lookups = self.kernel_lookups.lock();
+        let Some(entry) = lookups.get_mut(&ino) else {
+            return 0;
+        };
+        *entry = entry.saturating_sub(nlookup);
+        let remaining = *entry;
+        if remaining == 0 {
+            lookups.remove(&ino);
+        }
+        remaining
+    }
+
+    /// An unlinked inode must outlive both its open handles and the kernel's
+    /// lookup references, which stay valid until FORGET.
+    fn inode_referenced(&self, ino: u64) -> bool {
+        self.open_file_count(ino) > 0 || self.kernel_lookups.lock().contains_key(&ino)
     }
 
     fn register_file_handle(&self, fh: u64, ino: u64, inode_data_version: u64) {

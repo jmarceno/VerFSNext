@@ -4,13 +4,22 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
+import re
 import subprocess
 import time
 import traceback
 
-FAULTS = ['copy_sigkill', 'daemon_sigkill', 'daemon_sigterm',
-          'container_reboot', 'container_hard_stop', 'gc_idle_restart']
+FAULTS = ['copy_sigkill', 'daemon_sigkill', 'daemon_sigterm', 'container_reboot',
+          'container_hard_stop', 'gc_idle_restart', 'gc_rewrite_kill', 'snapshot_op_kill',
+          'recovery_double_kill']
+# Faults after which the daemon recovers from an abrupt stop; a torn WAL tail is legitimate there.
+CRASH_FAULTS = {'daemon_sigkill', 'container_hard_stop', 'gc_idle_restart', 'gc_rewrite_kill',
+                'snapshot_op_kill', 'recovery_double_kill'}
 UNIT = 'verfsnext-soak.service'
+DAEMON_LINE = re.compile(r' verfsnext\[\d+\]: ')
+DAEMON_FAILURE = re.compile(r'\bERROR\b|panicked|(sys|session|current)_total=[1-9]')
+WAL_TAIL = re.compile(r'Corrupted WAL record detected|Corruption in WAL')
 
 
 def save(path, value):
@@ -52,6 +61,8 @@ class Supervisor:
                               started_at=time.time(), faults={}, verifications=0,
                               mode='preflight' if args.cycles else 'endurance',
                               preflight_verifications=0, endurance_verifications=0,
+                              seed=time.time_ns(), gc_rewrite_hits=0, gc_rewrite_misses=0,
+                              wal_tail_repairs=0, daemon_warnings=0,
                               known_findings=['Snapshots clone hardlink names to separate inodes; snapshot hashes and metadata are checked, live hardlinks are checked strictly.'])
         self.started_cycles = self.state['cycle']
 
@@ -113,13 +124,18 @@ class Supervisor:
 
     def capture(self, suffix):
         cycle = self.state['cycle']
+        # Consecutive captures overlap by a second, so every daemon line is inspected at least once.
+        since = self.state.get('journal_since', self.state.get('cycle_started_at', time.time() - 60))
+        captured_at = time.time()
         journal = self.guest('journalctl', '-u', UNIT, '-u', 'verfsnext-workload.service',
-                             '--since', f"@{int(self.state.get('cycle_started_at', time.time() - 60))}",
-                             '--no-pager', '-o', 'short-iso-precise')
+                             '--since', f'@{int(since) - 1}', '--no-pager', '-o', 'short-iso-precise')
         path = self.root / f'journal-{cycle:06d}-{suffix}.log'
         path.write_text(journal)
         with path.open('rb') as f:
             os.fsync(f.fileno())
+        self.checkpoint(journal_since=captured_at)
+        if suffix != 'failure':
+            self.check_daemon_log(journal, suffix)
         report = dict(time_ns=time.time_ns(), df=self.guest('df', '-B1', '/'),
                       memory=self.guest('cat', '/sys/fs/cgroup/memory.events'),
                       memory_current_peak_max=self.guest('cat', '/sys/fs/cgroup/memory.current',
@@ -130,6 +146,38 @@ class Supervisor:
                                        '-maxdepth', '2', '-type', 'f', '-printf', '%P %s %T@\n'))
         save(self.root / f'resources-{cycle:06d}-{suffix}.json', report)
 
+    def check_daemon_log(self, journal, suffix):
+        lines = [line for line in journal.splitlines() if DAEMON_LINE.search(line)]
+        warnings = [line for line in lines if ' WARN ' in line]
+        if warnings:
+            self.checkpoint(daemon_warnings=self.state['daemon_warnings'] + len(warnings))
+            self.event('daemon_warnings', capture=suffix, lines=warnings)
+        failures = [line for line in lines if DAEMON_FAILURE.search(line) or WAL_TAIL.search(line)]
+        tail = [line for line in failures if WAL_TAIL.search(line)]
+        if tail and suffix == 'after' and self.state.get('last_fault') in CRASH_FAULTS:
+            # Data loss from a torn tail is judged by the durability oracle, not by this message.
+            self.checkpoint(wal_tail_repairs=self.state['wal_tail_repairs'] + 1)
+            self.event('wal_tail_repair', lines=tail)
+            failures = [line for line in failures if line not in tail]
+        if failures:
+            self.event('daemon_log_failure', capture=suffix, lines=failures)
+            raise RuntimeError(f'daemon logged errors in {suffix} capture; see host-events.jsonl')
+
+    def wait_workload(self, label):
+        for _ in range(600):
+            active = self.guest('systemctl', 'is-active', 'verfsnext-workload.service', allowed=(0, 3))
+            if active.strip() != 'active':
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f'workload did not finish before {label}')
+        result = self.guest('systemctl', 'show', '--property=Result', '--value', 'verfsnext-workload.service')
+        if result.strip() != 'success':
+            raise RuntimeError(f'{label} workload failed: {result}')
+
+    def kill_daemon(self):
+        self.guest('systemctl', 'kill', '--kill-whom=main', '--signal=SIGKILL', UNIT)
+
     def capacity(self):
         free = int(self.guest('df', '--output=avail', '-B1', '/').splitlines()[-1])
         def strict_walk_error(error):
@@ -138,11 +186,11 @@ class Supervisor:
                              for directory, _, files in os.walk(self.root, onerror=strict_walk_error)
                              for name in files)
         self.checkpoint(rootfs_free_bytes=free, evidence_bytes=evidence_bytes)
-        if free < 768 * 1024 * 1024 or evidence_bytes > 32 * 1024 * 1024:
+        if free < 768 * 1024 * 1024 or evidence_bytes > 64 * 1024 * 1024:
             raise RuntimeError('resource budget reached; evidence preserved, no further writes allowed')
 
     def wait_progress(self, cycle):
-        for _ in range(100):
+        for _ in range(300):
             path = self.evidence / 'progress.json'
             if path.exists():
                 progress = json.loads(path.read_text())
@@ -174,32 +222,35 @@ class Supervisor:
         save(self.evidence / 'fault-window.json', window)
         self.guest('systemctl', 'start', 'verfsnext-workload.service')
         progress = self.wait_progress(cycle)
-        # Rotate injection timing through write, file-fsync, rename, and acknowledged data.
-        delay = [0.15, 1.55, 1.8, 2.2][(cycle - 1) % 4]
+        # Seeded random timing spans probe writes, file fsync, rename, acknowledgement and copy-only traffic.
+        rng = random.Random(f"{self.state['seed']}:{cycle}")
+        delay = rng.uniform(0.0, 3.0)
         time.sleep(delay)
         progress = json.loads((self.evidence / 'progress.json').read_text())
         window.update(phase='injecting', injection_intent_ns=time.time_ns())
         save(self.evidence / 'fault-window.json', window)
         self.checkpoint(phase='fault_pending', last_fault=kind, fault_progress=progress)
-        self.event('fault_intent', fault=kind, workload=progress,
+        self.event('fault_intent', fault=kind, workload=progress, delay=delay,
                    expected_sha256=self.run('sha256sum', str(self.evidence / 'expected.json')).split()[0])
         if kind == 'copy_sigkill':
             copy = json.loads((self.evidence / 'copy-process.json').read_text())
             if copy['cycle'] != cycle:
                 raise RuntimeError('copy PID belongs to another cycle')
             self.guest('kill', '-KILL', '--', '-' + str(copy['pid']))
-            for _ in range(80):
-                active = self.guest('systemctl', 'is-active', 'verfsnext-workload.service', allowed=(0, 3))
-                if active.strip() != 'active':
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError('workload did not finish after copy interruption')
-            result = self.guest('systemctl', 'show', '--property=Result', '--value', 'verfsnext-workload.service')
-            if result.strip() != 'success':
-                raise RuntimeError(f'copy interruption workload failed: {result}')
-        elif kind == 'daemon_sigkill':
-            self.guest('systemctl', 'kill', '--kill-whom=main', '--signal=SIGKILL', UNIT)
+            self.wait_workload('copy interruption')
+        elif kind in ('daemon_sigkill', 'snapshot_op_kill'):
+            self.kill_daemon()
+        elif kind == 'recovery_double_kill':
+            self.kill_daemon()
+            self.guest('systemctl', 'stop', 'verfsnext-workload.service')
+            self.guest('systemctl', 'stop', UNIT)
+            mounts = self.guest('cat', '/proc/self/mountinfo')
+            if any(line.split()[4] == '/mnt/verfsnext' for line in mounts.splitlines()):
+                self.guest('fusermount3', '-uz', '/mnt/verfsnext')
+            # The second kill lands during metadata/WAL recovery or right after the mount appears.
+            result = json.loads(self.guest('python3', self.guest_script, 'restart-kill', '--cycle', str(cycle),
+                                           '--delay', f'{rng.uniform(0.02, 1.0):.3f}').splitlines()[-1])
+            self.event('recovery_killed', **result)
         elif kind == 'daemon_sigterm':
             self.guest('systemctl', 'stop', UNIT)
             shutdown_result = self.guest('systemctl', 'show', '--property=Result', '--value', UNIT).strip()
@@ -211,20 +262,20 @@ class Supervisor:
             self.run('pct', 'stop', self.ct)
             self.run('pct', 'start', self.ct)
         elif kind == 'gc_idle_restart':
-            # Finish writes, then open an idle GC window; this does not claim to hit a pack swap.
-            for _ in range(250):
-                active = self.guest('systemctl', 'is-active', 'verfsnext-workload.service', allowed=(0, 3))
-                if active.strip() != 'active':
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError('workload did not finish before GC idle window')
-            result = self.guest('systemctl', 'show', '--property=Result', '--value', 'verfsnext-workload.service')
-            if result.strip() != 'success':
-                raise RuntimeError(f'GC workload failed: {result}')
-            time.sleep(6)
-            self.event('gc_idle_window_elapsed', seconds=6)
-            self.guest('systemctl', 'kill', '--kill-whom=main', '--signal=SIGKILL', UNIT)
+            # Finish writes, then kill at a random point of the idle GC window.
+            self.wait_workload('GC idle window')
+            idle = rng.uniform(1.0, 8.0)
+            time.sleep(idle)
+            self.event('gc_idle_window_elapsed', seconds=idle)
+            self.kill_daemon()
+        elif kind == 'gc_rewrite_kill':
+            # Finish writes, then kill while a pack rewrite temp file exists (the B006 window).
+            self.wait_workload('GC rewrite window')
+            result = json.loads(self.guest('python3', self.guest_script, 'gc-kill', '--cycle', str(cycle),
+                                           timeout=90).splitlines()[-1])
+            counter = 'gc_rewrite_hits' if result['hit'] else 'gc_rewrite_misses'
+            self.checkpoint(**{counter: self.state[counter] + 1})
+            self.event('gc_rewrite_killed', **result)
         self.event('fault_applied', fault=kind)
         window.update(phase='recovering', fault_applied_ns=time.time_ns())
         save(self.evidence / 'fault-window.json', window)

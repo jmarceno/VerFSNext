@@ -4,10 +4,10 @@ use std::fs::File;
 use std::io::Read;
 use std::io::{IoSlice, Write};
 use std::mem;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -236,12 +236,65 @@ impl SessionNotifier {
 
 /// A loop to read requests from FUSE device continuously
 #[allow(clippy::needless_pass_by_value)]
+/// Admits FUSE requests until shutdown starts, then lets admitted requests finish.
+///
+/// Requests read after the gate closes are left unanswered; the kernel aborts them
+/// with a connection error when the daemon releases the FUSE device. No request
+/// reaches the filesystem once its final sync may have started.
+#[derive(Default)]
+struct RequestGate {
+    state: Mutex<GateState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    in_flight: usize,
+}
+
+/// Marks one admitted request; dropping it (also while unwinding) releases the gate.
+struct Admission<'a>(&'a RequestGate);
+
+impl RequestGate {
+    fn admit(&self) -> Option<Admission<'_>> {
+        let mut state = self.state.lock().expect("FUSE request gate lock poisoned");
+        if state.closed {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(Admission(self))
+    }
+
+    fn close_and_drain(&self) {
+        let mut state = self.state.lock().expect("FUSE request gate lock poisoned");
+        state.closed = true;
+        while state.in_flight > 0 {
+            state = self
+                .idle
+                .wait(state)
+                .expect("FUSE request gate lock poisoned");
+        }
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().expect("FUSE request gate lock poisoned");
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
 fn fuse_device_reader(
     buffer_tx: Sender<(File, AlignedBytes)>,
     buffer_rx: Receiver<(File, AlignedBytes)>,
     runtime_handle: Handle,
     proto_version: ProtoVersion,
     fs: Arc<dyn FileSystem + Send + Sync>,
+    gate: Arc<RequestGate>,
 ) {
     loop {
         let Ok((mut file, mut buffer)) = buffer_rx.recv() else {
@@ -297,6 +350,10 @@ fn fuse_device_reader(
             }
         };
 
+        let Some(_admission) = gate.admit() else {
+            info!("FUSE session is shutting down; request left for the kernel to abort");
+            return;
+        };
         runtime_handle.block_on(async {
             process_fuse_request(
                 buffer,
@@ -308,10 +365,6 @@ fn fuse_device_reader(
             )
             .await
         });
-        // if spawn_result.is_err() {
-        //     info!("Try to spawn task of `FuseRequest` after shutdow.");
-        //     return;
-        // }
     }
 }
 
@@ -380,6 +433,8 @@ pub struct Session<F: FileSystem + Send + Sync + 'static> {
     /// The underlying FUSE file system
     filesystem: Arc<F>,
     session_config: SessionConfig,
+    /// Stops request dispatch before the filesystem's final sync
+    gate: Arc<RequestGate>,
 }
 pub async fn new_session(
     mount_path: &Path,
@@ -396,6 +451,7 @@ pub async fn new_session(
         mount_path: Some(mount_path.to_owned()),
         filesystem: Arc::new(fs),
         session_config,
+        gate: Arc::default(),
     })
 }
 
@@ -467,18 +523,45 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
             let handle = Handle::current();
             let fs = Arc::clone(&self.filesystem);
             let protocol_version = self.proto_version.load();
-            // The `JoinHandle` is ignored
+            let gate = Arc::clone(&self.gate);
+            // Readers stop at the request gate; their `JoinHandle`s are not needed.
             thread::spawn(move || {
-                fuse_device_reader(pool_tx, pool_rx, handle, protocol_version, fs);
+                fuse_device_reader(pool_tx, pool_rx, handle, protocol_version, fs, gate);
             });
         }
 
         drop(pool_receiver);
 
         token.cancelled().await;
-        info!("Async FUSE session exits.");
+        // Pages held by the kernel writeback cache reach the filesystem only while
+        // requests are still served. A sync failure is returned after draining so the
+        // caller still performs its final filesystem sync.
+        let sync_result = self.sync_mount().await;
+        let gate = Arc::clone(&self.gate);
+        tokio::task::spawn_blocking(move || gate.close_and_drain())
+            .await
+            .context("FUSE request drain task failed")?;
+        info!("Async FUSE session exits; in-flight requests drained.");
 
-        Ok(())
+        sync_result
+    }
+
+    /// Flush the kernel's dirty pages for this mount into the filesystem.
+    async fn sync_mount(&self) -> anyhow::Result<()> {
+        let mount_path = self
+            .mount_path
+            .clone()
+            .context("FUSE session has no mount path to sync")?;
+        tokio::task::spawn_blocking(move || {
+            let root = File::open(&mount_path).with_context(|| {
+                format!("failed to open {} for shutdown sync", mount_path.display())
+            })?;
+            unistd::syncfs(root.as_raw_fd()).with_context(|| {
+                format!("syncfs of {} failed during shutdown", mount_path.display())
+            })
+        })
+        .await
+        .context("FUSE mount sync task failed")?
     }
 
     /// Setup buffer pool

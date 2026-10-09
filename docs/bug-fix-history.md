@@ -408,3 +408,120 @@ six-scenario LXC preflight before starting a fresh detached three-hour run.
 ### Affected Files
 
 - `scripts/resilience/guest.py`, `docs/resilience-test.md`
+
+## B012 - In-Flight FUSE Requests Failed With EIO During Graceful Shutdown - Oct 09 2026
+
+### Root Cause
+
+`Session::run` returned as soon as the shutdown token was cancelled, but its FUSE
+reader threads kept reading and dispatching requests. `graceful_shutdown` then
+closed the metadata store under them, so requests in flight or arriving in that
+window failed with `EIO` while the mount was still attached. Applications writing
+during a logout or service stop saw I/O errors on `chmod`, `pwrite` and similar
+calls. Pages held by the kernel writeback cache were also never flushed to the
+daemon before its final sync. Found by the reviewed resilience harness: its
+fsync-acknowledged writers hit `EIO` in the first `daemon_sigterm` preflight cycle.
+Post-recovery verification passed, so no acknowledged data was lost. The old
+harness missed this because its only writer had usually passed its last fsync when
+SIGTERM arrived.
+
+### Fix
+
+- After cancellation, `Session::run` calls `syncfs` on the mount while requests are
+  still served, so writeback-cached pages reach the filesystem before the final sync.
+- A request gate (`RequestGate` in `crates/verfsnext-async-fusex/src/session.rs`) then
+  closes and waits for admitted requests to finish. Reader threads leave requests read
+  after closure unanswered and exit; the kernel aborts those requests with
+  `ECONNABORTED` when the daemon releases the device, the same as after a daemon crash.
+- Only then does `run_mount` perform the final sync and unmount. A `syncfs` failure
+  is returned after draining, so the final sync still runs and the daemon exits nonzero.
+
+### Compatibility and Validation
+
+No persisted format, CLI or protocol change; no migration is required. An LXC
+reproducer SIGTERMs the daemon while two writers loop `pwrite`/`chmod`/`fsync`. The
+old binary returned `EIO` in 40 of 40 writer interruptions. Over 80 rounds the fixed
+binary returned `ECONNABORTED` in 159 interruptions and `ENOENT` once, for a path
+lookup after the lazy unmount; neither is `EIO`. This was followed by the nine-scenario
+preflight and a six-hour LXC run.
+
+### Affected Files
+
+- `crates/verfsnext-async-fusex/src/session.rs`
+- `docs/technical_deep_dive.md`, `docs/resilience-test.md`
+
+## B013 - Unlink Made Every Later syncfs Fail With ENOENT; Crash Leaked Open-Unlinked Files - Oct 09 2026
+
+### Root Cause
+
+With the FUSE writeback cache, the kernel updates an unlinked file's ctime and flushes
+it with `SETATTR(mtime|ctime)` before it forgets the inode. The daemon ignored
+`FORGET` and deleted the inode as soon as no file handle was open, so that `SETATTR`
+got `ENOENT`. The kernel records the error on the superblock's writeback error state,
+so the next `syncfs(2)` (`sync -f`) on the mount, by any application, failed with
+`ENOENT`. After every regular-file unlink or rename-over, such a `syncfs` failed. B012's
+shutdown `syncfs` exposed it in the first resilience preflight cycle; a FUSE request
+trace confirmed the sequence `UNLINK`, `SETATTR` (ENOENT), `FORGET`.
+
+Separately, an unlinked file kept alive by an open handle was stored with `nlink = 0`
+but nothing indexed it. If the daemon stopped before the handle closed, the inode and
+its chunks were never reclaimed.
+
+### Fix
+
+- `FsCore` tracks kernel lookup references (entry replies minus `FORGET`/`BATCH_FORGET`).
+- Unlink and rename-over keep an unlinked inode while it has an open handle or a kernel
+  reference, writing orphan index key `O<ino>` in the same transaction.
+- `release` and `forget` perform the final delete when both counts reach zero, under the
+  global write lock that also serializes unlink; the final delete removes the orphan key.
+- Startup deletes every indexed orphan before mounting.
+- FUSE `write` failures are now logged with inode, offset, length and flags, because
+  kernel writeback otherwise discards them.
+
+### Compatibility and Validation
+
+The orphan index is a new, additive key prefix. Older binaries ignore it; no migration
+is required. Orphans created by older builds have no index key and are not reclaimed.
+On the LXC, the old binary failed `sync -f` after unlink and after rename-over. The fixed
+binary passed unlink, rename-over, hardlink unlink, open-unlinked read and `sync -f`, and
+reclaimed an open-unlinked file after SIGKILL exactly once at the next start. This was
+followed by the nine-scenario preflight and the six-hour LXC run.
+
+### Affected Files
+
+- `src/fs/fuse.rs`, `src/fs/inode.rs`, `src/fs/mod.rs`, `src/types/mod.rs`
+- `docs/technical_deep_dive.md`
+
+## B014 - Writeback Writes Failed With EIO During Snapshot Operations - Oct 09 2026
+
+### Root Cause
+
+`apply_write_round` (`src/fs/write.rs`) began its metadata transaction and planned the
+write before taking the read side of the global mutation gate, and released the gate
+inside `apply_single_write_in_txn` before committing. Snapshot create/delete (and other
+namespace and vault mutations) hold the write side and commit large transactions that
+rewrite chunk refcounts. They could therefore commit inside every write transaction's
+window. While snapshots were created and deleted back to back, all 16 immediate commit
+retries lost with `Transaction write conflict`, and the kernel's writeback WRITE failed;
+applications saw `EIO` from `fsync`. Found by the resilience harness's `snapshot_op_kill`
+scenario: two acknowledged-write workers got `EIO` from `fsync`, one of them before any
+fault was injected. The new FUSE write-error log (B013) showed the cause. Post-recovery
+verification found no corruption of acknowledged data.
+
+### Fix
+
+Each write-round attempt holds the read side of the mutation gate from `begin_write`
+through commit, and the nested acquisition inside `apply_single_write_in_txn` is
+removed. tokio's fair `RwLock` would deadlock on a nested read while a writer is
+queued. No holder of the write side waits on the write batcher.
+
+### Compatibility and Validation
+
+No format or protocol change; no migration is required. A synthetic snapshot-churn
+reproducer did not trigger the conflict on either binary; with the fix, writer throughput
+under churn was higher (798 vs 659 fsyncs in 20 s). The decisive validation is the
+harness `snapshot_op_kill` preflight cycle and its repetitions in the six-hour run.
+
+### Affected Files
+
+- `src/fs/write.rs`

@@ -1,7 +1,7 @@
 use super::*;
 use crate::fs::FsCore;
 use crate::types::{
-    MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
+    orphan_key, KEY_PREFIX_ORPHAN, MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
     PERM_BIT_USER_EXEC, PERM_BIT_WRITE, PERM_TRIPLET_MASK,
 };
 
@@ -285,6 +285,7 @@ impl FsCore {
         } else if defer_final_delete {
             inode.nlink = 0;
             txn.set(inode_key(inode.ino), encode_rkyv(inode)?)?;
+            txn.set(orphan_key(inode.ino), Vec::new())?;
             Ok(false)
         } else {
             FsCore::remove_inode_payload_in_txn(txn, inode)?;
@@ -292,10 +293,12 @@ impl FsCore {
             Ok(true)
         }
     }
-    pub(crate) async fn cleanup_unlinked_inode_if_closed(&self, ino: u64) -> Result<()> {
+    /// Deletes an unlinked inode once no open handle and no kernel lookup
+    /// reference remains. The kernel may still send requests (such as a
+    /// timestamp SETATTR) for an inode until it forgets it.
+    pub(crate) async fn cleanup_unlinked_inode_if_unreferenced(&self, ino: u64) -> Result<()> {
         let _guard = self.write_lock.write().await;
-        // An unlinked file keeps its data until the last handle is released.
-        if self.open_file_count(ino) > 0 {
+        if self.inode_referenced(ino) {
             return Ok(());
         }
         self.meta
@@ -309,11 +312,43 @@ impl FsCore {
                 }
                 FsCore::remove_inode_payload_in_txn(txn, &inode)?;
                 txn.delete(inode_key(ino))?;
+                txn.delete(orphan_key(ino))?;
                 Ok(())
             })
             .await?;
         self.invalidate_inode_cache(ino);
         Ok(())
+    }
+    /// Deletes every indexed orphan; only valid while nothing is mounted.
+    pub(crate) async fn reclaim_orphans(meta: &MetaStore) -> Result<u64> {
+        let mut reclaimed = 0_u64;
+        meta.write_txn(|txn| {
+            let prefix = vec![KEY_PREFIX_ORPHAN];
+            let end = prefix_end(&prefix);
+            let keys = scan_range_pairs(txn, prefix, end)?
+                .map(|pair| pair.map(|(key, _)| key))
+                .collect::<Result<Vec<_>>>()?;
+            // Assigned, not accumulated: the transaction closure may be retried.
+            reclaimed = keys.len() as u64;
+            for key in keys {
+                let ino_bytes: [u8; 8] = key[1..]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("malformed orphan key {key:?}"))?;
+                let ino = u64::from_be_bytes(ino_bytes);
+                if let Some(raw) = txn.get(inode_key(ino))? {
+                    let inode: InodeRecord = decode_rkyv(&raw)?;
+                    if inode.nlink != 0 {
+                        anyhow::bail!("orphan index names inode {ino} with nlink {}", inode.nlink);
+                    }
+                    FsCore::remove_inode_payload_in_txn(txn, &inode)?;
+                    txn.delete(inode_key(ino))?;
+                }
+                txn.delete(key)?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(reclaimed)
     }
     pub(crate) fn is_dir_empty(txn: &verfsnext_surrealkv::Transaction, ino: u64) -> Result<bool> {
         let prefix = dirent_prefix(ino);

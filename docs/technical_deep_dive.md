@@ -40,7 +40,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
   - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate).
   - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals). It never scans metadata, unlike `stats`.
-- The daemon shuts down gracefully (final sync, unmount) on SIGINT and on SIGTERM.
+- The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final sync, unmount) on SIGINT and on SIGTERM.
 - Auto config discovery order when `--config/-c` is not provided:
   - `./config.toml`
   - `~/.config/verfsnext/config.toml`
@@ -244,6 +244,22 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
   - `SYS:vault.policy`
 - Inodes now carry `flags` with a read-only bit used for snapshot immutability.
   - Additional inode flags mark vault namespace and descendants.
+- Unlinked-inode lifetime follows the FUSE contract: an inode stays valid until the
+  kernel forgets it, not only until its last handle closes.
+  - `FsCore` counts kernel lookup references per inode: entry replies from `lookup`,
+    `create`, `mknod`, `mkdir`, `symlink` and `link` add one, and `FORGET`/`BATCH_FORGET`
+    subtract `nlookup`. READDIRPLUS is not negotiated, so it adds no references.
+  - Removing the last name of a regular file (unlink or rename-over) deletes it at once
+    only if no open handle and no kernel reference remains. Otherwise the inode is kept
+    with `nlink = 0`, and an orphan index key `O<ino>` is written in the same transaction.
+  - `release` and `forget` run the final delete (payload, inode and orphan key) under
+    the global write lock once both counts reach zero. A `FORGET` failure has no reply
+    and is logged.
+  - Before mounting, startup deletes every indexed orphan, because no kernel references
+    survive a restart. Orphans left by builds before B013 have no index key and are not
+    reclaimed.
+  - Without this, the kernel's post-unlink timestamp `SETATTR` (writeback cache) got
+    `ENOENT`, which it recorded as a writeback error that failed every later `syncfs`.
 
 ## Vault Data Path
 
@@ -333,13 +349,18 @@ Build completed successfully in this repository state.
 
 The OS-level harness in `scripts/resilience/` runs on a dedicated Proxmox LXC,
 with an external persistent supervisor, fsynced expected manifests, SHA-256 checks,
-concurrent readers, interrupted copies, daemon and container failures, snapshots,
-vault data, and idle GC windows. It freezes the test guest and preserves diagnostics
+concurrent readers, fsync-acknowledged POSIX mutations, interrupted copies, daemon
+and container failures, kills during GC pack rewrites, snapshot churn and recovery,
+snapshots, vault data, and idle GC windows. It freezes the test guest and preserves diagnostics
 on failure. See [Detached LXC resilience test](resilience-test.md) for its durability
 oracle, deployed resource limits, evidence, operating commands, and coverage limits.
 
-Normal mount shutdown retains the FUSE session while draining writes and syncing
-packs and metadata, then explicitly detaches the mount. Root uses `MNT_DETACH`,
+Normal mount shutdown first runs `syncfs` on the mount while requests are still
+served, so pages held by the kernel writeback cache reach the filesystem. It then
+closes the FUSE request gate and waits for admitted requests to finish; requests
+read after that are left unanswered and fail with `ECONNABORTED` when the daemon
+releases the device, never with `EIO` from a closed metadata store. Only then does
+it drain writes, sync packs and metadata, and explicitly detach the mount. Root uses `MNT_DETACH`,
 consistent with non-root `fusermount -uz`, so open descriptors do not leave a stale
 mount through `EBUSY`. Failures in signal handling, control-task completion, final
 sync or unmount propagate to the daemon's exit status. An explicitly attempted

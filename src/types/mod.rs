@@ -18,6 +18,8 @@ pub const KEY_PREFIX_CHUNK: u8 = b'C';
 pub const KEY_PREFIX_XATTR: u8 = b'X';
 pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
 pub const KEY_PREFIX_SNAPSHOT: u8 = b'S';
+/// Unlinked inode (`nlink == 0`) still referenced by the kernel or an open handle.
+pub const KEY_PREFIX_ORPHAN: u8 = b'O';
 
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
@@ -194,6 +196,13 @@ pub fn xattr_key(ino: u64, name: &[u8]) -> Vec<u8> {
 pub fn symlink_target_key(ino: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 8);
     key.push(KEY_PREFIX_SYMLINK);
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+pub fn orphan_key(ino: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 8);
+    key.push(KEY_PREFIX_ORPHAN);
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }
