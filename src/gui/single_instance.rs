@@ -4,16 +4,21 @@
 //! listens. A later launch connects, writes `activate\n` and exits; the
 //! primary turns that into [`Activation`] so the UI can show its window.
 //! A stale socket file left by a crash is detected (connect fails) and
-//! replaced.
+//! replaced. A primary running another executable (the app was rebuilt or
+//! updated while it ran) is terminated, and the new launch takes over.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 
 const ACTIVATE_MSG: &[u8] = b"activate\n";
+/// How long an outdated primary gets to exit after SIGTERM.
+const REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Delivered to the primary when another launch happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +64,9 @@ fn acquire_on(path: &Path) -> Result<AcquireOutcome> {
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to restrict {}", parent.display()))?;
 
-    if notify(path) {
+    if let Some(pid) = outdated_primary(path)? {
+        replace_primary(pid)?;
+    } else if notify(path) {
         return Ok(AcquireOutcome::Secondary);
     }
     // Only reached when nothing accepts connections: the file is stale.
@@ -87,6 +94,44 @@ fn acquire_on(path: &Path) -> Result<AcquireOutcome> {
         socket_path: path.to_path_buf(),
         rx,
     }))
+}
+
+/// PID of a live primary that runs another executable than this launch.
+fn outdated_primary(path: &Path) -> Result<Option<Pid>> {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(stream) = UnixStream::connect(path) else {
+        return Ok(None);
+    };
+    let cred = nix::sys::socket::getsockopt(
+        stream.as_raw_fd(),
+        nix::sys::socket::sockopt::PeerCredentials,
+    )
+    .context("failed to read the running app's process id")?;
+    if super::paths::runs_current_exe(cred.pid())? {
+        return Ok(None);
+    }
+    Ok(Some(Pid::from_raw(cred.pid())))
+}
+
+/// Terminates an outdated primary and waits for it to exit. The app holds no
+/// filesystem state: the filesystem runs in its own process, and the new
+/// instance restarts it when it is outdated too.
+fn replace_primary(pid: Pid) -> Result<()> {
+    tracing::info!(pid = pid.as_raw(), "replacing a running app that uses an outdated executable");
+    kill(pid, Signal::SIGTERM).context("failed to stop the outdated app")?;
+    let deadline = std::time::Instant::now() + REPLACE_TIMEOUT;
+    loop {
+        match kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Ok(()) => {}
+            Err(err) => return Err(err).context("failed to check the outdated app"),
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("the outdated VerFSNext app (pid {pid}) did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// True when a live primary accepted the activation message.

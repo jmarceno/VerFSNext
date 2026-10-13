@@ -60,3 +60,16 @@ pub fn app_runtime_dir() -> PathBuf {
 pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("failed to resolve the running executable")
 }
+
+/// Whether process `pid` runs the same executable file as this process.
+/// Compared by device and inode, so a binary rebuilt or updated in place
+/// (the old process then runs a deleted file) counts as different.
+pub fn runs_current_exe(pid: i32) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let other = std::fs::metadata(format!("/proc/{pid}/exe"))
+        .with_context(|| format!("failed to inspect the executable of process {pid}"))?;
+    let own = std::fs::metadata("/proc/self/exe")
+        .context("failed to inspect the running executable")?;
+    Ok(other.dev() == own.dev() && other.ino() == own.ino())
+}

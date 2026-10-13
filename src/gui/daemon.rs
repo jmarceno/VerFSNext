@@ -239,7 +239,7 @@ pub fn repair_mount(mount_point: &Path) -> Result<()> {
 /// control socket (i.e. it is mounted).
 pub fn start(config: &Config, config_path: &Path, child: &SharedChild) -> Result<()> {
     let socket = config.control_socket_path();
-    if socket_live(&socket) {
+    if socket_live(&socket) && !stop_outdated_daemon(config, child)? {
         return Ok(());
     }
     if mount_is_stale(&config.mount_point) {
@@ -287,6 +287,30 @@ pub fn start(config: &Config, config_path: &Path, child: &SharedChild) -> Result
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Stops a running filesystem whose executable is not this app's (the app
+/// was rebuilt or updated while it ran), so the folder is never left on old
+/// code. Returns whether it was stopped.
+fn stop_outdated_daemon(config: &Config, child: &SharedChild) -> Result<bool> {
+    let pid = daemon_pid(&config.control_socket_path())?;
+    if paths::runs_current_exe(pid.as_raw())? {
+        return Ok(false);
+    }
+    tracing::info!(pid = pid.as_raw(), "the running filesystem uses an outdated executable; restarting it");
+    if service_installed()? && service_main_pid()? == pid.as_raw() {
+        stop_service()?;
+    } else {
+        stop_app_mode(config, child)?;
+    }
+    Ok(true)
+}
+
+fn service_main_pid() -> Result<i32> {
+    let value = systemctl(&["show", "--property=MainPID", "--value", UNIT_NAME])?;
+    value
+        .parse()
+        .with_context(|| format!("unexpected MainPID {value:?} for {UNIT_NAME}"))
 }
 
 /// Stops the filesystem (blocks until the final sync is done).

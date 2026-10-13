@@ -596,3 +596,27 @@ No on-disk format change (the WAL bytes are identical, only buffered), so no mig
 - `crates/verfsnext-surrealkv/src/{lib.rs,lsm.rs,wal/mod.rs,wal/manager.rs,wal/writer.rs,wal/reader.rs}`
 - `src/write/batcher.rs`, `src/fs/write.rs`, `src/fs/fuse.rs`, `src/fs/chunk.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`
 - `src/meta/mod.rs`, `src/data/pack.rs`, `src/sync/mod.rs`
+
+## B017 - Launching an Updated App Kept the Old Filesystem Running - Oct 13 2026
+
+### Root Cause
+
+`daemon::start` (`src/gui/daemon.rs`) returned as soon as the control socket answered, without checking which executable served it. After a rebuild or update, opening the new app reattached to the daemon still running the old (deleted) binary, so the folder kept old code. B016's performance testing on the live mount ran against the pre-B016 daemon because of this. A second launch while an old app window was open only activated that window, which kept old code too (`src/gui/single_instance.rs`).
+
+### Fix
+
+- `paths::runs_current_exe` compares `/proc/<pid>/exe` with `/proc/self/exe` by device and inode.
+- `daemon::start` stops a running daemon whose executable differs and starts the current one. It uses `systemctl --user stop` when that daemon is the service's `MainPID`, otherwise the app-mode stop (child or control-socket peer, SIGINT). The stop includes the final sync.
+- Single instance: when the primary runs another executable, the new launch sends it SIGTERM, waits up to 15 s for it to exit and becomes the primary. The app holds no filesystem state, and the new instance then restarts an outdated daemon as above.
+
+### Compatibility and Validation
+
+No data or protocol change. On the live desktop with the user service:
+- Launching the new binary with only an outdated daemon running stopped it (final sync logged) and restarted the service on the current binary.
+- After rebuilding in place with both the app and the daemon outdated, launching the binary replaced the app, then the daemon (new service `MainPID`), and the mount stayed available.
+- Afterwards the live metadata consistency check was clean, every file on the mount (1.87 GiB) read back without errors, and the user's test files matched their sources.
+
+### Affected Files
+
+- `src/gui/daemon.rs`, `src/gui/paths.rs`, `src/gui/single_instance.rs`
+
