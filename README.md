@@ -120,10 +120,11 @@ contains VerFSNext's internal storage.
 Build without the desktop app to omit Qt, D-Bus, and tray dependencies:
 
 ```bash
-cargo build --release --no-default-features
+cargo build --profile headless --no-default-features
 ```
 
-Then follow the [terminal mount guide](#mount-quickstart-terminal) below.
+The headless binary is `./target/headless/verfsnext`; the desktop build stays in
+`./target/release/verfsnext`. Then follow the [terminal mount guide](#mount-quickstart-terminal) below.
 A bare headless binary mounts the filesystem; a bare GUI-enabled binary opens
 the desktop app. `verfsnext mount` explicitly chooses terminal mounting in
 either build.
@@ -145,7 +146,7 @@ either build.
    ```bash
    ./target/release/verfsnext mount
    ```
-   (A bare `./target/release/verfsnext` opens the desktop app instead, unless it was built with `--no-default-features`.)
+   (A bare `./target/release/verfsnext` opens the desktop app; a bare headless `./target/headless/verfsnext` mounts.)
    Config resolution order is:
    - `./config.toml`
    - `~/.config/verfsnext/config.toml`
@@ -279,7 +280,7 @@ Notes:
 
 This is the system-wide service (runs as user `verfs`, needs root to install). For a personal setup without root, use the desktop app's background user service instead.
 
-1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start). The installer builds the headless binary (`--no-default-features`), so the server needs no Qt:
+1. Install everything (build, binary, user, config, mount/data dirs, unit, enable/start). The installer builds the headless binary (`--profile headless --no-default-features`, into `target/headless/`), so the server needs no Qt:
    ```bash
    ./contrib/systemd/verfsnext-service.sh install
    ```

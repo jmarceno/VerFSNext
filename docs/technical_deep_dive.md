@@ -33,7 +33,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext --config <path> ...`
   - `verfsnext -c <path> ...`
 - Entry points (see "Desktop App"):
-  - bare `verfsnext` opens the desktop app (builds with the default `gui` feature); a headless build (`--no-default-features`) mounts instead
+  - bare `verfsnext` opens the desktop app (builds with the default `gui` feature); a headless build (`--profile headless --no-default-features`, output in `target/headless/`) mounts instead
   - `verfsnext mount` mounts with config discovery; `verfsnext --config <path>` (no command) mounts with that file
 - The crate is a library (`src/lib.rs`, `verfsnext::run`) plus a thin `src/main.rs`. cxx-qt links its generated C++ objects into every target of the package, so the Qt bridge must live in a library that all targets (including `tests/`) link.
 - Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
@@ -217,7 +217,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 
 ## Desktop App
 
-Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni`); `--no-default-features` builds the headless daemon/CLI without Qt, D-Bus or tray libraries (the systemd installer does this). The UI follows the shared design of the other desktop apps (GravaAI, Lepramim, Celestial): same palette (`qml/VerfsTheme.qml`), flat `qml/` directory, every QML file listed in `build.rs`, Basic Quick Controls style, software rendering by default, QML written for Qt 6.2.
+Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni`); `--profile headless --no-default-features` builds the headless daemon/CLI into `target/headless/` (never overwriting the desktop binary in `target/release/`) without Qt, D-Bus or tray libraries (the systemd installer does this). The UI follows the shared design of the other desktop apps (GravaAI, Lepramim, Celestial): same palette (`qml/VerfsTheme.qml`), flat `qml/` directory, every QML file listed in `build.rs`, Basic Quick Controls style, software rendering by default, QML written for Qt 6.2.
 
 - `src/gui/mod.rs` — startup: single instance (`$XDG_RUNTIME_DIR/verfsnext/app.sock`; a second launch shows the open window), waits up to 120 s for a StatusNotifier tray host, owns a 2-thread tokio runtime for control-socket requests, loads `qml/Main.qml`, QML-load watchdog.
 - `src/gui/controller.rs` — the `AppController` QObject. Invokables run on the Qt GUI thread and never block: every process spawn, socket request, metadata scan and directory listing runs on a worker thread and comes back as an `Event` drained by `tick()` (100 ms QML timer). One user-visible operation (start/stop/restart/snapshot/vault/mode switch/folder change) runs at a time (`busy`).

@@ -13,7 +13,7 @@ BIN_DST="/usr/local/bin/verfsnext"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 UNIT_SRC="$SCRIPT_DIR/verfsnext.service"
-BIN_SRC="$REPO_ROOT/target/release/verfsnext"
+BIN_SRC="$REPO_ROOT/target/headless/verfsnext"
 
 if [[ -f "$REPO_ROOT/config.toml" ]]; then
   CONFIG_SRC="$REPO_ROOT/config.toml"
@@ -103,7 +103,7 @@ toml_path_value() {
 
 build_binary() {
   echo "Building release binary (headless: no desktop app, no Qt needed)..."
-  run_cmd cargo build --release --no-default-features --manifest-path "$REPO_ROOT/Cargo.toml"
+  run_cmd cargo build --profile headless --no-default-features --manifest-path "$REPO_ROOT/Cargo.toml"
   if [[ $DRY_RUN -eq 0 && ! -x "$BIN_SRC" ]]; then
     echo "build did not produce $BIN_SRC" >&2
     exit 1

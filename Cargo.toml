@@ -88,3 +88,9 @@ debug = false
 
 [profile.dev.package."*"]
 debug = false
+
+# Headless builds (`--profile headless --no-default-features`) land in
+# `target/headless/`, so they never overwrite the desktop binary in
+# `target/release/`.
+[profile.headless]
+inherits = "release"
