@@ -156,7 +156,11 @@ impl CoreInner {
         // This avoids creating intermediate empty WAL files
         let wal_path = opts.wal_dir();
         let wal_instance =
-            Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+            Wal::open_with_min_log_number(
+            &wal_path,
+            manifest_log_number,
+            wal::Options::default().with_durability_barrier(opts.durability_barrier.clone()),
+        )?;
 
         // Starts at 0 since no commits have happened yet.
         let visible_seq_num = Arc::new(AtomicU64::new(0));
@@ -1862,7 +1866,8 @@ impl Tree {
             let new_wal = Wal::open_with_min_log_number(
                 &wal_path,
                 manifest_log_number,
-                wal::Options::default(),
+                wal::Options::default()
+                    .with_durability_barrier(self.core.inner.opts.durability_barrier.clone()),
             )?;
             *wal_guard = new_wal;
         }
@@ -1951,6 +1956,14 @@ impl Tree {
     /// This is safe to call concurrently with ongoing transactions.
     pub fn flush_wal(&self, sync: bool) -> Result<()> {
         self.core.flush_wal(sync)
+    }
+
+    /// Hands buffered WAL records whose external data is already durable to
+    /// the OS cache, without running the durability barrier. Records still
+    /// waiting on the barrier stay buffered.
+    pub fn write_durable_wal_prefix(&self) -> Result<()> {
+        self.core.inner.wal.write().write_durable_prefix()?;
+        Ok(())
     }
 }
 
@@ -2137,6 +2150,13 @@ impl TreeBuilder {
     /// Controls whether to flush the active memtable during database shutdown.
     pub fn with_flush_on_close(mut self, value: bool) -> Self {
         self.opts = self.opts.with_flush_on_close(value);
+        self
+    }
+
+    /// Orders WAL records after the external data they reference. See
+    /// [`wal::DurabilityBarrier`].
+    pub fn with_durability_barrier(mut self, barrier: Arc<dyn wal::DurabilityBarrier>) -> Self {
+        self.opts = self.opts.with_durability_barrier(barrier);
         self
     }
 

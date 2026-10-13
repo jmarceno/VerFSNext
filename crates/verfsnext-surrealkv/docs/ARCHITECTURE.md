@@ -358,6 +358,22 @@ SurrealKV offers two durability levels:
 - **Eventual** (default): Data is written to the OS buffer cache but not fsynced. This is fast but data may be lost if the system crashes before the OS flushes to disk.
 - **Immediate**: Each commit calls fsync before returning. This guarantees durability but reduces throughput.
 
+**Durability Barrier (VerFSNext Vendor)**
+
+`Options::durability_barrier` (`TreeBuilder::with_durability_barrier`) takes an `Arc<dyn DurabilityBarrier>` that orders WAL records after external data they reference. VerFSNext uses it so metadata never becomes durable before the pack data it points at. The trait has three methods:
+- `watermark()`: position of the newest external write.
+- `durable()`: highest position known durable.
+- `make_durable(w)`: makes everything up to `w` durable.
+
+With a barrier set:
+- WAL writers run in manual-flush mode with a 4 MiB in-process buffer (`BufferedFileWriter`, `BARRIER_BUFFER_SIZE`). Records are not handed to the OS on commit.
+- Every logical record is tagged with `watermark()` when it is added (`BufferedFileWriter::end_record`).
+- `Tree::write_durable_wal_prefix` writes the longest run of buffered records whose tag is `<= durable()`, without calling the barrier.
+- A full flush (`flush_wal`, `sync`, rotation, close, full buffer) calls `make_durable` for the newest buffered tag (or the current watermark for a trailing partial record) before writing. It does so under the WAL lock.
+- Memtable rotation syncs the WAL first, so SSTables never contain entries that bypassed the barrier.
+
+Without a barrier, behavior is unchanged: every record is handed to the OS as it is added. Committed records in the buffer are lost if the process dies before they are handed off; the caller bounds that window by calling `write_durable_wal_prefix` periodically.
+
 **Sequence Numbers**
 
 Every entry receives a monotonically increasing 56-bit sequence number (the upper 56 bits of the 64-bit trailer). Sequence numbers serve multiple purposes:

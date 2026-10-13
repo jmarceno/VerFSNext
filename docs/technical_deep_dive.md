@@ -76,7 +76,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - global mutation gate is now an async `RwLock`:
     - write-side lock for namespace/global metadata mutations (rename/unlink/rmdir/link/xattr/vault/snapshot)
     - read-side lock for file-content writes/truncates so unrelated inode writes can continue concurrently
-  - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`)
+  - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`); the map itself and the POSIX lock table are `parking_lot` mutexes because their critical sections are single map operations
+  - blocking disk work never runs inline on a tokio worker: chunk payload reads on a cache miss (pack read plus decompression), the sync cycle's pack/WAL syncs and GC pack rewrites run under `block_in_place`, and the WAL hand-off pack sync runs in `spawn_blocking`
   - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
   - read path resolves chunk location through pack-local hash index
   - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
@@ -104,10 +105,11 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - session-level FUSE invalidation notifier is installed at mount and used for best-effort post-commit invalidation dispatch
 
 - `src/fs/write.rs`
-  - `apply_batch` coalesces adjacent writes, then splits the groups into rounds in which every inode appears at most once (per-inode order preserved); each round is staged into one SurrealKV transaction and committed before the next round starts
-  - every read a write plan depends on (inode, old extents, dedup check) goes through the batch transaction; whatever the plan depends on is either in the transaction snapshot or rewritten by it (inode key, touched extents, chunk refcounts), so concurrent changes surface as commit conflicts, after which the round is re-planned and retried
+  - `apply_batch` folds all writes of one inode into a single `WriteGroup` of sorted, disjoint, non-adjacent byte ranges, in arrival order (a later write wins where writes overlap); writeback writes that arrive out of order or with gaps therefore still share one group. All groups of a batch are staged into one SurrealKV transaction and committed together
+  - a block fully covered by one range is hashed straight from the write data; the old block is only read (and decompressed) for partially covered blocks
+  - every read a write plan depends on (inode, old extents, dedup check) goes through the batch transaction; whatever the plan depends on is either in the transaction snapshot or rewritten by it (inode key, touched extents, chunk refcounts), so concurrent changes surface as commit conflicts, after which the batch is re-planned and retried
   - a group that fails to stage is reported failed and the remaining groups are re-staged on a fresh transaction; a write is acknowledged only after the transaction containing it commits
-  - packs are synced before every metadata commit; a sync failure fails the batch
+  - commits do not sync packs; crash ordering between pack data and metadata is enforced by the WAL durability barrier (see "Write Durability and Ordering")
   - truncate stages inode, extent deletions, boundary chunk and refcount deltas in one transaction with the same retry loop
 - `src/meta/mod.rs`
   - `write_txn` takes an `FnMut` closure and re-runs it on a fresh transaction when the commit fails with `TransactionWriteConflict` or `TransactionRetry` (up to `MAX_COMMIT_ATTEMPTS`); closures must derive all writes from reads through `txn` and have no other side effects
@@ -117,7 +119,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - queue ingestion no longer blocks on `sink.apply_batch`
   - ingestion flushes pending ops into an internal apply queue and immediately resumes receiving FUSE writes
   - apply worker preserves batch order, applies each batch, and resolves per-write completion channels
-  - `drain` and `shutdown` are implemented as ordered barriers in the apply queue
+  - group commit: before applying, the apply worker merges every batch already queued (up to `batch_max_size_mb`) into one `apply_batch` call, so writes that arrived during the previous commit share the next one
+  - `drain` and `shutdown` are implemented as ordered barriers in the apply queue; a control message ends a merged group and runs right after it
+  - FUSE `read` drains the batcher only when fire-and-forget writes are pending (the same check as `flush`/`fsync`/`release`); every write is acknowledged after its commit, so an unconditional drain only stalled reads behind unrelated commits
 
 - `crates/verfsnext-async-fusex/src/fuse_fs.rs`
   - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
@@ -125,6 +129,9 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - entry responses now carry separate entry TTL and attr TTL values end-to-end
 
 - `crates/verfsnext-async-fusex/src/session.rs`
+  - the two device reader threads read requests and spawn each one as its own tokio task, so a write waiting on its commit never blocks lookups, getattrs, readdirs or reads queued behind it (previously each reader `block_on`-ed its request, so two slow writes stalled every other request, e.g. a file manager's UI)
+  - `max_background` is 32 (congestion threshold 24): up to 32 writeback writes are in flight and can join one group commit; the request buffer pool holds 16 more buffers than that so foreground requests always find one
+  - each in-flight request holds an owned admission on the request gate; shutdown waits until every spawned request has replied
   - exposes `Session::notifier()` returning a cloneable session notifier handle
   - notifier supports kernel invalidations for inode attrs and directory entries (`invalidate_inode`, `invalidate_entry`)
   - notify writes are serialized through a mutex-protected FUSE device clone and use FUSE notify message framing with `unique = 0`
@@ -179,6 +186,24 @@ The repository now includes a Phase 5 implementation on top of the existing full
     - updates chunk metadata `pack_id` mappings
     - resets GC discard cursor/phase and truncates discard file
     - moves old pack/index files into a backup directory for manual cleanup
+
+## Write Durability and Ordering
+
+Pack data must reach the disk before any metadata that points at it, or a power loss could leave extents referencing chunks that are not on disk. Before B016 this was enforced by an `fdatasync` of the active pack and its index before every write commit. On a rotational disk that cost 100-170 ms per commit and capped writes at about 4 MB/s.
+
+The ordering now lives in the metadata WAL, similar to ext4 `data=ordered`:
+
+- `MetaStore::open_with_pack_barrier` installs a `PackBarrier` as the SurrealKV durability barrier. The pack store counts appended records (`append_watermark`); a sync records the highest count it covered (`durable_watermark`).
+- The WAL keeps committed records in the process and tags each with the append watermark at commit time. Records reach the OS only once the pack data up to their watermark is durable.
+- The hand-off task (`SyncService`, every 250 ms) syncs the packs from `spawn_blocking` (skipped when nothing new was appended) and then hands the durable prefix of the WAL buffer to the OS. It never syncs while holding the WAL lock, so commits do not wait on the disk.
+- A full WAL buffer (4 MiB), WAL rotation, `flush_wal` (sync cycle, GC rewrite) and `fsync` hand everything off after an inline pack sync if needed.
+- `fsync` still runs a full sync cycle (packs `sync_all`, then WAL `sync_all`), so fsynced data is durable on return.
+
+Crash behavior:
+- Power loss: the WAL on disk never references pack data that is not on disk. Un-fsynced work since the last durable WAL write may be lost, as before (the periodic sync cycle never fsynced the WAL).
+- Daemon crash (SIGKILL, panic): commits not yet handed off are lost. This is at most about 250 ms plus the duration of one pack sync. Before B016 each commit was handed to the OS immediately. Data still dirty in the kernel's FUSE page cache is lost on a daemon crash either way.
+
+`PackStore::sync` holds the active-pack mutex only to flush buffered index entries and duplicate the file handles; the `fdatasync` runs on the duplicates, so appends and reads continue during it.
 
 ## Config
 

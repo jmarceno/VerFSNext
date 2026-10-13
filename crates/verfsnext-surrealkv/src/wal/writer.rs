@@ -111,6 +111,8 @@ impl Writer {
             begin = false;
         }
 
+        self.dest.end_record();
+
         // Flush if not in manual mode
         if !self.manual_flush {
             self.write_buffer()?;
@@ -154,6 +156,11 @@ impl Writer {
     /// For durability, call sync() explicitly when needed.
     pub fn write_buffer(&mut self) -> Result<()> {
         self.dest.flush() // Fast: OS cache only, no fsync
+    }
+
+    /// Hands buffered records whose external data is durable to the OS.
+    pub fn write_durable_prefix(&mut self) -> Result<()> {
+        self.dest.write_durable_prefix()
     }
 
     /// Syncs data to disk (slow, durable).
@@ -244,7 +251,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
 
         let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
@@ -263,7 +270,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
 
         let mut writer = Writer::new(buffered_writer, true, CompressionType::None, 0);
 
@@ -281,7 +288,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
 
         let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 

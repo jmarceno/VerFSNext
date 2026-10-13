@@ -38,6 +38,7 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
+pub use crate::wal::DurabilityBarrier;
 pub use crate::transaction::{
     Durability, HistoryOptions, MergeMissingBehavior, MergeOp, Mode, PutIfAbsentResult,
     ReadOptions, Transaction, WriteOptions,
@@ -267,6 +268,10 @@ pub struct Options {
     /// Remaining levels use leveled compaction.
     /// Default: 1 (only L0 is tiered-style)
     pub compaction_tiered_levels: u8,
+
+    /// Orders WAL records after the external data they reference; records are
+    /// buffered in the process until then. See [`wal::DurabilityBarrier`].
+    pub durability_barrier: Option<Arc<dyn wal::DurabilityBarrier>>,
 }
 
 impl Default for Options {
@@ -308,6 +313,7 @@ impl Default for Options {
             max_bytes_for_level: 256 * 1024 * 1024, // 256MB
             level_multiplier: 10.0,
             compaction_tiered_levels: 1,
+            durability_barrier: None,
         }
     }
 }
@@ -315,6 +321,11 @@ impl Default for Options {
 impl Options {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_durability_barrier(mut self, barrier: Arc<dyn wal::DurabilityBarrier>) -> Self {
+        self.durability_barrier = Some(barrier);
+        self
     }
 
     pub const fn with_block_size(mut self, value: usize) -> Self {

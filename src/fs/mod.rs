@@ -201,7 +201,7 @@ pub struct VerFs {
 struct FsCore {
     config: Config,
     meta: MetaStore,
-    packs: PackStore,
+    packs: Arc<PackStore>,
     chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
     chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
@@ -223,10 +223,10 @@ struct FsCore {
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
     write_lock: AsyncRwLock<()>,
-    inode_write_locks: Mutex<HashMap<u64, Weak<Mutex<()>>>>,
+    inode_write_locks: ParkingMutex<HashMap<u64, Weak<Mutex<()>>>>,
     inode_data_versions: ParkingMutex<HashMap<u64, u64>>,
     gc_lock: Mutex<()>,
-    file_locks: Mutex<HashMap<u64, Vec<FileLockState>>>,
+    file_locks: ParkingMutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: ParkingMutex<HashMap<u64, DirHandleState>>,
     file_handles: ParkingMutex<HashMap<u64, FileHandleState>>,
     file_read_plan_cache: Cache<u64, Arc<SmallFileReadPlan>>,
@@ -245,7 +245,10 @@ impl VerFs {
         config.ensure_dirs()?;
         normalize_data_tree(&config.data_dir)?;
 
-        let meta = MetaStore::open(&config.metadata_dir()).await?;
+        let pack_barrier = Arc::new(std::sync::OnceLock::new());
+        let meta =
+            MetaStore::open_with_pack_barrier(&config.metadata_dir(), Arc::clone(&pack_barrier))
+                .await?;
         ensure_pack_index_crc32_compat(&config, &meta).await?;
         if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {
             error!(
@@ -265,6 +268,10 @@ impl VerFs {
             config.pack_max_size_mb.saturating_mul(1024 * 1024),
         )?;
         packs.verify_pack_headers(packs.active_pack_id())?;
+        let packs = Arc::new(packs);
+        if pack_barrier.set(Arc::clone(&packs)).is_err() {
+            unreachable!("pack barrier is filled once, right after the pack store opens");
+        }
         let vault_initialized = meta
             .get_sys(SYS_VAULT_WRAP)?
             .map(|raw| !raw.is_empty())
@@ -322,10 +329,10 @@ impl VerFs {
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
             write_lock: AsyncRwLock::new(()),
-            inode_write_locks: Mutex::new(HashMap::new()),
+            inode_write_locks: ParkingMutex::new(HashMap::new()),
             inode_data_versions: ParkingMutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
-            file_locks: Mutex::new(HashMap::new()),
+            file_locks: ParkingMutex::new(HashMap::new()),
             dir_handles: ParkingMutex::new(HashMap::new()),
             file_handles: ParkingMutex::new(HashMap::new()),
             file_read_plan_cache: Cache::builder()
@@ -547,8 +554,8 @@ impl FsCore {
         self.dirent_cache.invalidate_all();
     }
 
-    async fn inode_write_lock(&self, ino: u64) -> Arc<Mutex<()>> {
-        let mut locks = self.inode_write_locks.lock().await;
+    fn inode_write_lock(&self, ino: u64) -> Arc<Mutex<()>> {
+        let mut locks = self.inode_write_locks.lock();
         if let Some(lock) = locks.get(&ino).and_then(Weak::upgrade) {
             return lock;
         }
@@ -1081,15 +1088,24 @@ impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
         self.persist_active_pack_id_if_needed().await?;
         self.persist_pack_crc32_read_error_count_if_needed().await?;
-        if full {
-            self.packs.sync(true)?;
-            self.meta.flush_wal(true)?;
-        } else {
-            self.packs.sync(false)?;
-            self.meta.flush_wal(false)?;
+        // Packs first, so the WAL barrier inside flush_wal has nothing left
+        // to sync while it holds the WAL lock. Both block on the disk.
+        tokio::task::block_in_place(|| {
+            self.packs.sync(full)?;
+            self.meta.flush_wal(full)
+        })?;
+        if !full {
             self.maybe_run_gc().await?;
         }
         Ok(())
+    }
+
+    async fn hand_off_wal(&self) -> Result<()> {
+        let packs = Arc::clone(&self.packs);
+        tokio::task::spawn_blocking(move || packs.sync_to(packs.append_watermark()))
+            .await
+            .map_err(|err| anyhow!("pack sync task failed: {err}"))??;
+        self.meta.write_durable_wal_prefix()
     }
 }
 
@@ -1114,7 +1130,7 @@ mod tests {
         path
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn bench_overwrite_performance() -> anyhow::Result<()> {
         let root = temp_dir_manual();
         let data_dir = root.join("data");

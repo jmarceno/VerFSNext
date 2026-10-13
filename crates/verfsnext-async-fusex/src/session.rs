@@ -64,9 +64,17 @@ const MIN_MAX_WRITE_BYTES: u32 = 4 * 1024;
 const MAX_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 /// Default max write if caller does not provide a session config.
 const DEFAULT_MAX_WRITE_BYTES: u32 = 1024 * 1024;
-/// Max background pending requests under processing, at least to be 4,
-/// otherwise deadlock
-const MAX_BACKGROUND: u16 = 10; // TODO: set to larger value when release
+/// Max background requests (writeback writes, readahead) the kernel keeps in
+/// flight. Every in-flight writeback write can join the same metadata commit,
+/// so this bounds how much data one commit and its pack sync can cover.
+const MAX_BACKGROUND: u16 = 32;
+/// Kernel marks the mount congested once this many background requests queue.
+const CONGESTION_THRESHOLD: u16 = 24;
+/// Request buffers. Requests run concurrently and each holds its buffer until
+/// it replies, so the pool exceeds `MAX_BACKGROUND`: foreground requests
+/// (lookup, getattr, readdir) always find a buffer while every background slot
+/// is waiting on a write commit.
+const REQUEST_BUFFER_COUNT: usize = MAX_BACKGROUND as usize + 16;
 /// The max number of FUSE device reader threads.
 const MAX_FUSE_READER: usize = 2; // TODO: make it custom
 
@@ -254,16 +262,16 @@ struct GateState {
 }
 
 /// Marks one admitted request; dropping it (also while unwinding) releases the gate.
-struct Admission<'a>(&'a RequestGate);
+struct Admission(Arc<RequestGate>);
 
 impl RequestGate {
-    fn admit(&self) -> Option<Admission<'_>> {
+    fn admit(self: &Arc<Self>) -> Option<Admission> {
         let mut state = self.state.lock().expect("FUSE request gate lock poisoned");
         if state.closed {
             return None;
         }
         state.in_flight += 1;
-        Some(Admission(self))
+        Some(Admission(Arc::clone(self)))
     }
 
     fn close_and_drain(&self) {
@@ -278,7 +286,7 @@ impl RequestGate {
     }
 }
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().expect("FUSE request gate lock poisoned");
         state.in_flight -= 1;
@@ -350,20 +358,18 @@ fn fuse_device_reader(
             }
         };
 
-        let Some(_admission) = gate.admit() else {
+        let Some(admission) = gate.admit() else {
             info!("FUSE session is shutting down; request left for the kernel to abort");
             return;
         };
-        runtime_handle.block_on(async {
-            process_fuse_request(
-                buffer,
-                size,
-                file,
-                Arc::clone(&fs),
-                buffer_tx.clone(),
-                proto_version,
-            )
-            .await
+        // Requests run as independent tasks so a write waiting on its commit
+        // never holds up lookups, getattrs or reads queued behind it, and
+        // concurrent writeback writes reach the batcher together.
+        let fs = Arc::clone(&fs);
+        let buffer_tx = buffer_tx.clone();
+        runtime_handle.spawn(async move {
+            let _admission = admission;
+            process_fuse_request(buffer, size, file, fs, buffer_tx, proto_version).await;
         });
     }
 }
@@ -576,9 +582,9 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
         let page_size = system_page_size();
 
         let (pool_sender, pool_receiver) =
-            crossbeam_channel::bounded::<(File, AlignedBytes)>(MAX_BACKGROUND.into());
+            crossbeam_channel::bounded::<(File, AlignedBytes)>(REQUEST_BUFFER_COUNT);
 
-        for _ in 0..MAX_BACKGROUND {
+        for _ in 0..REQUEST_BUFFER_COUNT {
             let buf = AlignedBytes::new_zeroed(buffer_size.cast(), page_size);
             let session_fd = self.dev_fd();
 
@@ -660,7 +666,7 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
         #[cfg(not(feature = "abi-7-13"))]
         let unused = 0_u32;
         #[cfg(feature = "abi-7-13")]
-        let congestion_threshold = 10_u16; // TODO: set congestion threshold
+        let congestion_threshold = CONGESTION_THRESHOLD;
         #[cfg(feature = "abi-7-23")]
         let time_gran = 1_u32; // TODO: set time_gran
         #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]

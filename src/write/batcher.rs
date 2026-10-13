@@ -72,10 +72,35 @@ impl WriteBatcher {
         let apply_sink = Arc::clone(&sink);
         let apply_handle = tokio::spawn(async move {
             let mut pending_error: Option<anyhow::Error> = None;
+            let mut deferred: Option<ApplyMessage> = None;
 
-            while let Some(msg) = apply_rx.recv().await {
+            loop {
+                let msg = match deferred.take() {
+                    Some(msg) => msg,
+                    None => match apply_rx.recv().await {
+                        Some(msg) => msg,
+                        None => break,
+                    },
+                };
                 match msg {
-                    ApplyMessage::Batch(batch) => {
+                    ApplyMessage::Batch(mut batch) => {
+                        // Group commit: writes that queued up while the previous
+                        // commit was running share this commit and its pack sync.
+                        // A control message ends the group and runs right after it.
+                        let mut batch_bytes = batch.iter().map(|entry| entry.bytes).sum::<usize>();
+                        while batch_bytes < max_size_bytes {
+                            match apply_rx.try_recv() {
+                                Ok(ApplyMessage::Batch(more)) => {
+                                    batch_bytes += more.iter().map(|entry| entry.bytes).sum::<usize>();
+                                    batch.extend(more);
+                                }
+                                Ok(other) => {
+                                    deferred = Some(other);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         apply_queued_batch(&apply_sink, batch, &mut pending_error).await;
                     }
                     ApplyMessage::Drain(done_tx) => {

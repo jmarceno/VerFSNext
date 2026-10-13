@@ -112,8 +112,9 @@ impl FsCore {
         };
         // A copy is accepted only if it authenticates with the record's nonce
         // (vault) and decompresses to the recorded length, which is how the
-        // pack store tells duplicate copies of one hash apart.
-        let payload = self.packs.read_chunk_with(
+        // pack store tells duplicate copies of one hash apart. The pack read
+        // and decompression block, so they run off the async workers.
+        let payload = tokio::task::block_in_place(|| self.packs.read_chunk_with(
             chunk.pack_id,
             extent.chunk_hash,
             chunk.codec,
@@ -142,7 +143,7 @@ impl FsCore {
                     ),
                 }
             },
-        )?;
+        ))?;
         let payload = Arc::new(payload);
         self.chunk_data_cache
             .insert(extent.chunk_hash, Arc::clone(&payload));

@@ -456,10 +456,14 @@ impl FsCore {
     /// (unlinks, truncates, the scan-phase deletes) is made durable first:
     /// otherwise a power loss could roll metadata back to a state that still
     /// references chunks the rewritten pack no longer holds.
+    ///
+    /// Copying a pack is long disk work, so it runs off the async workers.
     fn rewrite_pack_durably(&self, pack_id: u64) -> Result<()> {
-        self.meta.flush_wal(true)?;
-        let live_hashes = self.live_hashes_for_pack(pack_id)?;
-        self.packs.rewrite_pack_with_live_hashes(pack_id, &live_hashes)
+        tokio::task::block_in_place(|| {
+            self.meta.flush_wal(true)?;
+            let live_hashes = self.live_hashes_for_pack(pack_id)?;
+            self.packs.rewrite_pack_with_live_hashes(pack_id, &live_hashes)
+        })
     }
     pub(crate) async fn switch_to_scan_phase(&self) -> Result<()> {
         self.meta

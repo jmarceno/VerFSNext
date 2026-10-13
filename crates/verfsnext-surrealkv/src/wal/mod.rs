@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{self, read_dir, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
@@ -161,7 +161,34 @@ pub struct Options {
 
     /// The maximum size of the segment file.
     pub(crate) max_file_size: u64,
+
+    /// Called before buffered records are handed to the OS. See
+    /// [`DurabilityBarrier`].
+    pub(crate) durability_barrier: Option<std::sync::Arc<dyn DurabilityBarrier>>,
 }
+
+/// Orders WAL records after external data they may reference (for example
+/// file contents stored outside the tree). With a barrier, records stay
+/// buffered in the process and reach the OS only once the external data
+/// written before them is durable, so after a power loss the WAL never names
+/// data that is missing from disk.
+///
+/// The external store numbers its writes with a monotonic watermark. Each
+/// record is tagged with the watermark at the time it is added, which covers
+/// everything the record can reference.
+pub trait DurabilityBarrier: Send + Sync {
+    /// Watermark of the newest external write.
+    fn watermark(&self) -> u64;
+    /// Highest watermark known to be durable.
+    fn durable(&self) -> u64;
+    /// Makes all external writes up to `watermark` durable.
+    fn make_durable(&self, watermark: u64) -> io::Result<()>;
+}
+
+/// WAL buffer size when a durability barrier is set. Records normally leave
+/// the buffer through [`Wal::write_durable_prefix`](manager::Wal) calls; a
+/// full buffer is flushed after an inline barrier.
+pub(crate) const BARRIER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 impl Default for Options {
     fn default() -> Self {
@@ -171,6 +198,7 @@ impl Default for Options {
             compression_type: CompressionType::None,
             file_extension: Some("wal".to_string()),
             max_file_size: DEFAULT_FILE_SIZE,
+            durability_barrier: None,
         }
     }
 }
@@ -206,6 +234,15 @@ impl Options {
     #[allow(unused)]
     pub(crate) fn with_extension(mut self, extension: String) -> Self {
         self.file_extension = Some(extension);
+        self
+    }
+
+    /// Sets the durability barrier.
+    pub(crate) fn with_durability_barrier(
+        mut self,
+        barrier: Option<std::sync::Arc<dyn DurabilityBarrier>>,
+    ) -> Self {
+        self.durability_barrier = barrier;
         self
     }
 }
@@ -517,31 +554,100 @@ pub trait WritableFile: Send {
     fn close(&mut self) -> Result<()>;
 }
 
-/// Buffered file writer wrapping BufWriter<File>.
+/// Buffered WAL file writer. With a durability barrier, buffered bytes reach
+/// the file only once the external data their records may reference is
+/// durable.
 pub struct BufferedFileWriter {
-    writer: BufWriter<File>,
+    file: File,
+    buffer: Vec<u8>,
+    buffer_size: usize,
+    barrier: Option<std::sync::Arc<dyn DurabilityBarrier>>,
+    /// Buffer length at the end of each buffered record, with the watermark
+    /// that record may reference. Both are non-decreasing.
+    record_ends: Vec<(usize, u64)>,
     pending_sync: bool,
 }
 
 impl BufferedFileWriter {
     /// Creates a new BufferedFileWriter with the specified buffer size.
-    pub fn new(file: File, buffer_size: usize) -> Self {
+    pub fn new(
+        file: File,
+        buffer_size: usize,
+        barrier: Option<std::sync::Arc<dyn DurabilityBarrier>>,
+    ) -> Self {
         Self {
-            writer: BufWriter::with_capacity(buffer_size, file),
+            file,
+            buffer: Vec::with_capacity(buffer_size),
+            buffer_size,
+            barrier,
+            record_ends: Vec::new(),
             pending_sync: false,
         }
+    }
+
+    /// Marks the end of a logical record and tags it with the current
+    /// watermark.
+    pub fn end_record(&mut self) {
+        if let Some(barrier) = &self.barrier {
+            self.record_ends
+                .push((self.buffer.len(), barrier.watermark()));
+        }
+    }
+
+    /// Hands the longest run of buffered records whose external data is
+    /// already durable to the OS. Never waits for the barrier.
+    pub fn write_durable_prefix(&mut self) -> Result<()> {
+        let Some(barrier) = &self.barrier else {
+            return self.flush();
+        };
+        let durable = barrier.durable();
+        let ready = self
+            .record_ends
+            .iter()
+            .take_while(|(_, watermark)| *watermark <= durable)
+            .count();
+        if ready == 0 {
+            return Ok(());
+        }
+        let end = self.record_ends[ready - 1].0;
+        self.file.write_all(&self.buffer[..end])?;
+        self.buffer.drain(..end);
+        self.record_ends.drain(..ready);
+        for (record_end, _) in &mut self.record_ends {
+            *record_end -= end;
+        }
+        Ok(())
     }
 }
 
 impl WritableFile for BufferedFileWriter {
     fn append(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data)?;
+        self.buffer.extend_from_slice(data);
         self.pending_sync = true;
+        if self.buffer.len() >= self.buffer_size {
+            self.flush()?;
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(barrier) = &self.barrier {
+            // A trailing partial record has no tag yet; the current watermark
+            // covers it.
+            let required = match self.record_ends.last() {
+                Some((end, watermark)) if *end == self.buffer.len() => *watermark,
+                _ => barrier.watermark(),
+            };
+            if barrier.durable() < required {
+                barrier.make_durable(required)?;
+            }
+        }
+        self.file.write_all(&self.buffer)?;
+        self.buffer.clear();
+        self.record_ends.clear();
         Ok(())
     }
 
@@ -549,8 +655,8 @@ impl WritableFile for BufferedFileWriter {
         if !self.pending_sync {
             return Ok(());
         }
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.flush()?;
+        self.file.sync_all()?;
         self.pending_sync = false;
         Ok(())
     }

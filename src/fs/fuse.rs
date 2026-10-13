@@ -75,7 +75,7 @@ impl VirtualFs for VerFs {
         param: SetAttrParam,
     ) -> AsyncFusexResult<(Duration, FileAttr)> {
         let _mutation_guard = self.core.write_lock.read().await;
-        let inode_lock = self.core.inode_write_lock(ino).await;
+        let inode_lock = self.core.inode_write_lock(ino);
         let _inode_guard = inode_lock.lock().await;
         let mut inode = if let Some(size) = param.size {
             let inode = self
@@ -697,7 +697,7 @@ impl VirtualFs for VerFs {
         let oflags = OFlag::from_bits_truncate(flags as i32);
         if oflags.contains(OFlag::O_TRUNC) {
             let _mutation_guard = self.core.write_lock.read().await;
-            let inode_lock = self.core.inode_write_lock(ino).await;
+            let inode_lock = self.core.inode_write_lock(ino);
             let _inode_guard = inode_lock.lock().await;
             let _truncated = self
                 .core
@@ -728,10 +728,15 @@ impl VirtualFs for VerFs {
         self.core
             .validate_file_handle(fh, ino)
             .map_err(map_anyhow_to_fuse)?;
-        self.batcher
-            .drain()
-            .await
-            .map_err(map_anyhow_to_fuse)?;
+        // Writes are acknowledged only after their commit, so only writes
+        // queued without waiting can be missing from committed state. Draining
+        // unconditionally would stall every read behind an unrelated commit.
+        if self.batcher.pending_write_count() > 0 {
+            self.batcher
+                .drain()
+                .await
+                .map_err(map_anyhow_to_fuse)?;
+        }
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "read")
@@ -1655,12 +1660,12 @@ impl VirtualFs for VerFs {
             pid: lk_param.pid,
         };
 
-        let locks = self.core.file_locks.lock().await;
-        if let Some(existing) = locks.get(&ino).and_then(|list| {
+        let existing = self.core.file_locks.lock().get(&ino).and_then(|list| {
             list.iter()
                 .find(|entry| FsCore::lock_conflict(&request, entry))
                 .cloned()
-        }) {
+        });
+        if let Some(existing) = existing {
             return Ok(FileLockParam {
                 fh: lk_param.fh,
                 lock_owner: lk_param.lock_owner,
@@ -1706,32 +1711,35 @@ impl VirtualFs for VerFs {
         };
 
         loop {
-            let mut locks = self.core.file_locks.lock().await;
-            let entry = locks.entry(ino).or_default();
-            let conflict = entry
-                .iter()
-                .any(|existing| FsCore::lock_conflict(&request, existing));
-            if conflict {
-                if !sleep_wait {
-                    return build_error_result_from_errno(
-                        Errno::EAGAIN,
-                        "file lock conflict".to_owned(),
-                    );
+            let acquired = {
+                let mut locks = self.core.file_locks.lock();
+                let entry = locks.entry(ino).or_default();
+                let conflict = entry
+                    .iter()
+                    .any(|existing| FsCore::lock_conflict(&request, existing));
+                if !conflict {
+                    entry.retain(|existing| {
+                        !(existing.lock_owner == request.lock_owner
+                            && FsCore::lock_ranges_overlap(existing, &request))
+                    });
+                    if request.typ != libc::F_UNLCK as u32 {
+                        entry.push(request.clone());
+                    }
+                    if entry.is_empty() {
+                        locks.remove(&ino);
+                    }
                 }
-            } else {
-                entry.retain(|existing| {
-                    !(existing.lock_owner == request.lock_owner
-                        && FsCore::lock_ranges_overlap(existing, &request))
-                });
-                if request.typ != libc::F_UNLCK as u32 {
-                    entry.push(request.clone());
-                }
-                if entry.is_empty() {
-                    locks.remove(&ino);
-                }
+                !conflict
+            };
+            if acquired {
                 return Ok(());
             }
-            drop(locks);
+            if !sleep_wait {
+                return build_error_result_from_errno(
+                    Errno::EAGAIN,
+                    "file lock conflict".to_owned(),
+                );
+            }
             sleep(LOCK_RETRY_INTERVAL).await;
         }
     }

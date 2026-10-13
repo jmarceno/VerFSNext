@@ -556,3 +556,42 @@ the newly added race event path was not triggered in this run.
 ### Affected Files
 
 - `scripts/resilience/supervisor.py`, `docs/resilience-test.md`
+
+## B016 - Writes Ran at ~1-4 MB/s and Froze File Managers - Oct 13 2026
+
+### Symptom
+
+Copying files into the mount with Thunar ran at about 1.2 MB/s on a 160 MB/s disk, and Thunar's UI froze for the whole copy. Two 80 MB files took minutes.
+
+### Root Cause
+
+Measured on a rotational data disk (Seagate ST3000VM002), where an `fdatasync` plus cache flush costs 100-170 ms:
+
+1. **Serialized FUSE dispatch** (`crates/verfsnext-async-fusex/src/session.rs`): two device reader threads each `block_on`-ed a request to completion. At most two requests ran at once. While both waited on write commits, every lookup, getattr and readdir from the file manager's UI thread queued behind them, which froze Thunar.
+2. **One durable commit per FUSE write** (`src/write/batcher.rs`, `src/fs/write.rs`): every write waits for its commit, the ingest worker dispatched each such write immediately, and the apply worker committed them one by one. Each commit synced the active pack and its index before the metadata commit, so each FUSE write paid 100-170 ms of disk flushes.
+3. **Same-inode groups split into separate commits** (`src/fs/write.rs`): writeback writes for one file that were not contiguous in arrival order were placed in separate rounds, each with its own transaction and pack sync.
+4. **Kernel dirty throttling**: FUSE's strict per-mount dirty limit kept only one or two writes in flight while their pages waited on the reply. More concurrency alone could not amortize the sync.
+
+### Fix
+
+- FUSE requests are spawned as tasks; `max_background` raised to 32 and the buffer pool sized above it (`session.rs`).
+- Group commit in the batcher apply worker; all writes of an inode in a batch fold into one multi-range `WriteGroup`, so a batch is one transaction (`batcher.rs`, `write.rs`). Full-block overwrites no longer read the old block.
+- The per-commit pack sync is gone. Pack-before-metadata ordering is enforced by a SurrealKV WAL durability barrier with watermarks plus a 250 ms hand-off task (see "Write Durability and Ordering" in the technical deep dive). Truncate's per-commit pack sync was removed for the same reason.
+- `PackStore::sync` no longer holds the active-pack mutex during `fdatasync`.
+- `read` no longer drains the batcher unconditionally (see B005): all writes are acknowledged after their commit, so the drain only stalled reads behind unrelated commits. It now drains when fire-and-forget writes are pending, like `flush`/`fsync`/`release`.
+- Tokio hygiene: blocking pack reads on cache misses, sync-cycle syncs and GC pack rewrites run under `block_in_place`; the inode-lock map and POSIX lock table moved from tokio mutexes to `parking_lot`.
+
+### Behavior Change
+
+A daemon crash now loses commits made in roughly the last 250 ms plus one pack sync. Before, each commit reached the OS immediately. Power-loss guarantees and `fsync` semantics are unchanged. Dirty pages in the kernel's FUSE cache were already lost on a daemon crash.
+
+### Compatibility and Validation
+
+No on-disk format change (the WAL bytes are identical, only buffered), so no migration is needed. Measured on the same HDD with an isolated instance (80 MB files, old -> new): `gio copy` (Thunar's copy path) 20.4 s -> 0.38 s; `dd bs=1M conv=fsync` 19.5 s -> 0.92 s; `dd bs=64K conv=fsync` 15.9 s -> 0.79 s. `rsync -a` of 2000 small files (60 MB) 227.5 s -> 3.5 s. All copies read back byte-identical, and the rsync'd tree is identical. 14 SIGKILL-during-copy cycles: every closed or fsynced file intact, in-flight files a clean prefix of the source, metadata consistency check clean (0 refcount mismatches, missing chunks or orphan extents). `verfsnext` lib tests pass. SurrealKV lib tests pass except 4 `sstable_tests` that fail identically on the base commit.
+
+### Affected Files
+
+- `crates/verfsnext-async-fusex/src/session.rs`
+- `crates/verfsnext-surrealkv/src/{lib.rs,lsm.rs,wal/mod.rs,wal/manager.rs,wal/writer.rs,wal/reader.rs}`
+- `src/write/batcher.rs`, `src/fs/write.rs`, `src/fs/fuse.rs`, `src/fs/chunk.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`
+- `src/meta/mod.rs`, `src/data/pack.rs`, `src/sync/mod.rs`

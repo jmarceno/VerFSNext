@@ -1,6 +1,66 @@
 use super::*;
 use crate::fs::FsCore;
 
+/// All writes to one inode within a batch, kept as sorted, disjoint and
+/// non-adjacent byte ranges. Writes are folded in arrival order, so a later
+/// write wins where writes overlap.
+pub(crate) struct WriteGroup {
+    ino: u64,
+    segments: Vec<WriteOp>,
+    indices: Vec<usize>,
+}
+
+impl WriteGroup {
+    fn new(ino: u64) -> Self {
+        Self {
+            ino,
+            segments: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, idx: usize, op: WriteOp) {
+        self.indices.push(idx);
+        if op.data.is_empty() {
+            return;
+        }
+        let first = self
+            .segments
+            .iter()
+            .position(|segment| can_coalesce_write(segment, &op) || segment.offset > op.offset);
+        let Some(first) = first else {
+            self.segments.push(op);
+            return;
+        };
+        let touching = self.segments[first..]
+            .iter()
+            .take_while(|segment| can_coalesce_write(segment, &op))
+            .count();
+        if touching == 0 {
+            self.segments.insert(first, op);
+            return;
+        }
+        let mut touched = self.segments.drain(first..first + touching);
+        let mut merged = touched.next().expect("touching segment count is non-zero");
+        for segment in touched {
+            merge_write_op(&mut merged, segment);
+        }
+        merge_write_op(&mut merged, op);
+        self.segments.insert(first, merged);
+    }
+
+    fn first_offset(&self) -> u64 {
+        self.segments.first().map_or(0, |segment| segment.offset)
+    }
+
+    fn data_len(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.data.len() as u64)
+            .sum()
+    }
+}
+
 struct PreparedWritePlan {
     write_end: u64,
     dedup_hits: u64,
@@ -23,71 +83,87 @@ impl FsCore {
     }
     async fn prepare_write_plan(
         &self,
-        op: &WriteOp,
+        group: &WriteGroup,
         inode: &InodeRecord,
         txn: &verfsnext_surrealkv::Transaction,
     ) -> Result<PreparedWritePlan> {
-        let write_end = op
-            .offset
-            .checked_add(op.data.len() as u64)
-            .ok_or_else(|| anyhow_errno(Errno::EOVERFLOW, "write offset overflow"))?;
-        let start_block = op.offset / BLOCK_SIZE as u64;
-        let end_block = (write_end - 1) / BLOCK_SIZE as u64;
-        let touched_blocks = (end_block - start_block + 1) as usize;
+        let block_size = BLOCK_SIZE as u64;
+        let mut write_end = 0_u64;
+        // Blocks touched by the group in ascending order, each with the
+        // segments that overlap it. Segments are sorted and disjoint, so two
+        // segments can only share the last block of the first one.
+        let mut touched_blocks = Vec::<(u64, Vec<usize>)>::new();
+        for (segment_idx, segment) in group.segments.iter().enumerate() {
+            let segment_end = segment
+                .offset
+                .checked_add(segment.data.len() as u64)
+                .ok_or_else(|| anyhow_errno(Errno::EOVERFLOW, "write offset overflow"))?;
+            write_end = write_end.max(segment_end);
+            for block_idx in segment.offset / block_size..=(segment_end - 1) / block_size {
+                match touched_blocks.last_mut() {
+                    Some((last, segments)) if *last == block_idx => segments.push(segment_idx),
+                    _ => touched_blocks.push((block_idx, vec![segment_idx])),
+                }
+            }
+        }
 
         // Fast path: files with size == 0 have no extents. Skip the KV range scan.
         // This applies to newly created files and files truncated to zero.
-        let old_extents = if inode.size == 0 {
-            HashMap::new()
-        } else {
-            let mut map = HashMap::<u64, ExtentRecord>::new();
-            let start_key = extent_key(op.ino, start_block);
-            let end_key = end_block
-                .checked_add(1)
-                .map(|end| extent_key(op.ino, end))
-                .unwrap_or_else(|| prefix_end(&extent_prefix(op.ino)));
+        let mut old_extents = HashMap::<u64, ExtentRecord>::new();
+        if inode.size != 0 {
+            for segment in &group.segments {
+                let start_block = segment.offset / block_size;
+                let end_block = (segment.offset + segment.data.len() as u64 - 1) / block_size;
+                let start_key = extent_key(group.ino, start_block);
+                let end_key = end_block
+                    .checked_add(1)
+                    .map(|end| extent_key(group.ino, end))
+                    .unwrap_or_else(|| prefix_end(&extent_prefix(group.ino)));
 
-            let mut iter = txn.range(start_key, end_key)?;
-            let mut valid = iter.seek_first()?;
-            while valid {
-                let key = iter.key().user_key();
-                if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
-                    if block_idx >= start_block && block_idx <= end_block {
-                        let val = iter.value()?;
-                        let extent: ExtentRecord = decode_rkyv(&val)?;
-                        map.insert(block_idx, extent);
+                let mut iter = txn.range(start_key, end_key)?;
+                let mut valid = iter.seek_first()?;
+                while valid {
+                    let key = iter.key().user_key();
+                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
+                        if block_idx >= start_block && block_idx <= end_block {
+                            let val = iter.value()?;
+                            let extent: ExtentRecord = decode_rkyv(&val)?;
+                            old_extents.insert(block_idx, extent);
+                        }
                     }
+                    valid = iter.next()?;
                 }
-                valid = iter.next()?;
             }
-            map
-        };
+        }
 
         self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
 
-        let mut extent_updates = Vec::<(u64, [u8; 16])>::with_capacity(touched_blocks);
-        let mut ref_deltas = HashMap::<[u8; 16], i64>::with_capacity(touched_blocks.saturating_mul(2));
+        let mut extent_updates = Vec::<(u64, [u8; 16])>::with_capacity(touched_blocks.len());
+        let mut ref_deltas =
+            HashMap::<[u8; 16], i64>::with_capacity(touched_blocks.len().saturating_mul(2));
         let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
         let mut dedup_hits = 0_u64;
         let mut dedup_misses = 0_u64;
 
-        for block_idx in start_block..=end_block {
-            let block_start = block_idx * BLOCK_SIZE as u64;
-            let copy_from = op.offset.max(block_start);
-            let copy_until = write_end.min(block_start + BLOCK_SIZE as u64);
-            let src_start = (copy_from - op.offset) as usize;
-            let src_end = (copy_until - op.offset) as usize;
-            let dst_start = (copy_from - block_start) as usize;
-            let dst_end = dst_start + (src_end - src_start);
-            let is_full_block = dst_start == 0 && dst_end == BLOCK_SIZE;
+        for (block_idx, segment_indices) in touched_blocks {
+            let block_start = block_idx * block_size;
+            let block_end = block_start + block_size;
 
-            // Fast path: when writing to a new block with no old extent and the write
-            // covers the full block, we can hash the write data slice directly,
-            // skipping the zero-fill allocation and copy.
-            let has_old_extent = old_extents.contains_key(&block_idx);
-            let (new_hash, block_data) = if !has_old_extent && is_full_block {
-                let write_slice = &op.data[src_start..src_end];
+            // Fast path: a segment that covers the whole block replaces it, so
+            // the old block is never read and the write slice is hashed as is.
+            let full_cover = match segment_indices.as_slice() {
+                [only] => {
+                    let segment = &group.segments[*only];
+                    let segment_end = segment.offset + segment.data.len() as u64;
+                    (segment.offset <= block_start && segment_end >= block_end).then(|| {
+                        let src_start = (block_start - segment.offset) as usize;
+                        &segment.data[src_start..src_start + BLOCK_SIZE]
+                    })
+                }
+                _ => None,
+            };
+            let (new_hash, block_data) = if let Some(write_slice) = full_cover {
                 let hash = FsCore::hash_for_inode(inode, write_slice);
                 (hash, write_slice.to_vec())
             } else {
@@ -96,7 +172,17 @@ impl FsCore {
                 } else {
                     vec![0_u8; BLOCK_SIZE]
                 };
-                block_data[dst_start..dst_end].copy_from_slice(&op.data[src_start..src_end]);
+                for segment_idx in segment_indices {
+                    let segment = &group.segments[segment_idx];
+                    let segment_end = segment.offset + segment.data.len() as u64;
+                    let copy_from = segment.offset.max(block_start);
+                    let copy_until = segment_end.min(block_end);
+                    let src_start = (copy_from - segment.offset) as usize;
+                    let src_end = (copy_until - segment.offset) as usize;
+                    let dst_start = (copy_from - block_start) as usize;
+                    block_data[dst_start..dst_start + (src_end - src_start)]
+                        .copy_from_slice(&segment.data[src_start..src_end]);
+                }
                 let hash = FsCore::hash_for_inode(inode, &block_data);
                 (hash, block_data)
             };
@@ -285,10 +371,6 @@ impl FsCore {
         }
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-
-        if !new_chunk_records.is_empty() {
-            self.packs.sync(false)?;
-        }
         Ok((inode, Some(new_chunk_records)))
     }
     pub(crate) fn lock_type_valid(typ: u32) -> bool {
@@ -337,7 +419,7 @@ impl FsCore {
         Ok(())
     }
 
-    /// Stages one coalesced write into the shared batch transaction and
+    /// Stages all writes of one inode into the shared batch transaction and
     /// returns the chunk records it created.
     ///
     /// The inode and old extents are read through `txn`. Everything the plan
@@ -345,34 +427,35 @@ impl FsCore {
     /// rewritten by it (inode key, touched extents, chunk refcounts), so a
     /// concurrent change makes the commit fail with a conflict instead of
     /// being silently overwritten.
-    pub(crate) async fn apply_single_write_in_txn(
+    async fn apply_write_group_in_txn(
         &self,
-        op: WriteOp,
+        group: &WriteGroup,
         txn: &mut verfsnext_surrealkv::Transaction,
         mtime_sec: i64,
         mtime_nsec: u32,
     ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
-        let mut inode = FsCore::load_inode_in_txn(txn, op.ino, "write")?;
-        self.ensure_write_target_inode(op.ino, &inode)?;
-        if op.data.is_empty() {
+        let mut inode = FsCore::load_inode_in_txn(txn, group.ino, "write")?;
+        self.ensure_write_target_inode(group.ino, &inode)?;
+        if group.segments.is_empty() {
             return Ok(HashMap::new());
         }
-        let plan = self.prepare_write_plan(&op, &inode, txn).await?;
+        let plan = self.prepare_write_plan(group, &inode, txn).await?;
 
-        let inode_lock = self.inode_write_lock(op.ino).await;
+        let inode_lock = self.inode_write_lock(group.ino);
         let _inode_guard = inode_lock.lock().await;
-        self.commit_prepared_write_in_txn(op.ino, &mut inode, &plan, txn, mtime_sec, mtime_nsec)?;
+        self.commit_prepared_write_in_txn(group.ino, &mut inode, &plan, txn, mtime_sec, mtime_nsec)?;
 
         self.dedup_hits
             .fetch_add(plan.dedup_hits, Ordering::Relaxed);
         self.dedup_misses
             .fetch_add(plan.dedup_misses, Ordering::Relaxed);
         self.write_bytes_total
-            .fetch_add(op.data.len() as u64, Ordering::Relaxed);
+            .fetch_add(group.data_len(), Ordering::Relaxed);
         debug!(
-            ino = op.ino,
-            offset = op.offset,
-            bytes = op.data.len(),
+            ino = group.ino,
+            offset = group.first_offset(),
+            bytes = group.data_len(),
+            segments = group.segments.len(),
             dedup_hits = plan.dedup_hits,
             dedup_misses = plan.dedup_misses,
             "write completed through streaming dedup/compress pipeline"
@@ -390,47 +473,23 @@ impl WriteApply for FsCore {
             return Vec::new();
         }
 
-        let mut groups: Vec<(WriteOp, Vec<usize>)> = Vec::new();
+        // A write is planned from the state its transaction sees, so all
+        // writes of one inode are folded into a single group: two groups for
+        // the same inode in one transaction would plan the same blocks twice.
+        // One group per inode lets the whole batch share one commit and one
+        // pack sync, whatever order the kernel sent the writes in.
+        let mut groups = Vec::<WriteGroup>::new();
+        let mut group_of_inode = HashMap::<u64, usize>::new();
         for (idx, op) in ops.into_iter().enumerate() {
-            if let Some((group_op, group_indices)) = groups.last_mut() {
-                if can_coalesce_write(group_op, &op) {
-                    merge_write_op(group_op, op);
-                    group_indices.push(idx);
-                    continue;
-                }
-            }
-            groups.push((op, vec![idx]));
-        }
-
-        // A write is planned from the committed state of its inode (size and
-        // old extents), so two groups for the same inode must never share a
-        // transaction: the second would be planned without the first and
-        // overwrite its blocks, inode size and refcount deltas. Split the
-        // groups into rounds where each inode appears at most once, keeping
-        // per-inode order, and commit the rounds one after another.
-        let mut by_inode = HashMap::<u64, Vec<(WriteOp, Vec<usize>)>>::new();
-        let mut inode_order = Vec::<u64>::new();
-        for (group_op, indices) in groups {
-            let entry = by_inode.entry(group_op.ino).or_default();
-            if entry.is_empty() {
-                inode_order.push(group_op.ino);
-            }
-            entry.push((group_op, indices));
-        }
-        let round_count = by_inode.values().map(Vec::len).max().unwrap_or(0);
-        let mut rounds = (0..round_count).map(|_| Vec::new()).collect::<Vec<_>>();
-        for ino in &inode_order {
-            if let Some(inode_groups) = by_inode.remove(ino) {
-                for (round, group) in inode_groups.into_iter().enumerate() {
-                    rounds[round].push(group);
-                }
-            }
+            let position = *group_of_inode.entry(op.ino).or_insert_with(|| {
+                groups.push(WriteGroup::new(op.ino));
+                groups.len() - 1
+            });
+            groups[position].add(idx, op);
         }
 
         let mut out: Vec<Option<Result<()>>> = (0..original_len).map(|_| None).collect();
-        for round in rounds {
-            self.apply_write_round(round, &mut out).await;
-        }
+        self.apply_write_groups(groups, &mut out).await;
 
         debug!(
             dedup_hits = self.dedup_hits.load(Ordering::Relaxed),
@@ -444,16 +503,16 @@ impl WriteApply for FsCore {
 }
 
 impl FsCore {
-    /// Stages and commits one round of write groups (at most one group per
-    /// inode) in a single metadata transaction, filling `out` for every op.
+    /// Stages and commits write groups (one per inode) in a single metadata
+    /// transaction, filling `out` for every op.
     ///
     /// A group that fails to stage is reported as failed and the remaining
     /// groups are re-staged on a fresh transaction, so a write is acknowledged
     /// only when the transaction that contains it has committed. Commits that
     /// lose a race with a concurrent transaction are re-planned and retried.
-    async fn apply_write_round(
+    async fn apply_write_groups(
         &self,
-        mut pending: Vec<(WriteOp, Vec<usize>)>,
+        mut pending: Vec<WriteGroup>,
         out: &mut [Option<Result<()>>],
     ) {
         let mut attempt = 1;
@@ -476,9 +535,9 @@ impl FsCore {
             let (mtime_sec, mtime_nsec) = system_time_to_parts(SystemTime::now());
             let mut new_records = HashMap::<[u8; 16], ChunkRecord>::new();
             let mut failed_group = None;
-            for (position, (group_op, _)) in pending.iter().enumerate() {
+            for (position, group) in pending.iter().enumerate() {
                 match self
-                    .apply_single_write_in_txn(group_op.clone(), &mut txn, mtime_sec, mtime_nsec)
+                    .apply_write_group_in_txn(group, &mut txn, mtime_sec, mtime_nsec)
                     .await
                 {
                     Ok(records) => new_records.extend(records),
@@ -491,15 +550,16 @@ impl FsCore {
 
             if let Some((position, err)) = failed_group {
                 txn.rollback();
-                let (group_op, indices) = pending.remove(position);
+                let group = pending.remove(position);
                 tracing::error!(
-                    ino = group_op.ino,
-                    offset = group_op.offset,
-                    bytes = group_op.data.len(),
+                    ino = group.ino,
+                    offset = group.first_offset(),
+                    bytes = group.data_len(),
+                    segments = group.segments.len(),
                     error = %format!("{err:#}"),
                     "write group failed to stage; re-staging the rest of its batch"
                 );
-                let mut indices = indices.into_iter();
+                let mut indices = group.indices.into_iter();
                 if let Some(first) = indices.next() {
                     for idx in indices {
                         out[idx] = Some(Err(anyhow!("{err:#}")));
@@ -509,14 +569,8 @@ impl FsCore {
                 continue;
             }
 
-            // Pack payloads must be durable before metadata can point at them.
-            if let Err(err) = self.packs.sync(false) {
-                let err = err.context("pack sync before metadata commit failed");
-                tracing::error!(error = %format!("{err:#}"), "write batch not committed");
-                FsCore::fail_write_groups(&pending, &err, out);
-                return;
-            }
-
+            // No pack sync here: the metadata WAL syncs the packs before any
+            // record reaches the OS (see MetaStore::open_with_pack_barrier).
             match self.meta.commit_write_txn(&mut txn).await {
                 Ok(()) => {
                     // Caches are updated only after the commit so concurrent
@@ -524,12 +578,12 @@ impl FsCore {
                     for (hash, record) in &new_records {
                         self.chunk_meta_cache.insert(*hash, *record);
                     }
-                    for (group_op, indices) in &pending {
-                        self.invalidate_inode_cache(group_op.ino);
-                        self.bump_inode_data_version(group_op.ino);
+                    for group in &pending {
+                        self.invalidate_inode_cache(group.ino);
+                        self.bump_inode_data_version(group.ino);
                         self.mark_mutation();
-                        self.invalidate_inode_attr_best_effort(group_op.ino);
-                        for idx in indices {
+                        self.invalidate_inode_attr_best_effort(group.ino);
+                        for idx in &group.indices {
                             out[*idx] = Some(Ok(()));
                         }
                     }
@@ -550,12 +604,12 @@ impl FsCore {
     }
 
     fn fail_write_groups(
-        groups: &[(WriteOp, Vec<usize>)],
+        groups: &[WriteGroup],
         err: &anyhow::Error,
         out: &mut [Option<Result<()>>],
     ) {
-        for (_, indices) in groups {
-            for idx in indices {
+        for group in groups {
+            for idx in &group.indices {
                 out[*idx] = Some(Err(anyhow!("{err:#}")));
             }
         }

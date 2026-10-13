@@ -714,7 +714,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).expect("should create file");
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
 
         let mut writer =
             crate::wal::writer::Writer::new(buffered_writer, false, CompressionType::None, 0);

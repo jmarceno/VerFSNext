@@ -4,6 +4,7 @@ use std::io::{ErrorKind, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -95,6 +96,11 @@ pub struct PackStore {
     index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
     pack_file_cache: Cache<u64, Arc<File>>,
     max_pack_size_bytes: u64,
+    /// Number of records appended since open. Incremented under the
+    /// active-pack lock once a record is written.
+    append_watermark: AtomicU64,
+    /// Highest `append_watermark` known to be on disk.
+    durable_watermark: AtomicU64,
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -151,6 +157,8 @@ impl PackStore {
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
             swap_lock: RwLock::new(()),
+            append_watermark: AtomicU64::new(0),
+            durable_watermark: AtomicU64::new(0),
             active: Mutex::new(ActivePack {
                 pack_id: resolved_active_pack_id,
                 file,
@@ -194,6 +202,7 @@ impl PackStore {
             compressed_data,
             payload_crc32,
         )?;
+        self.append_watermark.fetch_add(1, Ordering::Release);
         Ok(active.pack_id)
     }
 
@@ -222,6 +231,7 @@ impl PackStore {
                 payload,
                 entry.payload_crc32,
             )?;
+            self.append_watermark.fetch_add(1, Ordering::Release);
         }
         Ok(active.pack_id)
     }
@@ -539,29 +549,60 @@ impl PackStore {
         Ok(())
     }
 
+    /// Makes everything appended so far durable.
+    ///
+    /// Only the index flush runs under the active-pack lock. The fsync goes
+    /// through duplicated handles so appends and reads continue while the disk
+    /// works; data appended before this call is covered either way, and a
+    /// rotation syncs the pack it retires itself.
     pub fn sync(&self, full: bool) -> Result<()> {
-        let mut active = self.active.lock();
-        // Flush buffered index entries to disk before syncing.
-        Self::flush_pending_index(&mut active)?;
+        let (watermark, file, index_file) = {
+            let mut active = self.active.lock();
+            Self::flush_pending_index(&mut active)?;
+            (
+                self.append_watermark.load(Ordering::Acquire),
+                active
+                    .file
+                    .try_clone()
+                    .context("failed to duplicate active pack handle for sync")?,
+                active
+                    .index_file
+                    .try_clone()
+                    .context("failed to duplicate active pack index handle for sync")?,
+            )
+        };
         if full {
-            active
-                .file
+            file.sync_all().context("failed to sync_all active pack")?;
+            index_file
                 .sync_all()
-                .context("failed to sync_all active pack")?;
-            active
-                .index_file
-                .sync_all()
-                .context("failed to sync_all active pack index")
+                .context("failed to sync_all active pack index")?;
         } else {
-            active
-                .file
+            file.sync_data().context("failed to sync_data active pack")?;
+            index_file
                 .sync_data()
-                .context("failed to sync_data active pack")?;
-            active
-                .index_file
-                .sync_data()
-                .context("failed to sync_data active pack index")
+                .context("failed to sync_data active pack index")?;
         }
+        self.durable_watermark.fetch_max(watermark, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Watermark of the newest appended record.
+    pub fn append_watermark(&self) -> u64 {
+        self.append_watermark.load(Ordering::Acquire)
+    }
+
+    /// Highest append watermark known to be on disk.
+    pub fn durable_watermark(&self) -> u64 {
+        self.durable_watermark.load(Ordering::Acquire)
+    }
+
+    /// Makes every record up to `watermark` durable, syncing only when one is
+    /// not yet known durable.
+    pub fn sync_to(&self, watermark: u64) -> Result<()> {
+        if self.durable_watermark() >= watermark {
+            return Ok(());
+        }
+        self.sync(false)
     }
 
     /// Write all buffered index entries to the index file in a single batch.

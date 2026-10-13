@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::writer::Writer;
 use super::{
     get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
-    RecordType, Result, BLOCK_SIZE, HEADER_SIZE,
+    RecordType, Result, BARRIER_BUFFER_SIZE, BLOCK_SIZE, HEADER_SIZE,
 };
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
@@ -138,12 +138,11 @@ impl Wal {
             // Calculate block_offset from file size
             let block_offset = (existing_size as usize) % BLOCK_SIZE;
 
-            // Create buffered file writer
-            let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts);
 
             Ok(Writer::new(
                 buffered_writer,
-                false,
+                manual_flush,
                 detected_compression,
                 block_offset,
             ))
@@ -151,14 +150,26 @@ impl Wal {
             // New file - use compression type from options
             let compression_type = opts.compression_type;
 
-            // Create buffered file writer
-            let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts);
 
-            let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
+            let mut writer = Writer::new(buffered_writer, manual_flush, compression_type, 0);
             if compression_type != CompressionType::None {
                 writer.add_compression_type_record()?;
             }
             Ok(writer)
+        }
+    }
+
+    /// Without a durability barrier every record is handed to the OS as it is
+    /// added. With one, records stay buffered until an explicit flush or sync
+    /// (or a full buffer), which is when the barrier runs.
+    fn buffered_writer(file: File, opts: &Options) -> (BufferedFileWriter, bool) {
+        match &opts.durability_barrier {
+            Some(barrier) => (
+                BufferedFileWriter::new(file, BARRIER_BUFFER_SIZE, Some(barrier.clone())),
+                true,
+            ),
+            None => (BufferedFileWriter::new(file, BLOCK_SIZE, None), false),
         }
     }
 
@@ -362,6 +373,15 @@ impl Wal {
             return Ok(());
         }
         self.active_writer.sync()
+    }
+
+    /// Hands buffered records whose external data is already durable to the
+    /// OS cache without waiting on the durability barrier.
+    pub(crate) fn write_durable_prefix(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.active_writer.write_durable_prefix()
     }
 
     /// Flushes buffered WAL data to OS cache (not to disk).

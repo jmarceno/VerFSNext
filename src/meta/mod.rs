@@ -1,9 +1,13 @@
+use std::io;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use nix::unistd::{getgid, getuid};
-use verfsnext_surrealkv::{Mode, Tree, TreeBuilder};
+use verfsnext_surrealkv::{DurabilityBarrier, Mode, Tree, TreeBuilder};
+
+use crate::data::pack::PackStore;
 
 use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
@@ -31,9 +35,65 @@ pub struct MetaStore {
     tree: Tree,
 }
 
+/// WAL durability barrier backed by the pack store; see
+/// [`MetaStore::open_with_pack_barrier`].
+struct PackBarrier(Arc<OnceLock<Arc<PackStore>>>);
+
+impl DurabilityBarrier for PackBarrier {
+    fn watermark(&self) -> u64 {
+        self.0.get().map_or(0, |packs| packs.append_watermark())
+    }
+
+    fn durable(&self) -> u64 {
+        self.0.get().map_or(0, |packs| packs.durable_watermark())
+    }
+
+    fn make_durable(&self, watermark: u64) -> io::Result<()> {
+        let Some(packs) = self.0.get() else {
+            return Ok(());
+        };
+        packs.sync_to(watermark).map_err(|err| {
+            tracing::error!(error = %format!("{err:#}"), "pack sync before WAL write failed");
+            io::Error::other(format!("pack sync before WAL write failed: {err:#}"))
+        })
+    }
+}
+
 impl MetaStore {
     pub async fn open(path: &Path) -> Result<Self> {
-        let tree = TreeBuilder::new()
+        Self::open_with_builder(path, TreeBuilder::new()).await
+    }
+
+    /// Opens the store so that no WAL record reaches the OS before the pack
+    /// data it may reference is durable: the WAL buffers records in the
+    /// process and syncs the active pack before each hand-off. Writes thus
+    /// commit without a pack fsync of their own while a crash still never
+    /// leaves durable metadata pointing at pack data that is not on disk.
+    ///
+    /// The pack store needs metadata to open, so it is put into `packs` once
+    /// open. Until then this process cannot have appended to any pack and the
+    /// barrier has nothing to sync.
+    pub async fn open_with_pack_barrier(
+        path: &Path,
+        packs: Arc<OnceLock<Arc<PackStore>>>,
+    ) -> Result<Self> {
+        Self::open_with_builder(
+            path,
+            TreeBuilder::new().with_durability_barrier(Arc::new(PackBarrier(packs))),
+        )
+        .await
+    }
+
+    /// Hands committed WAL records whose pack data is already durable to the
+    /// OS. Records waiting on a pack sync stay buffered in the process.
+    pub fn write_durable_wal_prefix(&self) -> Result<()> {
+        self.tree
+            .write_durable_wal_prefix()
+            .context("failed to hand off durable WAL records")
+    }
+
+    async fn open_with_builder(path: &Path, builder: TreeBuilder) -> Result<Self> {
+        let tree = builder
             .with_path(path.to_path_buf())
             .with_max_memtable_size(128 * 1024 * 1024)
             .with_flush_on_close(true)
