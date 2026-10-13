@@ -6,7 +6,8 @@ name: release
 # Everything else is automatic: the version (Cargo.toml when newer than every
 # release tag, otherwise the latest tag with the patch bumped), the build on
 # Ubuntu 22.04 (glibc 2.35), and the release with tag v<version> on the
-# dispatched commit. A commit that already has a release tag is refused.
+# dispatched commit, copied to the GitHub repository afterwards. A commit
+# that already has a release tag is refused.
 on:
   workflow_dispatch:
 
@@ -77,3 +78,10 @@ jobs:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
           RELEASE_SHA: ${{ gitea.sha }}
         run: .gitea/scripts/release-publish.sh "${{ steps.plan.outputs.tag }}" "VerFSNext ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist
+
+      - name: Copy release to GitHub
+        env:
+          GH_REPO: jmarceno/VerFSNext
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          RELEASE_SHA: ${{ gitea.sha }}
+        run: .gitea/scripts/github-publish.sh "${{ steps.plan.outputs.tag }}" "VerFSNext ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist
