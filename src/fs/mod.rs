@@ -1088,11 +1088,18 @@ impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
         self.persist_active_pack_id_if_needed().await?;
         self.persist_pack_crc32_read_error_count_if_needed().await?;
-        // Packs first, so the WAL barrier inside flush_wal has nothing left
-        // to sync while it holds the WAL lock. Both block on the disk.
+        // Both block on the disk. The periodic cycle only hands off WAL
+        // records whose pack data the sync just made durable: flushing the
+        // whole buffer would sync packs again under the WAL lock and pause
+        // every commit while writes are streaming in. A full cycle (fsync,
+        // shutdown) makes everything durable.
         tokio::task::block_in_place(|| {
             self.packs.sync(full)?;
-            self.meta.flush_wal(full)
+            if full {
+                self.meta.flush_wal(true)
+            } else {
+                self.meta.write_durable_wal_prefix()
+            }
         })?;
         if !full {
             self.maybe_run_gc().await?;

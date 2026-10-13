@@ -196,7 +196,8 @@ The ordering now lives in the metadata WAL, similar to ext4 `data=ordered`:
 - `MetaStore::open_with_pack_barrier` installs a `PackBarrier` as the SurrealKV durability barrier. The pack store counts appended records (`append_watermark`); a sync records the highest count it covered (`durable_watermark`).
 - The WAL keeps committed records in the process and tags each with the append watermark at commit time. Records reach the OS only once the pack data up to their watermark is durable.
 - The hand-off task (`SyncService`, every 250 ms) syncs the packs from `spawn_blocking` (skipped when nothing new was appended) and then hands the durable prefix of the WAL buffer to the OS. It never syncs while holding the WAL lock, so commits do not wait on the disk.
-- A full WAL buffer (4 MiB), WAL rotation, `flush_wal` (sync cycle, GC rewrite) and `fsync` hand everything off after an inline pack sync if needed.
+- The periodic sync cycle syncs the packs and then hands off only the durable prefix, like the hand-off task. Flushing the whole buffer there would sync packs again under the WAL lock and pause commits every `sync_interval_ms` while writes stream in.
+- A full WAL buffer (4 MiB), WAL rotation, `flush_wal` (full sync cycle, GC rewrite) and `fsync` hand everything off after an inline pack sync if needed.
 - `fsync` still runs a full sync cycle (packs `sync_all`, then WAL `sync_all`), so fsynced data is durable on return.
 
 Crash behavior:

@@ -578,6 +578,7 @@ Measured on a rotational data disk (Seagate ST3000VM002), where an `fdatasync` p
 - Group commit in the batcher apply worker; all writes of an inode in a batch fold into one multi-range `WriteGroup`, so a batch is one transaction (`batcher.rs`, `write.rs`). Full-block overwrites no longer read the old block.
 - The per-commit pack sync is gone. Pack-before-metadata ordering is enforced by a SurrealKV WAL durability barrier with watermarks plus a 250 ms hand-off task (see "Write Durability and Ordering" in the technical deep dive). Truncate's per-commit pack sync was removed for the same reason.
 - `PackStore::sync` no longer holds the active-pack mutex during `fdatasync`.
+- The periodic (non-full) sync cycle hands off only the WAL prefix whose pack data is durable, instead of flushing the whole buffer. A full flush synced packs again under the WAL lock and paused commits every 5 s during long copies.
 - `read` no longer drains the batcher unconditionally (see B005): all writes are acknowledged after their commit, so the drain only stalled reads behind unrelated commits. It now drains when fire-and-forget writes are pending, like `flush`/`fsync`/`release`.
 - Tokio hygiene: blocking pack reads on cache misses, sync-cycle syncs and GC pack rewrites run under `block_in_place`; the inode-lock map and POSIX lock table moved from tokio mutexes to `parking_lot`.
 
