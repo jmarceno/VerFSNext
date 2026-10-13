@@ -525,3 +525,34 @@ harness `snapshot_op_kill` preflight cycle and its repetitions in the six-hour r
 ### Affected Files
 
 - `src/fs/write.rs`
+
+## B015 - Resilience Resource Capture Raced GC Discard-File Replacement - Oct 09 2026
+
+### Root Cause
+
+The supervisor captured pack inventory with `find` while the daemon was atomically
+rewriting `packs/.DISCARD` through `packs/.DISCARD.tmp`. The temporary directory entry
+could disappear after `find` enumerated it but before `find` inspected its metadata.
+That diagnostic command returned exit 1, marking the run failed and freezing the LXC
+before cycle 41's fault was injected. Cycle 40 had passed its 215-object verification;
+the failure contained no integrity mismatch or daemon error. This was a harness race,
+not a product data-loss finding.
+
+### Fix
+
+Pack inventory now uses an explicit `scandir`/`stat` traversal in the guest. An entry
+that disappears during the scan is listed in the resource report and recorded as a
+`pack_inventory_entries_disappeared_during_scan` event. Errors opening directories or
+reading other metadata still fail the capture with their original error.
+
+### Compatibility and Validation
+
+No product format or protocol change; no migration is required. The corrected harness
+was syntax-checked with `uv` and its inventory command was run against the guest. A
+fresh preflight passed all nine fault scenarios, including a GC rewrite hit, and the
+first endurance cycle passed. No disappearance occurred during the new captures, so
+the newly added race event path was not triggered in this run.
+
+### Affected Files
+
+- `scripts/resilience/supervisor.py`, `docs/resilience-test.md`

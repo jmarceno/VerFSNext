@@ -1,0 +1,14 @@
+[Unit]
+Description=Continuous VerFSNext drift soak in LXC 101
+After=pve-guests.service
+Wants=pve-guests.service
+ConditionPathExists=/etc/pve/lxc/101.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/lib/verfsnext-resilience/releases/drift-30m/drift-supervisor.py --ct 101 --root /var/lib/verfsnext-resilience/drift-101 --drift-script /opt/verfsnext-resilience/releases/drift-30m/drift.py --seconds 1800
+Restart=no
+TimeoutStopSec=150
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal

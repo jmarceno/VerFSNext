@@ -20,6 +20,30 @@ UNIT = 'verfsnext-soak.service'
 DAEMON_LINE = re.compile(r' verfsnext\[\d+\]: ')
 DAEMON_FAILURE = re.compile(r'\bERROR\b|panicked|(sys|session|current)_total=[1-9]')
 WAL_TAIL = re.compile(r'Corrupted WAL record detected|Corruption in WAL')
+PACK_INVENTORY_SCRIPT = r'''
+import json, os, stat, sys
+
+root = sys.argv[1]
+files = []
+disappeared = []
+
+def scan(directory, depth, prefix=''):
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            relative = os.path.join(prefix, entry.name) if prefix else entry.name
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                disappeared.append(relative)
+                continue
+            if stat.S_ISREG(info.st_mode):
+                files.append(dict(path=relative, size=info.st_size, mtime=info.st_mtime))
+            elif depth and stat.S_ISDIR(info.st_mode):
+                scan(entry.path, depth - 1, relative)
+
+scan(root, 1)
+print(json.dumps(dict(files=files, disappeared_during_scan=disappeared), sort_keys=True))
+'''
 
 
 def save(path, value):
@@ -136,14 +160,19 @@ class Supervisor:
         self.checkpoint(journal_since=captured_at)
         if suffix != 'failure':
             self.check_daemon_log(journal, suffix)
+        inventory = json.loads(self.guest('python3', '-c', PACK_INVENTORY_SCRIPT,
+                                          '/var/lib/verfsnext-soak/data/packs'))
+        if inventory['disappeared_during_scan']:
+            self.event('pack_inventory_entries_disappeared_during_scan', capture=suffix,
+                       paths=inventory['disappeared_during_scan'])
         report = dict(time_ns=time.time_ns(), df=self.guest('df', '-B1', '/'),
                       memory=self.guest('cat', '/sys/fs/cgroup/memory.events'),
                       memory_current_peak_max=self.guest('cat', '/sys/fs/cgroup/memory.current',
                                                         '/sys/fs/cgroup/memory.peak', '/sys/fs/cgroup/memory.max'),
                       enforced_memory_max=Path(f'/sys/fs/cgroup/lxc/{self.ct}/memory.max').read_text().strip(),
                       enforced_cpu_max=Path(f'/sys/fs/cgroup/lxc/{self.ct}/cpu.max').read_text().strip(),
-                      packs=self.guest('find', '/var/lib/verfsnext-soak/data/packs',
-                                       '-maxdepth', '2', '-type', 'f', '-printf', '%P %s %T@\n'))
+                      packs=inventory['files'],
+                      pack_inventory_disappeared_during_scan=inventory['disappeared_during_scan'])
         save(self.root / f'resources-{cycle:06d}-{suffix}.json', report)
 
     def check_daemon_log(self, journal, suffix):

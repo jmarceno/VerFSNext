@@ -13,7 +13,8 @@ filesystem. It does not change the daemon or use its internal Rust APIs.
 - Initial failed run source: Git `43014ab759ac0c5d243d91c65b18c6feb91cee88`.
 - Initial executable SHA-256:
   `b602212a9378f29bb787459e75da83f937ee9dbf24de6036f120b4a7e12e0a4e`.
-- Build: `cargo remote -h -- build --release --no-default-features`.
+- Build: `cargo remote -h -- build --profile headless --no-default-features`
+  (lands in `target/headless/`, never in the desktop build's `target/release/`).
   The original local desktop executable was retained; the headless artifact is
   `target/resilience/verfsnext`.
 - Daemon data: `/var/lib/verfsnext-soak/data` inside LXC 101.
@@ -73,8 +74,21 @@ review. No further endurance run is scheduled automatically.
 - **2026-10-09, release `d19936e-b014-b61459be`**: B012, B013 and B014 fixed (remote
   headless build, SHA-256 `13145043…0165b`) with the reviewed harness. All nine
   preflight scenarios passed. `chain.sh` armed **six hours** of endurance at 07:54 -03
-  and started `verfsnext-resilience-101.service`, detached on Proxmox. Consult the active
-  `status.json`, `preflight-completed.json` and `provenance.json`.
+  and started `verfsnext-resilience-101.service`, detached on Proxmox. The run stopped
+  at cycle 41 after 31 endurance verifications because resource capture raced the
+  atomic `.DISCARD.tmp` replacement during GC; cycle 40's 215-object verification passed.
+  The supervisor failed on `find` reporting the already-removed temporary entry and
+  froze LXC 101. This was a harness diagnostic race; it did not report a data mismatch
+  or daemon error. Its supervisor artifacts and full LXC backup are in
+  `archives/101-20261009-085650-harness-capture-race/`.
+- **2026-10-09 18:43 -03, release `f42fb3c-harness-5b54a56d`**: rerun on a clean
+  synthetic corpus with the corrected inventory capture. All nine preflight scenarios
+  passed, including one GC rewrite hit. Endurance then ran until 23:28 -03, cycle 150,
+  with 141 endurance verifications, no mismatch, no daemon warning and no WAL-tail
+  repair. The supervisor stopped because host evidence reached 67 891 948 bytes, past
+  the 64 MiB cap, and froze LXC 101. Root free space was still about 1.84 GiB. This
+  is a harness budget stop, not an integrity failure. Archived as
+  `archives/101-20261009-232812-evidence-budget`.
 
 ## Workload and failure schedule
 
@@ -223,6 +237,49 @@ verification and the failing read, with the operation/fault context. They do not
 by themselves establish a root cause; retained packs, metadata and traces are the
 debugging evidence.
 
+## Drift soak
+
+`scripts/resilience/drift.py` is a separate run from the fault schedule. It keeps
+writing the same mounted volume for a fixed wall-clock duration and re-reads durable
+bytes on every pass. It does not inject crashes.
+
+On the existing mount it creates three namespaces:
+
+- `drift/stable`: 32 files of 8 MiB, written once. Any later change is drift.
+- `drift/hot`: 8 files of 16 MiB plus one 8 MiB file written once. Four writers
+  rewrite the 16 MiB files in 1 MiB aligned writes. About a third of the rewrites
+  repeat a retained image; the rest are new mixes of shared 1 MiB pages and unique
+  pages, or a one-page punch. Each writer keeps six recent images.
+- `drift/churn`: files are created, replaced and deleted continuously, sometimes
+  with a repeated image and sometimes with a new one.
+
+Every pass also re-hashes the pre-existing volume (tree, stable, vault, snapshots,
+acknowledged files, probe). Paths under `drift/hot` and `drift/churn` are excluded
+from that baseline because those subtrees are the live stress. A hot file is checked
+only against the generation published after its fsync. A read that races the next
+generation is retried; a stable generation whose bytes differ is a mismatch.
+
+About once a minute the writers pause for 3 s so idle GC can run, then the pass
+runs again. Below 150 MiB free, writers stop minting new bytes and only repeat a
+retained image, and churn deletes files; that is not a failed run. At the deadline
+the writers stop, the daemon is remounted, and the same audit runs against a cold
+FUSE mount. The oracle lives on the guest ext4 at
+`/var/lib/verfsnext-soak/drift-oracle/` (model, one status file, a pass log). It does
+not store a full manifest per pass. A mismatch or a daemon `ERROR` / panic / nonzero
+CRC32 counter fails the run. The container is left running.
+
+The short run is `verfsnext-drift-101.service` (not enabled): 1800 s of stress, then
+the remount audit. Its host status is `/var/lib/verfsnext-resilience/drift-101/status.json`.
+
+On 2026-10-10 the first two launches did not reach that audit. Rewriting the hot
+files stored new 1 MiB blocks faster than idle GC could reclaim them, and root free
+space crossed the 768 MiB floor (the second stop was at 796 MiB, with no mismatch
+and no daemon error). The supervisor froze LXC 101 each time. After unfreeze, deleting
+`drift/` and leaving the daemon idle let GC reclaim the packs. Old guest copies of
+previous soak data directories were moved to
+`/var/lib/verfsnext-resilience/guest-data-archives/pre-drift-soak-copies.tar` on the
+Proxmox host before those attempts, so the 4 GiB disk had room for the new files.
+
 ## Review commands
 
 From the workstation:
@@ -232,6 +289,8 @@ ssh proxmox 'cat /var/lib/verfsnext-resilience/101/status.json'
 ssh proxmox 'systemctl status verfsnext-resilience-101.service --no-pager'
 ssh proxmox 'tail -20 /var/lib/verfsnext-resilience/101/host-events.jsonl'
 ssh proxmox 'journalctl -u verfsnext-resilience-101.service --no-pager -n 50'
+ssh proxmox 'cat /var/lib/verfsnext-resilience/drift-101/status.json'
+ssh proxmox 'systemctl status verfsnext-drift-101.service --no-pager'
 ```
 
 `completed` is passing only after the final verification and daemon shutdown.
