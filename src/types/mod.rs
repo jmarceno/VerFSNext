@@ -5,7 +5,14 @@ use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const ROOT_INODE: u64 = 1;
-pub const BLOCK_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Layout of file data in metadata. Version 2: extents are keyed by their
+/// byte offset and each one maps a variable-length content-defined chunk.
+pub const STORAGE_FORMAT_VERSION: u64 = 2;
+pub const SYS_STORAGE_FORMAT: &str = "storage_format";
+/// Longest extent any mount of this data directory has written. Extent
+/// lookups scan back this far to find the extent that covers an offset.
+pub const SYS_MAX_EXTENT_LEN: &str = "max_extent_len";
 
 pub const INODE_KIND_FILE: u8 = 1;
 pub const INODE_KIND_DIR: u8 = 2;
@@ -88,6 +95,8 @@ pub struct DirentRecord {
 #[rkyv(bytecheck())]
 pub struct ExtentRecord {
     pub chunk_hash: [u8; 16],
+    /// Bytes of file data this extent maps; always the whole chunk.
+    pub len: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
@@ -166,9 +175,9 @@ pub fn extent_prefix(ino: u64) -> Vec<u8> {
     key
 }
 
-pub fn extent_key(ino: u64, block_idx: u64) -> Vec<u8> {
+pub fn extent_key(ino: u64, start: u64) -> Vec<u8> {
     let mut key = extent_prefix(ino);
-    key.extend_from_slice(&block_idx.to_be_bytes());
+    key.extend_from_slice(&start.to_be_bytes());
     key
 }
 

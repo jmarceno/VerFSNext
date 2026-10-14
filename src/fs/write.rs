@@ -61,13 +61,51 @@ impl WriteGroup {
     }
 }
 
+/// How far past the last written byte a region keeps re-chunking unchanged
+/// data while waiting for a cut to land on an existing extent boundary, in
+/// maximum chunk sizes. Past it the region ends at the next existing
+/// boundary.
+const RESYNC_MAX_CHUNKS: u64 = 2;
+
 struct PreparedWritePlan {
     write_end: u64,
     dedup_hits: u64,
     dedup_misses: u64,
-    extent_updates: Vec<(u64, [u8; 16])>,
+    /// Starts of extents that are removed without a replacement at the
+    /// same offset.
+    extent_deletes: Vec<u64>,
+    extent_sets: Vec<FileExtent>,
     ref_deltas: HashMap<[u8; 16], i64>,
     new_chunk_records: HashMap<[u8; 16], ChunkRecord>,
+}
+
+/// A chunk cut from a region, with the bytes it holds.
+struct CutChunk {
+    extent: FileExtent,
+    data: Arc<Vec<u8>>,
+}
+
+fn segment_end(segment: &WriteOp) -> u64 {
+    segment.offset + segment.data.len() as u64
+}
+
+/// The extent of `extents` that holds byte `offset`.
+fn covering_extent(extents: &BTreeMap<u64, FileExtent>, offset: u64) -> Option<FileExtent> {
+    extents
+        .range(..=offset)
+        .next_back()
+        .map(|(_, extent)| *extent)
+        .filter(|extent| extent.end() > offset)
+}
+
+/// Moves `next` past every segment that ends at or before `offset`.
+fn skip_segments_before(segments: &[WriteOp], next: &mut usize, offset: u64) {
+    while segments
+        .get(*next)
+        .is_some_and(|segment| segment_end(segment) <= offset)
+    {
+        *next += 1;
+    }
 }
 
 impl FsCore {
@@ -81,127 +119,91 @@ impl FsCore {
         }
         FsCore::ensure_inode_writable(inode, "write")
     }
+
+    /// Plans the extents of one inode after its batched writes.
+    ///
+    /// Chunk boundaries are content defined and independent of how the
+    /// kernel split the data into requests. Every write is re-chunked as part
+    /// of a region of the file that starts at the extent holding the byte
+    /// before the write, so an append continues the tail chunk instead of
+    /// starting a new one at the old end of file. A region runs past the end
+    /// of its writes until a cut lands on an existing extent boundary, from
+    /// where the existing extents are kept as they are.
     async fn prepare_write_plan(
         &self,
         group: &WriteGroup,
         inode: &InodeRecord,
         txn: &verfsnext_surrealkv::Transaction,
     ) -> Result<PreparedWritePlan> {
-        let block_size = BLOCK_SIZE as u64;
         let mut write_end = 0_u64;
-        // Blocks touched by the group in ascending order, each with the
-        // segments that overlap it. Segments are sorted and disjoint, so two
-        // segments can only share the last block of the first one.
-        let mut touched_blocks = Vec::<(u64, Vec<usize>)>::new();
-        for (segment_idx, segment) in group.segments.iter().enumerate() {
-            let segment_end = segment
+        for segment in &group.segments {
+            let end = segment
                 .offset
                 .checked_add(segment.data.len() as u64)
                 .ok_or_else(|| anyhow_errno(Errno::EOVERFLOW, "write offset overflow"))?;
-            write_end = write_end.max(segment_end);
-            for block_idx in segment.offset / block_size..=(segment_end - 1) / block_size {
-                match touched_blocks.last_mut() {
-                    Some((last, segments)) if *last == block_idx => segments.push(segment_idx),
-                    _ => touched_blocks.push((block_idx, vec![segment_idx])),
-                }
-            }
+            write_end = write_end.max(end);
         }
 
-        // Fast path: files with size == 0 have no extents. Skip the KV range scan.
-        // This applies to newly created files and files truncated to zero.
-        let mut old_extents = HashMap::<u64, ExtentRecord>::new();
+        // Extents a region can read: the one before each write, the ones it
+        // overwrites and the ones it re-chunks while resynchronizing.
+        let max_chunk = self.chunker.max_size() as u64;
+        let reach = (RESYNC_MAX_CHUNKS + 2) * max_chunk + 2 * self.max_extent_len;
+        let mut old_extents = BTreeMap::<u64, FileExtent>::new();
         if inode.size != 0 {
             for segment in &group.segments {
-                let start_block = segment.offset / block_size;
-                let end_block = (segment.offset + segment.data.len() as u64 - 1) / block_size;
-                let start_key = extent_key(group.ino, start_block);
-                let end_key = end_block
-                    .checked_add(1)
-                    .map(|end| extent_key(group.ino, end))
-                    .unwrap_or_else(|| prefix_end(&extent_prefix(group.ino)));
-
-                let mut iter = txn.range(start_key, end_key)?;
-                let mut valid = iter.seek_first()?;
-                while valid {
-                    let key = iter.key().user_key();
-                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
-                        if block_idx >= start_block && block_idx <= end_block {
-                            let val = iter.value()?;
-                            let extent: ExtentRecord = decode_rkyv(&val)?;
-                            old_extents.insert(block_idx, extent);
-                        }
-                    }
-                    valid = iter.next()?;
+                let from = segment.offset.saturating_sub(1);
+                let to = segment_end(segment).saturating_add(reach);
+                for extent in self.load_extents_in_txn(txn, group.ino, from, to)? {
+                    old_extents.insert(extent.start, extent);
                 }
             }
         }
 
-        self.prefetch_chunk_meta(old_extents.values().map(|e| e.chunk_hash))?;
+        let mut replaced = HashMap::<u64, FileExtent>::new();
+        let mut cut_chunks = Vec::<CutChunk>::new();
+        let mut next_segment = 0;
+        while let Some(segment) = group.segments.get(next_segment) {
+            let region_start = segment
+                .offset
+                .checked_sub(1)
+                .and_then(|before| covering_extent(&old_extents, before))
+                .map_or(segment.offset, |extent| extent.start);
+            let region_end = self.chunk_region(
+                inode,
+                &group.segments,
+                &mut next_segment,
+                &old_extents,
+                region_start,
+                &mut cut_chunks,
+            )?;
+            replaced.extend(
+                old_extents
+                    .range(region_start..region_end)
+                    .map(|(start, extent)| (*start, *extent)),
+            );
+        }
 
-        let mut extent_updates = Vec::<(u64, [u8; 16])>::with_capacity(touched_blocks.len());
+        let mut extent_sets = Vec::<FileExtent>::with_capacity(cut_chunks.len());
         let mut ref_deltas =
-            HashMap::<[u8; 16], i64>::with_capacity(touched_blocks.len().saturating_mul(2));
-        let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
+            HashMap::<[u8; 16], i64>::with_capacity(cut_chunks.len().saturating_mul(2));
+        let mut pending_chunks = HashMap::<[u8; 16], Arc<Vec<u8>>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
         let mut dedup_hits = 0_u64;
         let mut dedup_misses = 0_u64;
-
-        for (block_idx, segment_indices) in touched_blocks {
-            let block_start = block_idx * block_size;
-            let block_end = block_start + block_size;
-
-            // Fast path: a segment that covers the whole block replaces it, so
-            // the old block is never read and the write slice is hashed as is.
-            let full_cover = match segment_indices.as_slice() {
-                [only] => {
-                    let segment = &group.segments[*only];
-                    let segment_end = segment.offset + segment.data.len() as u64;
-                    (segment.offset <= block_start && segment_end >= block_end).then(|| {
-                        let src_start = (block_start - segment.offset) as usize;
-                        &segment.data[src_start..src_start + BLOCK_SIZE]
-                    })
+        for chunk in cut_chunks {
+            if let Some(old) = replaced.remove(&chunk.extent.start) {
+                if old.same_mapping(&chunk.extent) {
+                    continue;
                 }
-                _ => None,
-            };
-            let (new_hash, block_data) = if let Some(write_slice) = full_cover {
-                let hash = FsCore::hash_for_inode(inode, write_slice);
-                (hash, write_slice.to_vec())
-            } else {
-                let mut block_data = if let Some(extent) = old_extents.get(&block_idx) {
-                    self.read_extent_bytes(*extent, FsCore::inode_is_vault(inode))?
-                } else {
-                    vec![0_u8; BLOCK_SIZE]
-                };
-                for segment_idx in segment_indices {
-                    let segment = &group.segments[segment_idx];
-                    let segment_end = segment.offset + segment.data.len() as u64;
-                    let copy_from = segment.offset.max(block_start);
-                    let copy_until = segment_end.min(block_end);
-                    let src_start = (copy_from - segment.offset) as usize;
-                    let src_end = (copy_until - segment.offset) as usize;
-                    let dst_start = (copy_from - block_start) as usize;
-                    block_data[dst_start..dst_start + (src_end - src_start)]
-                        .copy_from_slice(&segment.data[src_start..src_end]);
-                }
-                let hash = FsCore::hash_for_inode(inode, &block_data);
-                (hash, block_data)
-            };
-            let old_hash = old_extents.get(&block_idx).map(|extent| extent.chunk_hash);
-
-            if old_hash == Some(new_hash) {
-                continue;
+                *ref_deltas.entry(old.record.chunk_hash).or_insert(0) -= 1;
             }
-
-            extent_updates.push((block_idx, new_hash));
-            *ref_deltas.entry(new_hash).or_insert(0) += 1;
-            if let Some(old_hash) = old_hash {
-                *ref_deltas.entry(old_hash).or_insert(0) -= 1;
-            }
-
+            let hash = chunk.extent.record.chunk_hash;
+            *ref_deltas.entry(hash).or_insert(0) += 1;
+            extent_sets.push(chunk.extent);
             let staged_new = self.stage_chunk_if_missing(
                 txn,
-                new_hash,
-                &block_data,
+                hash,
+                chunk.data,
                 &mut checked_hashes,
                 &mut pending_chunks,
             )?;
@@ -210,6 +212,11 @@ impl FsCore {
             } else {
                 dedup_hits = dedup_hits.saturating_add(1);
             }
+        }
+        let mut extent_deletes = Vec::with_capacity(replaced.len());
+        for (start, old) in replaced {
+            *ref_deltas.entry(old.record.chunk_hash).or_insert(0) -= 1;
+            extent_deletes.push(start);
         }
 
         let new_chunk_records = self
@@ -220,10 +227,146 @@ impl FsCore {
             write_end,
             dedup_hits,
             dedup_misses,
-            extent_updates,
+            extent_deletes,
+            extent_sets,
             ref_deltas,
             new_chunk_records,
         })
+    }
+
+    /// Cuts the region that starts at `region_start` into chunks, pushes them
+    /// onto `out` and returns the end of the region. Every extent of
+    /// `old_extents` that starts inside the region is replaced by the chunks;
+    /// the region never ends inside an extent.
+    ///
+    /// The region's bytes are the writes from `segments[*next_segment..]`
+    /// laid over the old extents. A write that the region reaches is merged
+    /// into it, and `next_segment` is left at the first write it did not
+    /// reach. The region ends at the first cut, past every merged write, that
+    /// falls on the start of an old extent or on the end of the data (end of
+    /// file or a hole), or at the old boundary that follows once the
+    /// resynchronization budget is spent.
+    fn chunk_region(
+        &self,
+        inode: &InodeRecord,
+        segments: &[WriteOp],
+        next_segment: &mut usize,
+        old_extents: &BTreeMap<u64, FileExtent>,
+        region_start: u64,
+        out: &mut Vec<CutChunk>,
+    ) -> Result<u64> {
+        let vault = FsCore::inode_is_vault(inode);
+        let max_chunk = self.chunker.max_size();
+        let resync_bytes = RESYNC_MAX_CHUNKS * max_chunk as u64;
+        // Bytes [pos, fill) of the region, materialized ahead of the cut.
+        let mut pending = Vec::<u8>::with_capacity(2 * max_chunk);
+        let mut pos = region_start;
+        let mut fill = region_start;
+        // End of the last write merged into the region.
+        let mut dirty_end = region_start;
+        // Set once the resynchronization budget is spent: the region ends
+        // exactly here.
+        let mut stop_at = None::<u64>;
+        let mut data_ended = false;
+        let mut last_payload = None::<(u64, Arc<Vec<u8>>)>;
+        loop {
+            while !data_ended && pending.len() < max_chunk {
+                let wanted = fill + (max_chunk - pending.len()) as u64;
+                skip_segments_before(segments, next_segment, fill);
+                if let Some(segment) = segments
+                    .get(*next_segment)
+                    .filter(|segment| segment.offset <= fill)
+                {
+                    let end = segment_end(segment);
+                    let piece_end = end.min(wanted);
+                    pending.extend_from_slice(
+                        &segment.data
+                            [(fill - segment.offset) as usize..(piece_end - segment.offset) as usize],
+                    );
+                    fill = piece_end;
+                    dirty_end = dirty_end.max(end);
+                    stop_at = None;
+                    continue;
+                }
+                if stop_at == Some(fill) {
+                    data_ended = true;
+                    break;
+                }
+                let Some(extent) = covering_extent(old_extents, fill) else {
+                    data_ended = true;
+                    break;
+                };
+                let mut piece_end = extent.end().min(wanted);
+                if let Some(segment) = segments.get(*next_segment) {
+                    piece_end = piece_end.min(segment.offset);
+                }
+                if let Some(stop) = stop_at {
+                    piece_end = piece_end.min(stop);
+                }
+                let payload = match &last_payload {
+                    Some((start, payload)) if *start == extent.start => Arc::clone(payload),
+                    _ => {
+                        let payload = self.load_extent_payload(&extent, vault)?;
+                        last_payload = Some((extent.start, Arc::clone(&payload)));
+                        payload
+                    }
+                };
+                pending.extend_from_slice(
+                    &payload[(fill - extent.start) as usize..(piece_end - extent.start) as usize],
+                );
+                fill = piece_end;
+            }
+
+            if pending.is_empty() {
+                return Ok(pos);
+            }
+            let len = self.chunker.cut(&pending);
+            let data = pending[..len].to_vec();
+            pending.drain(..len);
+            let chunk_hash = FsCore::hash_for_inode(inode, &data);
+            out.push(CutChunk {
+                extent: FileExtent {
+                    start: pos,
+                    record: ExtentRecord {
+                        chunk_hash,
+                        len: len as u32,
+                    },
+                },
+                data: Arc::new(data),
+            });
+            pos += len as u64;
+
+            if pos < dirty_end {
+                continue;
+            }
+            skip_segments_before(segments, next_segment, pos);
+            if segments
+                .get(*next_segment)
+                .is_some_and(|segment| segment.offset <= pos)
+            {
+                continue;
+            }
+            if pending.is_empty() && data_ended {
+                return Ok(pos);
+            }
+            if old_extents.contains_key(&pos) {
+                return Ok(pos);
+            }
+            if stop_at.is_none() && pos - dirty_end >= resync_bytes {
+                // No write is materialized past `dirty_end`, so `pos` lies in
+                // old data and inside an old extent.
+                let extent = covering_extent(old_extents, pos).ok_or_else(|| {
+                    anyhow_errno(
+                        Errno::EIO,
+                        format!("write region of inode {} lost its data at {}", inode.ino, pos),
+                    )
+                })?;
+                let stop = extent.end();
+                pending.truncate((stop - pos) as usize);
+                fill = fill.min(stop);
+                stop_at = Some(stop);
+            }
+        }
     }
     pub(crate) async fn truncate_file_locked(
         &self,
@@ -285,67 +428,40 @@ impl FsCore {
         }
 
         let old_size = inode.size;
-        let mut extent_updates = Vec::<(u64, [u8; 16])>::new();
-        let mut extent_deletes = Vec::<Vec<u8>>::new();
+        let mut extent_updates = Vec::<FileExtent>::new();
+        let mut extent_deletes = Vec::<u64>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-        let mut pending_chunks = HashMap::<[u8; 16], Vec<u8>>::new();
+        let mut pending_chunks = HashMap::<[u8; 16], Arc<Vec<u8>>>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
 
         if new_size < old_size {
-            let block_size = BLOCK_SIZE as u64;
-            let has_boundary = new_size > 0 && !new_size.is_multiple_of(block_size);
-            let boundary_block = new_size / block_size;
-            let keep_block_start = if has_boundary {
-                boundary_block + 1
-            } else {
-                new_size.div_ceil(block_size)
-            };
-
-            let extents = {
-                let prefix = extent_prefix(ino);
-                let end = prefix_end(&prefix);
-                let mut out = Vec::<(u64, [u8; 16], Vec<u8>)>::new();
-                for pair in scan_range_pairs(txn, prefix, end)? {
-                    let (key, value) = pair?;
-                    let Some(block_idx) = FsCore::extent_block_idx_from_key(&key) else {
-                        continue;
-                    };
-                    let extent: ExtentRecord = decode_rkyv(&value)?;
-                    out.push((block_idx, extent.chunk_hash, key));
-                }
-                out
-            };
-
-            self.prefetch_chunk_meta(extents.iter().map(|(_, hash, _)| *hash))?;
-
-            for (block_idx, chunk_hash, key) in extents {
-                if has_boundary && block_idx == boundary_block {
-                    let mut block_data = self.read_extent_bytes(
-                        ExtentRecord { chunk_hash },
-                        FsCore::inode_is_vault(&inode),
-                    )?;
-                    let offset_in_block = (new_size % block_size) as usize;
-                    block_data[offset_in_block..].fill(0);
-                    let new_hash = FsCore::hash_for_inode(&inode, &block_data);
-                    if new_hash != chunk_hash {
-                        extent_updates.push((block_idx, new_hash));
-                        *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
-                        *ref_deltas.entry(new_hash).or_insert(0) += 1;
-                        self.stage_chunk_if_missing(
-                            txn,
-                            new_hash,
-                            &block_data,
-                            &mut checked_hashes,
-                            &mut pending_chunks,
-                        )?;
-                    }
+            let vault = FsCore::inode_is_vault(&inode);
+            for extent in self.load_extents_in_txn(txn, ino, new_size, u64::MAX)? {
+                *ref_deltas.entry(extent.record.chunk_hash).or_insert(0) -= 1;
+                if extent.start >= new_size {
+                    extent_deletes.push(extent.start);
                     continue;
                 }
-
-                if block_idx >= keep_block_start {
-                    extent_deletes.push(key);
-                    *ref_deltas.entry(chunk_hash).or_insert(0) -= 1;
-                }
+                // The extent that holds the new last byte keeps its prefix.
+                let payload = self.load_extent_payload(&extent, vault)?;
+                let data = Arc::new(payload[..(new_size - extent.start) as usize].to_vec());
+                let chunk_hash = FsCore::hash_for_inode(&inode, &data);
+                let trimmed = FileExtent {
+                    start: extent.start,
+                    record: ExtentRecord {
+                        chunk_hash,
+                        len: data.len() as u32,
+                    },
+                };
+                *ref_deltas.entry(chunk_hash).or_insert(0) += 1;
+                extent_updates.push(trimmed);
+                self.stage_chunk_if_missing(
+                    txn,
+                    chunk_hash,
+                    data,
+                    &mut checked_hashes,
+                    &mut pending_chunks,
+                )?;
             }
         }
         let new_chunk_records = self
@@ -360,14 +476,11 @@ impl FsCore {
         inode.ctime_sec = sec;
         inode.ctime_nsec = nsec;
 
-        for key in extent_deletes {
-            txn.delete(key)?;
+        for start in extent_deletes {
+            txn.delete(extent_key(ino, start))?;
         }
-        for (block_idx, hash) in extent_updates {
-            txn.set(
-                extent_key(ino, block_idx),
-                encode_rkyv(&ExtentRecord { chunk_hash: hash })?,
-            )?;
+        for extent in extent_updates {
+            txn.set(extent_key(ino, extent.start), encode_rkyv(&extent.record)?)?;
         }
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
@@ -409,9 +522,11 @@ impl FsCore {
         inode.ctime_sec = mtime_sec;
         inode.ctime_nsec = mtime_nsec;
 
-        for (block_idx, hash) in plan.extent_updates.iter().copied() {
-            let extent = ExtentRecord { chunk_hash: hash };
-            txn.set(extent_key(ino, block_idx), encode_rkyv(&extent)?)?;
+        for start in &plan.extent_deletes {
+            txn.delete(extent_key(ino, *start))?;
+        }
+        for extent in &plan.extent_sets {
+            txn.set(extent_key(ino, extent.start), encode_rkyv(&extent.record)?)?;
         }
 
         FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunk_records)?;
@@ -458,7 +573,7 @@ impl FsCore {
             segments = group.segments.len(),
             dedup_hits = plan.dedup_hits,
             dedup_misses = plan.dedup_misses,
-            "write completed through streaming dedup/compress pipeline"
+            "write completed through content-defined chunking, dedup and compression"
         );
 
         Ok(plan.new_chunk_records)

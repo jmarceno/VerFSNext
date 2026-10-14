@@ -96,7 +96,7 @@ const FIELDS: &[FieldMeta] = &[
         "ultracdc_min_size_bytes",
         SPACE,
         "Smallest piece",
-        "Files are cut into pieces so identical pieces are stored only once. Smaller pieces find more duplicates but need more bookkeeping.",
+        "Files are cut into pieces where their content says, so identical pieces are stored only once, even when they sit at different places in different files. Smaller pieces find more duplicates but need more bookkeeping.",
         Kind::Unsigned,
     )
     .unit("KiB", 1024.0)
@@ -105,7 +105,7 @@ const FIELDS: &[FieldMeta] = &[
         "ultracdc_avg_size_bytes",
         SPACE,
         "Typical piece",
-        "Target size of the pieces files are cut into.",
+        "Typical size of the pieces files are cut into. Size of writes from apps does not affect it.",
         Kind::Unsigned,
     )
     .unit("KiB", 1024.0)
@@ -114,7 +114,7 @@ const FIELDS: &[FieldMeta] = &[
         "ultracdc_max_size_bytes",
         SPACE,
         "Largest piece",
-        "Upper limit for the pieces files are cut into.",
+        "Upper limit for the pieces files are cut into (at most 4 MiB).",
         Kind::Unsigned,
     )
     .unit("KiB", 1024.0)
@@ -274,7 +274,7 @@ const FIELDS: &[FieldMeta] = &[
         "fuse_max_write_bytes",
         FS,
         "Largest single write",
-        "Biggest write request accepted from the system at once.",
+        "Biggest write request accepted from the system at once. Only affects throughput; how files are cut into stored pieces is set separately.",
         Kind::Unsigned,
     )
     .unit("KiB", 1024.0)

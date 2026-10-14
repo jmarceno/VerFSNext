@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::data::chunker::{MAX_CHUNK_SIZE_LIMIT, MIN_CHUNK_SIZE_LIMIT};
 use crate::permissions::ensure_dir;
-use crate::types::BLOCK_SIZE;
 
 fn default_sync_interval_ms() -> u64 {
     5_000
@@ -50,8 +50,10 @@ fn default_ultracdc_max_size_bytes() -> usize {
     64 * 1024
 }
 
+/// Largest FUSE WRITE request. It only sets how much data one request
+/// carries; stored chunk boundaries come from the UltraCDC settings.
 fn default_fuse_max_write_bytes() -> u32 {
-    u32::try_from(BLOCK_SIZE).unwrap_or(1024 * 1024)
+    1024 * 1024
 }
 
 fn default_fuse_direct_io() -> bool {
@@ -224,14 +226,17 @@ impl Config {
         if self.zstd_compression_level < -7 || self.zstd_compression_level > 22 {
             bail!("zstd_compression_level must be in range -7..=22");
         }
-        if self.ultracdc_min_size_bytes == 0 {
-            bail!("ultracdc_min_size_bytes must be > 0");
+        if self.ultracdc_min_size_bytes < MIN_CHUNK_SIZE_LIMIT {
+            bail!("ultracdc_min_size_bytes must be >= {MIN_CHUNK_SIZE_LIMIT}");
         }
         if self.ultracdc_avg_size_bytes < self.ultracdc_min_size_bytes {
             bail!("ultracdc_avg_size_bytes must be >= ultracdc_min_size_bytes");
         }
         if self.ultracdc_max_size_bytes < self.ultracdc_avg_size_bytes {
             bail!("ultracdc_max_size_bytes must be >= ultracdc_avg_size_bytes");
+        }
+        if self.ultracdc_max_size_bytes > MAX_CHUNK_SIZE_LIMIT {
+            bail!("ultracdc_max_size_bytes must be <= {MAX_CHUNK_SIZE_LIMIT}");
         }
         if self.fuse_max_write_bytes < 4096 {
             bail!("fuse_max_write_bytes must be >= 4096");

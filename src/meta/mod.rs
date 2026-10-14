@@ -12,7 +12,7 @@ use crate::data::pack::PackStore;
 use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
     InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, PERM_DIRECTORY_DEFAULT, PERM_DIRECTORY_ROOT,
-    ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    ROOT_INODE, SNAPSHOTS_DIR_NAME, STORAGE_FORMAT_VERSION, SYS_STORAGE_FORMAT,
 };
 use crate::vault::{SYS_VAULT_POLICY, SYS_VAULT_STATE, VAULT_STATE_LOCKED};
 
@@ -136,8 +136,33 @@ impl MetaStore {
             let vault_state_key = sys_key(SYS_VAULT_STATE);
             let vault_policy_key = sys_key(SYS_VAULT_POLICY);
 
+            let storage_format_key = sys_key(SYS_STORAGE_FORMAT);
             if txn.get(root_inode_key.clone())?.is_none() {
                 txn.set(root_inode_key.clone(), encode_rkyv(&root)?)?;
+                txn.set(
+                    storage_format_key,
+                    STORAGE_FORMAT_VERSION.to_le_bytes().to_vec(),
+                )?;
+            } else {
+                let stored = txn
+                    .get(storage_format_key)?
+                    .map(|raw| {
+                        <[u8; 8]>::try_from(raw.as_slice())
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| {
+                                anyhow::anyhow!("invalid SYS:{SYS_STORAGE_FORMAT} length {}", raw.len())
+                            })
+                    })
+                    .transpose()?;
+                if stored != Some(STORAGE_FORMAT_VERSION) {
+                    anyhow::bail!(
+                        "data directory uses storage format {} but this version only reads format {}; \
+                         the fixed 1 MiB block layout (no format marker) is not supported, \
+                         recreate the data directory",
+                        stored.map_or_else(|| "1 (fixed 1 MiB blocks)".to_owned(), |v| v.to_string()),
+                        STORAGE_FORMAT_VERSION
+                    );
+                }
             }
             if txn.get(next_inode_key.clone())?.is_none() {
                 txn.set(next_inode_key.clone(), 2_u64.to_le_bytes().to_vec())?;

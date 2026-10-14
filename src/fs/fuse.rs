@@ -755,280 +755,48 @@ impl VirtualFs for VerFs {
 
         let read_end = inode.size.min(offset.saturating_add(size as u64));
 
-        const HANDLE_READ_PLAN_MAX_BLOCKS: u64 = 4;
-        if inode.size <= BLOCK_SIZE as u64 * HANDLE_READ_PLAN_MAX_BLOCKS {
+        // Small files keep their whole extent list per handle, so repeated
+        // reads skip the metadata lookup.
+        const READ_PLAN_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+        let extents = if inode.size <= READ_PLAN_MAX_FILE_BYTES {
             let current_version = self.core.inode_data_version(ino);
-            let mut plan = self
+            let cached = self
                 .core
                 .get_small_file_read_plan(fh, ino, current_version)
-                .map_err(map_anyhow_to_fuse)?;
-
-            if plan.is_none() {
-                let end_block = if inode.size == 0 {
-                    0
-                } else {
-                    (inode.size - 1) / BLOCK_SIZE as u64
-                };
-                tracing::warn!(
-                    "BUILD_PLAN ino={} fh={} offset={} size={} version={} inode_size={} end_block={}",
-                    ino, fh, offset, size, current_version, inode.size, end_block
-                );
-                let built_plan = self
-                    .core
-                    .meta
-                    .read_txn(|txn| {
-                        let mut extents = HashMap::<u64, ExtentRecord>::new();
-                        let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
-                        for block_idx in 0..=end_block {
-                            let Some(raw_extent) = txn.get(extent_key(ino, block_idx))? else {
-                                tracing::warn!("BUILD_PLAN no_extent ino={} block={}", ino, block_idx);
-                                continue;
-                            };
-                            let extent: ExtentRecord = decode_rkyv(&raw_extent)?;
-                            extents.insert(block_idx, extent);
-                            if let std::collections::hash_map::Entry::Vacant(entry) =
-                                chunks.entry(extent.chunk_hash)
-                            {
-                                let Some(raw_chunk) = txn.get(chunk_key(&extent.chunk_hash))? else {
-                                    tracing::warn!("BUILD_PLAN no_chunk ino={} hash={:x?}", ino, extent.chunk_hash);
-                                    continue;
-                                };
-                                let chunk: ChunkRecord = decode_rkyv(&raw_chunk)?;
-                                entry.insert(chunk);
-                            }
-                        }
-                        Ok(SmallFileReadPlan {
-                            file_size: inode.size,
-                            extents,
-                            chunks,
-                        })
-                    })
-                    .map_err(map_anyhow_to_fuse)?;
-                tracing::warn!(
-                    "BUILD_PLAN_DONE ino={} fh={} extents={} chunks={} file_size={}",
-                    ino, fh, built_plan.extents.len(), built_plan.chunks.len(), built_plan.file_size
-                );
-
-                self.core
-                    .store_small_file_read_plan(
-                        fh,
-                        ino,
-                        current_version,
-                        Some(built_plan.clone()),
-                    )
-                    .map_err(map_anyhow_to_fuse)?;
-                plan = Some(built_plan);
-            }
-
-            let initial_buf_len = buf.len();
-            buf.reserve((read_end - offset) as usize);
-
-            if let Some(ref plan) = plan {
-                if plan.file_size == inode.size {
-                    for (hash, chunk) in plan.chunks.iter() {
-                        self.core.chunk_meta_cache.insert(*hash, *chunk);
-                    }
-                    let start_block = offset / BLOCK_SIZE as u64;
-                    let end_block = (read_end - 1) / BLOCK_SIZE as u64;
-                    for block_idx in start_block..=end_block {
-                        let block_start = block_idx * BLOCK_SIZE as u64;
-                        let block_from = offset.max(block_start) as usize - block_start as usize;
-                        let block_to =
-                            read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
-                        if let Some(extent) = plan.extents.get(&block_idx) {
-                            if !plan.chunks.contains_key(&extent.chunk_hash) {
-                                return build_error_result_from_errno(
-                                    Errno::EIO,
-                                    format!("missing chunk metadata for block {}", block_idx),
-                                );
-                            }
-                            let payload = self
-                                .core
-                                .load_extent_payload(*extent, FsCore::inode_is_vault(&inode))
-                                .map_err(map_anyhow_to_fuse)?;
-                            let payload_len = payload.len().min(BLOCK_SIZE);
-                            let available_end = payload_len.min(block_to);
-                            if available_end > block_from {
-                                buf.extend_from_slice(&payload[block_from..available_end]);
-                            }
-                            if block_to > available_end {
-                                buf.resize(buf.len() + (block_to - available_end), 0);
-                            }
-                            continue;
-                        }
-                        buf.resize(buf.len() + (block_to - block_from), 0);
-                    }
-                    let read_len = buf.len() - initial_buf_len;
-                    self.core
-                        .read_bytes_total
-                        .fetch_add(read_len as u64, Ordering::Relaxed);
-                    return Ok(read_len);
-                }
-                self.core
-                    .store_small_file_read_plan(fh, ino, current_version, None)
-                    .map_err(map_anyhow_to_fuse)?;
-            }
-
-            let end_block = if inode.size == 0 {
-                0
-            } else {
-                (inode.size - 1) / BLOCK_SIZE as u64
-            };
-            let rebuilt_plan = self
-                .core
-                .meta
-                .read_txn(|txn| {
-                    let mut extents = HashMap::<u64, ExtentRecord>::new();
-                    let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
-                    for block_idx in 0..=end_block {
-                        let Some(raw_extent) = txn.get(extent_key(ino, block_idx))? else {
-                            continue;
-                        };
-                        let extent: ExtentRecord = decode_rkyv(&raw_extent)?;
-                        extents.insert(block_idx, extent);
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            chunks.entry(extent.chunk_hash)
-                        {
-                            let Some(raw_chunk) = txn.get(chunk_key(&extent.chunk_hash))? else {
-                                continue;
-                            };
-                            let chunk: ChunkRecord = decode_rkyv(&raw_chunk)?;
-                            entry.insert(chunk);
-                        }
-                    }
-                    Ok(SmallFileReadPlan {
+                .map_err(map_anyhow_to_fuse)?
+                .filter(|plan| plan.file_size == inode.size);
+            match cached {
+                Some(plan) => plan.extents,
+                None => {
+                    let plan = SmallFileReadPlan {
                         file_size: inode.size,
-                        extents,
-                        chunks,
-                    })
-                })
-                .map_err(map_anyhow_to_fuse)?;
-
-            self.core
-                .store_small_file_read_plan(fh, ino, current_version, Some(rebuilt_plan.clone()))
-                .map_err(map_anyhow_to_fuse)?;
-
-            for (hash, chunk) in rebuilt_plan.chunks.iter() {
-                self.core.chunk_meta_cache.insert(*hash, *chunk);
-            }
-            let start_block = offset / BLOCK_SIZE as u64;
-            let end_block = (read_end - 1) / BLOCK_SIZE as u64;
-            for block_idx in start_block..=end_block {
-                let block_start = block_idx * BLOCK_SIZE as u64;
-                let block_from = offset.max(block_start) as usize - block_start as usize;
-                let block_to =
-                    read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
-                if let Some(extent) = rebuilt_plan.extents.get(&block_idx) {
-                    if !rebuilt_plan.chunks.contains_key(&extent.chunk_hash) {
-                        return build_error_result_from_errno(
-                            Errno::EIO,
-                            format!("missing chunk metadata for block {}", block_idx),
-                        );
-                    }
-                    let payload = self
-                        .core
-                        .load_extent_payload(*extent, FsCore::inode_is_vault(&inode))
+                        extents: Arc::new(
+                            self.core
+                                .meta
+                                .read_txn(|txn| FsCore::load_all_extents_in_txn(txn, ino))
+                                .map_err(map_anyhow_to_fuse)?,
+                        ),
+                    };
+                    let extents = Arc::clone(&plan.extents);
+                    self.core
+                        .store_small_file_read_plan(fh, ino, current_version, Some(plan))
                         .map_err(map_anyhow_to_fuse)?;
-                    let payload_len = payload.len().min(BLOCK_SIZE);
-                    let available_end = payload_len.min(block_to);
-                    if available_end > block_from {
-                        buf.extend_from_slice(&payload[block_from..available_end]);
-                    }
-                    if block_to > available_end {
-                        buf.resize(buf.len() + (block_to - available_end), 0);
-                    }
-                    continue;
+                    extents
                 }
-                buf.resize(buf.len() + (block_to - block_from), 0);
             }
+        } else {
+            Arc::new(
+                self.core
+                    .meta
+                    .read_txn(|txn| self.core.load_extents_in_txn(txn, ino, offset, read_end))
+                    .map_err(map_anyhow_to_fuse)?,
+            )
+        };
 
-            let read_len = buf.len() - initial_buf_len;
-            self.core
-                .read_bytes_total
-                .fetch_add(read_len as u64, Ordering::Relaxed);
-            return Ok(read_len);
-        }
-
-        let start_block = offset / BLOCK_SIZE as u64;
-        let end_block = (read_end - 1) / BLOCK_SIZE as u64;
-
-        let (extents, chunks) = self
+        let read_len = self
             .core
-            .meta
-            .read_txn(|txn| {
-                let mut extents = HashMap::<u64, ExtentRecord>::new();
-                let mut hashes = HashSet::<[u8; 16]>::new();
-
-                let start_key = extent_key(ino, start_block);
-                let end_key = end_block
-                    .checked_add(1)
-                    .map(|end| extent_key(ino, end))
-                    .unwrap_or_else(|| prefix_end(&extent_prefix(ino)));
-
-                let mut iter = txn.range(start_key, end_key)?;
-                let mut valid = iter.seek_first()?;
-                while valid {
-                    let key = iter.key().user_key();
-                    if let Some(block_idx) = FsCore::extent_block_idx_from_key(key) {
-                        if block_idx >= start_block && block_idx <= end_block {
-                            let val = iter.value()?;
-                            let extent: ExtentRecord = decode_rkyv(&val)?;
-                            hashes.insert(extent.chunk_hash);
-                            extents.insert(block_idx, extent);
-                        }
-                    }
-                    valid = iter.next()?;
-                }
-
-                let mut chunks = HashMap::<[u8; 16], ChunkRecord>::new();
-                for hash in hashes {
-                    if let Some(raw) = txn.get(chunk_key(&hash))? {
-                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
-                        chunks.insert(hash, chunk);
-                    }
-                }
-
-                Ok((extents, chunks))
-            })
+            .read_extents_into(&inode, &extents, offset, read_end, buf)
             .map_err(map_anyhow_to_fuse)?;
-
-        for (hash, chunk) in chunks.iter() {
-            self.core.chunk_meta_cache.insert(*hash, *chunk);
-        }
-
-        let initial_buf_len = buf.len();
-        buf.reserve((read_end - offset) as usize);
-        for block_idx in start_block..=end_block {
-            let block_start = block_idx * BLOCK_SIZE as u64;
-            let from = offset.max(block_start) as usize - block_start as usize;
-            let to = read_end.min(block_start + BLOCK_SIZE as u64) as usize - block_start as usize;
-            if let Some(extent) = extents.get(&block_idx) {
-                if !chunks.contains_key(&extent.chunk_hash) {
-                    return build_error_result_from_errno(
-                        Errno::EIO,
-                        format!("missing chunk metadata for block {}", block_idx),
-                    );
-                }
-
-                let payload = self
-                    .core
-                    .load_extent_payload(*extent, FsCore::inode_is_vault(&inode))
-                    .map_err(map_anyhow_to_fuse)?;
-                let payload_len = payload.len().min(BLOCK_SIZE);
-                let available_end = payload_len.min(to);
-                if available_end > from {
-                    buf.extend_from_slice(&payload[from..available_end]);
-                }
-                if to > available_end {
-                    buf.resize(buf.len() + (to - available_end), 0);
-                }
-                continue;
-            }
-
-            buf.resize(buf.len() + (to - from), 0);
-        }
-
-        let read_len = buf.len() - initial_buf_len;
         self.core
             .read_bytes_total
             .fetch_add(read_len as u64, Ordering::Relaxed);

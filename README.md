@@ -36,7 +36,7 @@ compressed chunks in a separate data directory.
 
 | What you want | What VerFSNext gives you |
 | --- | --- |
-| **Less repeated data on disk** | Inline UltraCDC chunking identifies shared content so duplicate chunks can reuse stored data. Chunk sizes are configurable. |
+| **Less repeated data on disk** | Inline UltraCDC content-defined chunking cuts files where their content says, not where writes happen to split them, so data shared between files (even at different offsets) is stored once. Chunk sizes (16/32/64 KiB min/average/max by default) are configurable. |
 | **Compression as you write** | Zstandard compresses chunks before they reach storage, with a configurable compression level. |
 | **Earlier versions you can browse** | Create read-only snapshots and open their files through `.snapshots` at the mount root. |
 | **Private files in their own space** | The optional `.vault` namespace uses Argon2id key derivation and XChaCha20-Poly1305 authenticated encryption. It is hidden and inaccessible while locked. |
@@ -243,6 +243,13 @@ The command reads the key file as you and sends its content to the daemon over t
 After lock:
 - `/.vault` disappears from directory listings
 - Direct access to `/.vault/*` fails until next unlock
+
+## Storage Format
+
+Data directories record their storage format in metadata. The current format
+(2) stores files as variable-length content-defined chunks. Directories created
+by earlier builds used fixed 1 MiB blocks (format 1); they are refused at
+startup with an explicit error and must be recreated. There is no migration.
 
 ## Pack Size Migration
 

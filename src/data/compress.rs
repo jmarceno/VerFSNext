@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
@@ -16,7 +18,8 @@ pub struct CompressedChunk {
 #[derive(Debug, Clone)]
 pub struct PendingChunk {
     pub hash: [u8; 16],
-    pub data: Vec<u8>,
+    /// Shared with the chunk data cache, so staging a chunk copies nothing.
+    pub data: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,8 @@ pub fn decompress_chunk(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         compress_chunk, compress_parallel, decompress_chunk, PendingChunk, CODEC_RAW, CODEC_ZSTD,
     };
@@ -159,15 +164,15 @@ mod tests {
         let inputs = vec![
             PendingChunk {
                 hash: [1_u8; 16],
-                data: vec![0_u8; 32 * 1024],
+                data: Arc::new(vec![0_u8; 32 * 1024]),
             },
             PendingChunk {
                 hash: [2_u8; 16],
-                data: b"second chunk payload".to_vec(),
+                data: Arc::new(b"second chunk payload".to_vec()),
             },
             PendingChunk {
                 hash: [3_u8; 16],
-                data: vec![5_u8; 8 * 1024],
+                data: Arc::new(vec![5_u8; 8 * 1024]),
             },
         ];
 
@@ -182,7 +187,7 @@ mod tests {
                 out.chunk.uncompressed_len,
             )
             .expect("roundtrip");
-            assert_eq!(plain, inputs[i].data);
+            assert_eq!(plain, *inputs[i].data);
         }
     }
 }

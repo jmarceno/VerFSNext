@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +22,7 @@ use nix::libc;
 use nix::sys::stat::SFlag;
 use nix::sys::statvfs;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use verfsnext_surrealkv::LSMIterator;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
@@ -29,6 +30,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::data::chunker::UltraCdc;
 use crate::data::compress::{compress_parallel, PendingChunk};
 use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
@@ -45,10 +47,10 @@ use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, BLOCK_SIZE, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
+    DirentRecord, ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
     INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
     MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
-    VAULT_DIR_NAME,
+    SYS_MAX_EXTENT_LEN, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -98,11 +100,32 @@ struct DirHandleState {
     snapshot: Option<Vec<CachedDirEntry>>,
 }
 
+/// One extent of a file: `record.len` bytes of chunk `record.chunk_hash`
+/// starting at byte `start`. A file's extents never overlap; bytes no extent
+/// covers are holes and read as zeros.
+#[derive(Debug, Clone, Copy)]
+struct FileExtent {
+    start: u64,
+    record: ExtentRecord,
+}
+
+impl FileExtent {
+    fn end(&self) -> u64 {
+        self.start + u64::from(self.record.len)
+    }
+
+    fn same_mapping(&self, other: &FileExtent) -> bool {
+        self.start == other.start
+            && self.record.len == other.record.len
+            && self.record.chunk_hash == other.record.chunk_hash
+    }
+}
+
+/// Every extent of a small file, sorted by offset.
 #[derive(Clone)]
 struct SmallFileReadPlan {
     file_size: u64,
-    extents: HashMap<u64, ExtentRecord>,
-    chunks: HashMap<[u8; 16], ChunkRecord>,
+    extents: Arc<Vec<FileExtent>>,
 }
 
 #[derive(Clone)]
@@ -200,6 +223,10 @@ pub struct VerFs {
 
 struct FsCore {
     config: Config,
+    chunker: UltraCdc,
+    /// Upper bound of every extent length in this data directory
+    /// (`SYS:max_extent_len`), fixed for the session.
+    max_extent_len: u64,
     meta: MetaStore,
     packs: Arc<PackStore>,
     chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
@@ -282,6 +309,7 @@ impl VerFs {
         if reclaimed_orphans > 0 {
             info!(reclaimed_orphans, "reclaimed unlinked inodes left by a previous run");
         }
+        let max_extent_len = FsCore::raise_max_extent_len(&meta, &config).await?;
         if meta.get_sys(SYS_VAULT_STATE)?.is_none() {
             meta.write_txn(|txn| {
                 txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
@@ -292,6 +320,12 @@ impl VerFs {
 
         let core = Arc::new(FsCore {
             config: config.clone(),
+            chunker: UltraCdc::new(
+                config.ultracdc_min_size_bytes,
+                config.ultracdc_avg_size_bytes,
+                config.ultracdc_max_size_bytes,
+            ),
+            max_extent_len,
             meta,
             packs,
             chunk_meta_cache: Cache::builder()
@@ -480,6 +514,30 @@ impl VerFs {
 }
 
 impl FsCore {
+    /// Records the configured maximum chunk size in `SYS:max_extent_len`
+    /// when it exceeds every extent written so far, and returns the bound.
+    /// Every extent written in this session is at most the configured
+    /// maximum, so the bound never changes while mounted.
+    async fn raise_max_extent_len(meta: &MetaStore, config: &Config) -> Result<u64> {
+        let configured = config.ultracdc_max_size_bytes as u64;
+        let stored = match meta.get_sys(SYS_MAX_EXTENT_LEN)? {
+            Some(_) => meta.get_u64_sys(SYS_MAX_EXTENT_LEN)?,
+            None => 0,
+        };
+        if configured > stored {
+            meta.write_txn(|txn| {
+                txn.set(
+                    sys_key(SYS_MAX_EXTENT_LEN),
+                    configured.to_le_bytes().to_vec(),
+                )?;
+                Ok(())
+            })
+            .await?;
+            return Ok(configured);
+        }
+        Ok(stored)
+    }
+
     fn configured_attr_ttl(&self) -> Duration {
         Duration::from_millis(self.config.fuse_attr_ttl_ms)
     }
@@ -1036,9 +1094,9 @@ impl FsCore {
         let approx_cache_memory_bytes = metadata_cache_entries
             .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
             .saturating_add(
-                chunk_cache_entries
-                    .saturating_mul((size_of::<([u8; 16], Arc<Vec<u8>>)>() + BLOCK_SIZE) as u64),
-            );
+                chunk_cache_entries.saturating_mul(size_of::<([u8; 16], Arc<Vec<u8>>)>() as u64),
+            )
+            .saturating_add(self.chunk_data_cache.weighted_size());
 
         let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
         let process_private_memory_bytes =

@@ -11,7 +11,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - ingest stage batches by byte threshold or flush interval
   - apply stage drains ordered batches and reports completion to waiting syscalls
 - Background sync + shutdown full-sync barrier
-- Streaming UltraCDC chunking telemetry in write ingress path
+- Content-defined chunking (UltraCDC) of all file data, independent of FUSE request sizes (see "Content-Defined Chunking")
 - XXH3-128 hash-authoritative dedup decisions
 - zstd compression with rayon parallel compression workers
 - Hash-only two-index lookup model:
@@ -69,6 +69,33 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - Pack stage: rewrites eligible non-active packs by reclaim threshold and atomically replaces pack + index files
   - Offline recovery path: `verfsnext gc offline [--run]` rebuilds `.DISCARD` by scanning pack indexes against current chunk metadata (including orphaned/stale pack entries) and can optionally run only the pack-stage rewrite loop afterward
 
+## Content-Defined Chunking
+
+File data is stored as variable-length, content-defined chunks. Chunk boundaries depend only on the file's bytes, never on how the kernel split them into FUSE requests: `fuse_max_write_bytes` only sizes requests, while `ultracdc_min_size_bytes`, `ultracdc_avg_size_bytes` and `ultracdc_max_size_bytes` control the stored chunks. Until this was introduced (B018) every file was stored as fixed, zero-padded 1 MiB blocks and the UltraCDC settings had no effect.
+
+- `src/data/chunker.rs` implements UltraCDC (Zhou et al., 2022): an 8-byte window is compared against the pattern `0xAA..AA`; its Hamming distance is updated byte by byte and a cut is taken where `distance & mask == 0`, with mask `0x2F` before the normal (average) size and `0x2C` after it. No cut is taken before the minimum size, a cut is forced at the maximum size, and a run of 64 identical 8-byte windows (low-entropy data such as zeros) is cut immediately. The chunker needs either `max_size` bytes or all remaining bytes of a data run, so a cut never depends on how much data happened to be buffered. With 16/32/64 KiB the mean chunk on random data is about 32 KiB.
+- Config limits: `ultracdc_min_size_bytes >= 64`, `min <= avg <= max`, `ultracdc_max_size_bytes <= 4 MiB`.
+
+### Extent layout (storage format 2)
+
+- Extent key: `E` + inode (u64 BE) + first byte offset (u64 BE). Value: `ExtentRecord { chunk_hash, len }`; an extent always maps a whole chunk and `len` equals the chunk's `uncompressed_len` (a mismatch is an `EIO`, logged with both lengths).
+- Extents of a file never overlap and lie inside `[0, size)`. Gaps between extents, and the space between the last extent and `size`, are holes that read as zeros; writes beyond end of file and `truncate` up never store zeros.
+- `SYS:max_extent_len` is the largest maximum chunk size any mount of the data directory has used. At startup it is raised to the configured `ultracdc_max_size_bytes` if lower and is then fixed for the session (every extent written is at most the configured maximum). The extent covering an offset is found with a forward range scan that starts `max_extent_len - 1` bytes before it, so lookups need no reverse iteration.
+- Snapshots copy extent records verbatim; GC, pack format and chunk records are unchanged, since the pack store was already chunk-size agnostic (one record per chunk hash).
+
+### Write planning
+
+`prepare_write_plan` processes the sorted, disjoint segments of a write group as regions:
+
+1. A region starts at the start of the extent that holds the byte just before its first write (or at the write itself after a hole or at offset 0). An append therefore re-chunks the file's tail chunk together with the new data instead of starting a chunk at the old end of file.
+2. Its bytes are the writes laid over the old extents. The region is materialized incrementally (at most `max_size` bytes ahead of the current cut) and cut with UltraCDC. A later write of the group that the region reaches is merged into it.
+3. Past the end of the last merged write, the region ends at the first cut that lands on the start of an old extent (resynchronization: from there the old cuts are what UltraCDC would produce again, so those extents are kept), or at the end of the data (end of file or a hole). If no cut has landed on an old boundary after `RESYNC_MAX_CHUNKS` (2) maximum chunk sizes, the region ends at the next old extent boundary.
+4. Old extents that start inside a region are replaced by its chunks. A chunk identical to the old extent at the same offset (same start, length and hash) is left untouched, so rewriting identical data changes no extents or refcounts. Other extents get refcount `+1` for the new chunk and `-1` for the replaced one; replaced extents with no new extent at their offset are deleted.
+
+Old extents a region can reach are loaded through the batch transaction once per segment (from one byte before the write to `(RESYNC_MAX_CHUNKS + 2) * max_size + 2 * max_extent_len` after it). A missing extent at the far end only looks like a hole at an extent start, which is a valid region end.
+
+Cost: each FUSE write that extends a file re-reads (usually from the chunk cache) and re-stores the file's tail chunk, and the superseded tail chunk becomes garbage for GC. Copying a 32 MiB file stored about 5% extra pack data before GC. A random write re-chunks the extent before it, the extents it overwrites and normally one or two more until resynchronization.
+
 ## Runtime Layout
 
 - `src/fs/mod.rs`
@@ -78,8 +105,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
     - read-side lock for file-content writes/truncates so unrelated inode writes can continue concurrently
   - per-inode async write locks are allocated lazily and weakly cached (`inode -> Weak<Mutex<()>>`); the map itself and the POSIX lock table are `parking_lot` mutexes because their critical sections are single map operations
   - blocking disk work never runs inline on a tokio worker: chunk payload reads on a cache miss (pack read plus decompression), the sync cycle's pack/WAL syncs and GC pack rewrites run under `block_in_place`, and the WAL hand-off pack sync runs in `spawn_blocking`
-  - write path stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
-  - read path resolves chunk location through pack-local hash index
+  - write path cuts file data into content-defined chunks, stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
+  - read path resolves the extents that overlap the request, loads the chunks missing from the cache in parallel (rayon, under one `block_in_place`), and resolves chunk location through pack-local hash index; bytes no extent covers are holes and read as zeros
   - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
   - bounded chunk metadata and chunk payload caches
   - committed metadata read caches (bounded `moka`) for inode and dirent lookups with post-commit invalidation on mutation paths
@@ -101,17 +128,18 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
   - directory handles now keep a per-`opendir` snapshot for stable pagination while the namespace is mutating (prevents recursive-delete entry skips)
-  - file-handle read-plan cache uses bounded `moka` entries keyed by `fh`; plans are version-checked against inode data version before reuse
+  - file-handle read-plan cache uses bounded `moka` entries keyed by `fh`; for files up to 4 MiB a plan holds the file's whole extent list, version-checked against inode data version before reuse
   - session-level FUSE invalidation notifier is installed at mount and used for best-effort post-commit invalidation dispatch
 
 - `src/fs/write.rs`
   - `apply_batch` folds all writes of one inode into a single `WriteGroup` of sorted, disjoint, non-adjacent byte ranges, in arrival order (a later write wins where writes overlap); writeback writes that arrive out of order or with gaps therefore still share one group. All groups of a batch are staged into one SurrealKV transaction and committed together
-  - a block fully covered by one range is hashed straight from the write data; the old block is only read (and decompressed) for partially covered blocks
+  - each group is re-chunked by `prepare_write_plan`/`chunk_region` (see "Content-Defined Chunking"); old chunk payloads are read only where a region keeps old bytes (the extent before a write, partly overwritten extents, resynchronization)
   - every read a write plan depends on (inode, old extents, dedup check) goes through the batch transaction; whatever the plan depends on is either in the transaction snapshot or rewritten by it (inode key, touched extents, chunk refcounts), so concurrent changes surface as commit conflicts, after which the batch is re-planned and retried
   - a group that fails to stage is reported failed and the remaining groups are re-staged on a fresh transaction; a write is acknowledged only after the transaction containing it commits
   - commits do not sync packs; crash ordering between pack data and metadata is enforced by the WAL durability barrier (see "Write Durability and Ordering")
-  - truncate stages inode, extent deletions, boundary chunk and refcount deltas in one transaction with the same retry loop
+  - truncate stages inode, extent deletions, the trimmed boundary chunk (the prefix of the extent holding the new last byte) and refcount deltas in one transaction with the same retry loop
 - `src/meta/mod.rs`
+  - bootstrap writes `SYS:storage_format` (currently 2) into a new data directory and refuses to open one with any other value or with no marker (the fixed 1 MiB block layout, format 1), with an explicit error; there is no migration from format 1
   - `write_txn` takes an `FnMut` closure and re-runs it on a fresh transaction when the commit fails with `TransactionWriteConflict` or `TransactionRetry` (up to `MAX_COMMIT_ATTEMPTS`); closures must derive all writes from reads through `txn` and have no other side effects
   - read-modify-write of metadata must always read through the committing transaction (never from caches or a separate read transaction)
 
@@ -299,7 +327,7 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
    - `lookup` and direct inode operations against vault entries return inaccessible/not-found semantics
 3. `verfsnext crypt -u`: the CLI reads the key file as the calling user and sends its content in the `vault_unlock` request; the daemon never opens key files. The daemon unwraps the folder key into process memory and flips runtime state to unlocked.
 4. Vault writes:
-   - block payload is compressed
+   - chunk payload is compressed
    - compressed bytes are encrypted with XChaCha20-Poly1305 and random 192-bit nonce
    - encrypted payload is appended to pack
    - nonce + encryption flag are persisted in chunk metadata

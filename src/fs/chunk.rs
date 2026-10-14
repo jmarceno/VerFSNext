@@ -46,59 +46,74 @@ impl FsCore {
         self.chunk_meta_cache.insert(hash, chunk);
         Ok(chunk)
     }
-    pub(crate) fn prefetch_chunk_meta(
+    /// Returns the plaintext of chunk `hash`, from the chunk cache or the
+    /// pack store.
+    pub(crate) fn load_chunk_payload(
         &self,
-        hashes: impl IntoIterator<Item = [u8; 16]>,
-    ) -> Result<()> {
-        let missing_hashes = hashes
-            .into_iter()
-            .filter(|hash| !self.chunk_meta_cache.contains_key(hash))
-            .collect::<HashSet<_>>();
-
-        if !missing_hashes.is_empty() {
-            let chunks = self.meta.read_txn(|txn| {
-                let mut chunks = Vec::with_capacity(missing_hashes.len());
-                for hash in &missing_hashes {
-                    if let Some(raw) = txn.get(chunk_key(hash))? {
-                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
-                        chunks.push((*hash, chunk));
-                    }
-                }
-                Ok(chunks)
-            })?;
-            for (hash, chunk) in chunks {
-                self.chunk_meta_cache.insert(hash, chunk);
-            }
-        }
-        Ok(())
-    }
-    pub(crate) fn read_extent_bytes(
-        &self,
-        extent: ExtentRecord,
-        vault_encrypted: bool,
-    ) -> Result<Vec<u8>> {
-        let payload = self.load_extent_payload(extent, vault_encrypted)?;
-        let mut payload = payload.as_ref().clone();
-        if payload.len() < BLOCK_SIZE {
-            payload.resize(BLOCK_SIZE, 0);
-        }
-        if payload.len() > BLOCK_SIZE {
-            payload.truncate(BLOCK_SIZE);
-        }
-        Ok(payload)
-    }
-    pub(crate) fn load_extent_payload(
-        &self,
-        extent: ExtentRecord,
+        hash: [u8; 16],
         vault_encrypted: bool,
     ) -> Result<Arc<Vec<u8>>> {
-        if let Some(cached) = self.chunk_data_cache.get(&extent.chunk_hash) {
+        if let Some(cached) = self.chunk_data_cache.get(&hash) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
         self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
+        // The pack read and decompression block, so they run off the async
+        // workers.
+        let payload = Arc::new(tokio::task::block_in_place(|| {
+            self.read_chunk_from_pack(hash, vault_encrypted)
+        })?);
+        self.chunk_data_cache.insert(hash, Arc::clone(&payload));
+        Ok(payload)
+    }
 
-        let chunk = self.load_chunk_record(extent.chunk_hash)?;
+    /// Returns the plaintext of every chunk in `hashes`. Chunks missing from
+    /// the cache are read and decompressed in parallel, so a read that spans
+    /// many small chunks does not pay for them one after another.
+    pub(crate) fn load_chunk_payloads(
+        &self,
+        hashes: &[[u8; 16]],
+        vault_encrypted: bool,
+    ) -> Result<HashMap<[u8; 16], Arc<Vec<u8>>>> {
+        let mut out = HashMap::with_capacity(hashes.len());
+        let mut missing = Vec::new();
+        for hash in hashes {
+            if out.contains_key(hash) || missing.contains(hash) {
+                continue;
+            }
+            match self.chunk_data_cache.get(hash) {
+                Some(cached) => {
+                    self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    out.insert(*hash, cached);
+                }
+                None => missing.push(*hash),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        self.chunk_data_cache_misses
+            .fetch_add(missing.len() as u64, Ordering::Relaxed);
+        let loaded = tokio::task::block_in_place(|| {
+            missing
+                .par_iter()
+                .map(|hash| {
+                    self.read_chunk_from_pack(*hash, vault_encrypted)
+                        .map(|payload| (*hash, Arc::new(payload)))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (hash, payload) in loaded {
+            self.chunk_data_cache.insert(hash, Arc::clone(&payload));
+            out.insert(hash, payload);
+        }
+        Ok(out)
+    }
+
+    /// Reads, authenticates and decompresses chunk `hash` from its pack.
+    /// Blocks on the disk.
+    fn read_chunk_from_pack(&self, hash: [u8; 16], vault_encrypted: bool) -> Result<Vec<u8>> {
+        let chunk = self.load_chunk_record(hash)?;
         let folder_key = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
             if !vault_encrypted {
                 return Err(anyhow_errno(
@@ -112,21 +127,15 @@ impl FsCore {
         };
         // A copy is accepted only if it authenticates with the record's nonce
         // (vault) and decompresses to the recorded length, which is how the
-        // pack store tells duplicate copies of one hash apart. The pack read
-        // and decompression block, so they run off the async workers.
-        let payload = tokio::task::block_in_place(|| self.packs.read_chunk_with(
+        // pack store tells duplicate copies of one hash apart.
+        self.packs.read_chunk_with(
             chunk.pack_id,
-            extent.chunk_hash,
+            hash,
             chunk.codec,
             chunk.uncompressed_len,
             chunk.compressed_len,
             |stored, index| {
-                self.validate_pack_payload_crc32(
-                    chunk.pack_id,
-                    extent.chunk_hash,
-                    index.payload_crc32,
-                    stored,
-                );
+                self.validate_pack_payload_crc32(chunk.pack_id, hash, index.payload_crc32, stored);
                 match &folder_key {
                     Some(key) => {
                         let compressed = decrypt_chunk_payload(key, &chunk.nonce, stored)?;
@@ -143,11 +152,138 @@ impl FsCore {
                     ),
                 }
             },
-        ))?;
-        let payload = Arc::new(payload);
-        self.chunk_data_cache
-            .insert(extent.chunk_hash, Arc::clone(&payload));
+        )
+    }
+
+    /// Returns the plaintext of `extent`, checked against the extent length.
+    pub(crate) fn load_extent_payload(
+        &self,
+        extent: &FileExtent,
+        vault_encrypted: bool,
+    ) -> Result<Arc<Vec<u8>>> {
+        let payload = self.load_chunk_payload(extent.record.chunk_hash, vault_encrypted)?;
+        FsCore::check_extent_payload_len(extent, &payload)?;
         Ok(payload)
+    }
+
+    pub(crate) fn check_extent_payload_len(extent: &FileExtent, payload: &[u8]) -> Result<()> {
+        if payload.len() != extent.record.len as usize {
+            tracing::error!(
+                start = extent.start,
+                extent_len = extent.record.len,
+                payload_len = payload.len(),
+                chunk_hash = ?extent.record.chunk_hash,
+                "chunk length does not match the extent that maps it"
+            );
+            return Err(anyhow_errno(
+                Errno::EIO,
+                format!(
+                    "chunk {:x?} holds {} bytes but its extent at {} maps {}",
+                    extent.record.chunk_hash,
+                    payload.len(),
+                    extent.start,
+                    extent.record.len
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Appends bytes `[offset, read_end)` of `inode` to `buf` and returns how
+    /// many it appended. `extents` must hold every extent of the file that
+    /// overlaps the range, sorted by offset; bytes no extent covers are
+    /// holes and read as zeros.
+    pub(crate) fn read_extents_into(
+        &self,
+        inode: &InodeRecord,
+        extents: &[FileExtent],
+        offset: u64,
+        read_end: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let first = extents.partition_point(|extent| extent.end() <= offset);
+        let overlapping = &extents[first..];
+        let overlapping =
+            &overlapping[..overlapping.partition_point(|extent| extent.start < read_end)];
+        let hashes = overlapping
+            .iter()
+            .map(|extent| extent.record.chunk_hash)
+            .collect::<Vec<_>>();
+        let payloads = self.load_chunk_payloads(&hashes, FsCore::inode_is_vault(inode))?;
+
+        let initial_len = buf.len();
+        buf.reserve((read_end - offset) as usize);
+        let mut cursor = offset;
+        for extent in overlapping {
+            let payload = payloads.get(&extent.record.chunk_hash).ok_or_else(|| {
+                anyhow_errno(
+                    Errno::EIO,
+                    format!("chunk {:x?} was not loaded", extent.record.chunk_hash),
+                )
+            })?;
+            FsCore::check_extent_payload_len(extent, payload)?;
+            let from = extent.start.max(cursor);
+            buf.resize(buf.len() + (from - cursor) as usize, 0);
+            let to = extent.end().min(read_end);
+            buf.extend_from_slice(
+                &payload[(from - extent.start) as usize..(to - extent.start) as usize],
+            );
+            cursor = to;
+        }
+        buf.resize(buf.len() + (read_end - cursor) as usize, 0);
+        Ok(buf.len() - initial_len)
+    }
+
+    /// Extents of `ino` that overlap `[from, to)`, sorted by offset.
+    ///
+    /// Extents are keyed by their first byte, so the extent covering `from`
+    /// starts at most `max_extent_len - 1` bytes earlier.
+    pub(crate) fn load_extents_in_txn(
+        &self,
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<FileExtent>> {
+        let mut out = Vec::new();
+        if from >= to {
+            return Ok(out);
+        }
+        let scan_from = from.saturating_sub(self.max_extent_len.saturating_sub(1));
+        let mut iter = txn.range(extent_key(ino, scan_from), extent_key(ino, to))?;
+        let mut valid = iter.seek_first()?;
+        while valid {
+            let key = iter.key().user_key();
+            let start = FsCore::extent_start_from_key(key).ok_or_else(|| {
+                anyhow_errno(Errno::EIO, format!("malformed extent key {:x?}", key))
+            })?;
+            let record: ExtentRecord = decode_rkyv(&iter.value()?)?;
+            let extent = FileExtent { start, record };
+            if extent.end() > from {
+                out.push(extent);
+            }
+            valid = iter.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Every extent of `ino`, sorted by offset.
+    pub(crate) fn load_all_extents_in_txn(
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+    ) -> Result<Vec<FileExtent>> {
+        let prefix = extent_prefix(ino);
+        let end = prefix_end(&prefix);
+        let mut out = Vec::new();
+        for pair in scan_range_pairs(txn, prefix, end)? {
+            let (key, value) = pair?;
+            let start = FsCore::extent_start_from_key(&key).ok_or_else(|| {
+                anyhow_errno(Errno::EIO, format!("malformed extent key {:x?}", key))
+            })?;
+            let record: ExtentRecord = decode_rkyv(&value)?;
+            out.push(FileExtent { start, record });
+        }
+        Ok(out)
     }
     /// Decides whether `chunk_hash` must be stored as a new chunk.
     ///
@@ -162,27 +298,25 @@ impl FsCore {
         &self,
         txn: &verfsnext_surrealkv::Transaction,
         chunk_hash: [u8; 16],
-        data: &[u8],
+        data: Arc<Vec<u8>>,
         checked_hashes: &mut HashSet<[u8; 16]>,
-        pending_chunks: &mut HashMap<[u8; 16], Vec<u8>>,
+        pending_chunks: &mut HashMap<[u8; 16], Arc<Vec<u8>>>,
     ) -> Result<bool> {
         if !checked_hashes.insert(chunk_hash) {
             return Ok(false);
         }
 
-        let data_vec = data.to_vec();
-        self.chunk_data_cache
-            .insert(chunk_hash, Arc::new(data_vec.clone()));
+        self.chunk_data_cache.insert(chunk_hash, Arc::clone(&data));
         if txn.get(chunk_key(&chunk_hash))?.is_some() {
             return Ok(false);
         }
 
-        pending_chunks.insert(chunk_hash, data_vec);
+        pending_chunks.insert(chunk_hash, data);
         Ok(true)
     }
     pub(crate) async fn materialize_pending_chunks(
         &self,
-        pending_chunks: HashMap<[u8; 16], Vec<u8>>,
+        pending_chunks: HashMap<[u8; 16], Arc<Vec<u8>>>,
         encrypt_for_vault: bool,
     ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
         if pending_chunks.is_empty() {
@@ -293,7 +427,7 @@ impl FsCore {
         }
         Ok(())
     }
-    pub(crate) fn extent_block_idx_from_key(key: &[u8]) -> Option<u64> {
+    pub(crate) fn extent_start_from_key(key: &[u8]) -> Option<u64> {
         if key.len() != 17 || key[0] != crate::types::KEY_PREFIX_EXTENT {
             return None;
         }

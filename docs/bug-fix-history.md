@@ -620,3 +620,44 @@ No data or protocol change. On the live desktop with the user service:
 
 - `src/gui/daemon.rs`, `src/gui/paths.rs`, `src/gui/single_instance.rs`
 
+
+## B018 - Content-Defined Chunking Was Never Implemented; Files Were Stored as Fixed 1 MiB Blocks - Oct 14 2026
+
+### Root Cause
+
+The system was designed around UltraCDC content-defined chunking, and the README, configuration, desktop settings and this documentation all described it, but the storage path never used it. `src/fs/write.rs` split every file into fixed 1 MiB blocks (`BLOCK_SIZE` in `src/types/mod.rs`), hashed whole blocks and zero-padded partial ones; every pack record of an inspected live pack had `uncompressed_len = 1048576`. History (all refs, not shallow):
+
+- `b398a9c` (2026-02-17) added `UltraStreamChunker`, but production only called `ultracdc_chunk_count()`, which threw the spans away and logged their count. Content-defined boundaries never reached storage.
+- `27539db` (2026-02-17) raised `BLOCK_SIZE` from 4 KiB to 1 MiB for FUSE throughput and derived the default `fuse_max_write_bytes` from it, coupling the FUSE request size to the stored block size. It also changed the CDC defaults to 16/32/64 KiB, which only affected the telemetry.
+- `503ef1b` (2026-05-01) and `41c5716` (2026-05-02) removed the telemetry and `src/data/chunker.rs`.
+
+So no commit disabled working CDC; the `ultracdc_*` settings never controlled anything. Any shift of data inside or between files defeated dedup, and identical regions smaller than 1 MiB were never shared.
+
+### Fix
+
+- `src/data/chunker.rs`: UltraCDC (8-byte window Hamming distance against `0xAA..AA`, masks `0x2F`/`0x2C` before/after the normal size, low-entropy run detection, min/max bounds), driven by the `ultracdc_*` settings.
+- Storage format 2: extents are keyed by byte offset and map whole variable-length chunks (`ExtentRecord { chunk_hash, len }`); holes are gaps between extents. `BLOCK_SIZE` is gone and `fuse_max_write_bytes` has its own 1 MiB default.
+- `prepare_write_plan` / `chunk_region` re-chunk each write as part of a region that starts at the extent before it and ends where a cut resynchronizes with an old extent boundary (or at end of data, or at the next old boundary after 2 maximum chunk sizes). Unchanged chunks keep their extents and refcounts.
+- Truncate keeps the prefix of the extent holding the new last byte and deletes the rest.
+- Reads assemble overlapping extents and load uncached chunks in parallel; the per-handle read plan of small files holds the extent list.
+- `SYS:max_extent_len` bounds extent lengths so the extent covering an offset is found with a forward scan.
+- `SYS:storage_format` marks new data directories; directories without it (format 1, fixed blocks) are refused with an explicit error. As agreed, there is no migration: all existing data was disposable test data.
+- Pack records are written with one `write` call each (records are now ~32x more numerous). The pack format itself is unchanged; it was already chunk-size agnostic.
+- Config validation: `ultracdc_min_size_bytes >= 64`, `ultracdc_max_size_bytes <= 4 MiB`.
+
+### Compatibility and Validation
+
+Breaking metadata change without migration (agreed: no real deployments). Validation:
+- Library unit tests (43) and all 7 functional FUSE integration tests in `tests/rsync_integration.rs` pass.
+- Manual OS-command checks on a scratch mount against a reference copy: sequential writes in mixed request sizes, 300 random overwrites (1 B to 300 KB), sparse writes 50 MiB past EOF and into the hole, truncate down/up with writes after each, snapshot isolation after an in-place edit, vault write/truncate/lock/unlock, unmount/remount (all SHA-256 sums matched), offline GC followed by remount (data and vault intact). Metadata consistency stayed clean (0 refcount mismatches, 0 missing chunks, 0 orphan extents) and there were no CRC32 errors.
+- Dedup: a 32 MiB random file copied again with 8 bytes prepended stored 3.6 MB of new chunk data instead of 32 MiB; most of that is superseded tail chunks (below).
+- `bench_comfyui_profile` against the previous commit, two runs each: totals 114.2 s / 100.6 s (new) vs 93.4 s / 102.9 s (old). The difference is in `sm_write_dura`, which is dominated by 3000 `fsync` calls and varied from 43 s to 69 s between runs of the same binary; a separate run of that phase alone gave 60-64 s (new) vs 58-68 s (old). Reads were faster in both runs (`lg_read_seq` 2.8/1.7 s vs 4.7/2.0 s, `sm_read_seq` 1.5/1.3 s vs 2.4/2.0 s); `mod_write_dura` was 17.3/14.6 s vs 18.6/12.8 s.
+
+Known cost: each write that extends a file re-chunks and re-stores the file's tail chunk, and the superseded tail is garbage until GC (about 5% extra pack writes when copying a 32 MiB file).
+
+### Affected Files
+
+- `src/data/chunker.rs` (new), `src/data/mod.rs`, `src/data/compress.rs`, `src/data/pack.rs`
+- `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`
+- `src/types/mod.rs`, `src/meta/mod.rs`, `src/config.rs`, `src/gui/settings.rs`
+- `README.md`, `config.toml.example`, `docs/technical_deep_dive.md`

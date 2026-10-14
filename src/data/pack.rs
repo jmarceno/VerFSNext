@@ -265,13 +265,13 @@ impl PackStore {
         };
         let header_bytes = Self::encode_pack_header(&header)?;
 
-        // Write header and payload separately. The seek was removed (size_bytes
-        // is already known), so we save one syscall per chunk already.
+        // One write per record: content-defined chunks are small, so the
+        // syscall count matters more than the copy of the payload.
+        let mut record = Vec::with_capacity(record_len as usize);
+        record.extend_from_slice(&header_bytes);
+        record.extend_from_slice(compressed_data);
         let file = &mut active.file;
-        if let Err(err) = file
-            .write_all(&header_bytes)
-            .and_then(|()| file.write_all(compressed_data))
-        {
+        if let Err(err) = file.write_all(&record) {
             // A partial record (e.g. ENOSPC) would shift every later record
             // away from the offset recorded in its index entry, so cut the
             // pack back to the last complete record before reporting.
