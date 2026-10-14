@@ -42,6 +42,7 @@ ScrollView {
             ["Unique data after compression", b(stats.stored_unique_compressed_bytes)],
             ["Compression savings", b(stats.compression_saved_bytes) + " (" + theme.percent(stats.compression_savings_ratio) + ")"],
             ["Unreachable indexed payload (partial garbage)", b(stats.unreachable_chunk_compressed_bytes)],
+            ["Obsolete data awaiting cleanup", b(stats.obsolete_awaiting_cleanup_bytes)],
             ["Net savings (all namespaces)", b(stats.net_saved_bytes) + " (" + theme.percent(stats.net_savings_ratio) + ")"],
             ["Metadata on disk", b(stats.metadata_size_bytes)],
             ["Data folder on disk", b(stats.data_dir_size_bytes)],
@@ -221,7 +222,9 @@ ScrollView {
                                              : "This looks through all your files and can take a moment on large folders.")
                               : (root.logicalAll === 0 ? "Copy files into your folder and VerFSNext will start removing duplicates and compressing them."
                                  : (root.saved > 0 ? theme.percent(root.stats.net_savings_ratio) + " less space than storing your files and snapshots as they are."
-                                    : "This includes VerFSNext's records and space from changed files that is reclaimed when the folder is idle. Savings grow with your files."))
+                                    : (root.stats.obsolete_awaiting_cleanup_bytes > 0
+                                       ? "Records use " + theme.bytes(root.stats.metadata_size_bytes) + ". Deleted data still on disk uses " + theme.bytes(root.stats.obsolete_awaiting_cleanup_bytes) + " and is reclaimed when the folder is idle."
+                                       : "Records use " + theme.bytes(root.stats.metadata_size_bytes) + ". The remaining difference is indexes and pack framing.")))
                         color: root.controller.stats_error.length > 0 && !root.stats ? theme.dangerStrong : theme.textMuted
                         font.pixelSize: 13
                         Layout.fillWidth: true
@@ -316,7 +319,12 @@ ScrollView {
                 Layout.fillHeight: true
                 label: "Used on disk"
                 value: root.stats ? theme.bytes(root.stats.data_dir_size_bytes) : "—"
-                caption: root.stats ? "Including " + theme.bytes(root.stats.metadata_size_bytes) + " of records" : ""
+                caption: root.stats
+                         ? "Records " + theme.bytes(root.stats.metadata_size_bytes)
+                           + (root.stats.obsolete_awaiting_cleanup_bytes > 0
+                              ? "; " + theme.bytes(root.stats.obsolete_awaiting_cleanup_bytes) + " awaiting cleanup"
+                              : "")
+                         : ""
             }
             StatTile {
                 Layout.fillWidth: true

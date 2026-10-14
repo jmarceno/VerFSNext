@@ -746,7 +746,7 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         )
     } else if disk_vs_live_logical > 0 {
         format!(
-            "overhead {} vs live logical",
+            "{} above live logical; metadata and obsolete data are reported on their own rows",
             human_bytes(u64::try_from(disk_vs_live_logical as u128).unwrap_or(u64::MAX))
         )
     } else {
@@ -833,7 +833,14 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         (
             "Unreachable Chunk Payload (Indexed)".to_owned(),
             human_bytes(stats.unreachable_chunk_compressed_bytes),
-            "excludes unindexed obsolete pack entries; not a total GC estimate".to_owned(),
+            "chunk records with no reachable file; excludes payloads already handed to cleanup"
+                .to_owned(),
+        ),
+        (
+            "Obsolete Data Awaiting Cleanup".to_owned(),
+            human_bytes(stats.obsolete_awaiting_cleanup_bytes),
+            "discarded chunk payloads still stored in packs until compaction; separate from metadata"
+                .to_owned(),
         ),
         (
             "Net Savings (All Reachable Namespaces)".to_owned(),
@@ -862,7 +869,10 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         (
             "Metadata Size".to_owned(),
             human_bytes(stats.metadata_size_bytes),
-            format!("{} bytes", stats.metadata_size_bytes),
+            format!(
+                "{} bytes of bookkeeping records",
+                stats.metadata_size_bytes
+            ),
         ),
         (
             "Data Dir Size (On Disk)".to_owned(),
@@ -1130,6 +1140,7 @@ mod tests {
             compression_saved_bytes: 6_000,
             compression_savings_ratio: 6.0 / 11.0,
             unreachable_chunk_compressed_bytes: 0,
+            obsolete_awaiting_cleanup_bytes: 0,
             net_saved_bytes: 4_500,
             net_savings_ratio: 0.375,
             metadata_size_bytes: 1_000,

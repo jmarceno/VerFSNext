@@ -1,6 +1,12 @@
 use super::*;
 use crate::fs::FsCore;
 
+enum RewriteStep {
+    Rewritten(u64),
+    Paused,
+    None,
+}
+
 impl VerFs {
     pub async fn run_offline_gc_rebuild_discard(
         &self,
@@ -147,36 +153,16 @@ impl FsCore {
                 .insert(record.chunk_hash128, record);
         }
 
-        let active_pack_id = self.packs.active_pack_id();
-        let mut rewritten_pack: Option<u64> = None;
-
-        for (pack_id, dead_records) in by_pack.iter() {
-            if *pack_id == active_pack_id {
-                continue;
+        let outcome = self.rewrite_one_eligible_pack(&by_pack, true).await?;
+        let RewriteStep::Rewritten(rewritten_pack_id) = outcome else {
+            if matches!(outcome, RewriteStep::Paused) {
+                return Ok(());
             }
-            let reclaim_bytes = dead_records
-                .values()
-                .map(|record| record.block_size_bytes as u64)
-                .sum::<u64>();
+            self.switch_to_scan_phase().await?;
+            return Ok(());
+        };
 
-            let pack_size = self.packs.pack_size(*pack_id)?;
-            if pack_size == 0 {
-                continue;
-            }
-            let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
-            let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
-            let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
-            if meets_bytes || meets_percent {
-                if !self.gc_idle_window_open() {
-                    return Ok(());
-                }
-                self.rewrite_pack_durably(*pack_id)?;
-                rewritten_pack = Some(*pack_id);
-                break;
-            }
-        }
-
-        if let Some(rewritten_pack_id) = rewritten_pack {
+        {
             let current = read_records(&discard_path, checkpoint)?;
             let kept = current
                 .records
@@ -193,8 +179,6 @@ impl FsCore {
                     Ok(())
                 })
                 .await?;
-        } else {
-            self.switch_to_scan_phase().await?;
         }
 
         Ok(())
@@ -403,33 +387,16 @@ impl FsCore {
                 .insert(record.chunk_hash128, record);
         }
 
-        let active_pack_id = self.packs.active_pack_id();
-        let mut rewritten_pack: Option<u64> = None;
-
-        for (pack_id, dead_records) in by_pack.iter() {
-            if *pack_id == active_pack_id {
-                continue;
+        let outcome = self.rewrite_one_eligible_pack(&by_pack, false).await?;
+        let RewriteStep::Rewritten(rewritten_pack_id) = outcome else {
+            if matches!(outcome, RewriteStep::Paused) {
+                return Ok(false);
             }
-            let reclaim_bytes = dead_records
-                .values()
-                .map(|record| record.block_size_bytes as u64)
-                .sum::<u64>();
+            self.switch_to_scan_phase().await?;
+            return Ok(false);
+        };
 
-            let pack_size = self.packs.pack_size(*pack_id)?;
-            if pack_size == 0 {
-                continue;
-            }
-            let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
-            let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
-            let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
-            if meets_bytes || meets_percent {
-                self.rewrite_pack_durably(*pack_id)?;
-                rewritten_pack = Some(*pack_id);
-                break;
-            }
-        }
-
-        if let Some(rewritten_pack_id) = rewritten_pack {
+        {
             let current = read_records(&discard_path, checkpoint)?;
             let kept = current
                 .records
@@ -446,19 +413,79 @@ impl FsCore {
                     Ok(())
                 })
                 .await?;
-            Ok(true)
-        } else {
-            self.switch_to_scan_phase().await?;
-            Ok(false)
         }
+        Ok(true)
+    }
+    /// One pack per call. An eligible active pack is sealed first, after
+    /// in-flight writes have committed, so the rewrite cannot drop a chunk
+    /// whose metadata is still being committed. The copy itself does not hold
+    /// the write lock.
+    async fn rewrite_one_eligible_pack(
+        &self,
+        by_pack: &HashMap<u64, HashMap<[u8; 16], DiscardRecord>>,
+        pause_when_active: bool,
+    ) -> Result<RewriteStep> {
+        for (pack_id, dead_records) in by_pack {
+            if !self.pack_reclaim_eligible(*pack_id, dead_records)? {
+                continue;
+            }
+            if pause_when_active && !self.gc_idle_window_open() {
+                return Ok(RewriteStep::Paused);
+            }
+            if *pack_id == self.packs.active_pack_id() {
+                let sealed = self.seal_active_pack_for_reclaim(*pack_id).await?;
+                if !sealed {
+                    continue;
+                }
+            }
+            if pause_when_active && !self.gc_idle_window_open() {
+                return Ok(RewriteStep::Paused);
+            }
+            if self.rewrite_pack_durably(*pack_id)? {
+                return Ok(RewriteStep::Rewritten(*pack_id));
+            }
+        }
+        Ok(RewriteStep::None)
+    }
+    fn pack_reclaim_eligible(
+        &self,
+        pack_id: u64,
+        dead_records: &HashMap<[u8; 16], DiscardRecord>,
+    ) -> Result<bool> {
+        let reclaim_bytes = dead_records
+            .values()
+            .map(|record| record.block_size_bytes as u64)
+            .sum::<u64>();
+        let pack_size = self.packs.pack_size(pack_id)?;
+        if pack_size == 0 {
+            return Ok(false);
+        }
+        let reclaim_percent = (reclaim_bytes as f64 / pack_size as f64) * 100.0;
+        let meets_bytes = reclaim_bytes >= self.config.gc_pack_rewrite_min_reclaim_bytes;
+        let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
+        Ok(meets_bytes || meets_percent)
+    }
+    /// Drains in-flight writes, syncs the active pack, and rotates it. The new
+    /// id is persisted before any rewrite so a crash reopens the fresh pack.
+    async fn seal_active_pack_for_reclaim(&self, pack_id: u64) -> Result<bool> {
+        let sealed = {
+            let _guard = self.write_lock.write().await;
+            tokio::task::block_in_place(|| self.packs.seal_active_pack(pack_id))?
+        };
+        if sealed {
+            self.persist_active_pack_id_if_needed().await?;
+        }
+        Ok(sealed)
     }
     /// Drops the dead records of `pack_id`. Every metadata commit up to now
     /// (unlinks, truncates, the scan-phase deletes) is made durable first:
     /// otherwise a power loss could roll metadata back to a state that still
     /// references chunks the rewritten pack no longer holds.
     ///
+    /// Returns false when the pack is still active and was left unchanged.
     /// Copying a pack is long disk work, so it runs off the async workers.
-    fn rewrite_pack_durably(&self, pack_id: u64) -> Result<()> {
+    /// Readers keep using the current pack until the short swap at the end.
+    fn rewrite_pack_durably(&self, pack_id: u64) -> Result<bool> {
         tokio::task::block_in_place(|| {
             self.meta.flush_wal(true)?;
             let live_hashes = self.live_hashes_for_pack(pack_id)?;

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use verfsnext_async_fusex::session::SessionNotifier;
 use verfsnext_async_fusex::fs_util::{
@@ -155,6 +155,8 @@ pub struct VerFsStats {
     pub compression_saved_bytes: i128,
     pub compression_savings_ratio: f64,
     pub unreachable_chunk_compressed_bytes: u64,
+    /// Discarded chunk payloads still stored in packs until compaction.
+    pub obsolete_awaiting_cleanup_bytes: u64,
     pub net_saved_bytes: i128,
     pub net_savings_ratio: f64,
     pub metadata_size_bytes: u64,
@@ -1155,6 +1157,7 @@ impl FsCore {
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
+        let obsolete_awaiting_cleanup_bytes = self.obsolete_awaiting_cleanup_bytes()?;
 
         let compression_saved_bytes = stored_unique_uncompressed_bytes as i128
             - stored_unique_compressed_bytes as i128;
@@ -1215,6 +1218,7 @@ impl FsCore {
             compression_saved_bytes,
             compression_savings_ratio,
             unreachable_chunk_compressed_bytes,
+            obsolete_awaiting_cleanup_bytes,
             net_saved_bytes,
             net_savings_ratio,
             metadata_size_bytes,
@@ -1239,6 +1243,41 @@ impl FsCore {
             chunk_cache_entries,
             approx_cache_memory_bytes,
         })
+    }
+
+    /// Bytes of chunk payloads already recorded in `.DISCARD` and still sitting
+    /// in packs. This is obsolete data waiting for compaction, not metadata.
+    fn obsolete_awaiting_cleanup_bytes(&self) -> Result<u64> {
+        let discard_path = self
+            .config
+            .packs_dir()
+            .join(&self.config.gc_discard_filename);
+        let file_len = match std::fs::metadata(&discard_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to stat discard file {}", discard_path.display())
+                });
+            }
+        };
+        if file_len == 0 {
+            return Ok(0);
+        }
+        let checkpoint = self
+            .meta
+            .get_u64_sys("gc.discard_checkpoint")
+            .unwrap_or(file_len);
+        let upper = if checkpoint == 0 { file_len } else { checkpoint };
+        let parsed = read_records(&discard_path, upper)?;
+        let mut seen = HashSet::<(u64, [u8; 16])>::new();
+        let mut total = 0_u64;
+        for record in parsed.records {
+            if seen.insert((record.pack_id, record.chunk_hash128)) {
+                total = total.saturating_add(record.block_size_bytes as u64);
+            }
+        }
+        Ok(total)
     }
 
 }

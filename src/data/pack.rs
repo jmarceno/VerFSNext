@@ -896,7 +896,37 @@ impl PackStore {
         Ok(size)
     }
 
+    /// Seals `pack_id` when it is the active pack, so a later rewrite can drop
+    /// its obsolete records.
+    ///
+    /// The retired pack is synced before the new pack becomes active. Callers
+    /// that append under the filesystem write lock must hold that lock across
+    /// this call: an append that has reached the pack but not metadata yet
+    /// would otherwise be dropped by the rewrite. Returns false when `pack_id`
+    /// is still the active pack because it holds no bytes.
+    pub fn seal_active_pack(&self, pack_id: u64) -> Result<bool> {
+        let mut active = self.active.lock();
+        if active.pack_id != pack_id {
+            return Ok(true);
+        }
+        if active.size_bytes == 0 {
+            return Ok(false);
+        }
+        let retired_pack_id = active.pack_id;
+        self.rotate_active_pack(&mut active)?;
+        tracing::info!(
+            retired_pack_id,
+            active_pack_id = active.pack_id,
+            "sealed active pack so garbage collection can reclaim its obsolete data"
+        );
+        Ok(true)
+    }
+
     /// Rewrites a non-active pack keeping only records of `live_hashes`.
+    ///
+    /// Returns false when `pack_id` is still the active pack. Rewriting the
+    /// pack writers are appending to would race with those appends, so the
+    /// caller seals it first.
     ///
     /// Every copy of a live hash that the pack index references is kept in its
     /// original order, so readers resolve exactly the same copy afterwards
@@ -906,21 +936,23 @@ impl PackStore {
     /// index CRC32 and the rewrite aborts on any mismatch instead of carrying
     /// damaged data forward under a fresh checksum.
     ///
-    /// The swap is crash-safe: the old index is removed before the new pack is
-    /// renamed into place, so a crash between the renames leaves a pack without
-    /// an index, which startup rebuilds from the pack itself.
+    /// The long copy runs before the swap lock is taken, so reads of this pack
+    /// continue against the current file. The swap is crash-safe: the old
+    /// index is removed before the new pack is renamed into place, so a crash
+    /// between the renames leaves a pack without an index, which startup
+    /// rebuilds from the pack itself.
     pub fn rewrite_pack_with_live_hashes(
         &self,
         pack_id: u64,
         live_hashes: &HashSet<[u8; 16]>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if pack_id == self.active_pack_id() {
-            return Ok(());
+            return Ok(false);
         }
 
         let src_pack_path = self.pack_path(pack_id);
         if !src_pack_path.exists() {
-            return Ok(());
+            return Ok(true);
         }
         let src_idx_path = self.index_path(pack_id);
         let src_entries = self.read_index_entries(pack_id)?;
@@ -1127,7 +1159,7 @@ impl PackStore {
         }
         self.pack_file_cache.invalidate(&pack_id);
         self.prime_index_cache(pack_id)?;
-        Ok(())
+        Ok(true)
     }
 
     fn open_pack_file(&self, pack_id: u64) -> Result<Arc<File>> {

@@ -709,3 +709,31 @@ copies and direct reads produced recent peaks of 31.4/33.9 MB/s over measured
 sampling baseline; file SHA-256 and metadata consistency remained correct.
 The actual OverviewPage QML rendered offscreen with real daemon RPC data and
 showed the shared savings and recent speed fields. No new tests were added.
+
+## B022 - Idle Cleanup Could Not Reclaim Garbage in the Active Pack - Oct 14 2026
+
+Pack rewrite skipped the pack writers were still appending to, and that pack
+rotates only at its size limit. Deleted and overwritten data therefore stayed
+in the open pack until it reached that limit, and the space report folded
+those bytes into the same excess as metadata.
+
+When a pack meets the existing reclaim threshold, idle and offline cleanup now
+drain in-flight writes, sync that pack, rotate to a new active pack, and
+persist `SYS:active_pack_id` before the rewrite. The copy still runs before
+the short swap, so reads of the pack continue against the current file. Every
+indexed copy of a hash that still has metadata is kept, including vault
+ciphertext. `.DISCARD` bytes waiting for that compaction are reported on their
+own, separate from metadata bookkeeping. No pack or metadata format change, so
+no migration.
+
+Validation: 43 existing library tests passed on the remote builder. A temporary
+FUSE mount with a 10 GiB pack limit (so size rotation could not explain the
+result) stored an 8 MiB file that was overwritten once, plus 128 MiB that was
+then deleted. Before rewrite, stats showed 140.70 MiB obsolete and awaiting
+cleanup against 1.92 MiB of metadata records. While the rewrite temp file
+existed and the source pack was still 157,265,754 bytes, a read of the live
+file matched its SHA-256. After cleanup the largest pack was 8,397,088 bytes,
+metadata consistency was ok, and checksum errors stayed at 0. An overwritten
+4 MiB vault file survived deletion of an 80 MiB vault file in the same pack;
+after unmount, remount, and unlock, both the plain file and the vault file
+still matched. No new tests were added.
