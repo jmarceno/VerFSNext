@@ -718,22 +718,37 @@ in the open pack until it reached that limit, and the space report folded
 those bytes into the same excess as metadata.
 
 When a pack meets the existing reclaim threshold, idle and offline cleanup now
-drain in-flight writes, sync that pack, rotate to a new active pack, and
-persist `SYS:active_pack_id` before the rewrite. The copy still runs before
-the short swap, so reads of the pack continue against the current file. Every
-indexed copy of a hash that still has metadata is kept, including vault
-ciphertext. `.DISCARD` bytes waiting for that compaction are reported on their
-own, separate from metadata bookkeeping. No pack or metadata format change, so
-no migration.
+compact it in place, the active pack included. GC briefly takes the write
+lock so in-flight writes commit, and for the active pack records the current
+size as a cutoff. Live hashes are read after that, so a chunk appended but not
+yet committed cannot be dropped. Records below the cutoff are filtered without
+any lock; appends then wait only while the records written during the copy are
+carried over unchanged and the files are swapped, and the same pack id is
+reopened for appends. The active pack therefore still grows to its size limit:
+cleanup never rotates it or creates smaller packs. Every indexed copy of a
+hash that still has metadata is kept, including vault ciphertext. `.DISCARD`
+bytes waiting for that compaction are reported on their own, separate from
+metadata bookkeeping. No pack or metadata format change, so no migration.
 
-Validation: 43 existing library tests passed on the remote builder. A temporary
-FUSE mount with a 10 GiB pack limit (so size rotation could not explain the
-result) stored an 8 MiB file that was overwritten once, plus 128 MiB that was
-then deleted. Before rewrite, stats showed 140.70 MiB obsolete and awaiting
-cleanup against 1.92 MiB of metadata records. While the rewrite temp file
-existed and the source pack was still 157,265,754 bytes, a read of the live
-file matched its SHA-256. After cleanup the largest pack was 8,397,088 bytes,
-metadata consistency was ok, and checksum errors stayed at 0. An overwritten
-4 MiB vault file survived deletion of an 80 MiB vault file in the same pack;
-after unmount, remount, and unlock, both the plain file and the vault file
-still matched. No new tests were added.
+The first attempt sealed (rotated) the active pack before rewriting it. That
+left packs far below the size limit, one per cleanup, and was replaced before
+release. The write-lock drain also closes an older window: a pack that rotated
+while a write that had appended to it was still committing could be rewritten
+without that chunk.
+
+Validation: 43 library tests passed on the remote builder. At the user's
+request, two mount integration tests were added in `tests/rsync_integration.rs`:
+`gc_compacts_active_pack_in_place_under_concurrent_io` compacts the active pack
+while reading a live file, appending fsynced data during the copy (the test
+fails if the copy finished first), re-creating the content of deleted plain and
+vault files, and overwriting a file. It checks that the pack keeps its id,
+shrinks, and then grows on new writes, and that every file matches after a
+vault lock and unlock and after a remount, with metadata consistency ok and
+zero checksum errors. `gc_active_pack_compaction_survives_crash` sends SIGKILL
+to the daemon during compaction right after an fsynced append, then checks that
+the data survives, that cleanup completes after restart without leaving a
+temporary pack, and that the data survives a second remount. Both tests passed
+four runs in a row. The full mount suite apart from the benchmarks (9 tests)
+passed. A manual mount with a 600 MiB file and 200 MiB deleted also matched
+every checksum after compaction and after a remount, and pack 1 stayed the
+only pack.

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use verfsnext_async_fusex::session::SessionNotifier;
 use verfsnext_async_fusex::fs_util::{
@@ -1252,24 +1252,13 @@ impl FsCore {
             .config
             .packs_dir()
             .join(&self.config.gc_discard_filename);
-        let file_len = match std::fs::metadata(&discard_path) {
-            Ok(meta) => meta.len(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to stat discard file {}", discard_path.display())
-                });
-            }
-        };
-        if file_len == 0 {
-            return Ok(0);
-        }
+        // Same bound as the rewrite phase: records past the checkpoint are not
+        // handed to cleanup yet. Without a checkpoint the whole file counts.
         let checkpoint = self
             .meta
             .get_u64_sys("gc.discard_checkpoint")
-            .unwrap_or(file_len);
-        let upper = if checkpoint == 0 { file_len } else { checkpoint };
-        let parsed = read_records(&discard_path, upper)?;
+            .unwrap_or(u64::MAX);
+        let parsed = read_records(&discard_path, checkpoint)?;
         let mut seen = HashSet::<(u64, [u8; 16])>::new();
         let mut total = 0_u64;
         for record in parsed.records {

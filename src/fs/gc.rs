@@ -416,10 +416,8 @@ impl FsCore {
         }
         Ok(true)
     }
-    /// One pack per call. An eligible active pack is sealed first, after
-    /// in-flight writes have committed, so the rewrite cannot drop a chunk
-    /// whose metadata is still being committed. The copy itself does not hold
-    /// the write lock.
+    /// One pack per call, the active pack included: it is compacted in place
+    /// and keeps growing to its size limit.
     async fn rewrite_one_eligible_pack(
         &self,
         by_pack: &HashMap<u64, HashMap<[u8; 16], DiscardRecord>>,
@@ -432,18 +430,8 @@ impl FsCore {
             if pause_when_active && !self.gc_idle_window_open() {
                 return Ok(RewriteStep::Paused);
             }
-            if *pack_id == self.packs.active_pack_id() {
-                let sealed = self.seal_active_pack_for_reclaim(*pack_id).await?;
-                if !sealed {
-                    continue;
-                }
-            }
-            if pause_when_active && !self.gc_idle_window_open() {
-                return Ok(RewriteStep::Paused);
-            }
-            if self.rewrite_pack_durably(*pack_id)? {
-                return Ok(RewriteStep::Rewritten(*pack_id));
-            }
+            self.rewrite_pack_durably(*pack_id).await?;
+            return Ok(RewriteStep::Rewritten(*pack_id));
         }
         Ok(RewriteStep::None)
     }
@@ -465,31 +453,30 @@ impl FsCore {
         let meets_percent = reclaim_percent >= self.config.gc_pack_rewrite_min_reclaim_percent;
         Ok(meets_bytes || meets_percent)
     }
-    /// Drains in-flight writes, syncs the active pack, and rotates it. The new
-    /// id is persisted before any rewrite so a crash reopens the fresh pack.
-    async fn seal_active_pack_for_reclaim(&self, pack_id: u64) -> Result<bool> {
-        let sealed = {
-            let _guard = self.write_lock.write().await;
-            tokio::task::block_in_place(|| self.packs.seal_active_pack(pack_id))?
-        };
-        if sealed {
-            self.persist_active_pack_id_if_needed().await?;
-        }
-        Ok(sealed)
-    }
-    /// Drops the dead records of `pack_id`. Every metadata commit up to now
-    /// (unlinks, truncates, the scan-phase deletes) is made durable first:
-    /// otherwise a power loss could roll metadata back to a state that still
-    /// references chunks the rewritten pack no longer holds.
+    /// Drops the dead records of `pack_id`.
     ///
-    /// Returns false when the pack is still active and was left unchanged.
-    /// Copying a pack is long disk work, so it runs off the async workers.
-    /// Readers keep using the current pack until the short swap at the end.
-    fn rewrite_pack_durably(&self, pack_id: u64) -> Result<bool> {
+    /// In-flight writes are drained first, so every record already in the
+    /// pack has its metadata committed before the live hashes are read; a
+    /// write that appended to this pack just before it rotated is covered the
+    /// same way. For the active pack this also fixes the cutoff below which
+    /// records are filtered; later appends are carried over unchanged.
+    ///
+    /// Every metadata commit up to now (unlinks, truncates, the scan-phase
+    /// deletes) is made durable before the copy: otherwise a power loss could
+    /// roll metadata back to a state that still references chunks the
+    /// rewritten pack no longer holds. Copying a pack is long disk work, so it
+    /// runs off the async workers, and readers keep using the current pack
+    /// until the short swap at the end.
+    async fn rewrite_pack_durably(&self, pack_id: u64) -> Result<()> {
+        let cutoff = {
+            let _guard = self.write_lock.write().await;
+            self.packs.active_pack_cutoff(pack_id)?
+        };
         tokio::task::block_in_place(|| {
             self.meta.flush_wal(true)?;
             let live_hashes = self.live_hashes_for_pack(pack_id)?;
-            self.packs.rewrite_pack_with_live_hashes(pack_id, &live_hashes)
+            self.packs
+                .rewrite_pack_with_live_hashes(pack_id, &live_hashes, cutoff)
         })
     }
     pub(crate) async fn switch_to_scan_phase(&self) -> Result<()> {

@@ -134,6 +134,20 @@ impl MountDaemon {
     }
 }
 
+impl MountDaemon {
+    /// Kills the daemon without letting it flush or unmount, like a crash.
+    fn kill_hard(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            bail!("daemon is not running");
+        };
+        child.kill().context("failed to SIGKILL daemon")?;
+        child.wait().context("failed to reap killed daemon")?;
+        let mount_s = self.mount_point.to_string_lossy().into_owned();
+        run_cmd(10, None, "fusermount", &["-uz", &mount_s])?;
+        Ok(())
+    }
+}
+
 impl Drop for MountDaemon {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -1804,6 +1818,456 @@ echo "BENCH:summary_total:$(( p9_end - p1_start ))"
     let peak_rss_mb = peak_rss as f64 / (1024.0 * 1024.0);
     println!("  {:20}  {:>8.1} MB", "peak_rss", peak_rss_mb);
     println!("METRIC peak_rss_mb={:.2}", peak_rss_mb);
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+fn verfsnext_bin() -> Result<String> {
+    Ok(std::env::var_os("CARGO_BIN_EXE_verfsnext")
+        .context("CARGO_BIN_EXE_verfsnext is not set")?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn control(root: &Path, args: &[&str]) -> Result<String> {
+    let bin = verfsnext_bin()?;
+    let config = root.join("config.toml").to_string_lossy().into_owned();
+    let mut full = vec!["--config", config.as_str()];
+    full.extend_from_slice(args);
+    let out = run_cmd(120, Some(root), &bin, &full)?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn assert_stats_healthy(root: &Path) -> Result<()> {
+    let stats = control(root, &["stats"])?;
+    let row = |name: &str| {
+        stats
+            .lines()
+            .find(|line| line.contains(name))
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("stats has no '{name}' row:\n{stats}"))
+    };
+    let consistency = row("Metadata Consistency")?;
+    if !consistency.contains("| ok") {
+        bail!("metadata consistency is not ok: {consistency}");
+    }
+    let crc_errors = row("Pack CRC32 Read Errors")?;
+    if !crc_errors.contains("| 0 ") {
+        bail!("pack checksum errors reported: {crc_errors}");
+    }
+    Ok(())
+}
+
+fn random_file(dir: &Path, name: &str, mib: u64) -> Result<PathBuf> {
+    let path = dir.join(name);
+    let of = format!("of={}", path.display());
+    let count = format!("count={mib}");
+    run_cmd(
+        300,
+        None,
+        "dd",
+        &["if=/dev/urandom", &of, "bs=1M", &count, "status=none"],
+    )?;
+    Ok(path)
+}
+
+fn copy_into(src: &Path, dst: &Path) -> Result<()> {
+    let src_s = src.to_string_lossy().into_owned();
+    let dst_s = dst.to_string_lossy().into_owned();
+    run_cmd(300, None, "cp", &[&src_s, &dst_s])?;
+    Ok(())
+}
+
+/// Copies `src` to `dst` and fsyncs it before returning, so the data has
+/// reached the pack and its metadata is committed.
+fn copy_into_fsync(src: &Path, dst: &Path) -> Result<()> {
+    let iff = format!("if={}", src.display());
+    let of = format!("of={}", dst.display());
+    run_cmd(
+        300,
+        None,
+        "dd",
+        &[&iff, &of, "bs=1M", "conv=fsync", "status=none"],
+    )?;
+    Ok(())
+}
+
+fn remove(path: &Path) -> Result<()> {
+    let path_s = path.to_string_lossy().into_owned();
+    run_cmd(120, None, "rm", &[&path_s])?;
+    Ok(())
+}
+
+fn run_sync() -> Result<()> {
+    run_cmd(120, None, "sync", &[])?;
+    Ok(())
+}
+
+/// Pack data files (`pack-*.vpk`) by name with their sizes.
+fn pack_files(packs_dir: &Path) -> Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(packs_dir).context("failed to read packs dir")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.starts_with("pack-") && name.ends_with(".vpk") {
+                out.push((name, file.metadata()?.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// True while a pack rewrite has its temporary pack file on disk.
+fn rewrite_in_progress(packs_dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(packs_dir).context("failed to read packs dir")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            if file?.file_name().to_string_lossy().ends_with(".vpk.rewrite") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn wait_for(
+    what: &str,
+    timeout: Duration,
+    poll: Duration,
+    mut done: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done()? {
+            return Ok(());
+        }
+        thread::sleep(poll);
+    }
+    bail!("timed out waiting for {what}")
+}
+
+fn assert_same_content(expected: &Path, actual: &Path) -> Result<()> {
+    if sha256(expected)? != sha256(actual)? {
+        bail!(
+            "content of {} does not match {}",
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+fn compaction_test_config(mount_point: &Path, data_dir: &Path) -> String {
+    format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_flush_interval_ms = 50\ngc_idle_min_ms = 2000\nvault_argon2_mem_kib = 8192\nvault_argon2_iters = 1\n",
+        mount_point.display(),
+        data_dir.display()
+    )
+}
+
+fn compaction_tests_enabled() -> Result<bool> {
+    if std::env::consts::OS != "linux" {
+        return Ok(false);
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(false);
+    }
+    for tool in [
+        "timeout",
+        "dd",
+        "cp",
+        "sync",
+        "sha256sum",
+        "mountpoint",
+        "fusermount",
+    ] {
+        require_tool(tool)?;
+    }
+    Ok(true)
+}
+
+/// The active pack is compacted in place while files are written, overwritten,
+/// re-created with the content of deleted files (plain and vault) and read.
+/// Data appended while the copy runs must be carried over, the pack must keep
+/// its id and keep growing, and every file must match before and after a
+/// remount.
+#[test]
+fn gc_compacts_active_pack_in_place_under_concurrent_io() -> Result<()> {
+    if !compaction_tests_enabled()? {
+        return Ok(());
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let src_dir = root.join("src");
+    let key_dir = root.join("keys");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&src_dir).context("failed to create source dir")?;
+    fs::write(
+        root.join("config.toml"),
+        compaction_test_config(&mount_point, &data_dir),
+    )
+    .context("failed to write config.toml")?;
+    let packs_dir = data_dir.join("packs");
+
+    let keep = random_file(&src_dir, "keep.bin", 512)?;
+    let dead_big = random_file(&src_dir, "dead_big.bin", 192)?;
+    let dead_small = random_file(&src_dir, "dead_small.bin", 16)?;
+    let cow_v1 = random_file(&src_dir, "cow_v1.bin", 16)?;
+    let cow_v2 = random_file(&src_dir, "cow_v2.bin", 16)?;
+    let vault_keep = random_file(&src_dir, "vault_keep.bin", 24)?;
+    let vault_dead = random_file(&src_dir, "vault_dead.bin", 64)?;
+    let during = (0..4)
+        .map(|i| random_file(&src_dir, &format!("during{i}.bin"), 8))
+        .collect::<Result<Vec<_>>>()?;
+    let after = random_file(&src_dir, "after.bin", 16)?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let password = "compaction-test-password";
+    let key_dir_s = key_dir.to_string_lossy().into_owned();
+    let key_file = control(&root, &["crypt", "-c", "-p", password, "-path", &key_dir_s])?
+        .lines()
+        .last()
+        .context("crypt -c printed no key file")?
+        .trim()
+        .to_owned();
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    let vault = mount_point.join(".vault");
+
+    copy_into(&keep, &mount_point.join("keep.bin"))?;
+    copy_into(&dead_big, &mount_point.join("dead_big.bin"))?;
+    copy_into(&dead_small, &mount_point.join("dead_small.bin"))?;
+    copy_into(&cow_v1, &mount_point.join("cow.bin"))?;
+    copy_into(&vault_keep, &vault.join("keep.bin"))?;
+    copy_into(&vault_dead, &vault.join("dead.bin"))?;
+    // Overwriting leaves the first version as garbage in the active pack.
+    copy_into(&cow_v2, &mount_point.join("cow.bin"))?;
+    run_sync()?;
+
+    let packs_before = pack_files(&packs_dir)?;
+    if packs_before.len() != 1 {
+        bail!("expected a single active pack before cleanup, found {packs_before:?}");
+    }
+    let pack_size_before = packs_before[0].1;
+
+    remove(&mount_point.join("dead_big.bin"))?;
+    remove(&mount_point.join("dead_small.bin"))?;
+    remove(&vault.join("dead.bin"))?;
+    run_sync()?;
+
+    wait_for(
+        "active pack compaction to start",
+        Duration::from_secs(180),
+        Duration::from_millis(10),
+        || rewrite_in_progress(&packs_dir),
+    )?;
+
+    let stop_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop_reader = Arc::clone(&stop_reader);
+        let expected = sha256(&keep)?;
+        let target = mount_point.join("keep.bin");
+        thread::spawn(move || -> Result<u64> {
+            let mut reads = 0_u64;
+            while !stop_reader.load(Ordering::Relaxed) {
+                if sha256(&target)? != expected {
+                    bail!("keep.bin changed while its pack was compacted");
+                }
+                reads += 1;
+            }
+            Ok(reads)
+        })
+    };
+
+    // Appends while the copy runs: new data, and the content of deleted files
+    // whose dead copies sit in the part of the pack being filtered.
+    copy_into_fsync(&during[0], &mount_point.join("during0.bin"))?;
+    let carried_tail = rewrite_in_progress(&packs_dir)?;
+    copy_into_fsync(&dead_small, &mount_point.join("resurrected.bin"))?;
+    copy_into_fsync(&vault_dead, &vault.join("resurrected.bin"))?;
+    for (i, src) in during.iter().enumerate().skip(1) {
+        copy_into_fsync(src, &mount_point.join(format!("during{i}.bin")))?;
+    }
+    if !carried_tail {
+        bail!(
+            "compaction finished before the concurrent append; grow keep.bin so this test covers appends during the copy"
+        );
+    }
+
+    wait_for(
+        "active pack compaction to finish",
+        Duration::from_secs(300),
+        Duration::from_millis(100),
+        || Ok(!rewrite_in_progress(&packs_dir)?),
+    )?;
+    stop_reader.store(true, Ordering::Relaxed);
+    let reads = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+    if reads == 0 {
+        bail!("no read of keep.bin completed during compaction");
+    }
+
+    let verify_all = |vault_unlocked: bool| -> Result<()> {
+        assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+        assert_same_content(&cow_v2, &mount_point.join("cow.bin"))?;
+        assert_same_content(&dead_small, &mount_point.join("resurrected.bin"))?;
+        for (i, src) in during.iter().enumerate() {
+            assert_same_content(src, &mount_point.join(format!("during{i}.bin")))?;
+        }
+        for gone in ["dead_big.bin", "dead_small.bin"] {
+            if mount_point.join(gone).exists() {
+                bail!("{gone} reappeared after compaction");
+            }
+        }
+        if vault_unlocked {
+            assert_same_content(&vault_keep, &vault.join("keep.bin"))?;
+            assert_same_content(&vault_dead, &vault.join("resurrected.bin"))?;
+            if vault.join("dead.bin").exists() {
+                bail!("deleted vault file reappeared after compaction");
+            }
+        }
+        Ok(())
+    };
+    verify_all(true)?;
+
+    let packs_compacted = pack_files(&packs_dir)?;
+    if packs_compacted.len() != 1 || packs_compacted[0].0 != packs_before[0].0 {
+        bail!("compaction must keep the active pack id: before {packs_before:?}, after {packs_compacted:?}");
+    }
+    if packs_compacted[0].1 >= pack_size_before {
+        bail!("active pack did not shrink: before {packs_before:?}, after {packs_compacted:?}");
+    }
+
+    // The compacted pack stays active and keeps growing.
+    copy_into(&after, &mount_point.join("after.bin"))?;
+    run_sync()?;
+    let packs_grown = pack_files(&packs_dir)?;
+    if packs_grown.len() != 1
+        || packs_grown[0].0 != packs_before[0].0
+        || packs_grown[0].1 <= packs_compacted[0].1
+    {
+        bail!("new data must be appended to the compacted pack: compacted {packs_compacted:?}, now {packs_grown:?}");
+    }
+    assert_same_content(&after, &mount_point.join("after.bin"))?;
+    assert_stats_healthy(&root)?;
+
+    control(&root, &["crypt", "-l"])?;
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    verify_all(true)?;
+
+    daemon.stop_graceful()?;
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    verify_all(false)?;
+    assert_same_content(&after, &mount_point.join("after.bin"))?;
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    verify_all(true)?;
+    assert_stats_healthy(&root)?;
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// The daemon is killed while the active pack is being compacted, right after
+/// an fsynced append. Everything acknowledged must survive the restart, the
+/// interrupted compaction must complete afterwards, and no temporary pack may
+/// be left behind.
+#[test]
+fn gc_active_pack_compaction_survives_crash() -> Result<()> {
+    if !compaction_tests_enabled()? {
+        return Ok(());
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let src_dir = root.join("src");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&src_dir).context("failed to create source dir")?;
+    fs::write(
+        root.join("config.toml"),
+        compaction_test_config(&mount_point, &data_dir),
+    )
+    .context("failed to write config.toml")?;
+    let packs_dir = data_dir.join("packs");
+
+    let keep = random_file(&src_dir, "keep.bin", 384)?;
+    let dead = random_file(&src_dir, "dead.bin", 192)?;
+    let during = random_file(&src_dir, "during.bin", 8)?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    copy_into(&keep, &mount_point.join("keep.bin"))?;
+    copy_into(&dead, &mount_point.join("dead.bin"))?;
+    run_sync()?;
+    let packs_before = pack_files(&packs_dir)?;
+    if packs_before.len() != 1 {
+        bail!("expected a single active pack, found {packs_before:?}");
+    }
+
+    remove(&mount_point.join("dead.bin"))?;
+    run_sync()?;
+    wait_for(
+        "active pack compaction to start",
+        Duration::from_secs(180),
+        Duration::from_millis(10),
+        || rewrite_in_progress(&packs_dir),
+    )?;
+    copy_into_fsync(&during, &mount_point.join("during.bin"))?;
+    daemon.kill_hard()?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    if mount_point.join("dead.bin").exists() {
+        bail!("deleted file reappeared after crash");
+    }
+
+    let dead_len = fs::metadata(&dead)?.len();
+    wait_for(
+        "compaction to finish after restart",
+        Duration::from_secs(300),
+        Duration::from_millis(200),
+        || {
+            let packs = pack_files(&packs_dir)?;
+            Ok(!rewrite_in_progress(&packs_dir)?
+                && packs.len() == 1
+                && packs[0].1 + dead_len / 2 < packs_before[0].1)
+        },
+    )?;
+    let packs_after = pack_files(&packs_dir)?;
+    if packs_after[0].0 != packs_before[0].0 {
+        bail!("compaction must keep the active pack id: before {packs_before:?}, after {packs_after:?}");
+    }
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    assert_stats_healthy(&root)?;
+
+    daemon.stop_graceful()?;
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    assert_stats_healthy(&root)?;
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);

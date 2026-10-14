@@ -896,37 +896,32 @@ impl PackStore {
         Ok(size)
     }
 
-    /// Seals `pack_id` when it is the active pack, so a later rewrite can drop
-    /// its obsolete records.
+    /// Returns the size of the active pack when it is `pack_id`, after writing
+    /// its buffered index entries, so a rewrite can copy everything below that
+    /// offset without the append lock.
     ///
-    /// The retired pack is synced before the new pack becomes active. Callers
-    /// that append under the filesystem write lock must hold that lock across
-    /// this call: an append that has reached the pack but not metadata yet
-    /// would otherwise be dropped by the rewrite. Returns false when `pack_id`
-    /// is still the active pack because it holds no bytes.
-    pub fn seal_active_pack(&self, pack_id: u64) -> Result<bool> {
+    /// Callers that append under the filesystem write lock must hold that lock
+    /// across this call: every record below the returned offset then has its
+    /// metadata committed (or never will), so the live hashes read afterwards
+    /// cover it.
+    pub fn active_pack_cutoff(&self, pack_id: u64) -> Result<Option<u64>> {
         let mut active = self.active.lock();
         if active.pack_id != pack_id {
-            return Ok(true);
+            return Ok(None);
         }
-        if active.size_bytes == 0 {
-            return Ok(false);
-        }
-        let retired_pack_id = active.pack_id;
-        self.rotate_active_pack(&mut active)?;
-        tracing::info!(
-            retired_pack_id,
-            active_pack_id = active.pack_id,
-            "sealed active pack so garbage collection can reclaim its obsolete data"
-        );
-        Ok(true)
+        Self::flush_pending_index(&mut active)?;
+        Ok(Some(active.size_bytes))
     }
 
-    /// Rewrites a non-active pack keeping only records of `live_hashes`.
+    /// Rewrites `pack_id` keeping only records of `live_hashes`.
     ///
-    /// Returns false when `pack_id` is still the active pack. Rewriting the
-    /// pack writers are appending to would race with those appends, so the
-    /// caller seals it first.
+    /// `cutoff` is the active pack's size from `active_pack_cutoff`, or None
+    /// for a pack that was not active then. Records below it are filtered;
+    /// records appended at or after it are carried over unchanged, because
+    /// their metadata may still be committing. The active pack is compacted in
+    /// place: appends wait only while that tail is copied and the files are
+    /// swapped, then continue on the same pack id, so it still grows to its
+    /// size limit.
     ///
     /// Every copy of a live hash that the pack index references is kept in its
     /// original order, so readers resolve exactly the same copy afterwards
@@ -945,17 +940,22 @@ impl PackStore {
         &self,
         pack_id: u64,
         live_hashes: &HashSet<[u8; 16]>,
-    ) -> Result<bool> {
-        if pack_id == self.active_pack_id() {
-            return Ok(false);
-        }
-
+        cutoff: Option<u64>,
+    ) -> Result<()> {
         let src_pack_path = self.pack_path(pack_id);
         if !src_pack_path.exists() {
-            return Ok(true);
+            return Ok(());
         }
+        let copy_end = match cutoff {
+            Some(cutoff) => cutoff,
+            None => self.pack_size(pack_id)?,
+        };
         let src_idx_path = self.index_path(pack_id);
-        let src_entries = self.read_index_entries(pack_id)?;
+        let src_entries = self
+            .read_index_entries(pack_id)?
+            .into_iter()
+            .filter(|(_, entry)| entry.offset < copy_end)
+            .collect::<Vec<_>>();
         let indexed_by_offset = src_entries
             .iter()
             .map(|(hash, entry)| (entry.offset, (*hash, *entry)))
@@ -996,7 +996,7 @@ impl PackStore {
         let mut cursor = 0_u64;
         let mut new_offset = 0_u64;
         let mut kept_offsets = HashSet::<u64>::new();
-        loop {
+        while cursor < copy_end {
             let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
             match src_file.read_exact_at(raw_header.as_mut_slice(), cursor) {
                 Ok(()) => {
@@ -1111,6 +1111,33 @@ impl PackStore {
             }
         }
 
+        // Appends wait from here until the swap is done, so nothing reaches
+        // the old file after its tail is copied.
+        let mut active = Some(self.active.lock()).filter(|active| active.pack_id == pack_id);
+        let tail_end = match active.as_mut() {
+            Some(active) => {
+                Self::flush_pending_index(active)?;
+                active.size_bytes
+            }
+            None => self.pack_size(pack_id)?,
+        };
+        let tail_entries = if tail_end > copy_end {
+            self.copy_pack_tail(
+                &src_file,
+                &mut dst_file,
+                &mut dst_index,
+                pack_id,
+                copy_end,
+                tail_end,
+                new_offset,
+            )?
+        } else {
+            Vec::new()
+        };
+        let new_size = new_offset
+            .checked_add(tail_end.saturating_sub(copy_end))
+            .context("destination size overflow during pack rewrite")?;
+
         dst_file.sync_all().with_context(|| {
             format!("failed to sync rewritten pack {}", tmp_pack_path.display())
         })?;
@@ -1154,12 +1181,86 @@ impl PackStore {
         })?;
         sync_dir(pack_dir)?;
 
-        for (hash, _) in src_entries.iter() {
+        if let Some(active) = active.as_mut() {
+            active.file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&src_pack_path)
+                .with_context(|| {
+                    format!("failed to reopen compacted pack {}", src_pack_path.display())
+                })?;
+            active.index_file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&src_idx_path)
+                .with_context(|| {
+                    format!(
+                        "failed to reopen compacted pack index {}",
+                        src_idx_path.display()
+                    )
+                })?;
+            active.size_bytes = new_size;
+        }
+        tracing::info!(
+            pack_id,
+            active = active.is_some(),
+            source_bytes = tail_end,
+            kept_bytes = new_size,
+            carried_tail_bytes = tail_end - copy_end,
+            "rewrote pack keeping live records"
+        );
+
+        for (hash, _) in src_entries.iter().chain(tail_entries.iter()) {
             self.index_cache.invalidate(&(pack_id, *hash));
         }
         self.pack_file_cache.invalidate(&pack_id);
         self.prime_index_cache(pack_id)?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Copies the records in `[from, to)` of a pack being rewritten unchanged
+    /// to `dst_offset` of the new pack and appends their index entries,
+    /// shifted to the new offsets. Returns the copied index entries.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_pack_tail(
+        &self,
+        src_file: &File,
+        dst_file: &mut File,
+        dst_index: &mut File,
+        pack_id: u64,
+        from: u64,
+        to: u64,
+        dst_offset: u64,
+    ) -> Result<Vec<([u8; 16], PackIndexEntry)>> {
+        let mut buf = vec![0_u8; 8 * 1024 * 1024];
+        let mut cursor = from;
+        while cursor < to {
+            let len = (to - cursor).min(buf.len() as u64) as usize;
+            src_file
+                .read_exact_at(&mut buf[..len], cursor)
+                .with_context(|| format!("failed to read tail of pack {pack_id} while rewriting"))?;
+            dst_file
+                .write_all(&buf[..len])
+                .with_context(|| format!("failed to write tail of pack {pack_id} while rewriting"))?;
+            cursor += len as u64;
+        }
+
+        let tail_entries = self
+            .read_index_entries(pack_id)?
+            .into_iter()
+            .filter(|(_, entry)| entry.offset >= from && entry.offset < to)
+            .collect::<Vec<_>>();
+        for (hash, entry) in &tail_entries {
+            Self::append_index_record(
+                dst_index,
+                *hash,
+                PackIndexEntry {
+                    offset: entry.offset - from + dst_offset,
+                    ..*entry
+                },
+            )?;
+        }
+        Ok(tail_entries)
     }
 
     fn open_pack_file(&self, pack_id: u64) -> Result<Arc<File>> {
