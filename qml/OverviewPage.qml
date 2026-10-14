@@ -59,8 +59,9 @@ ScrollView {
             ["Cached data pieces", String(stats.chunk_cache_entries)],
             ["Read since start", b(stats.read_bytes_total)],
             ["Written since start", b(stats.write_bytes_total)],
-            ["Average read speed", b(stats.read_throughput_bps) + "/s"],
-            ["Average write speed", b(stats.write_throughput_bps) + "/s"],
+            ["Recent read speed", status ? b(status.read_throughput_bps) + "/s" : "—"],
+            ["Recent write speed", status ? b(status.write_throughput_bps) + "/s" : "—"],
+            ["Throughput sample", status ? status.throughput_sample_secs.toFixed(3) + " s (every second)" : "—"],
             ["Running for", theme.duration(stats.uptime_secs)],
         ]
     }
@@ -404,10 +405,10 @@ ScrollView {
                         text: root.stats ? theme.bytes(root.stats.approx_cache_memory_bytes) : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
-                    Label { text: "Average speed"; color: theme.textMuted; font.pixelSize: 13 }
+                    Label { text: "Recent speed (1 s)"; color: theme.textMuted; font.pixelSize: 13 }
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: root.stats ? "↓ " + theme.bytes(root.stats.read_throughput_bps) + "/s  ↑ " + theme.bytes(root.stats.write_throughput_bps) + "/s" : "—"
+                        text: root.status ? "↓ " + theme.bytes(root.status.read_throughput_bps) + "/s  ↑ " + theme.bytes(root.status.write_throughput_bps) + "/s" : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
                 }

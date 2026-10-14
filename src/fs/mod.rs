@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
@@ -172,6 +172,7 @@ pub struct VerFsStats {
     pub read_bytes_total: u64,
     pub write_bytes_total: u64,
     pub uptime_secs: f64,
+    pub throughput_sample_secs: f64,
     pub read_throughput_bps: f64,
     pub write_throughput_bps: f64,
     pub metadata_cache_entries: u64,
@@ -181,7 +182,7 @@ pub struct VerFsStats {
 
 /// Cheap daemon state for frequent polling (the desktop app). Unlike
 /// [`VerFsStats`] it never scans metadata: every field is an atomic, a lock
-/// probe or a point lookup.
+/// probe, a short metrics snapshot or a point lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub vault_enabled: bool,
@@ -191,6 +192,16 @@ pub struct DaemonStatus {
     pub uptime_secs: f64,
     pub read_bytes_total: u64,
     pub write_bytes_total: u64,
+    pub throughput_sample_secs: f64,
+    pub read_throughput_bps: f64,
+    pub write_throughput_bps: f64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ThroughputSample {
+    interval_secs: f64,
+    read_bps: f64,
+    write_bps: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +237,7 @@ pub struct VerFs {
     core: Arc<FsCore>,
     batcher: WriteBatcher,
     sync_service: SyncService,
+    throughput_worker: tokio::task::JoinHandle<()>,
     shutdown_started: AtomicBool,
 }
 
@@ -251,6 +263,7 @@ struct FsCore {
     chunk_meta_cache_misses: AtomicU64,
     chunk_data_cache_hits: AtomicU64,
     chunk_data_cache_misses: AtomicU64,
+    throughput: ParkingMutex<ThroughputSample>,
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
     pack_crc32_read_error_count: AtomicU64,
@@ -364,6 +377,7 @@ impl VerFs {
             chunk_meta_cache_misses: AtomicU64::new(0),
             chunk_data_cache_hits: AtomicU64::new(0),
             chunk_data_cache_misses: AtomicU64::new(0),
+            throughput: ParkingMutex::new(ThroughputSample::default()),
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
             pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
@@ -389,6 +403,31 @@ impl VerFs {
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
 
+        let throughput_core = Arc::downgrade(&core);
+        let throughput_worker = tokio::spawn(async move {
+            let mut sampled_at = Instant::now();
+            let mut previous_read = 0_u64;
+            let mut previous_write = 0_u64;
+            loop {
+                sleep(Duration::from_secs(1)).await;
+                let Some(core) = throughput_core.upgrade() else {
+                    break;
+                };
+                let now = Instant::now();
+                let interval_secs = now.duration_since(sampled_at).as_secs_f64();
+                let read = core.read_bytes_total.load(Ordering::Relaxed);
+                let written = core.write_bytes_total.load(Ordering::Relaxed);
+                *core.throughput.lock() = ThroughputSample {
+                    interval_secs,
+                    read_bps: (read - previous_read) as f64 / interval_secs,
+                    write_bps: (written - previous_write) as f64 / interval_secs,
+                };
+                sampled_at = now;
+                previous_read = read;
+                previous_write = written;
+            }
+        });
+
         let write_sink: Arc<dyn WriteApply> = core.clone();
         let sync_target: Arc<dyn SyncTarget> = core.clone();
 
@@ -404,6 +443,7 @@ impl VerFs {
             core,
             batcher,
             sync_service,
+            throughput_worker,
             shutdown_started: AtomicBool::new(false),
         })
     }
@@ -413,6 +453,7 @@ impl VerFs {
             return Ok(());
         }
 
+        self.throughput_worker.abort();
         self.batcher.shutdown().await?;
         self.sync_service.shutdown_with_full_sync().await?;
         self.core.meta.close().await?;
@@ -505,6 +546,7 @@ impl VerFs {
             .is_some_and(|raw| !raw.is_empty());
         let elapsed_ms =
             now_millis().saturating_sub(self.core.stats_started_ms.load(Ordering::Relaxed));
+        let throughput = *self.core.throughput.lock();
         Ok(DaemonStatus {
             vault_enabled: self.core.config.vault_enabled,
             vault_initialized,
@@ -513,6 +555,9 @@ impl VerFs {
             uptime_secs: elapsed_ms as f64 / 1000.0,
             read_bytes_total: self.core.read_bytes_total.load(Ordering::Relaxed),
             write_bytes_total: self.core.write_bytes_total.load(Ordering::Relaxed),
+            throughput_sample_secs: throughput.interval_secs,
+            read_throughput_bps: throughput.read_bps,
+            write_throughput_bps: throughput.write_bps,
         })
     }
 
@@ -1155,8 +1200,7 @@ impl FsCore {
         let pack_crc32_read_error_count = self.pack_crc32_read_error_count.load(Ordering::Relaxed);
         let elapsed_ms = now_millis().saturating_sub(self.stats_started_ms.load(Ordering::Relaxed));
         let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
-        let read_throughput_bps = read_bytes_total as f64 / uptime_secs;
-        let write_throughput_bps = write_bytes_total as f64 / uptime_secs;
+        let throughput = *self.throughput.lock();
 
         Ok(VerFsStats {
             live_logical_size_bytes,
@@ -1188,8 +1232,9 @@ impl FsCore {
             read_bytes_total,
             write_bytes_total,
             uptime_secs,
-            read_throughput_bps,
-            write_throughput_bps,
+            throughput_sample_secs: throughput.interval_secs,
+            read_throughput_bps: throughput.read_bps,
+            write_throughput_bps: throughput.write_bps,
             metadata_cache_entries,
             chunk_cache_entries,
             approx_cache_memory_bytes,

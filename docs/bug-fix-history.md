@@ -690,3 +690,22 @@ delete and a locked/unlocked vault. Compression and dedup totals remained
 identical across vault lock transitions; disk bytes matched `du -s -B1`; hashes
 matched and all metadata consistency counters were zero. CLI rendered the same
 byte and percentage fields as the control RPC consumed by the GUI.
+
+## B021 - Transfer Speed Averaged All Idle Time Since Startup - Oct 14 2026
+
+Traffic divided by daemon uptime made fast transfers appear slow after long
+idle periods. A daemon-owned one-second monotonic counter sampler now supplies
+the latest read/write rates and actual interval to stats and status. It starts
+from zero on each daemon instance and reports zero when idle. GUI speed uses
+existing cheap two-second status polls; full metadata scans remain every
+30 seconds. CLI labels the recent rate and sampling interval; totals stay
+separate. No storage change or migration.
+
+Validation: 43 existing library tests passed remotely. The existing mounted
+`rsync_copy_remount_and_delete_persistence` integration test passed using its
+remote-compiled executable on the local FUSE-capable user service. Real repeated
+copies and direct reads produced recent peaks of 31.4/33.9 MB/s over measured
+1.000-1.001 s intervals, then zero idle rates. Restart reset both totals and the
+sampling baseline; file SHA-256 and metadata consistency remained correct.
+The actual OverviewPage QML rendered offscreen with real daemon RPC data and
+showed the shared savings and recent speed fields. No new tests were added.

@@ -906,13 +906,16 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             "active cache keys".to_owned(),
         ),
         (
-            "Average Throughput".to_owned(),
+            "Recent Throughput".to_owned(),
             format!(
                 "read {}/s | write {}/s",
                 human_bytes(stats.read_throughput_bps as u64),
                 human_bytes(stats.write_throughput_bps as u64)
             ),
-            format!("uptime {:.1}s", stats.uptime_secs),
+            format!(
+                "latest {:.3}s counter sample; sampled every second",
+                stats.throughput_sample_secs
+            ),
         ),
         (
             "I/O Totals".to_owned(),
@@ -1144,6 +1147,7 @@ mod tests {
             read_bytes_total: 100_000,
             write_bytes_total: 50_000,
             uptime_secs: 10.0,
+            throughput_sample_secs: 1.0,
             read_throughput_bps: 10_000.0,
             write_throughput_bps: 5_000.0,
             metadata_cache_entries: 123,
@@ -1161,7 +1165,7 @@ mod tests {
         assert!(report.contains("Compression (Stored Unique Chunks)"));
         assert!(report.contains("Metadata Consistency"));
         assert!(report.contains("Pack CRC32 Read Errors"));
-        assert!(report.contains("Average Throughput"));
+        assert!(report.contains("Recent Throughput"));
         assert!(report.contains("I/O Totals"));
     }
 

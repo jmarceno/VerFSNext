@@ -454,3 +454,22 @@ still indexed in metadata. It is explicitly a partial garbage measure: obsolete
 pack entries whose chunk records have already been removed or relocated also
 consume disk until pack rewrite. It must not be presented as total reclaimable
 space. GUI and CLI use the daemon's same signed savings and percentage fields.
+
+## Recent throughput
+
+One daemon task samples cumulative successful FUSE read/write byte counters
+every second. Rates are counter deltas divided by the actual monotonic elapsed
+interval, returned as `throughput_sample_secs`, `read_throughput_bps` and
+`write_throughput_bps` in both stats and cheap status. Delayed scheduling extends
+the reported interval; no metadata, disk I/O or FUSE-path locks are involved.
+A short metrics mutex only publishes/copies the sample. Sampling is independent
+of clients, so requesting stats after a long idle period still reports recent
+traffic, and multiple clients do not reset each other's baselines. Before the
+first sample, the interval and rates are zero. A new daemon creates a fresh
+baseline; idle samples return zero. These are FUSE transfer rates: reads served
+by the kernel page cache do not increment the daemon's counters.
+
+The GUI reads rates from its existing two-second status poll, retaining the
+30-second full metadata refresh. CLI stats displays the latest completed sample
+and its exact interval. Cumulative I/O and uptime remain separately labeled;
+the old traffic/uptime lifetime average is removed. No storage migration.
