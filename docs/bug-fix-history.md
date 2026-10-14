@@ -673,3 +673,20 @@ its full scope. No storage change or migration. Validation: 43 existing library 
 on the remote builder. On a temporary FUSE mount, two identical 8 MiB + 123 B
 random files reported exactly 8,388,731 bytes / 50% saved; SHA-256 matched both
 copies and all three metadata consistency counters were zero.
+
+## B020 - Compression Savings Included Obsolete Data and Hid Expansion - Oct 14 2026
+
+Compression now compares only useful reachable unique CDC bytes with their
+stored payload, with shared daemon calculations for GUI and CLI. Signed bytes
+and percentages expose expansion instead of clamping it away. Net savings
+include all namespaces and actual allocated disk blocks, including metadata,
+indexes and garbage. Unreachable indexed payload is reported separately and
+explicitly marked as a partial garbage measure. Format 2 has no block padding;
+no storage change or migration is needed.
+
+Validation: 43 existing library tests passed remotely. A temporary FUSE workflow
+used incompressible and compressible files, 128 MiB sparse holes, a snapshot,
+delete and a locked/unlocked vault. Compression and dedup totals remained
+identical across vault lock transitions; disk bytes matched `du -s -B1`; hashes
+matched and all metadata consistency counters were zero. CLI rendered the same
+byte and percentage fields as the control RPC consumed by the GUI.

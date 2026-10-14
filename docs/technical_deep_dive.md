@@ -439,3 +439,18 @@ is that saving divided by referenced data (zero for an empty population).
 Invalid negative dedup accounting is an explicit error, not clamped to zero.
 Format 2 stores whole useful CDC chunks without block padding. This statistics
 change does not modify storage or require a migration.
+
+Compression bytes saved = reachable unique uncompressed bytes - reachable unique
+stored payload bytes; percentage = saved / unique uncompressed (zero when empty).
+Negative savings remain visible, including encryption overhead in vault payloads.
+Deduplication, sparse holes, stale chunks, metadata and indexes are excluded.
+Net bytes saved = all reachable logical bytes - allocated data-directory disk
+bytes; percentage = saved / all logical (zero when empty). Disk consumption sums
+`st_blocks * 512` for files and directories without following symlinks, including
+metadata, indexes, pack headers, duplicates and garbage. Disk scans occur after
+the metadata transaction and can reflect concurrent writes/GC.
+`unreachable_chunk_compressed_bytes` measures only unreachable chunk records
+still indexed in metadata. It is explicitly a partial garbage measure: obsolete
+pack entries whose chunk records have already been removed or relocated also
+consume disk until pack rewrite. It must not be presented as total reclaimable
+space. GUI and CLI use the daemon's same signed savings and percentage fields.

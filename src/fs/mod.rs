@@ -152,6 +152,11 @@ pub struct VerFsStats {
     pub dedup_savings_ratio: f64,
     pub stored_unique_uncompressed_bytes: u64,
     pub stored_unique_compressed_bytes: u64,
+    pub compression_saved_bytes: i128,
+    pub compression_savings_ratio: f64,
+    pub unreachable_chunk_compressed_bytes: u64,
+    pub net_saved_bytes: i128,
+    pub net_savings_ratio: f64,
     pub metadata_size_bytes: u64,
     pub data_dir_size_bytes: u64,
     pub vault_locked: bool,
@@ -949,6 +954,7 @@ impl FsCore {
             referenced_data_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
+            unreachable_chunk_compressed_bytes,
             chunk_refcount_mismatch_count,
             missing_chunk_records_for_extents,
             orphan_extent_records,
@@ -1044,6 +1050,7 @@ impl FsCore {
 
             let mut stored_unique_uncompressed_bytes = 0_u64;
             let mut stored_unique_compressed_bytes = 0_u64;
+            let mut unreachable_chunk_compressed_bytes = 0_u64;
             let mut chunk_refcount_mismatch_count = 0_u64;
             let mut seen_chunk_records = HashSet::<[u8; 16]>::new();
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
@@ -1062,6 +1069,8 @@ impl FsCore {
                 if reachable_chunks.contains(&hash) {
                     stored_unique_uncompressed_bytes += chunk_uncompressed;
                     stored_unique_compressed_bytes += chunk_compressed;
+                } else {
+                    unreachable_chunk_compressed_bytes += chunk_compressed;
                 }
                 let expected_refcount = all_extent_refcounts.get(&hash).copied().unwrap_or(0);
                 if chunk.refcount != expected_refcount {
@@ -1083,6 +1092,7 @@ impl FsCore {
                 referenced_data_bytes,
                 stored_unique_uncompressed_bytes,
                 stored_unique_compressed_bytes,
+                unreachable_chunk_compressed_bytes,
                 chunk_refcount_mismatch_count,
                 missing_chunk_records_for_extents,
                 orphan_extent_records,
@@ -1100,6 +1110,20 @@ impl FsCore {
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
+
+        let compression_saved_bytes = stored_unique_uncompressed_bytes as i128
+            - stored_unique_compressed_bytes as i128;
+        let compression_savings_ratio = if stored_unique_uncompressed_bytes == 0 {
+            0.0
+        } else {
+            compression_saved_bytes as f64 / stored_unique_uncompressed_bytes as f64
+        };
+        let net_saved_bytes = all_logical_size_bytes as i128 - data_dir_size_bytes as i128;
+        let net_savings_ratio = if all_logical_size_bytes == 0 {
+            0.0
+        } else {
+            net_saved_bytes as f64 / all_logical_size_bytes as f64
+        };
 
         let cache_hits = self
             .chunk_meta_cache_hits
@@ -1144,6 +1168,11 @@ impl FsCore {
             dedup_savings_ratio,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
+            compression_saved_bytes,
+            compression_savings_ratio,
+            unreachable_chunk_compressed_bytes,
+            net_saved_bytes,
+            net_savings_ratio,
             metadata_size_bytes,
             data_dir_size_bytes,
             vault_locked,

@@ -15,9 +15,8 @@ ScrollView {
 
     readonly property real logicalAll: stats ? stats.all_logical_size_bytes : 0
     readonly property real onDisk: stats ? stats.data_dir_size_bytes : 0
-    readonly property real saved: logicalAll - onDisk
-    readonly property real compressionSaving: stats && stats.stored_unique_uncompressed_bytes > 0
-        ? Math.max(0, 1 - stats.stored_unique_compressed_bytes / stats.stored_unique_uncompressed_bytes) : 0
+    readonly property real saved: stats ? stats.net_saved_bytes : 0
+    readonly property real compressionSaving: stats ? stats.compression_savings_ratio : 0
     readonly property real dedupSaving: stats ? stats.dedup_savings_ratio : 0
     readonly property bool healthy: stats ? (stats.chunk_refcount_mismatch_count === 0
                                              && stats.missing_chunk_records_for_extents === 0
@@ -41,6 +40,9 @@ ScrollView {
             ["Dedup savings (all namespaces)", b(stats.dedup_saved_bytes) + " (" + theme.percent(stats.dedup_savings_ratio) + ")"],
             ["Unique data before compression", b(stats.stored_unique_uncompressed_bytes)],
             ["Unique data after compression", b(stats.stored_unique_compressed_bytes)],
+            ["Compression savings", b(stats.compression_saved_bytes) + " (" + theme.percent(stats.compression_savings_ratio) + ")"],
+            ["Unreachable indexed payload (partial garbage)", b(stats.unreachable_chunk_compressed_bytes)],
+            ["Net savings (all namespaces)", b(stats.net_saved_bytes) + " (" + theme.percent(stats.net_savings_ratio) + ")"],
             ["Metadata on disk", b(stats.metadata_size_bytes)],
             ["Data folder on disk", b(stats.data_dir_size_bytes)],
             ["Vault", stats.vault_locked ? "Locked" : "Unlocked or not created"],
@@ -206,7 +208,7 @@ ScrollView {
                         text: !root.stats ? (root.controller.stats_loading ? "Measuring your space…" : "Space savings")
                               : (root.logicalAll === 0 ? "Nothing stored yet"
                                  : (root.saved > 0 ? "You're saving " + theme.bytes(root.saved)
-                                    : "Using " + theme.bytes(-root.saved) + " for bookkeeping"))
+                                    : "Using " + theme.bytes(-root.saved) + " beyond logical data"))
                         color: theme.textPrimary
                         font.pixelSize: 22
                         font.bold: true
@@ -217,7 +219,7 @@ ScrollView {
                         text: !root.stats ? (root.controller.stats_error.length > 0 ? root.controller.stats_error
                                              : "This looks through all your files and can take a moment on large folders.")
                               : (root.logicalAll === 0 ? "Copy files into your folder and VerFSNext will start removing duplicates and compressing them."
-                                 : (root.saved > 0 ? theme.percent(root.saved / root.logicalAll) + " less space than storing your files and snapshots as they are."
+                                 : (root.saved > 0 ? theme.percent(root.stats.net_savings_ratio) + " less space than storing your files and snapshots as they are."
                                     : "This includes VerFSNext's records and space from changed files that is reclaimed when the folder is idle. Savings grow with your files."))
                         color: root.controller.stats_error.length > 0 && !root.stats ? theme.dangerStrong : theme.textMuted
                         font.pixelSize: 13
@@ -277,7 +279,7 @@ ScrollView {
                     }
                     Item { Layout.fillWidth: true }
                     Label {
-                        text: "Files and snapshots: " + theme.bytes(root.logicalAll)
+                        text: "Files, snapshots and vault: " + theme.bytes(root.logicalAll)
                         color: theme.textMuted
                         font.pixelSize: 12
                     }
@@ -329,7 +331,7 @@ ScrollView {
                 label: "Compression"
                 value: theme.percent(root.compressionSaving)
                 valueColor: theme.accentStrong
-                caption: "Smaller after compressing unique data"
+                caption: root.stats ? theme.bytes(root.stats.compression_saved_bytes) + " saved on reachable unique data" : ""
             }
             StatTile {
                 Layout.fillWidth: true

@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::MetadataExt;
 
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
@@ -81,14 +82,14 @@ pub(crate) fn dir_size_recursive(path: &Path) -> Result<u64> {
     };
 
     if metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(metadata.len());
+        return Ok(metadata.blocks() * 512);
     }
 
     if !metadata.is_dir() {
         return Ok(0);
     }
 
-    let mut total = 0_u64;
+    let mut total = metadata.blocks() * 512;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         total = total.saturating_add(dir_size_recursive(&entry.path())?);

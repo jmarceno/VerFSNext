@@ -737,11 +737,6 @@ async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
 }
 
 fn format_stats_report(stats: &VerFsStats) -> String {
-    let stored_compression_ratio = ratio(
-        stats.stored_unique_compressed_bytes,
-        stats.stored_unique_uncompressed_bytes,
-    );
-    let stored_compression_savings_ratio = (1.0 - stored_compression_ratio).max(0.0);
     let disk_vs_live_logical =
         stats.data_dir_size_bytes as i128 - stats.live_logical_size_bytes as i128;
     let disk_delta_note = if disk_vs_live_logical < 0 {
@@ -815,10 +810,14 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         ),
         (
             "Compression (Stored Unique Chunks)".to_owned(),
-            format!("{:.2}% smaller", stored_compression_savings_ratio * 100.0),
             format!(
-                "compressed/original: {:.2}%",
-                stored_compression_ratio * 100.0
+                "{} ({:.2}%)",
+                human_bytes_signed(stats.compression_saved_bytes),
+                stats.compression_savings_ratio * 100.0
+            ),
+            format!(
+                "{} bytes saved; reachable unique data, no padding",
+                stats.compression_saved_bytes
             ),
         ),
         (
@@ -830,6 +829,20 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             "Unique Compressed (Reachable Chunks)".to_owned(),
             human_bytes(stats.stored_unique_compressed_bytes),
             format!("{} bytes", stats.stored_unique_compressed_bytes),
+        ),
+        (
+            "Unreachable Chunk Payload (Indexed)".to_owned(),
+            human_bytes(stats.unreachable_chunk_compressed_bytes),
+            "excludes unindexed obsolete pack entries; not a total GC estimate".to_owned(),
+        ),
+        (
+            "Net Savings (All Reachable Namespaces)".to_owned(),
+            format!(
+                "{} ({:.2}%)",
+                human_bytes_signed(stats.net_saved_bytes),
+                stats.net_savings_ratio * 100.0
+            ),
+            "logical minus allocated disk bytes; includes metadata, indexes and garbage".to_owned(),
         ),
         (
             "Metadata Consistency".to_owned(),
@@ -933,14 +946,6 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         "VerFSNext Stats\n(scoped to mounted live tree unless explicitly marked otherwise)\n{}",
         table
     )
-}
-
-fn ratio(numerator: u64, denominator: u64) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
 }
 
 fn render_stats_table(rows: &[(String, String, String)]) -> String {
@@ -1119,6 +1124,11 @@ mod tests {
             dedup_savings_ratio: 1.0 / 12.0,
             stored_unique_uncompressed_bytes: 11_000,
             stored_unique_compressed_bytes: 5_000,
+            compression_saved_bytes: 6_000,
+            compression_savings_ratio: 6.0 / 11.0,
+            unreachable_chunk_compressed_bytes: 0,
+            net_saved_bytes: 4_500,
+            net_savings_ratio: 0.375,
             metadata_size_bytes: 1_000,
             data_dir_size_bytes: 7_500,
             vault_locked: false,
