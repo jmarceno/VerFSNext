@@ -425,3 +425,17 @@ errors separately from complete content mismatches. Every recovered mount is
 verified against its external durable checkpoint before fault observations are
 classified. Per-revision source paths and saved provenance preserve the exact
 code behind each traceback. See B010 in [Bug fix history](bug-fix-history.md).
+
+## Reachable data statistics
+
+Deduplication uses all reachable file inodes in the live tree, snapshots and vault
+(including the locked vault). Hard links count once per namespace inode.
+`referenced_data_bytes` sums their whole CDC extent lengths, excluding sparse holes.
+`stored_unique_uncompressed_bytes` and `stored_unique_compressed_bytes` sum each
+reachable chunk once. Zero-reference and unreachable chunks are excluded even
+before GC; consistency checks still audit every extent and chunk record.
+Dedup bytes saved = referenced data - unique uncompressed data; the percentage
+is that saving divided by referenced data (zero for an empty population).
+Invalid negative dedup accounting is an explicit error, not clamped to zero.
+Format 2 stores whole useful CDC chunks without block padding. This statistics
+change does not modify storage or require a migration.

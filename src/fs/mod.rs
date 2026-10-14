@@ -147,6 +147,9 @@ pub struct VerFsStats {
     pub snapshots_logical_size_bytes: u64,
     pub hidden_vault_logical_size_bytes: u64,
     pub all_logical_size_bytes: u64,
+    pub referenced_data_bytes: u64,
+    pub dedup_saved_bytes: u64,
+    pub dedup_savings_ratio: f64,
     pub stored_unique_uncompressed_bytes: u64,
     pub stored_unique_compressed_bytes: u64,
     pub metadata_size_bytes: u64,
@@ -943,6 +946,7 @@ impl FsCore {
             snapshots_logical_size_bytes,
             hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
+            referenced_data_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
             chunk_refcount_mismatch_count,
@@ -1000,6 +1004,13 @@ impl FsCore {
                 .saturating_add(snapshots_logical_size_bytes)
                 .saturating_add(hidden_vault_logical_size_bytes);
 
+            let reachable_inodes: HashSet<u64> = live_seen_inodes
+                .union(&snapshots_seen_inodes)
+                .copied()
+                .chain(hidden_vault_seen_inodes.iter().copied())
+                .collect();
+            let mut reachable_chunks = HashSet::<[u8; 16]>::new();
+            let mut referenced_data_bytes = 0_u64;
             let mut all_extent_refcounts = HashMap::<[u8; 16], u64>::new();
             let mut inode_present_cache = HashMap::<u64, bool>::new();
             let mut orphan_extent_records = 0_u64;
@@ -1023,6 +1034,10 @@ impl FsCore {
                 }
 
                 let extent: ExtentRecord = decode_rkyv(&value)?;
+                if reachable_inodes.contains(&owner_ino) {
+                    referenced_data_bytes += u64::from(extent.len);
+                    reachable_chunks.insert(extent.chunk_hash);
+                }
                 let counter = all_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
                 *counter = counter.saturating_add(1);
             }
@@ -1044,10 +1059,10 @@ impl FsCore {
 
                 let chunk_uncompressed = chunk.uncompressed_len as u64;
                 let chunk_compressed = chunk.compressed_len as u64;
-                stored_unique_uncompressed_bytes =
-                    stored_unique_uncompressed_bytes.saturating_add(chunk_uncompressed);
-                stored_unique_compressed_bytes =
-                    stored_unique_compressed_bytes.saturating_add(chunk_compressed);
+                if reachable_chunks.contains(&hash) {
+                    stored_unique_uncompressed_bytes += chunk_uncompressed;
+                    stored_unique_compressed_bytes += chunk_compressed;
+                }
                 let expected_refcount = all_extent_refcounts.get(&hash).copied().unwrap_or(0);
                 if chunk.refcount != expected_refcount {
                     chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
@@ -1065,6 +1080,7 @@ impl FsCore {
                 snapshots_logical_size_bytes,
                 hidden_vault_logical_size_bytes,
                 all_logical_size_bytes,
+                referenced_data_bytes,
                 stored_unique_uncompressed_bytes,
                 stored_unique_compressed_bytes,
                 chunk_refcount_mismatch_count,
@@ -1072,6 +1088,15 @@ impl FsCore {
                 orphan_extent_records,
             ))
         })?;
+
+        let dedup_saved_bytes = referenced_data_bytes
+            .checked_sub(stored_unique_uncompressed_bytes)
+            .ok_or_else(|| anyhow!("invalid dedup accounting: reachable unique bytes exceed referenced data bytes"))?;
+        let dedup_savings_ratio = if referenced_data_bytes == 0 {
+            0.0
+        } else {
+            dedup_saved_bytes as f64 / referenced_data_bytes as f64
+        };
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
@@ -1114,6 +1139,9 @@ impl FsCore {
             snapshots_logical_size_bytes,
             hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
+            referenced_data_bytes,
+            dedup_saved_bytes,
+            dedup_savings_ratio,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
             metadata_size_bytes,

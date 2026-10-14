@@ -794,6 +794,26 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
         (
+            "Referenced Data (All Reachable Namespaces)".to_owned(),
+            human_bytes(stats.referenced_data_bytes),
+            format!(
+                "{} bytes; sparse holes excluded",
+                stats.referenced_data_bytes
+            ),
+        ),
+        (
+            "Dedup Savings (All Reachable Namespaces)".to_owned(),
+            format!(
+                "{} ({:.2}%)",
+                human_bytes(stats.dedup_saved_bytes),
+                stats.dedup_savings_ratio * 100.0
+            ),
+            format!(
+                "{} bytes; repeated extent data stored once",
+                stats.dedup_saved_bytes
+            ),
+        ),
+        (
             "Compression (Stored Unique Chunks)".to_owned(),
             format!("{:.2}% smaller", stored_compression_savings_ratio * 100.0),
             format!(
@@ -802,12 +822,12 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
         (
-            "Stored Unique Uncompressed (All Chunks)".to_owned(),
+            "Unique Uncompressed (Reachable Chunks)".to_owned(),
             human_bytes(stats.stored_unique_uncompressed_bytes),
             format!("{} bytes", stats.stored_unique_uncompressed_bytes),
         ),
         (
-            "Stored Unique Compressed (All Chunks)".to_owned(),
+            "Unique Compressed (Reachable Chunks)".to_owned(),
             human_bytes(stats.stored_unique_compressed_bytes),
             format!("{} bytes", stats.stored_unique_compressed_bytes),
         ),
@@ -1094,6 +1114,9 @@ mod tests {
             snapshots_logical_size_bytes: 2_000,
             hidden_vault_logical_size_bytes: 0,
             all_logical_size_bytes: 12_000,
+            referenced_data_bytes: 12_000,
+            dedup_saved_bytes: 1_000,
+            dedup_savings_ratio: 1.0 / 12.0,
             stored_unique_uncompressed_bytes: 11_000,
             stored_unique_compressed_bytes: 5_000,
             metadata_size_bytes: 1_000,

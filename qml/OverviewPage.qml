@@ -18,8 +18,7 @@ ScrollView {
     readonly property real saved: logicalAll - onDisk
     readonly property real compressionSaving: stats && stats.stored_unique_uncompressed_bytes > 0
         ? Math.max(0, 1 - stats.stored_unique_compressed_bytes / stats.stored_unique_uncompressed_bytes) : 0
-    readonly property real dedupSaving: stats && stats.all_logical_size_bytes > 0
-        ? Math.max(0, 1 - stats.stored_unique_uncompressed_bytes / stats.all_logical_size_bytes) : 0
+    readonly property real dedupSaving: stats ? stats.dedup_savings_ratio : 0
     readonly property bool healthy: stats ? (stats.chunk_refcount_mismatch_count === 0
                                              && stats.missing_chunk_records_for_extents === 0
                                              && stats.orphan_extent_records === 0) : true
@@ -38,6 +37,8 @@ ScrollView {
             ["Files kept by snapshots", b(stats.snapshots_logical_size_bytes)],
             ["Hidden in locked vault", b(stats.hidden_vault_logical_size_bytes)],
             ["Everything reachable", b(stats.all_logical_size_bytes)],
+            ["Referenced data (excluding holes)", b(stats.referenced_data_bytes)],
+            ["Dedup savings (all namespaces)", b(stats.dedup_saved_bytes) + " (" + theme.percent(stats.dedup_savings_ratio) + ")"],
             ["Unique data before compression", b(stats.stored_unique_uncompressed_bytes)],
             ["Unique data after compression", b(stats.stored_unique_compressed_bytes)],
             ["Metadata on disk", b(stats.metadata_size_bytes)],
@@ -320,7 +321,7 @@ ScrollView {
                 label: "Duplicates removed"
                 value: theme.percent(root.dedupSaving)
                 valueColor: theme.accentStrong
-                caption: "Identical pieces are stored once"
+                caption: root.stats ? theme.bytes(root.stats.dedup_saved_bytes) + " saved across files, snapshots and vault" : ""
             }
             StatTile {
                 Layout.fillWidth: true

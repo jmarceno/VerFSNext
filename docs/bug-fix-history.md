@@ -661,3 +661,15 @@ Known cost: each write that extends a file re-chunks and re-stores the file's ta
 - `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`
 - `src/types/mod.rs`, `src/meta/mod.rs`, `src/config.rs`, `src/gui/settings.rs`
 - `README.md`, `config.toml.example`, `docs/technical_deep_dive.md`
+
+## B019 - Dedup Statistics Counted Unreachable Chunks - Oct 14 2026
+
+The dashboard compared all chunk records, including obsolete data, with logical
+file sizes and clamped negative savings to zero. Dedup now compares reachable
+extent data with reachable unique CDC data, across live files, snapshots and
+locked/unlocked vault. Sparse holes and unreachable chunks do not inflate the
+result. CLI and GUI show saved bytes and percentage; integrity auditing retains
+its full scope. No storage change or migration. Validation: 43 existing library tests passed
+on the remote builder. On a temporary FUSE mount, two identical 8 MiB + 123 B
+random files reported exactly 8,388,731 bytes / 50% saved; SHA-256 matched both
+copies and all three metadata consistency counters were zero.
