@@ -81,24 +81,86 @@ struct ActivePack {
     size_bytes: u64,
     /// Buffer of index entries not yet written to disk.
     /// Flushed to index_file during sync() or rotate_active_pack().
-    /// Reading works correctly because index_cache is updated immediately.
+    /// Readers find them in `index_map`, which gets every entry on append.
     pending_index: Vec<([u8; 16], PackIndexEntry)>,
+    /// Lookup map of this pack, including entries not yet flushed.
+    index_map: SharedIndexMap,
+}
+
+/// Every indexed copy of each hash in one pack, oldest first. The newest copy
+/// is the one readers try first.
+#[derive(Default)]
+struct PackIndexMap {
+    copies: HashMap<[u8; 16], Vec<PackIndexEntry>>,
+    len: usize,
+}
+
+type SharedIndexMap = Arc<RwLock<PackIndexMap>>;
+
+impl PackIndexMap {
+    fn insert(&mut self, hash: [u8; 16], entry: PackIndexEntry) {
+        self.copies.entry(hash).or_default().push(entry);
+        self.len += 1;
+    }
+
+    fn from_entries(entries: impl IntoIterator<Item = ([u8; 16], PackIndexEntry)>) -> Self {
+        let mut map = Self::default();
+        for (hash, entry) in entries {
+            map.insert(hash, entry);
+        }
+        map
+    }
+
+    /// Copies of `hash`, newest first.
+    fn copies_newest_first(&self, hash: &[u8; 16]) -> Vec<PackIndexEntry> {
+        self.copies
+            .get(hash)
+            .map(|copies| copies.iter().rev().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Makes `offset` the copy tried first for `hash`.
+    fn prefer(&mut self, hash: &[u8; 16], offset: u64) {
+        if let Some(copies) = self.copies.get_mut(hash) {
+            if let Some(position) = copies.iter().position(|entry| entry.offset == offset) {
+                let entry = copies.remove(position);
+                copies.push(entry);
+            }
+        }
+    }
+}
+
+/// Lookup maps held in memory: the active pack's (always, it holds entries
+/// not yet on disk) and a bounded LRU of sealed packs' maps, loaded from the
+/// index file in one read when a pack is first needed.
+struct IndexMaps {
+    active_pack_id: u64,
+    active: SharedIndexMap,
+    /// Least recently used first.
+    sealed: Vec<(u64, SharedIndexMap)>,
+    sealed_entries: usize,
 }
 
 pub struct PackStore {
     packs_dir: PathBuf,
     active: Mutex<ActivePack>,
-    /// Held shared by readers for the whole index-lookup-plus-payload-read
-    /// sequence and exclusively while GC swaps a rewritten pack into place, so
-    /// a reader never pairs an offset from one pack generation with the file
-    /// of another.
-    swap_lock: RwLock<()>,
+    /// Per pack: held shared by readers for the whole index-lookup-plus-
+    /// payload-read sequence and exclusively while GC swaps a rewritten pack
+    /// into place, so a reader never pairs an offset from one pack generation
+    /// with the file of another. Readers of other packs never wait on a swap.
+    swap_locks: Mutex<HashMap<u64, Arc<RwLock<()>>>>,
     /// Set when a pack swap failed after its first destructive step. The
     /// active-pack handles may then point at a file that is no longer the
     /// canonical pack, so every later append and sync fails until a restart
     /// recovers the pack and its index from disk.
     swap_failure: Mutex<Option<String>>,
-    index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
+    index_maps: Mutex<IndexMaps>,
+    /// Serializes loading sealed maps so concurrent readers of one pack load
+    /// its index once.
+    index_map_load: Mutex<()>,
+    /// Upper bound for the entries of the sealed-pack maps kept in memory;
+    /// the most recently used map is always kept.
+    index_map_capacity_entries: usize,
     pack_file_cache: Cache<u64, Arc<File>>,
     max_pack_size_bytes: u64,
     /// Number of records appended since open. Incremented under the
@@ -164,10 +226,13 @@ impl PackStore {
             .metadata()
             .with_context(|| format!("failed to stat active pack file {}", path.display()))?
             .len();
+        let active_map: SharedIndexMap = Arc::new(RwLock::new(PackIndexMap::from_entries(
+            Self::read_index_entries_at(&index_path)?,
+        )));
 
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
-            swap_lock: RwLock::new(()),
+            swap_locks: Mutex::new(HashMap::new()),
             swap_failure: Mutex::new(None),
             append_watermark: AtomicU64::new(0),
             durable_watermark: AtomicU64::new(0),
@@ -177,17 +242,22 @@ impl PackStore {
                 index_file,
                 size_bytes,
                 pending_index: Vec::new(),
+                index_map: Arc::clone(&active_map),
             }),
-            index_cache: Cache::builder().max_capacity(index_cache_capacity).build(),
+            index_maps: Mutex::new(IndexMaps {
+                active_pack_id: resolved_active_pack_id,
+                active: active_map,
+                sealed: Vec::new(),
+                sealed_entries: 0,
+            }),
+            index_map_load: Mutex::new(()),
+            index_map_capacity_entries: usize::try_from(index_cache_capacity)
+                .context("pack index cache capacity does not fit in memory")?,
             pack_file_cache: Cache::builder()
                 .max_capacity(PACK_FILE_CACHE_CAPACITY)
                 .build(),
             max_pack_size_bytes,
         };
-
-        for pack_id in all_pack_ids {
-            store.prime_index_cache(pack_id)?;
-        }
 
         Ok(store)
     }
@@ -214,7 +284,6 @@ impl PackStore {
         self.ensure_no_swap_failure()?;
         self.make_room(&mut active, Self::record_len(compressed_data.len()))?;
         Self::append_record_locked(
-            &self.index_cache,
             &mut active,
             chunk_hash,
             codec,
@@ -244,7 +313,6 @@ impl PackStore {
         self.make_room(&mut active, group_len)?;
         for (entry, payload) in copies {
             Self::append_record_locked(
-                &self.index_cache,
                 &mut active,
                 chunk_hash,
                 entry.codec,
@@ -258,7 +326,6 @@ impl PackStore {
     }
 
     fn append_record_locked(
-        index_cache: &Cache<(u64, [u8; 16]), PackIndexEntry>,
         active: &mut ActivePack,
         chunk_hash: [u8; 16],
         codec: u8,
@@ -319,9 +386,9 @@ impl PackStore {
         };
         // Buffer the index entry instead of writing it immediately.
         // Index entries are flushed to disk in a single write during sync().
-        // The index_cache is updated immediately so reads are still correct.
+        // The lookup map is updated immediately so reads are still correct.
         active.pending_index.push((chunk_hash, index));
-        index_cache.insert((active.pack_id, chunk_hash), index);
+        active.index_map.write().insert(chunk_hash, index);
         active.size_bytes = next_size;
         Ok(())
     }
@@ -330,14 +397,14 @@ impl PackStore {
     /// produces from its stored payload.
     ///
     /// A pack can hold several copies of one hash: a commit retry appends the
-    /// chunk again, and older versions appended chunks that already existed.
-    /// Copies are not interchangeable when they differ (vault ciphertext is
-    /// sealed with a random nonce, and only the nonce of one copy is in the
-    /// chunk record), so `accept` decides: it must fail for a copy that does
-    /// not belong to the record, e.g. when AEAD authentication fails. The
-    /// copy the index cache points at (the most recent) is tried first, then
-    /// every other indexed copy from newest to oldest; the accepted copy
-    /// becomes the cached entry.
+    /// chunk again, a repair stores a fresh copy of a damaged chunk, and older
+    /// versions appended chunks that already existed. Copies are not
+    /// interchangeable when they differ (vault ciphertext is sealed with a
+    /// random nonce, and only the nonce of one copy is in the chunk record),
+    /// so `accept` decides: it must fail for a copy that does not belong to
+    /// the record, e.g. when AEAD authentication or the CRC fails. Copies are
+    /// tried from newest to oldest, including entries not yet flushed to the
+    /// index file; an accepted older copy is tried first from then on.
     pub fn read_chunk_with<T>(
         &self,
         pack_id: u64,
@@ -347,80 +414,70 @@ impl PackStore {
         expected_compressed_len: u32,
         mut accept: impl FnMut(&[u8], &PackIndexEntry) -> Result<T>,
     ) -> Result<T> {
-        let _swap_guard = self.swap_lock.read();
-        let primary = self
-            .lookup_index_entry(pack_id, expected_hash)?
-            .with_context(|| {
-                format!(
-                    "missing pack index entry for pack {} hash {:x?}",
-                    pack_id, expected_hash
-                )
-            })?;
-        let primary_err = match self
-            .read_indexed_copy(
+        let swap_lock = self.swap_lock(pack_id);
+        let _swap_guard = swap_lock.read();
+        let map = self.index_map(pack_id)?;
+        let copies = map.read().copies_newest_first(&expected_hash);
+        let Some(primary) = copies.first().copied() else {
+            bail!(
+                "missing pack index entry for pack {} hash {:x?}",
                 pack_id,
-                expected_hash,
-                &primary,
-                expected_codec,
-                expected_uncompressed_len,
-                expected_compressed_len,
-            )
-            .and_then(|payload| accept(&payload, &primary))
-        {
-            Ok(value) => return Ok(value),
-            Err(err) => err,
+                expected_hash
+            );
         };
-
-        let mut other_copies = Self::read_index_entries_at(&self.index_path(pack_id))?
-            .into_iter()
-            .filter(|(hash, entry)| *hash == expected_hash && entry.offset != primary.offset)
-            .map(|(_, entry)| entry)
-            .collect::<Vec<_>>();
-        other_copies.reverse();
-        let other_copy_count = other_copies.len();
-        for entry in other_copies {
+        let mut primary_err = None;
+        for entry in &copies {
             let result = self
                 .read_indexed_copy(
                     pack_id,
                     expected_hash,
-                    &entry,
+                    entry,
                     expected_codec,
                     expected_uncompressed_len,
                     expected_compressed_len,
                 )
-                .and_then(|payload| accept(&payload, &entry));
+                .and_then(|payload| accept(&payload, entry));
             match result {
                 Ok(value) => {
-                    tracing::error!(
-                        pack_id,
-                        chunk_hash = ?expected_hash,
-                        rejected_offset = primary.offset,
-                        accepted_offset = entry.offset,
-                        rejected_reason = %format!("{primary_err:#}"),
-                        "newest pack copy of chunk does not match its record; resolved to an older duplicate copy"
-                    );
-                    self.index_cache.insert((pack_id, expected_hash), entry);
+                    if let Some(rejected) = primary_err {
+                        tracing::error!(
+                            pack_id,
+                            chunk_hash = ?expected_hash,
+                            rejected_offset = primary.offset,
+                            accepted_offset = entry.offset,
+                            rejected_reason = %format!("{rejected:#}"),
+                            "newest pack copy of chunk does not match its record; resolved to an older duplicate copy"
+                        );
+                        map.write().prefer(&expected_hash, entry.offset);
+                    }
                     return Ok(value);
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        pack_id,
-                        chunk_hash = ?expected_hash,
-                        offset = entry.offset,
-                        error = %format!("{err:#}"),
-                        "duplicate chunk copy rejected"
-                    );
+                    if primary_err.is_none() {
+                        primary_err = Some(err);
+                    } else {
+                        tracing::warn!(
+                            pack_id,
+                            chunk_hash = ?expected_hash,
+                            offset = entry.offset,
+                            error = %format!("{err:#}"),
+                            "duplicate chunk copy rejected"
+                        );
+                    }
                 }
             }
         }
 
+        let primary_err = primary_err.context("chunk copies were tried without a result")?;
         Err(primary_err.context(format!(
             "no stored copy of chunk {:x?} in pack {} is usable ({} other indexed copies tried)",
-            expected_hash, pack_id, other_copy_count
+            expected_hash,
+            pack_id,
+            copies.len() - 1
         )))
     }
 
-    /// Reads every indexed copy of `hash` in `pack_id`, in index order, without
+    /// Reads every indexed copy of `hash` in `pack_id`, oldest first, without
     /// interpreting the payloads. Used to move chunks between packs while the
     /// vault may be locked, so that the copy matching the chunk record is
     /// carried along whichever one it is.
@@ -429,12 +486,19 @@ impl PackStore {
         pack_id: u64,
         hash: [u8; 16],
     ) -> Result<Vec<(PackIndexEntry, Vec<u8>)>> {
-        let _swap_guard = self.swap_lock.read();
-        let mut copies = Vec::new();
-        for (entry_hash, entry) in Self::read_index_entries_at(&self.index_path(pack_id))? {
-            if entry_hash != hash {
-                continue;
-            }
+        let swap_lock = self.swap_lock(pack_id);
+        let _swap_guard = swap_lock.read();
+        let mut entries = self.index_map(pack_id)?.read().copies_newest_first(&hash);
+        entries.reverse();
+        if entries.is_empty() {
+            bail!(
+                "missing pack index entry for pack {} hash {:x?}",
+                pack_id,
+                hash
+            );
+        }
+        let mut copies = Vec::with_capacity(entries.len());
+        for entry in entries {
             let payload = self.read_indexed_copy(
                 pack_id,
                 hash,
@@ -445,14 +509,85 @@ impl PackStore {
             )?;
             copies.push((entry, payload));
         }
-        if copies.is_empty() {
+        Ok(copies)
+    }
+
+    /// The swap lock of `pack_id`.
+    fn swap_lock(&self, pack_id: u64) -> Arc<RwLock<()>> {
+        Arc::clone(self.swap_locks.lock().entry(pack_id).or_default())
+    }
+
+    /// The lookup map of `pack_id`. Callers hold that pack's swap lock, so the
+    /// map matches the pack file they read. A sealed pack's map is loaded from
+    /// its index file in one read and kept in a bounded LRU.
+    fn index_map(&self, pack_id: u64) -> Result<SharedIndexMap> {
+        if let Some(map) = self.cached_index_map(pack_id) {
+            return Ok(map);
+        }
+        let _load_guard = self.index_map_load.lock();
+        if let Some(map) = self.cached_index_map(pack_id) {
+            return Ok(map);
+        }
+        let map: SharedIndexMap = Arc::new(RwLock::new(PackIndexMap::from_entries(
+            Self::load_index_file(&self.index_path(pack_id))?,
+        )));
+        self.insert_sealed_index_map(pack_id, Arc::clone(&map));
+        Ok(map)
+    }
+
+    fn cached_index_map(&self, pack_id: u64) -> Option<SharedIndexMap> {
+        let mut maps = self.index_maps.lock();
+        if maps.active_pack_id == pack_id {
+            return Some(Arc::clone(&maps.active));
+        }
+        let position = maps.sealed.iter().position(|(id, _)| *id == pack_id)?;
+        let entry = maps.sealed.remove(position);
+        let map = Arc::clone(&entry.1);
+        maps.sealed.push(entry);
+        Some(map)
+    }
+
+    /// Adds (or replaces) the map of a sealed pack as the most recently used
+    /// one and evicts the least recently used maps above the capacity.
+    fn insert_sealed_index_map(&self, pack_id: u64, map: SharedIndexMap) {
+        let entries = map.read().len;
+        let mut maps = self.index_maps.lock();
+        if let Some(position) = maps.sealed.iter().position(|(id, _)| *id == pack_id) {
+            let (_, old) = maps.sealed.remove(position);
+            maps.sealed_entries -= old.read().len;
+        }
+        maps.sealed.push((pack_id, map));
+        maps.sealed_entries += entries;
+        while maps.sealed.len() > 1 && maps.sealed_entries > self.index_map_capacity_entries {
+            let (_, evicted) = maps.sealed.remove(0);
+            maps.sealed_entries -= evicted.read().len;
+        }
+    }
+
+    /// Reads a whole index file in one read and decodes its entries in order.
+    fn load_index_file(path: &Path) -> Result<Vec<([u8; 16], PackIndexEntry)>> {
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read pack index {}", path.display()));
+            }
+        };
+        if raw.len() % INDEX_ENTRY_LEN != 0 {
             bail!(
-                "missing pack index entry for pack {} hash {:x?}",
-                pack_id,
-                hash
+                "pack index {} has a torn entry ({} bytes)",
+                path.display(),
+                raw.len()
             );
         }
-        Ok(copies)
+        let mut out = Vec::with_capacity(raw.len() / INDEX_ENTRY_LEN);
+        let mut aligned = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
+        for record in raw.chunks_exact(INDEX_ENTRY_LEN) {
+            aligned.as_mut_slice().copy_from_slice(record);
+            out.push(Self::decode_index_record(aligned.as_slice())?);
+        }
+        Ok(out)
     }
 
     /// Reads the payload of the record `index` points at after checking that
@@ -854,8 +989,6 @@ impl PackStore {
                 .with_context(|| format!("failed to stat next pack file {}", next_path.display()))?
                 .len();
 
-            self.prime_index_cache(next_pack_id)?;
-
             if next_size >= self.max_pack_size_bytes && next_size > 0 {
                 next_pack_id = next_pack_id
                     .checked_add(1)
@@ -863,6 +996,17 @@ impl PackStore {
                 continue;
             }
 
+            let next_map: SharedIndexMap = Arc::new(RwLock::new(PackIndexMap::from_entries(
+                Self::load_index_file(&next_index_path)?,
+            )));
+            let retired_pack_id = active.pack_id;
+            let retired_map = std::mem::replace(&mut active.index_map, Arc::clone(&next_map));
+            {
+                let mut maps = self.index_maps.lock();
+                maps.active_pack_id = next_pack_id;
+                maps.active = next_map;
+            }
+            self.insert_sealed_index_map(retired_pack_id, retired_map);
             active.pack_id = next_pack_id;
             active.file = next_file;
             active.index_file = next_index_file;
@@ -987,6 +1131,8 @@ impl PackStore {
         // copy of the same hash is kept (a write stored the content again
         // after the damage was found); otherwise the rewrite is refused.
         let mut damaged = Vec::<([u8; 16], u64)>::new();
+        // Entries of the rewritten index, in order, for its lookup map.
+        let mut new_entries = Vec::<([u8; 16], PackIndexEntry)>::new();
         while cursor < copy_end {
             let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
             match src_file.read_exact_at(raw_header.as_mut_slice(), cursor) {
@@ -1063,17 +1209,15 @@ impl PackStore {
                                 src_pack_path.display()
                             )
                         })?;
-                        Self::append_index_record(
-                            &mut dst_index,
-                            hash,
-                            PackIndexEntry {
-                                offset: new_offset,
-                                codec,
-                                uncompressed_len: ulen,
-                                compressed_len: clen,
-                                payload_crc32,
-                            },
-                        )?;
+                        let kept_entry = PackIndexEntry {
+                            offset: new_offset,
+                            codec,
+                            uncompressed_len: ulen,
+                            compressed_len: clen,
+                            payload_crc32,
+                        };
+                        Self::append_index_record(&mut dst_index, hash, kept_entry)?;
+                        new_entries.push((hash, kept_entry));
                         kept_offsets.insert(cursor);
                         new_offset = new_offset
                             .checked_add(record_len)
@@ -1209,7 +1353,13 @@ impl PackStore {
             )),
             None => None,
         };
-        let _swap_guard = self.swap_lock.write();
+        // The lookup map of the new generation is built before readers are
+        // blocked, so the swap itself stays short.
+        let new_map: SharedIndexMap = Arc::new(RwLock::new(PackIndexMap::from_entries(
+            new_entries.into_iter().chain(tail_entries.iter().copied()),
+        )));
+        let swap_lock = self.swap_lock(pack_id);
+        let _swap_guard = swap_lock.write();
         let swap_result = Self::swap_rewritten_pack(
             pack_dir,
             &src_pack_path,
@@ -1230,11 +1380,17 @@ impl PackStore {
             return Err(err);
         }
 
-        if let (Some(active), Some((file, index_file))) = (active.as_mut(), replacement_handles) {
-            active.file = file;
-            active.index_file = index_file;
-            active.size_bytes = new_size;
+        match (active.as_mut(), replacement_handles) {
+            (Some(active), Some((file, index_file))) => {
+                active.file = file;
+                active.index_file = index_file;
+                active.size_bytes = new_size;
+                active.index_map = Arc::clone(&new_map);
+                self.index_maps.lock().active = new_map;
+            }
+            _ => self.insert_sealed_index_map(pack_id, new_map),
         }
+        self.pack_file_cache.invalidate(&pack_id);
         tracing::info!(
             pack_id,
             active = active.is_some(),
@@ -1243,12 +1399,6 @@ impl PackStore {
             carried_tail_bytes = tail_end - copy_end,
             "rewrote pack keeping live records"
         );
-
-        for (hash, _) in src_entries.iter().chain(tail_entries.iter()) {
-            self.index_cache.invalidate(&(pack_id, *hash));
-        }
-        self.pack_file_cache.invalidate(&pack_id);
-        self.prime_index_cache(pack_id)?;
         Ok(())
     }
 
@@ -1293,7 +1443,7 @@ impl PackStore {
 
     /// Copies the records in `[from, to)` of a pack being rewritten unchanged
     /// to `dst_offset` of the new pack and appends their index entries,
-    /// shifted to the new offsets. Returns the copied index entries.
+    /// shifted to the new offsets. Returns the shifted index entries.
     #[allow(clippy::too_many_arguments)]
     fn copy_pack_tail(
         &self,
@@ -1322,16 +1472,18 @@ impl PackStore {
             .read_index_entries(pack_id)?
             .into_iter()
             .filter(|(_, entry)| entry.offset >= from && entry.offset < to)
+            .map(|(hash, entry)| {
+                (
+                    hash,
+                    PackIndexEntry {
+                        offset: entry.offset - from + dst_offset,
+                        ..entry
+                    },
+                )
+            })
             .collect::<Vec<_>>();
         for (hash, entry) in &tail_entries {
-            Self::append_index_record(
-                dst_index,
-                *hash,
-                PackIndexEntry {
-                    offset: entry.offset - from + dst_offset,
-                    ..*entry
-                },
-            )?;
+            Self::append_index_record(dst_index, *hash, *entry)?;
         }
         Ok(tail_entries)
     }
@@ -1348,53 +1500,6 @@ impl PackStore {
         );
         self.pack_file_cache.insert(pack_id, Arc::clone(&file));
         Ok(file)
-    }
-
-    fn lookup_index_entry(
-        &self,
-        pack_id: u64,
-        expected_hash: [u8; 16],
-    ) -> Result<Option<PackIndexEntry>> {
-        if let Some(entry) = self.index_cache.get(&(pack_id, expected_hash)) {
-            return Ok(Some(entry));
-        }
-
-        let path = self.index_path(pack_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let file = File::open(&path)
-            .with_context(|| format!("failed to open pack index file {}", path.display()))?;
-        let mut cursor = 0_u64;
-        let mut found = None;
-        loop {
-            let mut raw = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
-            match file.read_exact_at(raw.as_mut_slice(), cursor) {
-                Ok(()) => {
-                    let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
-                    // The most recent entry for a hash wins, matching both the
-                    // cache update on append and prime_index_cache.
-                    if hash == expected_hash {
-                        found = Some(entry);
-                    }
-                    cursor = cursor
-                        .checked_add(INDEX_ENTRY_LEN_U64)
-                        .context("pack index cursor overflow")?;
-                }
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("failed to scan pack index {}", path.display()));
-                }
-            }
-        }
-
-        if let Some(entry) = found {
-            self.index_cache.insert((pack_id, expected_hash), entry);
-            return Ok(Some(entry));
-        }
-        Ok(None)
     }
 
     fn pack_path(&self, pack_id: u64) -> PathBuf {
@@ -1622,36 +1727,6 @@ impl PackStore {
                 .context("pack index path has no parent directory")?,
         )?;
         tracing::info!(pack = %pack_path.display(), records_bytes = cursor, "rebuilt pack index");
-        Ok(())
-    }
-
-    fn prime_index_cache(&self, pack_id: u64) -> Result<()> {
-        let index_path = self.index_path(pack_id);
-        if !index_path.exists() {
-            return Ok(());
-        }
-
-        let file = File::open(&index_path)
-            .with_context(|| format!("failed to open pack index file {}", index_path.display()))?;
-        let mut cursor = 0_u64;
-        loop {
-            let mut raw = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
-            match file.read_exact_at(raw.as_mut_slice(), cursor) {
-                Ok(()) => {
-                    let (hash, entry) = Self::decode_index_record(raw.as_slice())?;
-                    self.index_cache.insert((pack_id, hash), entry);
-                    cursor = cursor
-                        .checked_add(INDEX_ENTRY_LEN_U64)
-                        .context("pack index cursor overflow while priming cache")?;
-                }
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("failed to prime index from {}", index_path.display())
-                    });
-                }
-            }
-        }
         Ok(())
     }
 

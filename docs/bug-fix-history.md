@@ -874,3 +874,37 @@ injection at the directory-sync/rename steps and was verified by review.
 ### Affected Files
 `src/data/pack.rs`
 
+## B027 - Pack Index Lookups: Unflushed Entries Lost on Eviction, Full Scans per Miss, Priming Under the Swap Lock - Oct 15 2026
+
+### Root Cause
+- Index entries of the active pack were kept only in a bounded Moka cache
+  until the next index flush (sync every 250 ms or 5 s). An evicted entry
+  made a committed chunk unreadable: with small caches an 8 MiB write read
+  back before any sync failed with EIO (reproduced; the same read passed after
+  fsync).
+- A cache miss scanned the whole `.idx` file with one `pread` per 40-byte
+  entry, to find one hash: O(chunks x pack entries) on large datasets.
+- GC held one global swap lock while it fsynced the directory three times and
+  re-primed the cache entry by entry, so compacting one pack stalled reads of
+  every pack.
+
+### Fix
+Per-pack lookup maps replace the global (pack, hash) cache. The active pack's
+map is resident and updated on append (covers unflushed entries). Sealed maps
+are loaded in one read and kept in an LRU bounded by
+`pack_index_cache_capacity_entries`. GC builds the new map from the rewritten
+entries before taking the lock, and swap locks are per pack. Duplicate copies
+are tried newest first from the map, including unflushed ones. No format
+change.
+
+### Validation
+- Unflushed-entry scenario (chunk cache 1 MiB, index cache 8 entries, 8 MiB
+  in 512 KiB writes, read before sync, three partial overwrites, remount):
+  byte-identical; the previous build fails the first read with EIO.
+- Cold reads of 1 GiB spread over 81 packs with small caches: 41 MiB/s before,
+  189 MiB/s after (two runs each).
+- Mount suite without benchmarks (9 tests) and 43 library tests passed.
+
+### Affected Files
+`src/data/pack.rs`
+
