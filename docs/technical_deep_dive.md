@@ -197,7 +197,7 @@ Cost: each FUSE write that extends a file re-reads (usually from the chunk cache
   - Pack record format `VPK2` archived with `rkyv`
   - Sidecar index file per pack (`.idx`) uses fixed-size archived `rkyv` records including `payload_crc32`
   - Pack header and index record decode paths use checked `rkyv::access` for zero-copy validation
-  - Automatic active-pack rollover on append when configured pack size target is reached
+  - Automatic active-pack rollover on append when configured pack size target is reached; the pack subdirectory is fsynced after the new pack and index are opened (created), and `PackStore::open` fsyncs the packs directory and the active pack's subdirectory, so a pack that metadata can reference never loses its directory entry on power loss
   - Existing packs are discovered on startup; highest pack id becomes active if metadata lags
   - Hash lookup resolves the copy through the pack's in-memory lookup map (hash -> every indexed copy, oldest first), then reads the payload. The active pack's map is always resident and gets each entry at append time, so records not yet flushed to the `.idx` file are found however full the caches are. Sealed packs' maps are loaded from their `.idx` in one read the first time a pack is needed (single-flight) and kept in an LRU bounded by `pack_index_cache_capacity_entries` (total entries; the most recently used map is always kept). Lookups cost one hash-map probe, never an index-file scan
   - CRC32 is computed on stored payload bytes (ciphertext for vault chunks, compressed/raw payload for non-vault chunks)

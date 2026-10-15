@@ -963,3 +963,24 @@ source files.
 ### Affected Files
 `src/snapshot/mod.rs`, `src/fs/mod.rs`, `src/lib.rs`
 
+## B030 - New Pack Files Were Not Made Durable in Their Directory - Oct 15 2026
+
+### Root Cause
+Rotation and startup created pack and index files and later synced only the
+file handles. POSIX does not make a new name durable without an fsync of its
+directory, yet the WAL barrier treats synced pack data as durable, so after a
+power loss metadata could reference a pack whose directory entry was lost
+(ext4/XFS journaling usually covers it; other filesystems may not).
+
+### Fix
+`rotate_active_pack` syncs the pack subdirectory after opening the next pack
+and index; `PackStore::open` syncs the packs directory after creating the
+subdirectories and the active pack's subdirectory after opening its files.
+
+### Validation
+Scratch mount with 8 MiB packs: a 30 MB file rotates through 5 packs and
+matches after remount. Power loss itself cannot be simulated with OS commands.
+
+### Affected Files
+`src/data/pack.rs`
+

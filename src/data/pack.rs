@@ -189,6 +189,9 @@ impl PackStore {
             let subdir_path = packs_dir.join(subdir);
             ensure_dir(&subdir_path)?;
         }
+        // Subdirectories and pack files created here must survive a power
+        // loss before metadata may reference chunks in them.
+        sync_dir(packs_dir)?;
 
         let existing_pack_ids = Self::list_existing_pack_ids(packs_dir)?;
         let resolved_active_pack_id = existing_pack_ids
@@ -222,6 +225,7 @@ impl PackStore {
             .open(&index_path)
             .with_context(|| format!("failed to open pack index file {}", index_path.display()))?;
         set_file_mode(&index_path)?;
+        sync_dir(path.parent().context("pack path has no parent directory")?)?;
         let size_bytes = file
             .metadata()
             .with_context(|| format!("failed to stat active pack file {}", path.display()))?
@@ -984,6 +988,11 @@ impl PackStore {
                     )
                 })?;
             set_file_mode(&next_index_path)?;
+            sync_dir(
+                next_path
+                    .parent()
+                    .context("pack path has no parent directory")?,
+            )?;
             let next_size = next_file
                 .metadata()
                 .with_context(|| format!("failed to stat next pack file {}", next_path.display()))?
