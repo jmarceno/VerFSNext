@@ -382,9 +382,7 @@ impl FsCore {
             };
             match self.meta.commit_write_txn(&mut txn).await {
                 Ok(()) => {
-                    for (hash, record) in &new_chunk_records {
-                        self.chunk_meta_cache.insert(*hash, *record);
-                    }
+                    self.publish_committed_chunk_records(&new_chunk_records);
                     self.invalidate_inode_cache(ino);
                     self.mark_mutation();
                     self.bump_inode_data_version(ino);
@@ -690,9 +688,7 @@ impl FsCore {
                 Ok(()) => {
                     // Caches are updated only after the commit so concurrent
                     // readers never observe uncommitted state.
-                    for (hash, record) in &new_records {
-                        self.chunk_meta_cache.insert(*hash, *record);
-                    }
+                    self.publish_committed_chunk_records(&new_records);
                     for group in &pending {
                         self.invalidate_inode_cache(group.ino);
                         self.bump_inode_data_version(group.ino);

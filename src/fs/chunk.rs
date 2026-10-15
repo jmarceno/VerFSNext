@@ -2,16 +2,18 @@ use super::*;
 use crate::fs::FsCore;
 
 impl FsCore {
+    /// Fails with EIO when a stored payload does not match the CRC32 its
+    /// pack index recorded for it, so a damaged copy is never decoded.
     pub(crate) fn validate_pack_payload_crc32(
         &self,
         pack_id: u64,
         chunk_hash: [u8; 16],
         expected_crc32: u32,
         payload: &[u8],
-    ) {
+    ) -> Result<()> {
         let actual_crc32 = crc32c::crc32c(payload);
         if actual_crc32 == expected_crc32 {
-            return;
+            return Ok(());
         }
 
         let total = self
@@ -26,6 +28,13 @@ impl FsCore {
             total_crc32_errors = total,
             "pack payload crc32 mismatch detected during read"
         );
+        Err(anyhow_errno(
+            Errno::EIO,
+            format!(
+                "stored copy of chunk {:x?} in pack {} fails its crc32 (expected {}, got {})",
+                chunk_hash, pack_id, expected_crc32, actual_crc32
+            ),
+        ))
     }
     pub(crate) fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
         if let Some(cached) = self.chunk_meta_cache.get(&hash) {
@@ -110,11 +119,19 @@ impl FsCore {
         Ok(out)
     }
 
-    /// Reads, authenticates and decompresses chunk `hash` from its pack.
-    /// Blocks on the disk.
+    /// Reads, authenticates, decompresses and verifies chunk `hash` from its
+    /// pack. Blocks on the disk.
+    ///
+    /// A copy is accepted only if its payload matches the index CRC32, it
+    /// authenticates with the record's nonce (vault), it decompresses to the
+    /// recorded length and its plaintext hashes to `hash`. When every copy
+    /// is rejected and at least one was damaged (CRC or content hash), the
+    /// chunk is marked corrupt so the next write of the same content stores
+    /// a fresh copy instead of deduplicating against the damaged one.
     fn read_chunk_from_pack(&self, hash: [u8; 16], vault_encrypted: bool) -> Result<Vec<u8>> {
         let chunk = self.load_chunk_record(hash)?;
-        let folder_key = if (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+        let encrypted = (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0;
+        let folder_key = if encrypted {
             if !vault_encrypted {
                 return Err(anyhow_errno(
                     Errno::EIO,
@@ -125,34 +142,68 @@ impl FsCore {
         } else {
             None
         };
-        // A copy is accepted only if it authenticates with the record's nonce
-        // (vault) and decompresses to the recorded length, which is how the
-        // pack store tells duplicate copies of one hash apart.
-        self.packs.read_chunk_with(
+        let mut damaged = false;
+        let result = self.packs.read_chunk_with(
             chunk.pack_id,
             hash,
             chunk.codec,
             chunk.uncompressed_len,
             chunk.compressed_len,
             |stored, index| {
-                self.validate_pack_payload_crc32(chunk.pack_id, hash, index.payload_crc32, stored);
-                match &folder_key {
+                if let Err(err) =
+                    self.validate_pack_payload_crc32(chunk.pack_id, hash, index.payload_crc32, stored)
+                {
+                    damaged = true;
+                    return Err(err);
+                }
+                let plaintext = match &folder_key {
                     Some(key) => {
                         let compressed = decrypt_chunk_payload(key, &chunk.nonce, stored)?;
                         crate::data::compress::decompress_chunk(
                             chunk.codec,
                             &compressed,
                             chunk.uncompressed_len,
-                        )
+                        )?
                     }
                     None => crate::data::compress::decompress_chunk(
                         chunk.codec,
                         stored,
                         chunk.uncompressed_len,
-                    ),
+                    )?,
+                };
+                if FsCore::chunk_content_hash(encrypted, &plaintext) != hash {
+                    damaged = true;
+                    tracing::error!(
+                        pack_id = chunk.pack_id,
+                        chunk_hash = ?hash,
+                        offset = index.offset,
+                        "chunk plaintext does not match its content hash"
+                    );
+                    return Err(anyhow_errno(
+                        Errno::EIO,
+                        format!(
+                            "stored copy of chunk {:x?} in pack {} decodes to different content",
+                            hash, chunk.pack_id
+                        ),
+                    ));
                 }
+                Ok(plaintext)
             },
-        )
+        );
+        match result {
+            Ok(plaintext) => Ok(plaintext),
+            Err(err) => {
+                if damaged {
+                    self.corrupt_chunks.lock().insert(hash);
+                    tracing::error!(
+                        pack_id = chunk.pack_id,
+                        chunk_hash = ?hash,
+                        "no stored copy of chunk is intact; it is marked corrupt and the next write of the same content will store it again"
+                    );
+                }
+                Err(anyhow_errno(Errno::EIO, format!("{err:#}")))
+            }
+        }
     }
 
     /// Returns the plaintext of `extent`, checked against the extent length.
@@ -294,6 +345,10 @@ impl FsCore {
     /// or a second record for the same hash. The in-memory chunk metadata
     /// cache is never used for this decision because it can hold entries for
     /// chunks GC has already deleted.
+    ///
+    /// A chunk whose stored copy is known to be damaged is stored again; the
+    /// commit then repoints its record at the fresh copy, which repairs every
+    /// file that references it.
     pub(crate) fn stage_chunk_if_missing(
         &self,
         txn: &verfsnext_surrealkv::Transaction,
@@ -307,8 +362,17 @@ impl FsCore {
         }
 
         self.chunk_data_cache.insert(chunk_hash, Arc::clone(&data));
-        if txn.get(chunk_key(&chunk_hash))?.is_some() {
-            return Ok(false);
+        if let Some(raw) = txn.get(chunk_key(&chunk_hash))? {
+            let existing: ChunkRecord = decode_rkyv(&raw)?;
+            let damaged = (existing.flags & CHUNK_FLAG_CORRUPT) != 0
+                || self.corrupt_chunks.lock().contains(&chunk_hash);
+            if !damaged {
+                return Ok(false);
+            }
+            tracing::warn!(
+                chunk_hash = ?chunk_hash,
+                "storing a fresh copy of a chunk whose stored copy is damaged"
+            );
         }
 
         pending_chunks.insert(chunk_hash, data);
@@ -378,21 +442,43 @@ impl FsCore {
 
         Ok(out)
     }
+    /// Applies refcount deltas and stores the records of freshly written
+    /// chunks. A fresh chunk whose hash already has a record replaces a
+    /// damaged copy: the record keeps its refcount and is repointed at the
+    /// new copy.
     pub(crate) fn apply_ref_deltas_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
         ref_deltas: &HashMap<[u8; 16], i64>,
         new_chunk_records: &HashMap<[u8; 16], ChunkRecord>,
     ) -> Result<()> {
-        for (hash, delta) in ref_deltas.iter() {
-            let hash = *hash;
-            let delta = *delta;
-            if delta == 0 {
-                continue;
-            }
+        let hashes = ref_deltas
+            .iter()
+            .filter(|(_, delta)| **delta != 0)
+            .map(|(hash, _)| *hash)
+            .chain(new_chunk_records.keys().copied())
+            .collect::<HashSet<_>>();
+        for hash in hashes {
+            let delta = ref_deltas.get(&hash).copied().unwrap_or(0);
+            let fresh = new_chunk_records.get(&hash).copied();
 
             let key = chunk_key(&hash);
             if let Some(raw) = txn.get(key.clone())? {
-                let mut chunk: ChunkRecord = decode_rkyv(&raw)?;
+                let existing: ChunkRecord = decode_rkyv(&raw)?;
+                let mut chunk = match fresh {
+                    Some(fresh) => {
+                        tracing::warn!(
+                            chunk_hash = ?hash,
+                            old_pack_id = existing.pack_id,
+                            new_pack_id = fresh.pack_id,
+                            "repointing damaged chunk record at a fresh copy"
+                        );
+                        ChunkRecord {
+                            refcount: existing.refcount,
+                            ..fresh
+                        }
+                    }
+                    None => existing,
+                };
                 let next_ref = chunk.refcount as i64 + delta;
                 if next_ref < 0 {
                     tracing::error!(
@@ -416,7 +502,7 @@ impl FsCore {
                 continue;
             }
 
-            let Some(mut chunk) = new_chunk_records.get(&hash).cloned() else {
+            let Some(mut chunk) = fresh else {
                 return Err(anyhow_errno(
                     Errno::EIO,
                     format!("missing staged chunk metadata for hash {:x?}", hash),
@@ -426,6 +512,23 @@ impl FsCore {
             txn.set(key, encode_rkyv(&chunk)?)?;
         }
         Ok(())
+    }
+    /// Updates the in-memory state after the chunk records written by a
+    /// commit became visible: a damaged chunk that got a fresh copy is no
+    /// longer corrupt. The metadata cache entry is dropped rather than
+    /// filled, since the committed refcount is not known here.
+    pub(crate) fn publish_committed_chunk_records(
+        &self,
+        new_chunk_records: &HashMap<[u8; 16], ChunkRecord>,
+    ) {
+        if new_chunk_records.is_empty() {
+            return;
+        }
+        let mut corrupt = self.corrupt_chunks.lock();
+        for hash in new_chunk_records.keys() {
+            self.chunk_meta_cache.invalidate(hash);
+            corrupt.remove(hash);
+        }
     }
     pub(crate) fn extent_start_from_key(key: &[u8]) -> Option<u64> {
         if key.len() != 17 || key[0] != crate::types::KEY_PREFIX_EXTENT {

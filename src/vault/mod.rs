@@ -23,6 +23,10 @@ pub const VAULT_STATE_LOCKED: u8 = 0;
 pub const VAULT_STATE_UNLOCKED: u8 = 1;
 
 pub const CHUNK_FLAG_ENCRYPTED: u8 = 1 << 0;
+/// The stored copy failed verification on read; the next write of the same
+/// content stores a fresh copy and repoints the record instead of
+/// deduplicating against the damaged one.
+pub const CHUNK_FLAG_CORRUPT: u8 = 1 << 1;
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[rkyv(bytecheck())]

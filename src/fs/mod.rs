@@ -54,7 +54,7 @@ use crate::types::{
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
-    unwrap_folder_key, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_ENCRYPTED,
+    unwrap_folder_key, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_CORRUPT, CHUNK_FLAG_ENCRYPTED,
     SYS_VAULT_STATE, SYS_VAULT_WRAP, VAULT_STATE_LOCKED, VAULT_STATE_UNLOCKED,
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
@@ -269,6 +269,10 @@ struct FsCore {
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
     pack_crc32_read_error_count: AtomicU64,
+    /// Chunks whose every stored copy failed verification on read. Writes
+    /// store such content again instead of deduplicating against it; the
+    /// sync cycle persists the mark as `CHUNK_FLAG_CORRUPT`.
+    corrupt_chunks: ParkingMutex<HashSet<[u8; 16]>>,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
@@ -383,6 +387,7 @@ impl VerFs {
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
             pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
+            corrupt_chunks: ParkingMutex::new(HashSet::new()),
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),
@@ -1276,6 +1281,7 @@ impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {
         self.persist_active_pack_id_if_needed().await?;
         self.persist_pack_crc32_read_error_count_if_needed().await?;
+        self.persist_corrupt_chunk_marks().await?;
         // Both block on the disk. The periodic cycle only hands off WAL
         // records whose pack data the sync just made durable: flushing the
         // whole buffer would sync packs again under the WAL lock and pause

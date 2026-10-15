@@ -107,7 +107,8 @@ Cost: each FUSE write that extends a file re-reads (usually from the chunk cache
   - blocking disk work never runs inline on a tokio worker: chunk payload reads on a cache miss (pack read plus decompression), the sync cycle's pack/WAL syncs and GC pack rewrites run under `block_in_place`, and the WAL hand-off pack sync runs in `spawn_blocking`
   - write path cuts file data into content-defined chunks, stages unique missing chunks, compresses them in parallel, appends to pack, then commits metadata
   - read path resolves the extents that overlap the request, loads the chunks missing from the cache in parallel (rayon, under one `block_in_place`), and resolves chunk location through pack-local hash index; bytes no extent covers are holes and read as zeros
-  - read path validates pack payload CRC32 from `.idx`; mismatches are logged and counted and reads continue
+  - read path verifies every stored copy before using it: payload CRC32 from `.idx`, vault AEAD, decompressed length and the plaintext's content hash; a damaged copy is rejected (logged and counted), the next indexed copy of the hash is tried, and when none is intact the read fails with EIO, never returning damaged bytes
+  - a chunk with no intact copy is marked corrupt (in memory at once, persisted as `CHUNK_FLAG_CORRUPT` on its record by the next sync cycle); the next write of the same content stores a fresh copy instead of deduplicating against it and repoints the record, keeping its refcount, which repairs every file that references the chunk
   - bounded chunk metadata and chunk payload caches
   - committed metadata read caches (bounded `moka`) for inode and dirent lookups with post-commit invalidation on mutation paths
   - dedup hit/miss counters emitted in write-path debug logs
@@ -200,7 +201,7 @@ Cost: each FUSE write that extends a file re-reads (usually from the chunk cache
   - CRC32 is computed on stored payload bytes (ciphertext for vault chunks, compressed/raw payload for non-vault chunks)
   - Supports encrypted-payload reads (`read_chunk_payload`) for vault decrypt-then-decompress flow
   - Index is rebuilt from pack data when missing (including non-active packs loaded at startup)
-  - GC pack rewrite keeps every indexed copy of each hash that still has a chunk record (any refcount), verifies each payload against its index CRC32 (aborts on mismatch), and swaps files crash-safely: remove old index, rename pack, rename index, fsync the directory after each step; a crash in between leaves a pack without an index, which startup rebuilds
+  - GC pack rewrite keeps every indexed copy of each hash that still has a chunk record (any refcount), verifies each payload against its index CRC32 (a damaged copy is dropped only when an intact copy of the same hash is kept, e.g. after a repair write; otherwise the rewrite aborts), and swaps files crash-safely: remove old index, rename pack, rename index, fsync the directory after each step; a crash in between leaves a pack without an index, which startup rebuilds
   - readers hold a shared swap lock across index lookup and payload read; the rewrite holds it exclusively during the swap and cache invalidation
   - failed appends and index flushes roll back partial writes; startup truncates an incomplete record at the end of the active pack and drops an index that no longer matches it
   - index-file lookups use the most recent entry for a hash, matching the cache

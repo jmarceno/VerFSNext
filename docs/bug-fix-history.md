@@ -752,3 +752,39 @@ four runs in a row. The full mount suite apart from the benchmarks (9 tests)
 passed. A manual mount with a 600 MiB file and 200 MiB deleted also matched
 every checksum after compaction and after a remount, and pack 1 stayed the
 only pack.
+
+## B023 - Reads Returned Damaged Chunk Data and Writes Could Not Repair It - Oct 15 2026
+
+### Root Cause
+The read path compared each stored payload with its pack-index CRC32 but only
+logged and counted a mismatch, then decoded the damaged bytes. Raw chunks have
+no other check, and zstd frames are written without a content checksum, so a
+single flipped byte in a pack was returned to applications as file content.
+Nothing compared the decoded plaintext with the chunk's content hash. Because
+the CRC never rejected a copy, the duplicate-copy fallback was never tried.
+Writing the correct content again did not help: it deduplicated against the
+damaged chunk record, so the new file was damaged too.
+
+### Fix
+- A copy is accepted only if its CRC32, vault AEAD, decoded length and
+  plaintext content hash all match. A rejected copy falls through to the next
+  indexed copy; with none intact the read fails with EIO.
+- A chunk with no intact copy is marked corrupt in memory and persisted as
+  `CHUNK_FLAG_CORRUPT` by the sync cycle. Staging treats such a chunk as
+  missing, stores a fresh copy and the commit repoints the existing record
+  (refcount kept), repairing every file that shares it.
+- GC drops a damaged copy only when an intact copy of the same hash survives
+  the rewrite; otherwise it still refuses to rewrite the pack.
+- The flag uses a free bit of the existing `flags` byte: no format change.
+
+### Validation
+Scratch mount, one byte flipped in a raw chunk: reads fail with EIO; copying
+the correct content to a new name heals both the new and the original file,
+also when a restart separates detection and rewrite (persisted flag). Offline
+GC with the damaged and the fresh copy in the same pack drops the damaged copy
+and all files stay intact after remount.
+
+### Affected Files
+`src/fs/chunk.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`, `src/fs/vault.rs`,
+`src/fs/write.rs`, `src/vault/mod.rs`, `src/data/pack.rs`
+

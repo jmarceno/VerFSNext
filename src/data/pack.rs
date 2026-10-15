@@ -928,7 +928,8 @@ impl PackStore {
     /// (duplicate copies of one hash can differ, e.g. vault ciphertext sealed
     /// with different nonces). Records the index does not reference were never
     /// readable and are dropped. Each kept payload is verified against its
-    /// index CRC32 and the rewrite aborts on any mismatch instead of carrying
+    /// index CRC32: a damaged copy is dropped only when an intact copy of the
+    /// same hash is kept, otherwise the rewrite aborts instead of carrying
     /// damaged data forward under a fresh checksum.
     ///
     /// The long copy runs before the swap lock is taken, so reads of this pack
@@ -996,6 +997,10 @@ impl PackStore {
         let mut cursor = 0_u64;
         let mut new_offset = 0_u64;
         let mut kept_offsets = HashSet::<u64>::new();
+        // Copies that fail their CRC32. One is dropped only when an intact
+        // copy of the same hash is kept (a write stored the content again
+        // after the damage was found); otherwise the rewrite is refused.
+        let mut damaged = Vec::<([u8; 16], u64)>::new();
         while cursor < copy_end {
             let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
             match src_file.read_exact_at(raw_header.as_mut_slice(), cursor) {
@@ -1045,14 +1050,19 @@ impl PackStore {
                             })?;
                         let payload_crc32 = crc32c::crc32c(&payload);
                         if payload_crc32 != entry.payload_crc32 {
-                            bail!(
-                                "pack payload crc32 mismatch for chunk {:x?} at offset {} in {}: index {}, payload {}; refusing to rewrite pack",
-                                hash,
-                                cursor,
-                                src_pack_path.display(),
-                                entry.payload_crc32,
-                                payload_crc32
+                            tracing::error!(
+                                pack_id,
+                                chunk_hash = ?hash,
+                                offset = cursor,
+                                index_crc32 = entry.payload_crc32,
+                                payload_crc32,
+                                "damaged chunk copy found while rewriting pack"
                             );
+                            damaged.push((hash, cursor));
+                            cursor = cursor
+                                .checked_add(record_len)
+                                .context("source offset overflow during pack rewrite")?;
+                            continue;
                         }
 
                         dst_file.write_all(raw_header.as_slice()).with_context(|| {
@@ -1100,8 +1110,12 @@ impl PackStore {
             }
         }
 
+        let damaged_offsets = damaged.iter().map(|(_, offset)| *offset).collect::<HashSet<_>>();
         for (hash, entry) in src_entries.iter() {
-            if live_hashes.contains(hash) && !kept_offsets.contains(&entry.offset) {
+            if live_hashes.contains(hash)
+                && !kept_offsets.contains(&entry.offset)
+                && !damaged_offsets.contains(&entry.offset)
+            {
                 bail!(
                     "pack index entry for live chunk {:x?} at offset {} does not point at a record in {}; refusing to rewrite pack",
                     hash,
@@ -1134,6 +1148,23 @@ impl PackStore {
         } else {
             Vec::new()
         };
+        let intact_hashes = src_entries
+            .iter()
+            .filter(|(_, entry)| kept_offsets.contains(&entry.offset))
+            .map(|(hash, _)| *hash)
+            .chain(tail_entries.iter().map(|(hash, _)| *hash))
+            .collect::<HashSet<_>>();
+        if let Some((hash, offset)) = damaged
+            .iter()
+            .find(|(hash, _)| !intact_hashes.contains(hash))
+        {
+            bail!(
+                "pack payload crc32 mismatch for live chunk {:x?} at offset {} in {} and no intact copy of it; refusing to rewrite pack",
+                hash,
+                offset,
+                src_pack_path.display()
+            );
+        }
         let new_size = new_offset
             .checked_add(tail_end.saturating_sub(copy_end))
             .context("destination size overflow during pack rewrite")?;

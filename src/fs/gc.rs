@@ -607,6 +607,42 @@ impl FsCore {
             .store(current, Ordering::Relaxed);
         Ok(())
     }
+    /// Persists the chunks found damaged on read as `CHUNK_FLAG_CORRUPT`, so
+    /// the next write of their content stores a fresh copy even after a
+    /// restart. A mark is written only while the chunk is still in the
+    /// in-memory set: a write that repointed it meanwhile removed it.
+    pub(crate) async fn persist_corrupt_chunk_marks(&self) -> Result<()> {
+        let pending = self.corrupt_chunks.lock().iter().copied().collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.meta
+            .write_txn(|txn| {
+                for hash in &pending {
+                    if !self.corrupt_chunks.lock().contains(hash) {
+                        continue;
+                    }
+                    let key = chunk_key(hash);
+                    let Some(raw) = txn.get(key.clone())? else {
+                        continue;
+                    };
+                    let mut chunk: ChunkRecord = decode_rkyv(&raw)?;
+                    if (chunk.flags & CHUNK_FLAG_CORRUPT) != 0 {
+                        continue;
+                    }
+                    chunk.flags |= CHUNK_FLAG_CORRUPT;
+                    txn.set(key, encode_rkyv(&chunk)?)?;
+                }
+                Ok(())
+            })
+            .await?;
+        let mut corrupt = self.corrupt_chunks.lock();
+        for hash in &pending {
+            corrupt.remove(hash);
+            self.chunk_meta_cache.invalidate(hash);
+        }
+        Ok(())
+    }
     /// Hashes whose chunk record still points at `pack_id`, whatever their
     /// refcount.
     pub(crate) fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {

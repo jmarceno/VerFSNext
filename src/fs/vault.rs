@@ -11,7 +11,12 @@ impl FsCore {
         (inode.flags & INODE_FLAG_VAULT) != 0
     }
     pub(crate) fn hash_for_inode(inode: &InodeRecord, data: &[u8]) -> [u8; 16] {
-        if FsCore::inode_is_vault(inode) {
+        FsCore::chunk_content_hash(FsCore::inode_is_vault(inode), data)
+    }
+    /// Content hash of a chunk's plaintext; vault chunks hash in their own
+    /// domain so they never deduplicate against plain chunks.
+    pub(crate) fn chunk_content_hash(vault: bool, data: &[u8]) -> [u8; 16] {
+        if vault {
             hash128_with_domain(VAULT_HASH_DOMAIN, data)
         } else {
             hash128(data)
