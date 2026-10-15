@@ -132,6 +132,12 @@ impl PackStore {
             .unwrap_or(active_pack_id);
 
         Self::repair_active_pack_tail(packs_dir, resolved_active_pack_id)?;
+        let mut all_pack_ids = existing_pack_ids;
+        all_pack_ids.insert(resolved_active_pack_id);
+        // Before any handle is opened: a rebuild replaces the index file.
+        for pack_id in all_pack_ids.iter().copied() {
+            Self::ensure_index_covers_pack(packs_dir, pack_id)?;
+        }
 
         let path = Self::pack_path_impl(packs_dir, resolved_active_pack_id);
         let index_path = Self::index_path_impl(packs_dir, resolved_active_pack_id);
@@ -173,10 +179,7 @@ impl PackStore {
             max_pack_size_bytes,
         };
 
-        let mut all_pack_ids = existing_pack_ids;
-        all_pack_ids.insert(resolved_active_pack_id);
         for pack_id in all_pack_ids {
-            store.rebuild_index_if_missing(pack_id)?;
             store.prime_index_cache(pack_id)?;
         }
 
@@ -663,9 +666,8 @@ impl PackStore {
     /// payloads are synced before metadata points at them, so it is truncated.
     /// Left in place, the next append would land after the fragment and every
     /// later record would be unreachable for the sequential scanners (GC
-    /// rewrite, index rebuild). When the index no longer matches the repaired
-    /// pack (torn entry or entry past the end), it is removed so that startup
-    /// rebuilds it from the pack.
+    /// rewrite, index rebuild). An index that no longer matches the repaired
+    /// pack is rebuilt by `ensure_index_covers_pack`.
     fn repair_active_pack_tail(packs_dir: &Path, pack_id: u64) -> Result<()> {
         let path = Self::pack_path_impl(packs_dir, pack_id);
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
@@ -717,39 +719,6 @@ impl PackStore {
                 .with_context(|| format!("failed to sync active pack {}", path.display()))?;
         }
 
-        let index_path = Self::index_path_impl(packs_dir, pack_id);
-        let index_len = match std::fs::metadata(&index_path) {
-            Ok(meta) => meta.len(),
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to stat pack index {}", index_path.display())
-                });
-            }
-        };
-        let index_matches_pack = index_len.is_multiple_of(INDEX_ENTRY_LEN_U64)
-            && Self::read_index_entries_at(&index_path)?
-                .iter()
-                .all(|(_, entry)| {
-                    entry
-                        .offset
-                        .checked_add(RECORD_HEADER_LEN_U64)
-                        .and_then(|v| v.checked_add(entry.compressed_len as u64))
-                        .is_some_and(|end| end <= valid_end)
-                });
-        if !index_matches_pack {
-            tracing::warn!(
-                index = %index_path.display(),
-                index_len,
-                "active pack index does not match the pack; it will be rebuilt from the pack"
-            );
-            std::fs::remove_file(&index_path).with_context(|| {
-                format!("failed to remove stale pack index {}", index_path.display())
-            })?;
-            if let Some(dir) = index_path.parent() {
-                sync_dir(dir)?;
-            }
-        }
         Ok(())
     }
 
@@ -839,6 +808,7 @@ impl PackStore {
         loop {
             let next_path = self.pack_path(next_pack_id);
             let next_index_path = self.index_path(next_pack_id);
+            Self::ensure_index_covers_pack(&self.packs_dir, next_pack_id)?;
             let next_file = OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -865,7 +835,6 @@ impl PackStore {
                 .with_context(|| format!("failed to stat next pack file {}", next_path.display()))?
                 .len();
 
-            self.rebuild_index_if_missing(next_pack_id)?;
             self.prime_index_cache(next_pack_id)?;
 
             if next_size >= self.max_pack_size_bytes && next_size > 0 {
@@ -965,13 +934,6 @@ impl PackStore {
             .iter()
             .map(|(hash, _)| *hash)
             .collect::<HashSet<_>>();
-        for hash in live_hashes.difference(&indexed_hashes) {
-            tracing::error!(
-                pack_id,
-                chunk_hash = ?hash,
-                "live chunk has no entry in its pack index and cannot be read"
-            );
-        }
 
         let tmp_pack_path = src_pack_path.with_extension("vpk.rewrite");
         let tmp_idx_path = src_idx_path.with_extension("idx.rewrite");
@@ -1148,6 +1110,20 @@ impl PackStore {
         } else {
             Vec::new()
         };
+        let tail_hashes = tail_entries
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect::<HashSet<_>>();
+        if let Some(hash) = live_hashes
+            .iter()
+            .find(|hash| !indexed_hashes.contains(*hash) && !tail_hashes.contains(*hash))
+        {
+            bail!(
+                "live chunk {:x?} of pack {} has no entry in the pack index; refusing to rewrite the pack, which would drop it",
+                hash,
+                pack_id
+            );
+        }
         let intact_hashes = src_entries
             .iter()
             .filter(|(_, entry)| kept_offsets.contains(&entry.offset))
@@ -1429,34 +1405,88 @@ impl PackStore {
         Ok(())
     }
 
-    fn rebuild_index_if_missing(&self, pack_id: u64) -> Result<()> {
-        let pack_path = self.pack_path(pack_id);
-        if !pack_path.exists() {
-            return Ok(());
-        }
-        let index_path = self.index_path(pack_id);
-        let index_missing_or_empty = match std::fs::metadata(&index_path) {
-            Ok(meta) => meta.len() == 0,
-            Err(err) if err.kind() == ErrorKind::NotFound => true,
+    /// Makes sure the index of `pack_id` describes every record of the pack,
+    /// rebuilding it from the pack when it does not.
+    ///
+    /// Records are appended and indexed in pack order, and GC rewrites and
+    /// migrations keep that order, so a complete index is a run of entries
+    /// that starts at offset 0, where each entry starts where the previous
+    /// record ends and the last one ends at the end of the pack. Anything else
+    /// (missing or torn index, an index cut short by an interrupted rebuild,
+    /// entries past the end of the pack, complete records written after the
+    /// last index flush) means records exist that readers and GC cannot see.
+    /// Only the index file is read, so this is cheap enough for every start.
+    fn ensure_index_covers_pack(packs_dir: &Path, pack_id: u64) -> Result<()> {
+        let pack_path = Self::pack_path_impl(packs_dir, pack_id);
+        let pack_len = match std::fs::metadata(&pack_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat pack {}", pack_path.display()));
+            }
+        };
+        let index_path = Self::index_path_impl(packs_dir, pack_id);
+        let index_len = match std::fs::metadata(&index_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == ErrorKind::NotFound => 0,
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!("failed to stat pack index {}", index_path.display())
                 });
             }
         };
-        if !index_missing_or_empty {
+        let mut covered_end = 0_u64;
+        let mut contiguous = index_len.is_multiple_of(INDEX_ENTRY_LEN_U64);
+        if contiguous {
+            for (_, entry) in Self::read_index_entries_at(&index_path)? {
+                if entry.offset != covered_end {
+                    contiguous = false;
+                    break;
+                }
+                covered_end = entry
+                    .offset
+                    .checked_add(RECORD_HEADER_LEN_U64)
+                    .and_then(|v| v.checked_add(entry.compressed_len as u64))
+                    .context("pack index entry end overflows")?;
+            }
+        }
+        if contiguous && covered_end == pack_len {
             return Ok(());
         }
+        tracing::warn!(
+            pack = %pack_path.display(),
+            pack_len,
+            index_len,
+            covered_end,
+            contiguous,
+            "pack index does not cover the pack; rebuilding it from the pack"
+        );
+        Self::rebuild_index(packs_dir, pack_id)
+    }
 
+    /// Rebuilds the index of `pack_id` from the pack's record headers.
+    ///
+    /// The new index is written and synced under a temporary name and then
+    /// renamed over the old one, so an interruption leaves either the old
+    /// index or the complete new one, never a prefix. Payload CRC32s are
+    /// computed from the stored bytes; damage that happened before is still
+    /// caught on read by the content-hash check.
+    fn rebuild_index(packs_dir: &Path, pack_id: u64) -> Result<()> {
+        let pack_path = Self::pack_path_impl(packs_dir, pack_id);
+        let index_path = Self::index_path_impl(packs_dir, pack_id);
+        let tmp_index_path = index_path.with_extension("idx.rebuild");
         let pack = File::open(&pack_path)
             .with_context(|| format!("failed to open pack file {}", pack_path.display()))?;
         let mut index = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&index_path)
-            .with_context(|| format!("failed to rebuild pack index {}", index_path.display()))?;
-        set_file_mode(&index_path)?;
+            .open(&tmp_index_path)
+            .with_context(|| {
+                format!("failed to create rebuilt pack index {}", tmp_index_path.display())
+            })?;
+        set_file_mode(&tmp_index_path)?;
 
         let mut cursor = 0_u64;
         loop {
@@ -1472,31 +1502,29 @@ impl PackStore {
                         );
                     }
 
+                    let payload_offset = cursor
+                        .checked_add(RECORD_HEADER_LEN_U64)
+                        .context("pack offset overflow while rebuilding index payload")?;
+                    let mut payload = vec![0_u8; header.compressed_len as usize];
+                    pack.read_exact_at(&mut payload, payload_offset)
+                        .with_context(|| {
+                            format!(
+                                "failed reading pack payload at offset {} while rebuilding index {}",
+                                cursor,
+                                pack_path.display()
+                            )
+                        })?;
                     let entry = PackIndexEntry {
                         offset: cursor,
                         codec: header.codec,
                         uncompressed_len: header.uncompressed_len,
                         compressed_len: header.compressed_len,
-                        payload_crc32: {
-                            let payload_offset = cursor
-                                .checked_add(RECORD_HEADER_LEN_U64)
-                                .context("pack offset overflow while rebuilding index payload")?;
-                            let mut payload = vec![0_u8; header.compressed_len as usize];
-                            pack.read_exact_at(&mut payload, payload_offset)
-                                .with_context(|| {
-                                    format!(
-                                        "failed reading pack payload while rebuilding index {}",
-                                        pack_path.display()
-                                    )
-                                })?;
-                            crc32c::crc32c(&payload)
-                        },
+                        payload_crc32: crc32c::crc32c(&payload),
                     };
                     Self::append_index_record(&mut index, header.hash, entry)?;
 
-                    cursor = cursor
-                        .checked_add(RECORD_HEADER_LEN_U64)
-                        .and_then(|v| v.checked_add(entry.compressed_len as u64))
+                    cursor = payload_offset
+                        .checked_add(entry.compressed_len as u64)
                         .context("pack offset overflow while rebuilding index")?;
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
@@ -1511,9 +1539,23 @@ impl PackStore {
             }
         }
 
-        index
-            .sync_all()
-            .with_context(|| format!("failed to sync rebuilt index {}", index_path.display()))?;
+        index.sync_all().with_context(|| {
+            format!("failed to sync rebuilt index {}", tmp_index_path.display())
+        })?;
+        drop(index);
+        std::fs::rename(&tmp_index_path, &index_path).with_context(|| {
+            format!(
+                "failed to replace pack index {} with rebuilt {}",
+                index_path.display(),
+                tmp_index_path.display()
+            )
+        })?;
+        sync_dir(
+            index_path
+                .parent()
+                .context("pack index path has no parent directory")?,
+        )?;
+        tracing::info!(pack = %pack_path.display(), records_bytes = cursor, "rebuilt pack index");
         Ok(())
     }
 

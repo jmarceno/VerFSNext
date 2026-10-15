@@ -813,3 +813,35 @@ commands; the call chain now ends in a WAL fsync.)
 ### Affected Files
 `src/fs/mod.rs`, `src/fs/fuse.rs`
 
+## B025 - Incomplete Pack Index Was Trusted and Let GC Delete Live Data - Oct 15 2026
+
+### Root Cause
+Index rebuild wrote straight into the canonical `.idx` (truncate, one entry at
+a time, sync at the end). An interruption left a non-empty prefix, and startup
+rebuilt only missing or empty indexes, so the prefix was trusted. The active
+pack check only verified that entries ended inside the pack, not that they
+covered it. Chunks past the prefix returned "missing pack index entry", and GC
+merely logged live hashes absent from the index, then rewrote the pack keeping
+only indexed records: the live payloads were deleted (reproduced by removing
+the last index entry and running offline GC).
+
+### Fix
+- `ensure_index_covers_pack` runs for every pack at startup, before any handle
+  is opened, and when rotation reuses an existing pack: the index must be a
+  contiguous run of entries from offset 0 to the end of the pack (index file
+  only, cheap). Otherwise the index is rebuilt.
+- `rebuild_index` writes `*.idx.rebuild`, syncs it, renames it over the index
+  and syncs the directory.
+- GC refuses to rewrite a pack when a live hash has no index entry.
+- The partial index check in `repair_active_pack_tail` is replaced by the
+  coverage check. No format change.
+
+### Validation
+Scratch mount: 8 MiB file, 32 KiB survivor, a deleted file; last 40-byte index
+entry removed and a stale `.idx.rebuild` left behind. Restart restores the
+index to full length and every file reads back; offline GC then rewrites the
+pack and every file still matches after remount.
+
+### Affected Files
+`src/data/pack.rs`
+
