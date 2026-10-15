@@ -27,6 +27,10 @@ pub const KEY_PREFIX_SYMLINK: u8 = b'Y';
 pub const KEY_PREFIX_SNAPSHOT: u8 = b'S';
 /// Unlinked inode (`nlink == 0`) still referenced by the kernel or an open handle.
 pub const KEY_PREFIX_ORPHAN: u8 = b'O';
+/// Payload of a chunk stored inline in metadata (`CHUNK_FLAG_INLINE`).
+pub const KEY_PREFIX_INLINE_CHUNK: u8 = b'T';
+/// `ChunkRecord::pack_id` of a chunk stored inline in metadata.
+pub const INLINE_PACK_ID: u64 = u64::MAX;
 
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
@@ -206,6 +210,13 @@ pub fn symlink_target_key(ino: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 8);
     key.push(KEY_PREFIX_SYMLINK);
     key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+pub fn inline_chunk_key(hash: &[u8; 16]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 16);
+    key.push(KEY_PREFIX_INLINE_CHUNK);
+    key.extend_from_slice(hash);
     key
 }
 

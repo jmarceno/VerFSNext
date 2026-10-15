@@ -1,6 +1,20 @@
 use super::*;
 use crate::fs::FsCore;
 
+/// A chunk staged by a write, before it is stored.
+pub(crate) struct StagedChunk {
+    pub(crate) data: Arc<Vec<u8>>,
+    /// Provisional end-of-file chunk, stored inline in metadata.
+    pub(crate) inline: bool,
+}
+
+/// A freshly stored chunk: its record, and the payload to write into
+/// metadata when it is inline.
+pub(crate) struct NewChunk {
+    pub(crate) record: ChunkRecord,
+    pub(crate) inline_payload: Option<Vec<u8>>,
+}
+
 impl FsCore {
     /// Fails with EIO when a stored payload does not match the CRC32 its
     /// pack index recorded for it, so a damaged copy is never decoded.
@@ -130,7 +144,34 @@ impl FsCore {
     /// chunk is marked corrupt so the next write of the same content stores
     /// a fresh copy instead of deduplicating against the damaged one.
     fn read_chunk_from_pack(&self, hash: [u8; 16], vault_encrypted: bool) -> Result<Vec<u8>> {
-        let chunk = self.load_chunk_record(hash)?;
+        let mut chunk = self.load_chunk_record(hash)?;
+        if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+            // Record and payload are read together: a promotion may have
+            // moved the chunk to a pack since the record was cached.
+            let (current, inline_payload) = self.meta.read_txn(|txn| {
+                let Some(raw) = txn.get(chunk_key(&hash))? else {
+                    return Err(anyhow_errno(
+                        Errno::EIO,
+                        format!("missing chunk metadata for hash {:x?}", hash),
+                    ));
+                };
+                let current: ChunkRecord = decode_rkyv(&raw)?;
+                if (current.flags & CHUNK_FLAG_INLINE) == 0 {
+                    return Ok((current, None));
+                }
+                let payload = txn.get(inline_chunk_key(&hash))?.ok_or_else(|| {
+                    anyhow_errno(
+                        Errno::EIO,
+                        format!("missing inline payload of chunk {:x?}", hash),
+                    )
+                })?;
+                Ok((current, Some(payload)))
+            })?;
+            chunk = current;
+            if let Some(stored) = inline_payload {
+                return self.decode_inline_chunk(hash, &chunk, &stored, vault_encrypted);
+            }
+        }
         let encrypted = (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0;
         let folder_key = if encrypted {
             if !vault_encrypted {
@@ -205,6 +246,43 @@ impl FsCore {
                 Err(anyhow_errno(Errno::EIO, format!("{err:#}")))
             }
         }
+    }
+
+    /// Decodes the payload of an inline chunk and verifies its content hash.
+    fn decode_inline_chunk(
+        &self,
+        hash: [u8; 16],
+        chunk: &ChunkRecord,
+        stored: &[u8],
+        vault_encrypted: bool,
+    ) -> Result<Vec<u8>> {
+        let encrypted = (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0;
+        let plaintext = if encrypted {
+            if !vault_encrypted {
+                return Err(anyhow_errno(
+                    Errno::EIO,
+                    "encrypted chunk referenced by non-vault inode",
+                ));
+            }
+            let key = self.current_vault_key()?;
+            decrypt_chunk_payload(&key, &chunk.nonce, stored)?
+        } else {
+            stored.to_vec()
+        };
+        let plaintext =
+            crate::data::compress::decompress_chunk(chunk.codec, &plaintext, chunk.uncompressed_len)?;
+        if FsCore::chunk_content_hash(encrypted, &plaintext) != hash {
+            self.corrupt_chunks.lock().insert(hash);
+            tracing::error!(
+                chunk_hash = ?hash,
+                "inline chunk does not match its content hash; it is marked corrupt and the next write of the same content will store it again"
+            );
+            return Err(anyhow_errno(
+                Errno::EIO,
+                format!("inline chunk {:x?} decodes to different content", hash),
+            ));
+        }
+        Ok(plaintext)
     }
 
     /// Returns the plaintext of `extent`, checked against the extent length.
@@ -350,13 +428,17 @@ impl FsCore {
     /// A chunk whose stored copy is known to be damaged is stored again; the
     /// commit then repoints its record at the fresh copy, which repairs every
     /// file that references it.
+    ///
+    /// `inline` marks the provisional end-of-file chunk of a write, which is
+    /// stored in metadata instead of a pack when it is new.
     pub(crate) fn stage_chunk_if_missing(
         &self,
         txn: &verfsnext_surrealkv::Transaction,
         chunk_hash: [u8; 16],
         data: Arc<Vec<u8>>,
+        inline: bool,
         checked_hashes: &mut HashSet<[u8; 16]>,
-        pending_chunks: &mut HashMap<[u8; 16], Arc<Vec<u8>>>,
+        pending_chunks: &mut HashMap<[u8; 16], StagedChunk>,
     ) -> Result<bool> {
         if !checked_hashes.insert(chunk_hash) {
             return Ok(false);
@@ -376,27 +458,64 @@ impl FsCore {
             );
         }
 
-        pending_chunks.insert(chunk_hash, data);
+        pending_chunks.insert(chunk_hash, StagedChunk { data, inline });
         Ok(true)
     }
+    /// Stores the staged chunks: pack chunks are compressed in parallel and
+    /// appended to the active pack; inline chunks keep their bytes (vault:
+    /// encrypted) for the commit to write into metadata.
     pub(crate) async fn materialize_pending_chunks(
         &self,
-        pending_chunks: HashMap<[u8; 16], Arc<Vec<u8>>>,
+        pending_chunks: HashMap<[u8; 16], StagedChunk>,
         encrypt_for_vault: bool,
-    ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
+    ) -> Result<HashMap<[u8; 16], NewChunk>> {
         if pending_chunks.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let pending = pending_chunks
-            .into_iter()
-            .map(|(hash, data)| PendingChunk { hash, data })
-            .collect::<Vec<_>>();
+        let mut out = HashMap::with_capacity(pending_chunks.len());
+        let mut pending = Vec::with_capacity(pending_chunks.len());
+        for (hash, staged) in pending_chunks {
+            if !staged.inline {
+                pending.push(PendingChunk {
+                    hash,
+                    data: staged.data,
+                });
+                continue;
+            }
+            let uncompressed_len = u32::try_from(staged.data.len())
+                .map_err(|_| anyhow!("chunk too large for u32 length: {}", staged.data.len()))?;
+            let (payload, nonce, flags) = if encrypt_for_vault {
+                let folder_key = self.current_vault_key()?;
+                let (ciphertext, nonce) = encrypt_chunk_payload(&folder_key, &staged.data)?;
+                (ciphertext, nonce, CHUNK_FLAG_INLINE | CHUNK_FLAG_ENCRYPTED)
+            } else {
+                (staged.data.as_ref().clone(), [0_u8; 24], CHUNK_FLAG_INLINE)
+            };
+            out.insert(
+                hash,
+                NewChunk {
+                    record: ChunkRecord {
+                        refcount: 0,
+                        pack_id: INLINE_PACK_ID,
+                        codec: CODEC_RAW,
+                        flags,
+                        nonce,
+                        uncompressed_len,
+                        compressed_len: payload.len() as u32,
+                    },
+                    inline_payload: Some(payload),
+                },
+            );
+        }
+        if pending.is_empty() {
+            return Ok(out);
+        }
+
         let zstd_level = self.config.zstd_compression_level;
         let ready = tokio::task::spawn_blocking(move || compress_parallel(pending, zstd_level))
             .await
             .map_err(|e| anyhow!("compression task failed: {}", e))??;
-        let mut out = HashMap::with_capacity(ready.len());
         for ready_chunk in ready {
             let chunk = if encrypt_for_vault {
                 let folder_key = self.current_vault_key()?;
@@ -438,7 +557,13 @@ impl FsCore {
                     compressed_len: ready_chunk.chunk.compressed_len,
                 }
             };
-            out.insert(ready_chunk.hash, chunk);
+            out.insert(
+                ready_chunk.hash,
+                NewChunk {
+                    record: chunk,
+                    inline_payload: None,
+                },
+            );
         }
 
         Ok(out)
@@ -446,21 +571,22 @@ impl FsCore {
     /// Applies refcount deltas and stores the records of freshly written
     /// chunks. A fresh chunk whose hash already has a record replaces a
     /// damaged copy: the record keeps its refcount and is repointed at the
-    /// new copy.
+    /// new copy. An inline chunk whose refcount drops to zero is deleted
+    /// with its payload right away: it has no pack copy for GC to reclaim.
     pub(crate) fn apply_ref_deltas_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
         ref_deltas: &HashMap<[u8; 16], i64>,
-        new_chunk_records: &HashMap<[u8; 16], ChunkRecord>,
+        new_chunks: &HashMap<[u8; 16], NewChunk>,
     ) -> Result<()> {
         let hashes = ref_deltas
             .iter()
             .filter(|(_, delta)| **delta != 0)
             .map(|(hash, _)| *hash)
-            .chain(new_chunk_records.keys().copied())
+            .chain(new_chunks.keys().copied())
             .collect::<HashSet<_>>();
         for hash in hashes {
             let delta = ref_deltas.get(&hash).copied().unwrap_or(0);
-            let fresh = new_chunk_records.get(&hash).copied();
+            let fresh = new_chunks.get(&hash);
 
             let key = chunk_key(&hash);
             if let Some(raw) = txn.get(key.clone())? {
@@ -470,12 +596,18 @@ impl FsCore {
                         tracing::warn!(
                             chunk_hash = ?hash,
                             old_pack_id = existing.pack_id,
-                            new_pack_id = fresh.pack_id,
+                            new_pack_id = fresh.record.pack_id,
                             "repointing damaged chunk record at a fresh copy"
                         );
+                        if (existing.flags & CHUNK_FLAG_INLINE) != 0 {
+                            txn.delete(inline_chunk_key(&hash))?;
+                        }
+                        if let Some(payload) = &fresh.inline_payload {
+                            txn.set(inline_chunk_key(&hash), payload.clone())?;
+                        }
                         ChunkRecord {
                             refcount: existing.refcount,
-                            ..fresh
+                            ..fresh.record
                         }
                     }
                     None => existing,
@@ -490,6 +622,11 @@ impl FsCore {
                     );
                 }
                 chunk.refcount = next_ref.max(0) as u64;
+                if chunk.refcount == 0 && (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+                    txn.delete(key)?;
+                    txn.delete(inline_chunk_key(&hash))?;
+                    continue;
+                }
                 txn.set(key, encode_rkyv(&chunk)?)?;
                 continue;
             }
@@ -503,12 +640,20 @@ impl FsCore {
                 continue;
             }
 
-            let Some(mut chunk) = fresh else {
+            let Some(fresh) = fresh else {
                 return Err(anyhow_errno(
                     Errno::EIO,
                     format!("missing staged chunk metadata for hash {:x?}", hash),
                 ));
             };
+            if delta == 0 && fresh.inline_payload.is_some() {
+                // Staged but no longer referenced by this commit.
+                continue;
+            }
+            if let Some(payload) = &fresh.inline_payload {
+                txn.set(inline_chunk_key(&hash), payload.clone())?;
+            }
+            let mut chunk = fresh.record;
             chunk.refcount = delta as u64;
             txn.set(key, encode_rkyv(&chunk)?)?;
         }
@@ -518,17 +663,18 @@ impl FsCore {
     /// commit became visible: a damaged chunk that got a fresh copy is no
     /// longer corrupt. The metadata cache entry is dropped rather than
     /// filled, since the committed refcount is not known here.
-    pub(crate) fn publish_committed_chunk_records(
-        &self,
-        new_chunk_records: &HashMap<[u8; 16], ChunkRecord>,
-    ) {
-        if new_chunk_records.is_empty() {
+    pub(crate) fn publish_committed_chunk_records(&self, new_chunks: &HashMap<[u8; 16], NewChunk>) {
+        if new_chunks.is_empty() {
             return;
         }
         let mut corrupt = self.corrupt_chunks.lock();
-        for hash in new_chunk_records.keys() {
+        let mut young_inline = self.young_inline_chunks.lock();
+        for (hash, chunk) in new_chunks {
             self.chunk_meta_cache.invalidate(hash);
             corrupt.remove(hash);
+            if chunk.inline_payload.is_some() {
+                young_inline.insert(*hash);
+            }
         }
     }
     pub(crate) fn extent_start_from_key(key: &[u8]) -> Option<u64> {

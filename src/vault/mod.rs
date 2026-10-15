@@ -27,6 +27,11 @@ pub const CHUNK_FLAG_ENCRYPTED: u8 = 1 << 0;
 /// content stores a fresh copy and repoints the record instead of
 /// deduplicating against the damaged one.
 pub const CHUNK_FLAG_CORRUPT: u8 = 1 << 1;
+/// The chunk's payload lives in metadata under `inline_chunk_key` instead of
+/// a pack: the provisional end-of-file chunk of a write, which the next
+/// append usually replaces. It is stored uncompressed (vault: encrypted with
+/// the record's nonce) and moved to a pack once it has stayed unchanged.
+pub const CHUNK_FLAG_INLINE: u8 = 1 << 2;
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 #[rkyv(bytecheck())]

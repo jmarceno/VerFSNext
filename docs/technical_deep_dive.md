@@ -94,7 +94,18 @@ File data is stored as variable-length, content-defined chunks. Chunk boundaries
 
 Old extents a region can reach are loaded through the batch transaction once per segment (from one byte before the write to `(RESYNC_MAX_CHUNKS + 2) * max_size + 2 * max_extent_len` after it). A missing extent at the far end only looks like a hole at an extent start, which is a valid region end.
 
-Cost: each FUSE write that extends a file re-reads (usually from the chunk cache) and re-stores the file's tail chunk, and the superseded tail chunk becomes garbage for GC. Copying a 32 MiB file stored about 5% extra pack data before GC. A random write re-chunks the extent before it, the extents it overwrites and normally one or two more until resynchronization.
+Cost: each FUSE write that extends a file re-reads (usually from the chunk cache) and re-stores the file's tail chunk. A random write re-chunks the extent before it, the extents it overwrites and normally one or two more until resynchronization.
+
+### Inline end-of-file chunks
+
+The chunk that ends a region at the end of the file is not a content-defined cut: the next append re-chunks it. Such a chunk, when new, is stored inline in metadata instead of a pack (`CHUNK_FLAG_INLINE`, `pack_id = INLINE_PACK_ID`, payload under `T` + hash; raw bytes, vault payloads encrypted with the record's nonce). Truncating down stores the kept prefix of the last extent the same way.
+
+- Extents, refcounts, dedup and snapshots treat it like any chunk record.
+- Reads take the record and the inline payload in one read transaction and verify the content hash.
+- When an inline chunk's refcount drops to zero in a commit, the record and its payload are deleted in that commit; zero-ref inline records left by snapshot delete are deleted with their payload by the GC scan, which emits no discard record for them.
+- Promotion: in the idle GC window, before the GC cycle, inline chunks that already existed at the previous pass (still alive and unchanged) are compressed (vault: moved as stored) and appended to the active pack under the read side of the write lock, and their records are repointed in one transaction per batch of 256. Chunks created since the previous pass stay inline, since they are probably still the open end of a file being written.
+
+Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -> 1.002, 128 KiB 1.122 -> 1.000, 32 KiB 1.503 -> 1.002, 8 KiB about 5 -> 1.002. The provisional tails go through the metadata WAL once instead of being compressed, packed and later compacted by GC.
 
 ## Runtime Layout
 

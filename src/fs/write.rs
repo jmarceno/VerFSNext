@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs::chunk::{NewChunk, StagedChunk};
 use crate::fs::FsCore;
 
 /// All writes to one inode within a batch, kept as sorted, disjoint and
@@ -76,13 +77,16 @@ struct PreparedWritePlan {
     extent_deletes: Vec<u64>,
     extent_sets: Vec<FileExtent>,
     ref_deltas: HashMap<[u8; 16], i64>,
-    new_chunk_records: HashMap<[u8; 16], ChunkRecord>,
+    new_chunks: HashMap<[u8; 16], NewChunk>,
 }
 
 /// A chunk cut from a region, with the bytes it holds.
 struct CutChunk {
     extent: FileExtent,
     data: Arc<Vec<u8>>,
+    /// Cut at the end of the file rather than at a content-defined boundary:
+    /// the next append re-chunks it, so it is stored inline.
+    eof_tail: bool,
 }
 
 fn segment_end(segment: &WriteOp) -> u64 {
@@ -148,6 +152,7 @@ impl FsCore {
         // overwrites and the ones it re-chunks while resynchronizing.
         let max_chunk = self.chunker.max_size() as u64;
         let reach = (RESYNC_MAX_CHUNKS + 2) * max_chunk + 2 * self.max_extent_len;
+        let file_end = inode.size.max(write_end);
         let mut old_extents = BTreeMap::<u64, FileExtent>::new();
         if inode.size != 0 {
             for segment in &group.segments {
@@ -174,6 +179,7 @@ impl FsCore {
                 &mut next_segment,
                 &old_extents,
                 region_start,
+                file_end,
                 &mut cut_chunks,
             )?;
             replaced.extend(
@@ -186,7 +192,7 @@ impl FsCore {
         let mut extent_sets = Vec::<FileExtent>::with_capacity(cut_chunks.len());
         let mut ref_deltas =
             HashMap::<[u8; 16], i64>::with_capacity(cut_chunks.len().saturating_mul(2));
-        let mut pending_chunks = HashMap::<[u8; 16], Arc<Vec<u8>>>::new();
+        let mut pending_chunks = HashMap::<[u8; 16], StagedChunk>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
         let mut dedup_hits = 0_u64;
         let mut dedup_misses = 0_u64;
@@ -204,6 +210,7 @@ impl FsCore {
                 txn,
                 hash,
                 chunk.data,
+                chunk.eof_tail,
                 &mut checked_hashes,
                 &mut pending_chunks,
             )?;
@@ -219,7 +226,7 @@ impl FsCore {
             extent_deletes.push(start);
         }
 
-        let new_chunk_records = self
+        let new_chunks = self
             .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(inode))
             .await?;
 
@@ -230,7 +237,7 @@ impl FsCore {
             extent_deletes,
             extent_sets,
             ref_deltas,
-            new_chunk_records,
+            new_chunks,
         })
     }
 
@@ -253,6 +260,7 @@ impl FsCore {
         next_segment: &mut usize,
         old_extents: &BTreeMap<u64, FileExtent>,
         region_start: u64,
+        file_end: u64,
         out: &mut Vec<CutChunk>,
     ) -> Result<u64> {
         let vault = FsCore::inode_is_vault(inode);
@@ -324,6 +332,7 @@ impl FsCore {
             let data = pending[..len].to_vec();
             pending.drain(..len);
             let chunk_hash = FsCore::hash_for_inode(inode, &data);
+            let eof_tail = data_ended && pending.is_empty() && pos + len as u64 == file_end;
             out.push(CutChunk {
                 extent: FileExtent {
                     start: pos,
@@ -333,6 +342,7 @@ impl FsCore {
                     },
                 },
                 data: Arc::new(data),
+                eof_tail,
             });
             pos += len as u64;
 
@@ -377,12 +387,12 @@ impl FsCore {
         loop {
             let mut txn = self.meta.begin_write()?;
             let (inode, staged) = self.stage_truncate_in_txn(ino, new_size, &mut txn).await?;
-            let Some(new_chunk_records) = staged else {
+            let Some(new_chunks) = staged else {
                 return Ok(inode);
             };
             match self.meta.commit_write_txn(&mut txn).await {
                 Ok(()) => {
-                    self.publish_committed_chunk_records(&new_chunk_records);
+                    self.publish_committed_chunk_records(&new_chunks);
                     self.invalidate_inode_cache(ino);
                     self.mark_mutation();
                     self.bump_inode_data_version(ino);
@@ -410,7 +420,7 @@ impl FsCore {
         ino: u64,
         new_size: u64,
         txn: &mut verfsnext_surrealkv::Transaction,
-    ) -> Result<(InodeRecord, Option<HashMap<[u8; 16], ChunkRecord>>)> {
+    ) -> Result<(InodeRecord, Option<HashMap<[u8; 16], NewChunk>>)> {
         let mut inode = FsCore::load_inode_in_txn(txn, ino, "truncate")?;
         self.ensure_inode_vault_access(&inode, "truncate")?;
         if inode.kind != INODE_KIND_FILE {
@@ -429,7 +439,7 @@ impl FsCore {
         let mut extent_updates = Vec::<FileExtent>::new();
         let mut extent_deletes = Vec::<u64>::new();
         let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-        let mut pending_chunks = HashMap::<[u8; 16], Arc<Vec<u8>>>::new();
+        let mut pending_chunks = HashMap::<[u8; 16], StagedChunk>::new();
         let mut checked_hashes = HashSet::<[u8; 16]>::new();
 
         if new_size < old_size {
@@ -453,16 +463,18 @@ impl FsCore {
                 };
                 *ref_deltas.entry(chunk_hash).or_insert(0) += 1;
                 extent_updates.push(trimmed);
+                // The kept prefix now ends the file: an append re-chunks it.
                 self.stage_chunk_if_missing(
                     txn,
                     chunk_hash,
                     data,
+                    true,
                     &mut checked_hashes,
                     &mut pending_chunks,
                 )?;
             }
         }
-        let new_chunk_records = self
+        let new_chunks = self
             .materialize_pending_chunks(pending_chunks, FsCore::inode_is_vault(&inode))
             .await?;
 
@@ -480,9 +492,9 @@ impl FsCore {
         for extent in extent_updates {
             txn.set(extent_key(ino, extent.start), encode_rkyv(&extent.record)?)?;
         }
-        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunk_records)?;
+        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunks)?;
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-        Ok((inode, Some(new_chunk_records)))
+        Ok((inode, Some(new_chunks)))
     }
     pub(crate) fn lock_type_valid(typ: u32) -> bool {
         typ == libc::F_RDLCK as u32 || typ == libc::F_WRLCK as u32 || typ == libc::F_UNLCK as u32
@@ -527,7 +539,7 @@ impl FsCore {
             txn.set(extent_key(ino, extent.start), encode_rkyv(&extent.record)?)?;
         }
 
-        FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunk_records)?;
+        FsCore::apply_ref_deltas_in_txn(txn, &plan.ref_deltas, &plan.new_chunks)?;
         txn.set(inode_key(ino), encode_rkyv(inode)?)?;
         Ok(())
     }
@@ -546,7 +558,7 @@ impl FsCore {
         txn: &mut verfsnext_surrealkv::Transaction,
         mtime_sec: i64,
         mtime_nsec: u32,
-    ) -> Result<HashMap<[u8; 16], ChunkRecord>> {
+    ) -> Result<HashMap<[u8; 16], NewChunk>> {
         let mut inode = FsCore::load_inode_in_txn(txn, group.ino, "write")?;
         self.ensure_write_target_inode(group.ino, &inode)?;
         if group.segments.is_empty() {
@@ -574,7 +586,7 @@ impl FsCore {
             "write completed through content-defined chunking, dedup and compression"
         );
 
-        Ok(plan.new_chunk_records)
+        Ok(plan.new_chunks)
     }
 }
 
@@ -646,7 +658,7 @@ impl FsCore {
             // Compute the timestamp once per attempt and reuse it for all
             // inode updates. Avoids redundant clock_gettime syscalls.
             let (mtime_sec, mtime_nsec) = system_time_to_parts(SystemTime::now());
-            let mut new_records = HashMap::<[u8; 16], ChunkRecord>::new();
+            let mut new_records = HashMap::<[u8; 16], NewChunk>::new();
             let mut failed_group = None;
             for (position, group) in pending.iter().enumerate() {
                 match self

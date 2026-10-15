@@ -60,6 +60,7 @@ impl FsCore {
         if !self.gc_idle_window_open() {
             return Ok(());
         }
+        self.promote_inline_chunks().await?;
         self.run_gc_cycle().await
     }
     pub(crate) async fn run_gc_cycle(&self) -> Result<()> {
@@ -100,6 +101,7 @@ impl FsCore {
                 let epoch = self.next_gc_epoch().await?;
                 let discard_records = candidates
                     .iter()
+                    .filter(|candidate| candidate.pack_id != INLINE_PACK_ID)
                     .map(|candidate| DiscardRecord {
                         epoch_id: epoch,
                         pack_id: candidate.pack_id,
@@ -318,6 +320,9 @@ impl FsCore {
                             if let Some(raw) = txn.get(key.clone())? {
                                 let chunk: ChunkRecord = decode_rkyv(&raw)?;
                                 if chunk.refcount == 0 {
+                                    if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+                                        txn.delete(inline_chunk_key(hash))?;
+                                    }
                                     txn.delete(key)?;
                                     batch_deleted += 1;
                                 }
@@ -547,6 +552,9 @@ impl FsCore {
                     if let Some(raw) = txn.get(key.clone())? {
                         let chunk: ChunkRecord = decode_rkyv(&raw)?;
                         if chunk.refcount == 0 {
+                            if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+                                txn.delete(inline_chunk_key(hash))?;
+                            }
                             txn.delete(key)?;
                         }
                     }
@@ -605,6 +613,136 @@ impl FsCore {
             .await?;
         self.last_persisted_pack_crc32_read_error_count
             .store(current, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Moves inline chunks that survived since the previous pass into the
+    /// active pack: they are no longer the open end of a file being written.
+    /// Chunks created since the previous pass stay inline for now. Each batch
+    /// is appended to the pack and committed under the read side of the
+    /// write lock, like a write, so GC's pack cutoff stays valid; a record
+    /// that changed meanwhile is left alone and its pack copy becomes garbage.
+    pub(crate) async fn promote_inline_chunks(&self) -> Result<()> {
+        const BATCH: usize = 256;
+        let young = std::mem::take(&mut *self.young_inline_chunks.lock());
+        let prefix = vec![KEY_PREFIX_INLINE_CHUNK];
+        let end = prefix_end(&prefix);
+        let mut start = prefix;
+        let mut promoted = 0_u64;
+        loop {
+            let (batch, next_start) = self.meta.read_txn(|txn| {
+                let (pairs, has_more) =
+                    scan_range_pairs_limited(txn, start.clone(), end.clone(), BATCH)?;
+                let next_start = match (has_more, pairs.last()) {
+                    (true, Some((key, _))) => {
+                        let mut next = key.clone();
+                        next.push(0);
+                        Some(next)
+                    }
+                    _ => None,
+                };
+                let mut batch = Vec::new();
+                for (key, payload) in pairs {
+                    let hash: [u8; 16] = key[1..]
+                        .try_into()
+                        .map_err(|_| anyhow!("malformed inline chunk key {key:?}"))?;
+                    if young.contains(&hash) {
+                        continue;
+                    }
+                    let Some(raw) = txn.get(chunk_key(&hash))? else {
+                        return Err(anyhow_errno(
+                            Errno::EIO,
+                            format!("inline payload of chunk {:x?} has no chunk record", hash),
+                        ));
+                    };
+                    let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                    // Zero-ref inline chunks are deleted by the scan phase.
+                    if chunk.refcount == 0 {
+                        continue;
+                    }
+                    batch.push((hash, chunk, payload));
+                }
+                Ok((batch, next_start))
+            })?;
+
+            if !batch.is_empty() {
+                let _mutation_guard = self.write_lock.read().await;
+                let mut moved = Vec::with_capacity(batch.len());
+                for (hash, inline, payload) in batch {
+                    // Vault payloads are already encrypted and are moved as
+                    // they are; plain payloads are compressed on the way.
+                    let (codec, stored) = if (inline.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+                        (inline.codec, payload)
+                    } else {
+                        let compressed = compress_chunk(&payload, self.config.zstd_compression_level)?;
+                        (compressed.codec, compressed.compressed)
+                    };
+                    let payload_crc32 = crc32c::crc32c(&stored);
+                    let pack_id = tokio::task::block_in_place(|| {
+                        self.packs.append_chunk_with_crc32(
+                            hash,
+                            codec,
+                            inline.uncompressed_len,
+                            &stored,
+                            payload_crc32,
+                        )
+                    })?;
+                    moved.push((
+                        hash,
+                        inline,
+                        ChunkRecord {
+                            refcount: 0,
+                            pack_id,
+                            codec,
+                            flags: inline.flags & !CHUNK_FLAG_INLINE,
+                            nonce: inline.nonce,
+                            uncompressed_len: inline.uncompressed_len,
+                            compressed_len: stored.len() as u32,
+                        },
+                    ));
+                }
+                let mut committed = 0_u64;
+                self.meta
+                    .write_txn(|txn| {
+                        committed = 0;
+                        for (hash, inline, packed) in &moved {
+                            let key = chunk_key(hash);
+                            let Some(raw) = txn.get(key.clone())? else {
+                                continue;
+                            };
+                            let current: ChunkRecord = decode_rkyv(&raw)?;
+                            if (current.flags & CHUNK_FLAG_INLINE) == 0
+                                || current.nonce != inline.nonce
+                                || current.compressed_len != inline.compressed_len
+                            {
+                                continue;
+                            }
+                            txn.set(
+                                key,
+                                encode_rkyv(&ChunkRecord {
+                                    refcount: current.refcount,
+                                    ..*packed
+                                })?,
+                            )?;
+                            txn.delete(inline_chunk_key(hash))?;
+                            committed += 1;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                for (hash, _, _) in &moved {
+                    self.chunk_meta_cache.invalidate(hash);
+                }
+                promoted += committed;
+            }
+
+            match next_start {
+                Some(next) => start = next,
+                None => break,
+            }
+        }
+        if promoted > 0 {
+            tracing::info!(promoted, "moved inline chunks to the active pack");
+        }
         Ok(())
     }
     /// Persists the chunks found damaged on read as `CHUNK_FLAG_CORRUPT`, so

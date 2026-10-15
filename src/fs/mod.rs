@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use fill_cache::FillCache;
 use crate::data::chunker::UltraCdc;
-use crate::data::compress::{compress_parallel, PendingChunk};
+use crate::data::compress::{compress_chunk, compress_parallel, PendingChunk, CODEC_RAW};
 use crate::data::hash::{hash128, hash128_with_domain};
 use crate::data::pack::PackStore;
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
@@ -45,17 +45,19 @@ use crate::permissions::normalize_data_tree;
 use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
-    chunk_key, decode_dirent_name, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
+    chunk_key, decode_dirent_name, inline_chunk_key, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
     encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
-    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, KEY_PREFIX_CHUNK,
+    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
+    KEY_PREFIX_INLINE_CHUNK,
     MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
     SYS_MAX_EXTENT_LEN, VAULT_DIR_NAME,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
     unwrap_folder_key, VaultArgon2Params, VaultRuntime, VaultWrapRecord, CHUNK_FLAG_CORRUPT, CHUNK_FLAG_ENCRYPTED,
+    CHUNK_FLAG_INLINE,
     SYS_VAULT_STATE, SYS_VAULT_WRAP, VAULT_STATE_LOCKED, VAULT_STATE_UNLOCKED,
 };
 use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
@@ -275,6 +277,10 @@ struct FsCore {
     /// store such content again instead of deduplicating against it; the
     /// sync cycle persists the mark as `CHUNK_FLAG_CORRUPT`.
     corrupt_chunks: ParkingMutex<HashSet<[u8; 16]>>,
+    /// Inline chunks created since the last promotion pass. They are likely
+    /// still the open end of a file being written, so that pass leaves them
+    /// inline; the next one moves them to a pack if they are still alive.
+    young_inline_chunks: ParkingMutex<HashSet<[u8; 16]>>,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
@@ -384,6 +390,7 @@ impl VerFs {
             write_bytes_total: AtomicU64::new(0),
             pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
             corrupt_chunks: ParkingMutex::new(HashSet::new()),
+            young_inline_chunks: ParkingMutex::new(HashSet::new()),
             stats_started_ms: AtomicU64::new(now_millis()),
             last_mutation_ms: AtomicU64::new(now_millis()),
             last_activity_ms: AtomicU64::new(now_millis()),

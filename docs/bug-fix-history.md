@@ -1003,3 +1003,36 @@ renameat2(RENAME_EXCHANGE) of xa/sub (dir) with xb/file and back: nlinks
 ### Affected Files
 `src/fs/fuse.rs`
 
+## B032 - Every Write Request Stored a Throw-Away End-of-File Chunk in the Pack - Oct 15 2026
+
+### Root Cause
+A write region that ends at the end of the file cuts its last chunk there, not
+at a content-defined boundary. That chunk was compressed and appended to the
+active pack, and the next append re-chunked it, so it immediately became
+garbage: pack bytes per data byte were 1.016 (1 MiB writes), 1.122 (128 KiB),
+1.503 (32 KiB) and about 5 (8 KiB), plus compression CPU and GC compaction
+of the garbage later.
+
+### Fix
+End-of-file chunks are stored inline in metadata (`CHUNK_FLAG_INLINE`, payload
+key `T` + hash) and deleted in the same commit when their refcount reaches
+zero. Inline chunks that survive one idle GC pass are moved to the active pack
+by the next one. Readers handle both kinds. Storage format change without
+migration: older data stays valid; data written by this version is not
+readable by older versions (owner decision: the existing data is test data).
+
+### Validation
+- Pack growth at 1 MiB / 128 KiB / 32 KiB / 8 KiB direct writes: 1.002 /
+  1.000 / 1.002 / 1.002, contents identical.
+- 40 plain files and 17 vault and truncated files written in 8 KiB requests:
+  identical after idle promotion (packs grew by the promoted tails), remount,
+  vault lock/unlock with a promotion pass while locked, and SIGKILL after an
+  fsynced append; metadata consistency ok.
+- Mount suite without benchmarks (9 tests) passed. ComfyUI benchmark, two runs
+  each, noisy disk: sm_write_dura 34.3 s vs 51.1 s before (average),
+  mod_write_dura 9.7 s vs 14.3 s, other phases unchanged.
+
+### Affected Files
+`src/fs/chunk.rs`, `src/fs/write.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`,
+`src/types/mod.rs`, `src/vault/mod.rs`
+
