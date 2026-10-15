@@ -110,7 +110,7 @@ Cost: each FUSE write that extends a file re-reads (usually from the chunk cache
   - read path verifies every stored copy before using it: payload CRC32 from `.idx`, vault AEAD, decompressed length and the plaintext's content hash; a damaged copy is rejected (logged and counted), the next indexed copy of the hash is tried, and when none is intact the read fails with EIO, never returning damaged bytes
   - a chunk with no intact copy is marked corrupt (in memory at once, persisted as `CHUNK_FLAG_CORRUPT` on its record by the next sync cycle); the next write of the same content stores a fresh copy instead of deduplicating against it and repoints the record, keeping its refcount, which repairs every file that references the chunk
   - bounded chunk metadata and chunk payload caches
-  - committed metadata read caches (bounded `moka`) for inode and dirent lookups with post-commit invalidation on mutation paths
+  - committed metadata read caches (bounded `moka`, wrapped in `FillCache`) for inode, dirent and chunk-record lookups with post-commit invalidation on mutation paths. A fill takes a ticket (its key stripe's epoch) before reading the store and inserts only if no invalidation of that stripe happened meanwhile, under the stripe lock that invalidation also takes, so a reader racing a commit can never cache the pre-commit value
   - dedup hit/miss counters emitted in write-path debug logs
   - runtime counters for chunk cache hit/miss and read/write byte totals
   - `collect_stats` computes namespace-scoped logical size plus cache/memory/throughput metrics

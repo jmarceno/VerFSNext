@@ -908,3 +908,29 @@ change.
 ### Affected Files
 `src/data/pack.rs`
 
+## B028 - Metadata Cache Fills Could Resurrect Invalidated Values - Oct 15 2026
+
+### Root Cause
+`load_inode_cached`, `load_dirent_cached` and `load_chunk_record` read the
+store on a miss and then inserted the result. Mutations commit and then
+invalidate. A lookup/getattr/read that read the store before a commit and
+inserted after its invalidation cached the old value, and the caches have no
+TTL: a stale inode size made reads stop short, and a stale dirent after
+rename-over-existing served the replaced file. Requests run as independent
+tasks and these paths take no write lock, so the interleaving is legal; the
+window is microseconds (not hit in 9000 stress iterations).
+
+### Fix
+`FillCache` (src/fs/fill_cache.rs) wraps the three caches: 64 striped epochs;
+invalidation bumps the key's stripe epoch under its lock; a fill records the
+epoch before the store read and inserts under the same lock only if it is
+unchanged. `invalidate_all` bumps every stripe. No TTL was added.
+
+### Validation
+Stress scripts (stat during appends, rename-over-existing with concurrent
+lookups) stay clean; mount suite passes. The interleaving itself is closed by
+construction (no deterministic hook).
+
+### Affected Files
+`src/fs/fill_cache.rs`, `src/fs/mod.rs`, `src/fs/chunk.rs`
+

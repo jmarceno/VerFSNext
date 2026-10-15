@@ -30,6 +30,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use fill_cache::FillCache;
 use crate::data::chunker::UltraCdc;
 use crate::data::compress::{compress_parallel, PendingChunk};
 use crate::data::hash::{hash128, hash128_with_domain};
@@ -64,6 +65,7 @@ const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE;
 
 pub mod chunk;
+mod fill_cache;
 pub mod fuse;
 pub mod gc;
 pub mod inode;
@@ -251,11 +253,11 @@ struct FsCore {
     max_extent_len: u64,
     meta: MetaStore,
     packs: Arc<PackStore>,
-    chunk_meta_cache: Cache<[u8; 16], ChunkRecord>,
+    chunk_meta_cache: FillCache<[u8; 16], ChunkRecord>,
     chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
-    inode_cache: Cache<u64, Option<InodeRecord>>,
-    dirent_cache: Cache<DirentCacheKey, Option<DirentRecord>>,
+    inode_cache: FillCache<u64, Option<InodeRecord>>,
+    dirent_cache: FillCache<DirentCacheKey, Option<DirentRecord>>,
     next_handle: AtomicU64,
     last_persisted_active_pack_id: AtomicU64,
     last_persisted_pack_crc32_read_error_count: AtomicU64,
@@ -355,9 +357,7 @@ impl VerFs {
             max_extent_len,
             meta,
             packs,
-            chunk_meta_cache: Cache::builder()
-                .max_capacity(config.metadata_cache_capacity_entries)
-                .build(),
+            chunk_meta_cache: FillCache::new(config.metadata_cache_capacity_entries),
             chunk_data_cache: Cache::builder()
                 .max_capacity(config.chunk_cache_capacity_mb.saturating_mul(1024 * 1024))
                 .weigher(|_k, v: &Arc<Vec<u8>>| v.capacity() as u32)
@@ -366,12 +366,8 @@ impl VerFs {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(60))
                 .build(),
-            inode_cache: Cache::builder()
-                .max_capacity(config.metadata_cache_capacity_entries)
-                .build(),
-            dirent_cache: Cache::builder()
-                .max_capacity(config.metadata_cache_capacity_entries)
-                .build(),
+            inode_cache: FillCache::new(config.metadata_cache_capacity_entries),
+            dirent_cache: FillCache::new(config.metadata_cache_capacity_entries),
             next_handle: AtomicU64::new(1),
             last_persisted_active_pack_id: AtomicU64::new(configured_active_pack_id),
             last_persisted_pack_crc32_read_error_count: AtomicU64::new(
@@ -637,8 +633,9 @@ impl FsCore {
         if let Some(inode) = self.inode_cache.get(&ino) {
             return Ok(inode);
         }
+        let ticket = self.inode_cache.ticket(&ino);
         let inode = self.meta.get_inode(ino)?;
-        self.inode_cache.insert(ino, inode);
+        self.inode_cache.insert_if_current(ino, inode, ticket);
         Ok(inode)
     }
 
@@ -647,6 +644,7 @@ impl FsCore {
         if let Some(dirent) = self.dirent_cache.get(&key) {
             return Ok(dirent);
         }
+        let ticket = self.dirent_cache.ticket(&key);
         let dirent = match self.meta.get_value(&dirent_key(parent, name))? {
             Some(raw) => {
                 let d: DirentRecord = decode_rkyv(&raw)?;
@@ -654,7 +652,7 @@ impl FsCore {
             }
             None => None,
         };
-        self.dirent_cache.insert(key, dirent);
+        self.dirent_cache.insert_if_current(key, dirent, ticket);
         Ok(dirent)
     }
 

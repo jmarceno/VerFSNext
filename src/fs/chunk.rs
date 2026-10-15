@@ -42,6 +42,7 @@ impl FsCore {
             return Ok(cached);
         }
         self.chunk_meta_cache_misses.fetch_add(1, Ordering::Relaxed);
+        let ticket = self.chunk_meta_cache.ticket(&hash);
         let chunk = self.meta.read_txn(|txn| {
             let Some(raw) = txn.get(chunk_key(&hash))? else {
                 return Err(anyhow_errno(
@@ -52,7 +53,7 @@ impl FsCore {
             let chunk: ChunkRecord = decode_rkyv(&raw)?;
             Ok(chunk)
         })?;
-        self.chunk_meta_cache.insert(hash, chunk);
+        self.chunk_meta_cache.insert_if_current(hash, chunk, ticket);
         Ok(chunk)
     }
     /// Returns the plaintext of chunk `hash`, from the chunk cache or the
