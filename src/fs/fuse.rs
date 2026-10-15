@@ -903,9 +903,12 @@ impl VirtualFs for VerFs {
                 .map_err(map_anyhow_to_fuse)?;
         }
         self.core
-            .sync_cycle(!datasync)
+            .sync_durably(datasync)
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(|err| {
+                error!(error = %format!("{err:#}"), datasync, "explicit fsync failed");
+                map_anyhow_to_fuse(err)
+            })
     }
 
     async fn opendir(&self, _uid: u32, _gid: u32, ino: u64, _flags: u32) -> AsyncFusexResult<u64> {
@@ -1009,9 +1012,12 @@ impl VirtualFs for VerFs {
                 .map_err(map_anyhow_to_fuse)?;
         }
         self.core
-            .sync_cycle(!datasync)
+            .sync_durably(datasync)
             .await
-            .map_err(map_anyhow_to_fuse)
+            .map_err(|err| {
+                error!(error = %format!("{err:#}"), datasync, "explicit fsync failed");
+                map_anyhow_to_fuse(err)
+            })
     }
 
     async fn statfs(&self, _uid: u32, _gid: u32, _ino: u64) -> AsyncFusexResult<StatFsParam> {

@@ -1276,6 +1276,21 @@ impl FsCore {
 
 }
 
+impl FsCore {
+    /// Makes every write acknowledged so far durable for an explicit
+    /// fsync/fdatasync/fsyncdir: the packs first, then the metadata WAL
+    /// records that reference them, both synced to disk before returning.
+    /// `data_only` (fdatasync) only relaxes the pack sync to `sync_data`;
+    /// the WAL is always synced, because the inode size, extents and chunk
+    /// records are needed to read the data back.
+    pub(crate) async fn sync_durably(&self, data_only: bool) -> Result<()> {
+        tokio::task::block_in_place(|| {
+            self.packs.sync(!data_only)?;
+            self.meta.flush_wal(true)
+        })
+    }
+}
+
 #[async_trait]
 impl SyncTarget for FsCore {
     async fn sync_cycle(&self, full: bool) -> Result<()> {

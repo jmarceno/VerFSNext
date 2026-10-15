@@ -788,3 +788,28 @@ and all files stay intact after remount.
 `src/fs/chunk.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`, `src/fs/vault.rs`,
 `src/fs/write.rs`, `src/vault/mod.rs`, `src/data/pack.rs`
 
+## B024 - fdatasync Returned Before the Metadata WAL Was on Disk - Oct 15 2026
+
+### Root Cause
+FUSE `fsync`/`fsyncdir` called `sync_cycle(!datasync)`. For `fdatasync`
+(`datasync = true`) that was the periodic, non-full cycle: it synced the packs
+but only handed the WAL prefix to the OS cache, without an fsync. The inode
+size, extents and chunk records needed to read the synced data back were not
+durable when `fdatasync` returned, so a power loss could lose data an
+application had explicitly synced (databases and journals use `fdatasync`).
+The call also ran the idle-GC check of the periodic cycle.
+
+### Fix
+`FsCore::sync_durably(data_only)` serves every explicit sync: packs
+`sync_all` (`sync_data` for `fdatasync`), then `flush_wal(true)`, which writes
+and fsyncs the whole WAL buffer. The periodic cycle and the 250 ms hand-off are
+unchanged. No format change.
+
+### Validation
+Scratch mount: write 3 MB, `fdatasync`, `fsync` on the directory, SIGKILL the
+daemon, remount: the file matches. (Power loss cannot be simulated with OS
+commands; the call chain now ends in a WAL fsync.)
+
+### Affected Files
+`src/fs/mod.rs`, `src/fs/fuse.rs`
+

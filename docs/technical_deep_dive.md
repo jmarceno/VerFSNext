@@ -227,7 +227,7 @@ The ordering now lives in the metadata WAL, similar to ext4 `data=ordered`:
 - The hand-off task (`SyncService`, every 250 ms) syncs the packs from `spawn_blocking` (skipped when nothing new was appended) and then hands the durable prefix of the WAL buffer to the OS. It never syncs while holding the WAL lock, so commits do not wait on the disk.
 - The periodic sync cycle syncs the packs and then hands off only the durable prefix, like the hand-off task. Flushing the whole buffer there would sync packs again under the WAL lock and pause commits every `sync_interval_ms` while writes stream in.
 - A full WAL buffer (4 MiB), WAL rotation, `flush_wal` (full sync cycle, GC rewrite) and `fsync` hand everything off after an inline pack sync if needed.
-- `fsync` still runs a full sync cycle (packs `sync_all`, then WAL `sync_all`), so fsynced data is durable on return.
+- `fsync`, `fdatasync` and `fsyncdir` call `FsCore::sync_durably`: the packs are synced (`sync_all`, or `sync_data` for `fdatasync`), then the whole WAL buffer is written and fsynced, so the data and the metadata needed to read it back are durable on return. Explicit syncs never run GC or the periodic bookkeeping of the sync cycle.
 
 Crash behavior:
 - Power loss: the WAL on disk never references pack data that is not on disk. Un-fsynced work since the last durable WAL write may be lost, as before (the periodic sync cycle never fsynced the WAL).
