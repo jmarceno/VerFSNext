@@ -845,3 +845,32 @@ pack and every file still matches after remount.
 ### Affected Files
 `src/data/pack.rs`
 
+## B026 - Failed Active-Pack Swap Left Appends on a Detached File - Oct 15 2026
+
+### Root Cause
+In-place compaction of the active pack removes the old index, renames the new
+pack over the old one, renames the new index and syncs the directory, and only
+then reopens the active-pack handles. Each step returned early on error. A
+failure after the pack rename (directory sync, index rename, reopen) left the
+active handles on the old, now unlinked pack. The sync loop only logged the
+error, so later writes were appended to and synced on the detached file, and
+WAL records could durably point at bytes absent from the canonical pack: a
+restart would lose those acknowledged writes.
+
+### Fix
+- The replacement handles are opened on the rewritten files before the first
+  destructive step and follow them through the renames.
+- The destructive steps run in `swap_rewritten_pack`; any error there records
+  a swap failure in `PackStore`, and every later append, sync, cutoff and
+  rewrite fails with an explicit error naming it (writes fail with EIO).
+  Restart recovers: startup rebuilds a missing or incomplete index.
+- No format change.
+
+### Validation
+Mount suite without benchmarks (9 tests, including the active-pack compaction
+and compaction-crash tests) passed. The failure path itself needs fault
+injection at the directory-sync/rename steps and was verified by review.
+
+### Affected Files
+`src/data/pack.rs`
+

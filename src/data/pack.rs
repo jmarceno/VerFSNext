@@ -93,6 +93,11 @@ pub struct PackStore {
     /// a reader never pairs an offset from one pack generation with the file
     /// of another.
     swap_lock: RwLock<()>,
+    /// Set when a pack swap failed after its first destructive step. The
+    /// active-pack handles may then point at a file that is no longer the
+    /// canonical pack, so every later append and sync fails until a restart
+    /// recovers the pack and its index from disk.
+    swap_failure: Mutex<Option<String>>,
     index_cache: Cache<(u64, [u8; 16]), PackIndexEntry>,
     pack_file_cache: Cache<u64, Arc<File>>,
     max_pack_size_bytes: u64,
@@ -163,6 +168,7 @@ impl PackStore {
         let store = Self {
             packs_dir: packs_dir.to_path_buf(),
             swap_lock: RwLock::new(()),
+            swap_failure: Mutex::new(None),
             append_watermark: AtomicU64::new(0),
             durable_watermark: AtomicU64::new(0),
             active: Mutex::new(ActivePack {
@@ -186,6 +192,16 @@ impl PackStore {
         Ok(store)
     }
 
+    /// Fails once a pack swap broke the active-pack handles.
+    fn ensure_no_swap_failure(&self) -> Result<()> {
+        match self.swap_failure.lock().as_ref() {
+            Some(reason) => bail!(
+                "pack store stopped accepting writes after a failed pack swap ({reason}); restart the daemon to recover the pack from disk"
+            ),
+            None => Ok(()),
+        }
+    }
+
     pub fn append_chunk_with_crc32(
         &self,
         chunk_hash: [u8; 16],
@@ -195,6 +211,7 @@ impl PackStore {
         payload_crc32: u32,
     ) -> Result<u64> {
         let mut active = self.active.lock();
+        self.ensure_no_swap_failure()?;
         self.make_room(&mut active, Self::record_len(compressed_data.len()))?;
         Self::append_record_locked(
             &self.index_cache,
@@ -223,6 +240,7 @@ impl PackStore {
             .map(|(_, payload)| Self::record_len(payload.len()))
             .sum::<u64>();
         let mut active = self.active.lock();
+        self.ensure_no_swap_failure()?;
         self.make_room(&mut active, group_len)?;
         for (entry, payload) in copies {
             Self::append_record_locked(
@@ -561,6 +579,7 @@ impl PackStore {
     pub fn sync(&self, full: bool) -> Result<()> {
         let (watermark, file, index_file) = {
             let mut active = self.active.lock();
+            self.ensure_no_swap_failure()?;
             Self::flush_pending_index(&mut active)?;
             (
                 self.append_watermark.load(Ordering::Acquire),
@@ -875,6 +894,7 @@ impl PackStore {
     /// cover it.
     pub fn active_pack_cutoff(&self, pack_id: u64) -> Result<Option<u64>> {
         let mut active = self.active.lock();
+        self.ensure_no_swap_failure()?;
         if active.pack_id != pack_id {
             return Ok(None);
         }
@@ -905,13 +925,17 @@ impl PackStore {
     /// continue against the current file. The swap is crash-safe: the old
     /// index is removed before the new pack is renamed into place, so a crash
     /// between the renames leaves a pack without an index, which startup
-    /// rebuilds from the pack itself.
+    /// rebuilds from the pack itself. The active pack's replacement handles
+    /// are opened before the swap; if any swap step fails, the store refuses
+    /// further appends and syncs instead of writing through handles that may
+    /// be detached from the canonical pack.
     pub fn rewrite_pack_with_live_hashes(
         &self,
         pack_id: u64,
         live_hashes: &HashSet<[u8; 16]>,
         cutoff: Option<u64>,
     ) -> Result<()> {
+        self.ensure_no_swap_failure()?;
         let src_pack_path = self.pack_path(pack_id);
         if !src_pack_path.exists() {
             return Ok(());
@@ -1160,52 +1184,55 @@ impl PackStore {
         let pack_dir = src_pack_path
             .parent()
             .context("pack path has no parent directory")?;
+        // The handles that continue appending to a compacted active pack are
+        // opened on the new files before anything is replaced; they follow
+        // the files through the renames below.
+        let replacement_handles = match active.as_ref() {
+            Some(_) => Some((
+                OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&tmp_pack_path)
+                    .with_context(|| {
+                        format!("failed to open compacted pack {}", tmp_pack_path.display())
+                    })?,
+                OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&tmp_idx_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to open compacted pack index {}",
+                            tmp_idx_path.display()
+                        )
+                    })?,
+            )),
+            None => None,
+        };
         let _swap_guard = self.swap_lock.write();
-        match std::fs::remove_file(&src_idx_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to remove old pack index {}", src_idx_path.display())
-                });
-            }
+        let swap_result = Self::swap_rewritten_pack(
+            pack_dir,
+            &src_pack_path,
+            &src_idx_path,
+            &tmp_pack_path,
+            &tmp_idx_path,
+        );
+        if let Err(err) = swap_result {
+            // The old index is already gone and the pack may already be
+            // replaced, so the active handles can no longer be trusted.
+            let reason = format!("{err:#}");
+            tracing::error!(
+                pack_id,
+                error = %reason,
+                "pack swap failed after its first destructive step; refusing further pack writes"
+            );
+            *self.swap_failure.lock() = Some(reason);
+            return Err(err);
         }
-        sync_dir(pack_dir)?;
-        std::fs::rename(&tmp_pack_path, &src_pack_path).with_context(|| {
-            format!(
-                "failed to atomically replace pack {} with {}",
-                src_pack_path.display(),
-                tmp_pack_path.display()
-            )
-        })?;
-        sync_dir(pack_dir)?;
-        std::fs::rename(&tmp_idx_path, &src_idx_path).with_context(|| {
-            format!(
-                "failed to atomically replace pack index {} with {}",
-                src_idx_path.display(),
-                tmp_idx_path.display()
-            )
-        })?;
-        sync_dir(pack_dir)?;
 
-        if let Some(active) = active.as_mut() {
-            active.file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&src_pack_path)
-                .with_context(|| {
-                    format!("failed to reopen compacted pack {}", src_pack_path.display())
-                })?;
-            active.index_file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&src_idx_path)
-                .with_context(|| {
-                    format!(
-                        "failed to reopen compacted pack index {}",
-                        src_idx_path.display()
-                    )
-                })?;
+        if let (Some(active), Some((file, index_file))) = (active.as_mut(), replacement_handles) {
+            active.file = file;
+            active.index_file = index_file;
             active.size_bytes = new_size;
         }
         tracing::info!(
@@ -1223,6 +1250,45 @@ impl PackStore {
         self.pack_file_cache.invalidate(&pack_id);
         self.prime_index_cache(pack_id)?;
         Ok(())
+    }
+
+    /// Replaces a pack and its index with their rewritten versions: removes
+    /// the old index, renames the pack, renames the index, and syncs the
+    /// directory after each step, so a crash leaves at most a pack without
+    /// an index, which startup rebuilds.
+    fn swap_rewritten_pack(
+        pack_dir: &Path,
+        src_pack_path: &Path,
+        src_idx_path: &Path,
+        tmp_pack_path: &Path,
+        tmp_idx_path: &Path,
+    ) -> Result<()> {
+        match std::fs::remove_file(src_idx_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to remove old pack index {}", src_idx_path.display())
+                });
+            }
+        }
+        sync_dir(pack_dir)?;
+        std::fs::rename(tmp_pack_path, src_pack_path).with_context(|| {
+            format!(
+                "failed to atomically replace pack {} with {}",
+                src_pack_path.display(),
+                tmp_pack_path.display()
+            )
+        })?;
+        sync_dir(pack_dir)?;
+        std::fs::rename(tmp_idx_path, src_idx_path).with_context(|| {
+            format!(
+                "failed to atomically replace pack index {} with {}",
+                src_idx_path.display(),
+                tmp_idx_path.display()
+            )
+        })?;
+        sync_dir(pack_dir)
     }
 
     /// Copies the records in `[from, to)` of a pack being rewritten unchanged
