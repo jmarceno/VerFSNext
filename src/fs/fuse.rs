@@ -574,9 +574,28 @@ impl VirtualFs for VerFs {
 
                     txn.set(inode_key(source.ino), encode_rkyv(&source_inode)?)?;
                     txn.set(inode_key(target.ino), encode_rkyv(&target_inode)?)?;
-                    FsCore::touch_parent_inode_in_txn(txn, param.old_parent, 0, sec, nsec)?;
                     if param.old_parent != param.new_parent {
-                        FsCore::touch_parent_inode_in_txn(txn, param.new_parent, 0, sec, nsec)?;
+                        // A directory's ".." links its parent: the parent that
+                        // receives a directory in exchange for a non-directory
+                        // gains a link, the other one loses it.
+                        let old_parent_delta = i32::from(target_inode.kind == INODE_KIND_DIR)
+                            - i32::from(source_is_dir);
+                        FsCore::touch_parent_inode_in_txn(
+                            txn,
+                            param.old_parent,
+                            old_parent_delta,
+                            sec,
+                            nsec,
+                        )?;
+                        FsCore::touch_parent_inode_in_txn(
+                            txn,
+                            param.new_parent,
+                            -old_parent_delta,
+                            sec,
+                            nsec,
+                        )?;
+                    } else {
+                        FsCore::touch_parent_inode_in_txn(txn, param.old_parent, 0, sec, nsec)?;
                     }
                     return Ok(());
                 }

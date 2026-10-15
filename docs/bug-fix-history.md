@@ -984,3 +984,22 @@ matches after remount. Power loss itself cannot be simulated with OS commands.
 ### Affected Files
 `src/data/pack.rs`
 
+## B031 - RENAME_EXCHANGE Left Parent Directory Link Counts Wrong - Oct 15 2026
+
+### Root Cause
+The exchange branch of `rename` updated the moved inodes' parents but touched
+both parent directories with an nlink delta of 0. Exchanging a directory with
+a non-directory across parents left the losing parent one link too high and
+the receiving parent one too low (reproduced: xa 3/xb 2 instead of 2/3).
+
+### Fix
+When the parents differ, the old parent's delta is (target is dir) - (source
+is dir) and the new parent gets the opposite.
+
+### Validation
+renameat2(RENAME_EXCHANGE) of xa/sub (dir) with xb/file and back: nlinks
+2/3 and then 3/2 as expected.
+
+### Affected Files
+`src/fs/fuse.rs`
+
