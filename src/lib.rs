@@ -1046,7 +1046,8 @@ async fn run_snapshot_via_metadata(config: &Config, cmd: &SnapshotCommand) -> Re
             }
             Ok(())
         }
-        SnapshotCommand::Delete(name) => snapshots.delete(name).await,
+        // Offline: nothing is mounted, so no file can be referenced.
+        SnapshotCommand::Delete(name) => snapshots.delete(name, |_| false).await,
     };
     let close_result = meta.close().await;
 

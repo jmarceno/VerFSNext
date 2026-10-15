@@ -184,6 +184,8 @@ Cost: each FUSE write that extends a file re-reads (usually from the chunk cache
 - `src/snapshot/mod.rs`
   - Snapshot create/list/delete workflows over metadata
   - recursive tree cloning excluding `/.snapshots` subtree
+  - hard links are preserved: an inode reached through several names is cloned once, and every further name becomes a dirent to that clone (its nlink counts the cloned names); delete handles each inode once
+  - delete keeps a snapshot file that is still referenced (open handle or kernel lookup) as an orphan (nlink 0, orphan record, extents and chunk refs kept), like an unlinked open file; release/forget run the final delete and startup reclaims leftovers. Offline delete (nothing mounted) removes everything
   - chunk refcount delta handling on create/delete
 
 - `src/gc/mod.rs`

@@ -487,7 +487,9 @@ impl VerFs {
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
         let _guard = self.core.write_lock.write().await;
         let snapshots = SnapshotManager::new(&self.core.meta);
-        snapshots.delete(name).await?;
+        snapshots
+            .delete(name, |ino| self.core.inode_referenced(ino))
+            .await?;
         self.core.invalidate_metadata_caches_all();
         self.core.mark_namespace_mutation().await;
         if let Ok(Some(snapshots_dir)) = self

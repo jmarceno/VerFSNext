@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
@@ -8,7 +8,7 @@ use verfsnext_surrealkv::LSMIterator;
 use crate::meta::MetaStore;
 use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_snapshot_name, dirent_key, dirent_prefix,
-    encode_rkyv, extent_prefix, inode_key, prefix_end, snapshot_key, snapshot_prefix,
+    encode_rkyv, extent_prefix, inode_key, orphan_key, prefix_end, snapshot_key, snapshot_prefix,
     symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
     DirentRecord, ExtentRecord, InodeRecord, SnapshotRecord, INODE_FLAG_READONLY, INODE_KIND_DIR,
     INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE, SNAPSHOTS_DIR_NAME,
@@ -87,12 +87,14 @@ impl<'a> SnapshotManager<'a> {
                     })?,
                 )?;
 
+                let mut cloned_links = HashMap::<u64, u64>::new();
                 clone_dir_children(
                     txn,
                     ROOT_INODE,
                     snap_root_ino,
                     &mut next_inode,
                     &mut ref_deltas,
+                    &mut cloned_links,
                     true,
                 )?;
 
@@ -115,7 +117,11 @@ impl<'a> SnapshotManager<'a> {
             .await
     }
 
-    pub async fn delete(&self, name: &str) -> Result<()> {
+    /// Deletes snapshot `name`. A file of the snapshot for which `referenced`
+    /// is true (open handles or kernel lookups) loses its name but keeps its
+    /// inode and data as an orphan, like an unlinked open file; its final
+    /// delete runs when the last reference goes away, or at the next start.
+    pub async fn delete(&self, name: &str, referenced: impl Fn(u64) -> bool) -> Result<()> {
         validate_snapshot_name(name)?;
 
         self.meta
@@ -132,7 +138,14 @@ impl<'a> SnapshotManager<'a> {
                 let snapshot_dirent: DirentRecord = decode_rkyv(&snapshot_dirent_raw)?;
 
                 let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-                remove_snapshot_subtree(txn, snapshot_dirent.ino, &mut ref_deltas)?;
+                let mut visited = HashSet::<u64>::new();
+                remove_snapshot_subtree(
+                    txn,
+                    snapshot_dirent.ino,
+                    &mut ref_deltas,
+                    &mut visited,
+                    &referenced,
+                )?;
                 apply_ref_deltas_in_txn(txn, &ref_deltas)?;
 
                 txn.delete(dirent_key(snapshots_dir, name.as_bytes()))?;
@@ -213,11 +226,28 @@ fn clone_dir_children(
     dst_dir_ino: u64,
     next_inode: &mut u64,
     ref_deltas: &mut HashMap<[u8; 16], i64>,
+    cloned_links: &mut HashMap<u64, u64>,
     src_is_root: bool,
 ) -> Result<()> {
     let entries = list_dirents(txn, src_dir_ino)?;
     for (name_bytes, dirent) in entries {
         if src_is_root && name_bytes == SNAPSHOTS_DIR_NAME.as_bytes() {
+            continue;
+        }
+
+        // A hard-linked file already cloned under another name gets only a
+        // dirent to that clone, which counts one more link.
+        if let Some(dst_ino) = cloned_links.get(&dirent.ino).copied() {
+            let mut dst_inode = load_inode(txn, dst_ino, "snapshot hard link clone")?;
+            dst_inode.nlink += 1;
+            txn.set(inode_key(dst_ino), encode_rkyv(&dst_inode)?)?;
+            txn.set(
+                dirent_key(dst_dir_ino, &name_bytes),
+                encode_rkyv(&DirentRecord {
+                    ino: dst_ino,
+                    kind: dst_inode.kind,
+                })?,
+            )?;
             continue;
         }
 
@@ -227,6 +257,13 @@ fn clone_dir_children(
         dst_inode.ino = dst_ino;
         dst_inode.parent = dst_dir_ino;
         dst_inode.flags |= INODE_FLAG_READONLY;
+        if src_inode.kind != INODE_KIND_DIR {
+            // Links are counted as the snapshot's names are cloned.
+            dst_inode.nlink = 1;
+            if src_inode.nlink > 1 {
+                cloned_links.insert(src_inode.ino, dst_ino);
+            }
+        }
 
         txn.set(inode_key(dst_ino), encode_rkyv(&dst_inode)?)?;
         txn.set(
@@ -241,7 +278,15 @@ fn clone_dir_children(
 
         match src_inode.kind {
             INODE_KIND_DIR => {
-                clone_dir_children(txn, src_inode.ino, dst_ino, next_inode, ref_deltas, false)?;
+                clone_dir_children(
+                    txn,
+                    src_inode.ino,
+                    dst_ino,
+                    next_inode,
+                    ref_deltas,
+                    cloned_links,
+                    false,
+                )?;
             }
             INODE_KIND_FILE => {
                 clone_file_extents(txn, src_inode.ino, dst_ino, ref_deltas)?;
@@ -307,19 +352,32 @@ fn clone_file_extents(
     Ok(())
 }
 
+/// Removes the subtree rooted at `ino`. Each inode is handled once even when
+/// several names (hard links) reach it. A non-directory inode that is still
+/// `referenced` is kept with nlink 0 and an orphan record instead.
 fn remove_snapshot_subtree(
     txn: &mut verfsnext_surrealkv::Transaction,
     ino: u64,
     ref_deltas: &mut HashMap<[u8; 16], i64>,
+    visited: &mut HashSet<u64>,
+    referenced: &impl Fn(u64) -> bool,
 ) -> Result<()> {
-    let inode = load_inode(txn, ino, "snapshot delete")?;
+    if !visited.insert(ino) {
+        return Ok(());
+    }
+    let mut inode = load_inode(txn, ino, "snapshot delete")?;
 
     if inode.kind == INODE_KIND_DIR {
         let children = list_dirents(txn, ino)?;
         for (name, dirent) in children {
-            remove_snapshot_subtree(txn, dirent.ino, ref_deltas)?;
+            remove_snapshot_subtree(txn, dirent.ino, ref_deltas, visited, referenced)?;
             txn.delete(dirent_key(ino, &name))?;
         }
+    } else if referenced(ino) {
+        inode.nlink = 0;
+        txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
+        txn.set(orphan_key(ino), Vec::new())?;
+        return Ok(());
     }
 
     let xattr_prefix_bytes = xattr_prefix(ino);

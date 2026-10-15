@@ -934,3 +934,32 @@ construction (no deterministic hook).
 ### Affected Files
 `src/fs/fill_cache.rs`, `src/fs/mod.rs`, `src/fs/chunk.rs`
 
+## B029 - Snapshot Delete Broke Open Files; Snapshots Split Hard Links - Oct 15 2026
+
+### Root Cause
+- `remove_snapshot_subtree` hard-deleted every inode and its extents and
+  dropped the chunk refcounts, ignoring open handles and kernel lookups. A
+  file open inside a snapshot failed with ENOENT on read and fstat right after
+  `snapshot delete` (reproduced), and GC could then reclaim its chunks.
+- `clone_dir_children` cloned every dirent as a new inode with the source
+  nlink: a hard-linked file became N separate inodes, each claiming nlink N.
+
+### Fix
+- Delete takes a `referenced` predicate (`inode_referenced` when mounted,
+  always false offline). A referenced file keeps its inode and data with
+  nlink 0 and an orphan record, and the existing release/forget/startup paths
+  finish it. Every inode is processed once.
+- Create maps source inode -> clone for hard-linked files; further names get a
+  dirent to the clone and bump its nlink. No format change; older snapshots
+  stay split.
+
+### Validation
+Scratch mount: three names of one file appear in the snapshot as one inode
+with nlink 3. A snapshot file opened before `snapshot delete` reads back in
+full through the open fd (fstat nlink 0); metadata consistency stays ok after
+close, after remount, and after deleting a second hard-link snapshot and the
+source files.
+
+### Affected Files
+`src/snapshot/mod.rs`, `src/fs/mod.rs`, `src/lib.rs`
+
