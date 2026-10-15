@@ -864,7 +864,7 @@ fn format_stats_report(stats: &VerFsStats) -> String {
         (
             "Pack CRC32 Read Errors".to_owned(),
             stats.pack_crc32_read_error_count.to_string(),
-            "read-time checksum mismatches (read continues)".to_owned(),
+            "damaged stored copies rejected on read (read fails with EIO when no intact copy exists)".to_owned(),
         ),
         (
             "Metadata Size".to_owned(),
