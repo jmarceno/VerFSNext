@@ -820,12 +820,21 @@ impl PackStore {
 
     /// Restores the append invariants of the active pack after an unclean stop.
     ///
-    /// A record cut short at the end of the pack was never committed, because
-    /// payloads are synced before metadata points at them, so it is truncated.
-    /// Left in place, the next append would land after the fragment and every
-    /// later record would be unreachable for the sequential scanners (GC
-    /// rewrite, index rebuild). An index that no longer matches the repaired
-    /// pack is rebuilt by `ensure_index_covers_pack`.
+    /// Payloads are synced before metadata points at them, and a successful
+    /// sync makes every byte up to the pack's length durable. After a power
+    /// loss, bytes past the last sync may be missing, zeroed (ext4 committed
+    /// the new size but not the data block) or torn, so the first header that
+    /// is not a whole record marks the start of a tail nothing committed
+    /// references. It is cut there. Left in place, the next append would land
+    /// after it and every later record would be unreachable for the
+    /// sequential scanners (GC rewrite, index rebuild), and startup would fail.
+    ///
+    /// Non-zero bytes are kept in `<pack>.tail-<millis>` before the cut. A
+    /// record header found after the damaged offset means the damage may not
+    /// be a power-loss tail (for example bit rot inside synced records), so it
+    /// is reported as an error; reads of any chunk that was lost fail and the
+    /// records check names the files. An index that no longer matches the
+    /// repaired pack is rebuilt by `ensure_index_covers_pack`.
     fn repair_active_pack_tail(packs_dir: &Path, pack_id: u64) -> Result<()> {
         let path = Self::pack_path_impl(packs_dir, pack_id);
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
@@ -846,38 +855,83 @@ impl PackStore {
             let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
             file.read_exact_at(raw_header.as_mut_slice(), valid_end)
                 .with_context(|| format!("failed to scan active pack {}", path.display()))?;
-            let header = Self::decode_pack_header(raw_header.as_slice())?;
-            if header.magic != RECORD_MAGIC {
-                bail!(
-                    "corrupt pack record magic at offset {} in {}",
-                    valid_end,
-                    path.display()
-                );
-            }
-            let record_end = valid_end
-                .checked_add(RECORD_HEADER_LEN_U64)
-                .and_then(|v| v.checked_add(header.compressed_len as u64))
-                .context("pack offset overflow while scanning active pack")?;
-            if record_end > pack_len {
+            let Some(record_end) = Self::whole_record_end(raw_header.as_slice(), valid_end, pack_len)
+            else {
                 break;
-            }
+            };
             valid_end = record_end;
         }
+        if valid_end == pack_len {
+            return Ok(());
+        }
 
-        if valid_end < pack_len {
+        let mut tail = vec![0_u8; (pack_len - valid_end) as usize];
+        file.read_exact_at(&mut tail, valid_end)
+            .with_context(|| format!("failed to read the tail of active pack {}", path.display()))?;
+        let headers_after = tail
+            .windows(RECORD_MAGIC.len())
+            .skip(1)
+            .filter(|window| *window == RECORD_MAGIC)
+            .count();
+        let kept = if tail.iter().any(|byte| *byte != 0) {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("system clock before 1970")?
+                .as_millis();
+            let mut name = path.as_os_str().to_owned();
+            name.push(format!(".tail-{millis}"));
+            let kept_path = PathBuf::from(name);
+            let mut kept_file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&kept_path)
+                .with_context(|| format!("failed to create {}", kept_path.display()))?;
+            kept_file
+                .write_all(&tail)
+                .and_then(|()| kept_file.sync_all())
+                .with_context(|| format!("failed to write {}", kept_path.display()))?;
+            sync_dir(path.parent().context("pack path has no parent directory")?)?;
+            Some(kept_path)
+        } else {
+            None
+        };
+        if headers_after > 0 {
+            tracing::error!(
+                pack = %path.display(),
+                pack_len,
+                valid_end,
+                headers_after,
+                kept = ?kept,
+                "active pack is damaged before record headers; cutting it at the damage"
+            );
+        } else {
             tracing::warn!(
                 pack = %path.display(),
                 pack_len,
                 valid_end,
-                "truncating incomplete record at the end of the active pack"
+                kept = ?kept,
+                "cutting a torn or zeroed tail off the active pack"
             );
-            file.set_len(valid_end)
-                .with_context(|| format!("failed to truncate active pack {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("failed to sync active pack {}", path.display()))?;
         }
-
+        file.set_len(valid_end)
+            .with_context(|| format!("failed to truncate active pack {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync active pack {}", path.display()))?;
         Ok(())
+    }
+
+    /// End of the record whose header is `raw_header` at `offset`, when that
+    /// header decodes, carries the record magic and the whole record fits in
+    /// `pack_len`.
+    fn whole_record_end(raw_header: &[u8], offset: u64, pack_len: u64) -> Option<u64> {
+        let header = Self::decode_pack_header(raw_header).ok()?;
+        if header.magic != RECORD_MAGIC {
+            return None;
+        }
+        offset
+            .checked_add(RECORD_HEADER_LEN_U64)?
+            .checked_add(header.compressed_len as u64)
+            .filter(|end| *end <= pack_len)
     }
 
     fn read_index_entries_at(path: &Path) -> Result<Vec<([u8; 16], PackIndexEntry)>> {

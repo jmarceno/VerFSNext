@@ -1159,3 +1159,35 @@ unknown-opcode path previously only logged and dropped the buffer.
 
 ### Affected Files
 `crates/verfsnext-async-fusex/src/session.rs`
+
+## B035 - A Zeroed Active-Pack Tail After Power Loss Prevented Startup - Oct 16 2026
+
+### Root Cause
+Found by the power-cut harness (docs/powercut-test.md), on the pre-B033 binary and
+again on HEAD 84d20a4. After a power cut the active pack ended in 1,594 zero bytes
+up to a 4 KiB boundary: ext4 had committed the larger file size, but the last
+partially written data block never reached disk, the same shape as B033's WAL tail.
+`repair_active_pack_tail` only truncated a record cut short at the end; on a header
+without the record magic it bailed, so startup failed with "corrupt pack record
+magic" and the filesystem could not be mounted until the pack was cut by hand.
+
+### Fix
+A successful pack sync makes every byte up to that length durable, and payloads are
+synced before metadata points at them, so after a power loss every missing, zeroed
+or torn byte lies past the last sync and nothing committed references it.
+`repair_active_pack_tail` now cuts the pack at the first header that is not a whole
+record (undecodable, wrong magic, or running past the end), fsyncs it, and logs a
+WARN. Non-zero cut bytes are first kept in `<pack>.vpk.tail-<millis>` (synced,
+ignored by pack listing). If a record header appears after the damaged offset, the
+damage may not be a power-loss tail (bit rot inside synced records), so the cut is
+logged as an ERROR: reads of any chunk that was lost fail with EIO, mark it corrupt,
+and the records check names the files. No format change.
+
+### Validation
+- VM reproduction: 20 files of 300 KB, directory fsync, `kill -9`, active pack padded
+  with zeros to the next 4 KiB boundary. HEAD 84d20a4: "corrupt pack record magic at
+  offset 5660793", no mount. Fixed: mounts, all 20 files match.
+- Power-cut harness run with all faults (see docs/powercut-test.md, run history).
+
+### Affected Files
+`src/data/pack.rs`
