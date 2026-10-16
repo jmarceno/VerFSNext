@@ -331,6 +331,5 @@ power loss, a Proxmox kernel crash, storage-controller failure, injected bit rot
 ENOSPC, a forced OOM, or production-scale timing. No physical host or other guest is
 rebooted by the harness. Because `pct stop` keeps the host page cache, data that was
 written but never fsynced survives it; a missing `fsync` in VerFSNext's own write path
-can therefore pass here. Validating that requires a VM whose virtual disk drops
-unflushed writes (for example QEMU with `cache=unsafe` killed abruptly, or
-`dm-log-writes` replay).
+can therefore pass here. B024, B030 and B033 did. Power loss is covered by the
+`dm-log-writes` replay harness in a VM: see [Power-cut crash-consistency test](powercut-test.md).

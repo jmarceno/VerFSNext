@@ -426,6 +426,14 @@ snapshots, vault data, and idle GC windows. It freezes the test guest and preser
 on failure. See [Detached LXC resilience test](resilience-test.md) for its durability
 oracle, deployed resource limits, evidence, operating commands, and coverage limits.
 
+That harness cannot lose unflushed writes: the Proxmox kernel keeps its page cache
+across process kills and container stops. Power loss is tested separately in a VM by
+`scripts/powercut/`: the data filesystem sits on `dm-log-writes`, and crash images are
+rebuilt at sampled log positions with every write after the last flush kept, dropped
+or torn. The daemon must recover each image with every fsync-acknowledged operation
+intact, survive a second crash after recovery, and survive a second recorded power cut
+during recovery. See [Power-cut crash-consistency test](powercut-test.md).
+
 Normal mount shutdown first runs `syncfs` on the mount while requests are still
 served, so pages held by the kernel writeback cache reach the filesystem. It then
 closes the FUSE request gate and waits for admitted requests to finish; requests

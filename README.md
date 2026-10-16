@@ -345,6 +345,7 @@ storage engine together as the project evolves.
 - [Technical deep dive](docs/technical_deep_dive.md) — storage layout, write and read paths, snapshots, vault, garbage collection, and the desktop architecture.
 - [Bug-fix history](docs/bug-fix-history.md) — fixes, their impact, and regression context.
 - [Resilience validation](docs/resilience-test.md) — workload and fault-injection procedures, scope, and recorded results.
+- [Power-cut test](docs/powercut-test.md) — crash images rebuilt from a block-level write log, checked against fsync-acknowledged operations.
 - [Configuration example](config.toml) — annotated storage, cache, FUSE, and vault settings.
 - Releases — run the `release` workflow from the Gitea Actions tab. It picks the version (`Cargo.toml` when newer than every release tag, otherwise the latest tag with the patch bumped), builds the desktop and headless binaries on Ubuntu 22.04, publishes them with tag `v<version>` on the dispatched commit, and copies the release to GitHub (Gitea user secret `GH_RELEASE_TOKEN`).
 
