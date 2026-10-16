@@ -174,6 +174,7 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - the two device reader threads read requests and spawn each one as its own tokio task, so a write waiting on its commit never blocks lookups, getattrs, readdirs or reads queued behind it (previously each reader `block_on`-ed its request, so two slow writes stalled every other request, e.g. a file manager's UI)
   - `max_background` is 32 (congestion threshold 24): up to 32 writeback writes are in flight and can join one group commit; the request buffer pool holds 16 more buffers than that so foreground requests always find one
   - each in-flight request holds an owned admission on the request gate; shutdown waits until every spawned request has replied
+  - `Session::run` holds a buffer-pool receiver until that drain finishes: readers return at the closed gate and drop theirs, so admitted requests still return their buffers to an open pool (B034)
   - exposes `Session::notifier()` returning a cloneable session notifier handle
   - notifier supports kernel invalidations for inode attrs and directory entries (`invalidate_inode`, `invalidate_entry`)
   - notify writes are serialized through a mutex-protected FUSE device clone and use FUSE notify message framing with `unique = 0`
@@ -436,7 +437,8 @@ during recovery. See [Power-cut crash-consistency test](powercut-test.md).
 
 Normal mount shutdown first runs `syncfs` on the mount while requests are still
 served, so pages held by the kernel writeback cache reach the filesystem. It then
-closes the FUSE request gate and waits for admitted requests to finish; requests
+closes the FUSE request gate and waits for admitted requests to finish (the
+request buffer pool stays open until they have returned their buffers); requests
 read after that are left unanswered and fail with `ECONNABORTED` when the daemon
 releases the device, never with `EIO` from a closed metadata store. Only then does
 it drain writes, sync packs and metadata, and explicitly detach the mount. Root uses `MNT_DETACH`,

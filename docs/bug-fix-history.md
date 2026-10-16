@@ -1119,3 +1119,43 @@ restart: the pre-fix binary returns mismatching content.
 `src/fs/mod.rs`, `src/control.rs`, `src/lib.rs`, `src/gui/controller.rs`,
 `qml/RecordsReport.qml`, `qml/RecordsFileRow.qml`, `qml/StatTile.qml`,
 `qml/OverviewPage.qml`
+
+## B034 - Graceful Shutdown Panicked When an Admitted Request Returned Its Buffer - Oct 16 2026
+
+### Root Cause
+Found by the power-cut harness, which SIGTERMs the daemon while workers run
+fsync-heavy POSIX ops:
+`panicked at crates/verfsnext-async-fusex/src/session.rs:426:9: failed to put
+the buffer back to buffer pool ... sending on a disconnected channel`.
+
+`Session::run` dropped its pool receiver right after spawning the two device
+reader threads, so the readers held the only receivers. Once shutdown closed the
+request gate (B012/B016), each reader that read one more request returned at the
+gate and dropped its receiver, while `close_and_drain` was still waiting for
+admitted requests (e.g. an `fsync` inside `sync_durably` /
+`rewrite_pack_durably`). Those requests replied, then sent their buffer back to
+a pool with no receivers and panicked. The reply had already been sent and the
+`Admission` was released while unwinding, so the drain finished, the process
+exited 0 and no acknowledged data was lost; the panic was still a shutdown-path
+failure.
+
+### Fix
+`Session::run` keeps its pool receiver until `close_and_drain` has returned, so
+the pool stays open for every admitted request and is dropped only after the
+last one returned its buffer. Both buffer returns in `process_fuse_request`
+(normal reply and unknown-opcode `ENOSYS` reply) go through `return_buffer`,
+which panics on a closed pool: that is now a broken invariant. The
+unknown-opcode path previously only logged and dropped the buffer.
+
+### Validation
+- Scratch mount, 12 concurrent workers (`dd conv=fsync`, `os.fsync`, `mv`),
+  SIGTERM after 1–3 s, repeated: pre-fix binary panicked in 8/10 runs, fixed
+  binary 0/30, all exits 0.
+- Mount suite (`rsync_integration`, benches skipped, test binary built with
+  `cargo remote` and run locally because the builder has no `/dev/fuse`): 9/9
+  passed.
+- `cargo remote -h -- test --profile headless --no-default-features`: all
+  passed.
+
+### Affected Files
+`crates/verfsnext-async-fusex/src/session.rs`
