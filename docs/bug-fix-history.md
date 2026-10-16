@@ -1191,3 +1191,27 @@ and the records check names the files. No format change.
 
 ### Affected Files
 `src/data/pack.rs`
+
+## B036 - Records Report Rows Were Blank and Their Buttons Did Nothing - Oct 16 2026
+
+### Symptom
+The "Records & data health" dialog said "1 file lost data" but the row under it had no
+path or details, and "Show in folder" / "Move to lost+found" did nothing when clicked.
+There was also no visible result after any move or delete.
+
+### Root Cause
+`RecordsFileRow` declares `required` properties, so Qt 6 stops injecting `modelData`
+into Repeater delegates. The `entry: modelData` binding resolved to `undefined`, every
+label binding threw, and the button handlers threw on click. Separately, the result
+toast lives in the window, below the dialog's modal overlay, so it was never seen.
+
+### Fix
+The row takes its data as `required property var modelData`, which the Repeater fills.
+The dialog shows the running operation and the last move/delete result (errors in red)
+next to the Re-check button.
+
+### Validation
+Release build; checked in the desktop app against the live mount.
+
+### Affected Files
+`qml/RecordsFileRow.qml`, `qml/RecordsReport.qml`

@@ -66,8 +66,23 @@ Popup {
     padding: 24
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
+    /// Result of the last move or delete, shown inside the dialog because
+    /// the window toast sits under this modal popup.
+    property string feedback: ""
+    property bool feedbackError: false
+
+    Connections {
+        target: root.controller
+        enabled: root.opened
+        function onToast_serialChanged() {
+            root.feedback = root.controller.toast
+            root.feedbackError = root.controller.toast_error
+        }
+    }
+
     onOpened: root.controller.checkRecords()
     onClosed: {
+        root.feedback = ""
         moveConfirm.close()
         deleteConfirm.close()
     }
@@ -226,7 +241,6 @@ Popup {
                     model: root.awaitingFiles
                     delegate: RecordsFileRow {
                         controller: root.controller
-                        entry: modelData
                         blockedReason: root.blockedReason(modelData.path)
                         movable: blockedReason === ""
                         problemText: "lost"
@@ -264,7 +278,6 @@ Popup {
                     model: root.parkedFiles
                     delegate: RecordsFileRow {
                         controller: root.controller
-                        entry: modelData
                         blockedReason: root.blockedReason(modelData.path)
                         problemText: "lost"
                     }
@@ -312,7 +325,6 @@ Popup {
                     model: root.damagedFiles
                     delegate: RecordsFileRow {
                         controller: root.controller
-                        entry: modelData
                         movable: true
                     }
                 }
@@ -342,7 +354,6 @@ Popup {
                     model: root.driftedFiles
                     delegate: RecordsFileRow {
                         controller: root.controller
-                        entry: modelData
                         problemText: "affected"
                     }
                 }
@@ -395,7 +406,14 @@ Popup {
                 enabled: !root.controller.records_loading
                 onClicked: root.controller.checkRecords()
             }
-            Item { Layout.fillWidth: true }
+            Spinner { visible: root.controller.busy }
+            Label {
+                Layout.fillWidth: true
+                text: root.controller.busy ? root.controller.busy_text : root.feedback
+                color: !root.controller.busy && root.feedbackError ? theme.danger : theme.textSecondary
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
             TealButton {
                 text: "Close"
                 primary: false

@@ -7,7 +7,7 @@ Rectangle {
     id: root
     readonly property VerfsTheme theme: VerfsTheme {}
     required property var controller
-    required property var entry
+    required property var modelData
     /// Shows the "Move to lost+found" action for files still in their place.
     property bool movable: false
     /// Why the file cannot be moved, shown instead of the action.
@@ -16,7 +16,7 @@ Rectangle {
     property string problemText: "damaged"
 
     function parentFolder() {
-        const path = root.entry.path
+        const path = root.modelData.path
         if (path === null)
             return root.controller.mount_point
         const cut = path.lastIndexOf("/")
@@ -40,10 +40,10 @@ Rectangle {
 
         Label {
             Layout.fillWidth: true
-            text: root.entry.path === null
-                  ? "File without a folder entry (inode " + root.entry.ino + ")"
-                  : "/" + root.entry.path
-            color: root.entry.path === null ? theme.textMuted : theme.textPrimary
+            text: root.modelData.path === null
+                  ? "File without a folder entry (inode " + root.modelData.ino + ")"
+                  : "/" + root.modelData.path
+            color: root.modelData.path === null ? theme.textMuted : theme.textPrimary
             font.pixelSize: 13
             font.family: "monospace"
             elide: Text.ElideMiddle
@@ -51,9 +51,9 @@ Rectangle {
 
         Label {
             Layout.fillWidth: true
-            text: theme.bytes(root.entry.size_bytes) + " · " + root.entry.pieces + " "
-                  + root.problemText + (root.entry.pieces === 1 ? " piece" : " pieces")
-                  + " · first at byte " + root.entry.first_offset
+            text: theme.bytes(root.modelData.size_bytes) + " · " + root.modelData.pieces + " "
+                  + root.problemText + (root.modelData.pieces === 1 ? " piece" : " pieces")
+                  + " · first at byte " + root.modelData.first_offset
             color: theme.textMuted
             font.pixelSize: 12
         }
@@ -71,8 +71,8 @@ Rectangle {
             spacing: 8
 
             TealButton {
-                visible: root.entry.path !== null
-                         && !(root.entry.path.indexOf(".vault/") === 0 && root.blockedReason.length > 0)
+                visible: root.modelData.path !== null
+                         && !(root.modelData.path.indexOf(".vault/") === 0 && root.blockedReason.length > 0)
                 text: "Show in folder"
                 primary: false
                 compact: true
@@ -84,7 +84,7 @@ Rectangle {
                 text: "Move to lost+found"
                 primary: false
                 compact: true
-                onClicked: root.controller.moveDamagedFiles(JSON.stringify([root.entry.path]))
+                onClicked: root.controller.moveDamagedFiles(JSON.stringify([root.modelData.path]))
             }
         }
     }
