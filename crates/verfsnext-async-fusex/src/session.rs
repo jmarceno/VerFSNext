@@ -402,9 +402,7 @@ async fn process_fuse_request(
                     .unwrap_or_else(|reply_err| {
                         panic!("Failed to reply an error code: {reply_err}.")
                     });
-                sender.send((file, byte_buffer)).unwrap_or_else(|_| {
-                    error!("The buffer pool is closed.");
-                });
+                return_buffer(&sender, file, byte_buffer);
                 return;
             }
 
@@ -421,9 +419,14 @@ async fn process_fuse_request(
             crate::util::format_nix_error(e), // TODO: refactor format_nix_error()
         );
     }
-    let res = sender.send((file, byte_buffer));
-    if let Err(e) = res {
-        panic!("failed to put the buffer back to buffer pool, the error is: {e}",);
+    return_buffer(&sender, file, byte_buffer);
+}
+
+/// Return a request buffer to the pool. `Session::run` holds a receiver until every
+/// admitted request has finished, so a closed pool is a broken shutdown invariant.
+fn return_buffer(sender: &Sender<(File, AlignedBytes)>, file: File, buffer: AlignedBytes) {
+    if let Err(e) = sender.send((file, buffer)) {
+        panic!("failed to put the buffer back to buffer pool, the error is: {e}");
     }
 }
 
@@ -536,8 +539,6 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
             });
         }
 
-        drop(pool_receiver);
-
         token.cancelled().await;
         // Pages held by the kernel writeback cache reach the filesystem only while
         // requests are still served. A sync failure is returned after draining so the
@@ -547,6 +548,10 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
         tokio::task::spawn_blocking(move || gate.close_and_drain())
             .await
             .context("FUSE request drain task failed")?;
+        // Readers return at the closed gate and drop their receivers while admitted
+        // requests are still running; this receiver keeps the pool open until every
+        // admitted request has returned its buffer.
+        drop(pool_receiver);
         info!("Async FUSE session exits; in-flight requests drained.");
 
         sync_result
