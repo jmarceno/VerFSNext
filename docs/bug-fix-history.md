@@ -1211,7 +1211,7 @@ The dialog shows the running operation and the last move/delete result (errors i
 next to the Re-check button.
 
 ### Validation
-Release build; checked in the desktop app against the live mount.
+Release build; deployed to the live desktop app. Not yet clicked through in the UI.
 
 ### Affected Files
 `qml/RecordsFileRow.qml`, `qml/RecordsReport.qml`
