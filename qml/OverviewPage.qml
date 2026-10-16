@@ -12,6 +12,27 @@ ScrollView {
     readonly property var stats: controller.stats_json.length > 0 ? JSON.parse(controller.stats_json) : null
     readonly property var status: controller.status_json.length > 0 ? JSON.parse(controller.status_json) : null
     property bool showAll: false
+    /// Speed of the most recent read/write activity. Kept after the transfer
+    /// ends so the user can still see how fast the last copy ran.
+    property real lastReadBps: 0
+    property real lastWriteBps: 0
+    onStatusChanged: {
+        if (!status)
+            return
+        if (status.read_throughput_bps > 0)
+            lastReadBps = status.read_throughput_bps
+        if (status.write_throughput_bps > 0)
+            lastWriteBps = status.write_throughput_bps
+    }
+
+    /// Current speed while data moves, otherwise the last measured one.
+    function speedText(current, last) {
+        if (current > 0)
+            return theme.bytes(current) + "/s"
+        if (last > 0)
+            return theme.bytes(last) + "/s (last)"
+        return theme.bytes(0) + "/s"
+    }
 
     readonly property real logicalAll: stats ? stats.all_logical_size_bytes : 0
     readonly property real onDisk: stats ? stats.data_dir_size_bytes : 0
@@ -60,8 +81,8 @@ ScrollView {
             ["Cached data pieces", String(stats.chunk_cache_entries)],
             ["Read since start", b(stats.read_bytes_total)],
             ["Written since start", b(stats.write_bytes_total)],
-            ["Recent read speed", status ? b(status.read_throughput_bps) + "/s" : "—"],
-            ["Recent write speed", status ? b(status.write_throughput_bps) + "/s" : "—"],
+            ["Recent read speed", status ? speedText(status.read_throughput_bps, lastReadBps) : "—"],
+            ["Recent write speed", status ? speedText(status.write_throughput_bps, lastWriteBps) : "—"],
             ["Throughput sample", status ? status.throughput_sample_secs.toFixed(3) + " s (every second)" : "—"],
             ["Running for", theme.duration(stats.uptime_secs)],
         ]
@@ -426,10 +447,11 @@ ScrollView {
                         text: root.stats ? theme.bytes(root.stats.approx_cache_memory_bytes) : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
-                    Label { text: "Recent speed (1 s)"; color: theme.textMuted; font.pixelSize: 13 }
+                    Label { text: "Speed"; color: theme.textMuted; font.pixelSize: 13 }
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: root.status ? "↓ " + theme.bytes(root.status.read_throughput_bps) + "/s  ↑ " + theme.bytes(root.status.write_throughput_bps) + "/s" : "—"
+                        text: root.status ? "↓ " + root.speedText(root.status.read_throughput_bps, root.lastReadBps)
+                                           + "  ↑ " + root.speedText(root.status.write_throughput_bps, root.lastWriteBps) : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
                 }
