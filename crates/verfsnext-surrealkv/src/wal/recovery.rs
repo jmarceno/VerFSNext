@@ -70,13 +70,60 @@ impl Reporter for DefaultReporter {
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
+#[cfg(test)]
 type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
 
+/// A segment that held bytes recovery could not use: a corrupted region, a
+/// zeroed region followed by records, or records rejected because they do not
+/// continue the sequence replayed before them.
+pub(crate) struct DamagedSegment {
+    pub(crate) segment_id: u64,
+    /// Bytes skipped by resyncing past corrupted regions.
+    pub(crate) skipped_bytes: usize,
+    /// Records that passed their checksum but were not replayed.
+    pub(crate) rejected_records: usize,
+    /// Raw payload of every replayed record, in order. Repair rewrites the
+    /// segment from exactly these, so the file matches what was replayed.
+    pub(crate) records: Vec<Vec<u8>>,
+}
+
+/// Result of replaying the WAL.
+pub(crate) struct ReplayOutcome {
+    /// Highest sequence number seen in any replayed batch.
+    pub(crate) max_seq_num: Option<u64>,
+    /// One memtable per WAL segment.
+    pub(crate) memtables: Vec<(Arc<MemTable>, u64)>,
+    /// Segments that need a repair (only when replaying with resync).
+    pub(crate) damaged_segments: Vec<DamagedSegment>,
+    /// Highest replayed segment and the file offset right after its last
+    /// replayed record. Anything past it is not a record (a torn or zeroed
+    /// tail) and must be cut before the writer appends to the segment.
+    pub(crate) last_segment_end: Option<(u64, u64)>,
+}
+
+/// Replays the WAL, failing at the first corrupted record.
+#[cfg(test)]
 pub(crate) fn replay_wal(
     wal_dir: &Path,
     min_wal_number: u64,
     arena_size: usize,
 ) -> Result<ReplayResult> {
+    let outcome = replay_wal_outcome(wal_dir, min_wal_number, arena_size, false)?;
+    Ok((outcome.max_seq_num, outcome.memtables))
+}
+
+/// Replays the WAL. With `resync`, corrupted regions are skipped instead of
+/// failing, and a record after any skipped region is replayed only when its
+/// first sequence number continues the replayed sequence: a crash that
+/// destroyed records can leave older, never-acknowledged records intact after
+/// the damage, and replaying those without the ones before them would break
+/// the prefix order the database relies on.
+pub(crate) fn replay_wal_outcome(
+    wal_dir: &Path,
+    min_wal_number: u64,
+    arena_size: usize,
+    resync: bool,
+) -> Result<ReplayOutcome> {
     log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
     eprintln!("Starting WAL recovery from directory: {:?}", wal_dir);
     log::debug!(
@@ -85,15 +132,22 @@ pub(crate) fn replay_wal(
         arena_size
     );
 
+    let mut outcome = ReplayOutcome {
+        max_seq_num: None,
+        memtables: Vec::new(),
+        damaged_segments: Vec::new(),
+        last_segment_end: None,
+    };
+
     // Check if WAL directory exists
     if !wal_dir.exists() {
         log::debug!("WAL directory does not exist, skipping recovery");
-        return Ok((None, vec![]));
+        return Ok(outcome);
     }
 
     if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
         log::debug!("No WAL segments found, skipping recovery");
-        return Ok((None, vec![]));
+        return Ok(outcome);
     }
 
     // Get range of segment IDs (looking for .wal files)
@@ -101,7 +155,7 @@ pub(crate) fn replay_wal(
         Ok(range) => range,
         Err(WalError::IO(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
             log::debug!("WAL segment range not found, skipping recovery");
-            return Ok((None, vec![]));
+            return Ok(outcome);
         }
         Err(e) => return Err(e.into()),
     };
@@ -109,7 +163,7 @@ pub(crate) fn replay_wal(
     // If no segments, nothing to replay
     if first > last {
         log::debug!("No valid WAL segment range, skipping recovery");
-        return Ok((None, vec![]));
+        return Ok(outcome);
     }
 
     // Determine the range of segments to replay
@@ -121,7 +175,7 @@ pub(crate) fn replay_wal(
             last,
             min_wal_number
         );
-        return Ok((None, vec![]));
+        return Ok(outcome);
     }
 
     log::info!(
@@ -139,9 +193,8 @@ pub(crate) fn replay_wal(
     let mut last_added_max_seq: u64 = 0; // Track highest seq successfully added to memtable
     let mut total_batches_replayed = 0;
     let mut segments_processed = 0;
-
-    // Collect memtables - one per WAL segment
-    let mut memtables: Vec<(Arc<MemTable>, u64)> = Vec::new();
+    // Sequence number the next replayed batch must start at after a gap.
+    let mut next_expected_seq: Option<u64> = None;
 
     // Get all segments in the directory
     let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
@@ -171,22 +224,71 @@ pub(crate) fn replay_wal(
         let file = File::open(&segment.file_path)?;
         let reporter = Box::new(DefaultReporter::new(segment_id));
         let mut reader = Reader::with_options(file, Some(reporter), segment_id);
+        reader.set_resyncing(resync);
 
         let mut batches_in_segment = 0;
         let mut last_valid_offset = 0;
+        let mut replayed_end: u64 = 0;
+        let mut replayed_records: Vec<Vec<u8>> = Vec::new();
+        let mut rejected_records = 0_usize;
+        let mut records_after_gap = 0_usize;
+        let mut awaiting_continuity = false;
 
         // Process each record in this segment
         loop {
             match reader.read() {
                 Ok((record_data, offset)) => {
                     last_valid_offset = offset as usize;
-                    let batch = Batch::decode(record_data).map_err(|e| {
-                        Error::wal_corruption(
-                            segment_id as usize,
-                            last_valid_offset,
-                            format!("failed to decode WAL batch archive: {e}"),
-                        )
-                    })?;
+                    let raw = resync.then(|| record_data.to_vec());
+                    let decoded = Batch::decode(record_data);
+                    if reader.take_gap() {
+                        records_after_gap += 1;
+                        awaiting_continuity = true;
+                    }
+                    let batch = match decoded {
+                        Ok(batch) => batch,
+                        Err(e) if resync => {
+                            // The record passed its checksum but is not a
+                            // batch; skip it and keep reading.
+                            log::error!(
+                                "Skipping undecodable record in WAL segment #{:020} at offset {}: {e}",
+                                segment_id,
+                                last_valid_offset
+                            );
+                            rejected_records += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(Error::wal_corruption(
+                                segment_id as usize,
+                                last_valid_offset,
+                                format!("failed to decode WAL batch archive: {e}"),
+                            ));
+                        }
+                    };
+                    if resync && awaiting_continuity {
+                        if let Some(expected) = next_expected_seq {
+                            if batch.starting_seq_num != expected {
+                                log::error!(
+                                    "Skipping WAL record in segment #{:020} at offset {}: it starts at \
+sequence {} after a damaged region, but the replayed sequence continues at {}; \
+it was never acknowledged",
+                                    segment_id,
+                                    last_valid_offset,
+                                    batch.starting_seq_num,
+                                    expected
+                                );
+                                rejected_records += 1;
+                                continue;
+                            }
+                        }
+                        awaiting_continuity = false;
+                    }
+                    next_expected_seq = Some(batch.starting_seq_num + batch.count() as u64);
+                    replayed_end = offset;
+                    if let Some(raw) = raw {
+                        replayed_records.push(raw);
+                    }
                     let batch_highest_seq_num = batch.get_highest_seq_num();
 
                     if batch_highest_seq_num > max_seq_num {
@@ -223,7 +325,9 @@ pub(crate) fn replay_wal(
                                 "WAL segment #{:020} exceeds single memtable capacity, splitting",
                                 segment_id
                             );
-                            memtables.push((Arc::clone(&current_memtable), segment_id));
+                            outcome
+                                .memtables
+                                .push((Arc::clone(&current_memtable), segment_id));
                             current_memtable =
                                 Arc::new(MemTable::new(arena_size, last_added_max_seq));
                             // Retry on fresh memtable
@@ -258,7 +362,28 @@ pub(crate) fn replay_wal(
 
         // Save this segment's memtable if it has data
         if !current_memtable.is_empty() {
-            memtables.push((current_memtable, segment_id));
+            outcome.memtables.push((current_memtable, segment_id));
+        }
+
+        let skipped_bytes = reader.resynced_bytes();
+        if resync && (skipped_bytes > 0 || rejected_records > 0 || records_after_gap > 0) {
+            let message = format!(
+                "WAL segment #{segment_id:020}: skipped {skipped_bytes} corrupted bytes, \
+{records_after_gap} damaged region(s) followed by records, {rejected_records} record(s) not replayed \
+because they do not continue the replayed sequence"
+            );
+            log::error!("{message}");
+            eprintln!("{message}");
+            outcome.damaged_segments.push(DamagedSegment {
+                segment_id,
+                skipped_bytes,
+                rejected_records,
+                records: replayed_records,
+            });
+        }
+
+        if segment_id == last {
+            outcome.last_segment_end = Some((segment_id, replayed_end));
         }
 
         if batches_in_segment > 0 {
@@ -273,7 +398,7 @@ pub(crate) fn replay_wal(
     }
 
     // Return results
-    let result = if max_seq_num > 0 {
+    outcome.max_seq_num = if max_seq_num > 0 {
         Some(max_seq_num)
     } else {
         None
@@ -283,119 +408,114 @@ pub(crate) fn replay_wal(
 		"WAL recovery complete: {} batches across {} segments, {} memtables created, max_seq_num={:?}",
 		total_batches_replayed,
 		segments_processed,
-		memtables.len(),
-		result
+		outcome.memtables.len(),
+		outcome.max_seq_num
 	);
     eprintln!(
         "WAL recovery complete: {} batches across {} segments, {} memtables created, max_seq_num={:?}",
         total_batches_replayed,
         segments_processed,
-        memtables.len(),
-        result
+        outcome.memtables.len(),
+        outcome.max_seq_num
     );
 
-    Ok((result, memtables))
+    Ok(outcome)
 }
 
-pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
+/// Rewrites a damaged segment from the records replay kept, after copying the
+/// damaged file aside.
+pub(crate) fn repair_corrupted_wal_segment(
+    wal_dir: &Path,
+    segment_id: u64,
+    records: &[Vec<u8>],
+) -> Result<()> {
     use std::fs;
 
     use crate::ensure_dir_with_mode;
     use crate::wal::manager::Wal;
-    use crate::wal::reader::Reader;
     use crate::wal::Options;
 
-    // Build segment paths
     let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
-
-    // Verify the corrupted segment exists
     if !segment_path.exists() {
         return Err(crate::error::Error::Other(format!(
             "WAL segment {segment_id:020}.wal does not exist"
         )));
     }
 
-    // Create a repair directory for the new WAL file
-    let repair_dir = wal_dir.join("repair_temp");
-    ensure_dir_with_mode(&repair_dir)?;
+    // Keep the damaged file as it was: support may still recover records from
+    // it by hand. The name keeps the numeric segment prefix but uses another
+    // extension, so segment listing and recovery ignore it.
+    let backup_path = wal_dir.join(format!(
+        "{segment_id:020}.corrupt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| crate::error::Error::Other(format!("system clock before 1970: {e}")))?
+            .as_millis()
+    ));
+    fs::copy(&segment_path, &backup_path)?;
+    fs::File::open(&backup_path)?.sync_all()?;
+    fsync_directory(wal_dir)?;
+    log::error!(
+        "Damaged WAL segment {segment_id:020}.wal preserved at {} before repair",
+        backup_path.display()
+    );
+    eprintln!(
+        "Damaged WAL segment {segment_id:020}.wal preserved at {} before repair",
+        backup_path.display()
+    );
 
-    // Create a new Wal for writing the repaired data
-    // We'll write to a temp directory then move the file
-    let opts = Options::default();
-    let mut repair_wal = Wal::open(&repair_dir, opts)?;
-
-    // Open the original segment file
-    let file = fs::File::open(&segment_path)?;
-    let mut reader = Reader::new(file);
-
-    let mut valid_batches_count = 0;
-    let mut repair_failed = false;
-
-    // Read valid batches from original and write them to the repair WAL
-    loop {
-        match reader.read() {
-            Ok((record_data, _offset)) => {
-                // We have a valid batch, write it to the repair WAL
-                if let Err(e) = repair_wal.append(record_data) {
-                    log::error!("Failed to write valid batch to repaired WAL: {e}");
-                    repair_failed = true;
-                    break;
-                }
-                valid_batches_count += 1;
-            }
-            Err(WalError::Corruption(err)) => {
-                // Stop at the first corruption
-                log::error!(
-                    "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
-                );
-                break;
-            }
-            Err(WalError::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // End of segment reached
-                log::info!(
-                    "Repair completed successfully. Recovered {valid_batches_count} valid batches."
-                );
-                break;
-            }
-            Err(err) => {
-                log::error!("Unexpected error during repair: {err}");
-                repair_failed = true;
-                break;
-            }
-        }
-    }
-
-    // Close the repair WAL
-    repair_wal.close()?;
-
-    // The repaired WAL was written to repair_temp/00000000000000000000.wal
-    let temp_wal_path = repair_dir.join("00000000000000000000.wal");
-
-    if repair_failed {
-        // Clean up
-        fs::remove_dir_all(&repair_dir).ok();
-        return Err(crate::error::Error::Other(format!(
-            "Failed to repair WAL segment {segment_id}. Original segment unchanged."
-        )));
-    }
-
-    if valid_batches_count == 0 {
-        // No valid data
+    if records.is_empty() {
         fs::remove_file(&segment_path)?;
-        fs::remove_dir_all(&repair_dir).ok();
-        log::info!("Deleted corrupted WAL segment {segment_id:020}.wal (no valid data)");
+        fsync_directory(wal_dir)?;
+        log::error!("Removed damaged WAL segment {segment_id:020}.wal: no record in it was replayed");
         return Ok(());
     }
 
-    // Replace the original with repaired version
+    // Write the replayed records to a fresh segment, then swap it in.
+    let repair_dir = wal_dir.join("repair_temp");
+    if repair_dir.exists() {
+        fs::remove_dir_all(&repair_dir)?;
+    }
+    ensure_dir_with_mode(&repair_dir)?;
+    let mut repair_wal = Wal::open(&repair_dir, Options::default())?;
+    for record in records {
+        repair_wal.append(record)?;
+    }
+    repair_wal.close()?;
+
+    let temp_wal_path = repair_dir.join("00000000000000000000.wal");
     fs::rename(&temp_wal_path, &segment_path)?;
-    fs::remove_dir_all(&repair_dir).ok();
     fsync_directory(wal_dir)?;
+    fs::remove_dir_all(&repair_dir)?;
 
-    log::info!(
-        "Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
+    log::error!(
+        "Repaired WAL segment {segment_id:020}.wal with the {} replayed records",
+        records.len()
     );
+    Ok(())
+}
 
+/// Cuts everything after `valid_end` from a segment: bytes that are not
+/// records (a torn or zeroed tail). The writer appends at the end of the
+/// file, so a record written after such a tail would be unreadable.
+pub(crate) fn truncate_wal_segment_tail(wal_dir: &Path, segment_id: u64, valid_end: u64) -> Result<()> {
+    let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+    let file = std::fs::OpenOptions::new().write(true).open(&segment_path)?;
+    let len = file.metadata()?.len();
+    if len <= valid_end {
+        return Ok(());
+    }
+    log::warn!(
+        "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end}) \
+so new records do not land behind a torn tail",
+        len - valid_end
+    );
+    eprintln!(
+        "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end})",
+        len - valid_end
+    );
+    file.set_len(valid_end)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -634,7 +754,7 @@ mod tests {
         fs::create_dir_all(wal_dir).unwrap();
 
         // Test repair of non-existent segment
-        let result = repair_corrupted_wal_segment(wal_dir, 999);
+        let result = repair_corrupted_wal_segment(wal_dir, 999, &[]);
         assert!(result.is_err(), "Should fail when segment doesn't exist");
     }
 

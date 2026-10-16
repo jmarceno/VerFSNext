@@ -71,10 +71,23 @@ pub(crate) struct Reader {
 
     /// Whether compression type record has been read
     compression_type_record_read: bool,
+
+    /// Whether a corrupted region is skipped so reading can continue at the
+    /// next record, instead of failing the whole segment. Used by the tolerant
+    /// recovery path; see [`Reader::set_resyncing`].
+    resyncing: bool,
+
+    /// Bytes skipped by resyncing so far.
+    resynced_bytes: usize,
+
+    /// Set when bytes that are not records were skipped (a resync or a zeroed
+    /// region) since the last record was returned; see [`Reader::take_gap`].
+    gap: bool,
 }
 
 impl Reader {
     /// Creates a new Reader from a File with default settings.
+    #[cfg(test)]
     pub(crate) fn new(file: File) -> Self {
         Self::with_options(file, None, 0)
     }
@@ -100,7 +113,30 @@ impl Reader {
             log_number,
             compression_type: CompressionType::None,
             compression_type_record_read: false,
+            resyncing: false,
+            resynced_bytes: 0,
+            gap: false,
         }
+    }
+
+    /// Skips corrupted regions instead of failing: [`Reader::read`] reports the
+    /// skipped bytes and continues at the next record that passes its checksum.
+    /// The default is to fail at the first corruption.
+    pub(crate) fn set_resyncing(&mut self, resyncing: bool) {
+        self.resyncing = resyncing;
+    }
+
+    /// Total bytes skipped because of corrupted regions (0 unless resyncing).
+    pub(crate) fn resynced_bytes(&self) -> usize {
+        self.resynced_bytes
+    }
+
+    /// Returns whether non-record bytes (a resync or a zeroed region) were
+    /// skipped before the record most recently returned, and clears the flag.
+    /// A record after such a gap is not necessarily the successor of the one
+    /// before it: the gap may have held records the crash destroyed.
+    pub(crate) fn take_gap(&mut self) -> bool {
+        std::mem::take(&mut self.gap)
     }
 
     /// Returns the compression type detected from the WAL file.
@@ -187,31 +223,48 @@ impl Reader {
             return Err(err.clone());
         }
 
-        match self.next() {
-            Ok(_) => {
-                // Return the file position immediately after this record
-                // (not end of buffer, which would be same for all records in a block)
-                let offset = self.end_of_buffer_offset - self.buffer_remaining();
-                Ok((&self.rec, offset as u64))
-            }
-            Err(e) => {
-                // Check if the error is an UnexpectedEof
-                if let Error::IO(io_err) = &e {
-                    if io_err.kind() == io::ErrorKind::UnexpectedEof {
-                        self.err = Some(e.clone());
-                        return Err(e);
-                    }
+        loop {
+            match self.next() {
+                Ok(_) => {
+                    // Return the file position immediately after this record
+                    // (not end of buffer, which would be same for all records in a block)
+                    let offset = self.end_of_buffer_offset - self.buffer_remaining();
+                    return Ok((&self.rec, offset as u64));
                 }
+                Err(e) => {
+                    // Check if the error is an UnexpectedEof
+                    if let Error::IO(io_err) = &e {
+                        if io_err.kind() == io::ErrorKind::UnexpectedEof {
+                            self.err = Some(e.clone());
+                            return Err(e);
+                        }
+                    }
 
-                // Calculate error offset and gather debugging info
-                let error_offset = self.end_of_buffer_offset - self.buffer_remaining();
-                let file_size = self.file.seek(SeekFrom::End(0)).unwrap_or(0);
-                let block_number = error_offset / BLOCK_SIZE;
-                let offset_within_block = error_offset % BLOCK_SIZE;
+                    // Resyncing readers keep every record after a corrupted
+                    // region instead of dropping them with the rest of the
+                    // segment. Records that follow are checksum-verified, so
+                    // only the corrupted bytes themselves are lost.
+                    if self.resyncing {
+                        if self.resync_past_corruption(&e.to_string())? {
+                            continue;
+                        }
+                        let eof = Error::IO(IOError::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "reached end of file after skipping a corrupted region",
+                        ));
+                        self.err = Some(eof.clone());
+                        return Err(eof);
+                    }
 
-                // Detailed error logging for debugging
-                log::error!(
-                    "WAL corruption detected: \
+                    // Calculate error offset and gather debugging info
+                    let error_offset = self.end_of_buffer_offset - self.buffer_remaining();
+                    let file_size = self.file.seek(SeekFrom::End(0)).unwrap_or(0);
+                    let block_number = error_offset / BLOCK_SIZE;
+                    let offset_within_block = error_offset % BLOCK_SIZE;
+
+                    // Detailed error logging for debugging
+                    log::error!(
+                        "WAL corruption detected: \
 					log_number={}, \
 					error_offset={} (0x{:X}), \
 					file_size={} bytes, \
@@ -225,34 +278,66 @@ impl Reader {
 					accumulated_record_len={}, \
 					current_record_type={:?}, \
 					error=\"{}\"",
-                    self.log_number,
-                    error_offset,
-                    error_offset,
-                    file_size,
-                    block_number,
-                    offset_within_block,
-                    self.buffer_offset,
-                    self.buffer.len(),
-                    self.end_of_buffer_offset,
-                    self.eof,
-                    self.compression_type,
-                    self.rec.len(),
-                    self.cur_rec_type,
-                    e
-                );
+                        self.log_number,
+                        error_offset,
+                        error_offset,
+                        file_size,
+                        block_number,
+                        offset_within_block,
+                        self.buffer_offset,
+                        self.buffer.len(),
+                        self.end_of_buffer_offset,
+                        self.eof,
+                        self.compression_type,
+                        self.rec.len(),
+                        self.cur_rec_type,
+                        e
+                    );
 
-                // Fixed behavior: Tolerate tail corruption, enable repair
-                let corruption_err = Error::Corruption(CorruptionError::new(
-                    io::ErrorKind::Other,
-                    e.to_string().as_str(),
-                    self.log_number,
-                    error_offset as u64,
-                ));
+                    // Fixed behavior: Tolerate tail corruption, enable repair
+                    let corruption_err = Error::Corruption(CorruptionError::new(
+                        io::ErrorKind::Other,
+                        e.to_string().as_str(),
+                        self.log_number,
+                        error_offset as u64,
+                    ));
 
-                // Report corruption and return error (caller will handle repair)
-                self.report_corruption(self.rec.len(), &e.to_string());
-                self.err = Some(corruption_err.clone());
-                Err(corruption_err)
+                    // Report corruption and return error (caller will handle repair)
+                    self.report_corruption(self.rec.len(), &e.to_string());
+                    self.err = Some(corruption_err.clone());
+                    return Err(corruption_err);
+                }
+            }
+        }
+    }
+
+    /// Scans forward for the next record that passes its checksum so reading can
+    /// continue after a corrupted region. Returns `false` when the end of the
+    /// segment is reached without finding one; the caller then treats the rest
+    /// of the segment as lost.
+    fn resync_past_corruption(&mut self, reason: &str) -> Result<bool> {
+        let mut skipped = 0_usize;
+        loop {
+            let remaining = self.buffer_remaining();
+            if let Some(relative) = find_record_start(&self.buffer[self.buffer_offset..]) {
+                skipped += relative;
+                self.buffer_offset += relative;
+                self.resynced_bytes = self.resynced_bytes.saturating_add(skipped);
+                self.report_corruption(skipped, reason);
+                self.gap = true;
+                return Ok(true);
+            }
+
+            // Nothing usable in the rest of this block: drop it and look at
+            // the next one.
+            skipped += remaining;
+            self.buffer_offset = self.buffer.len();
+            if !self.read_more()? {
+                self.resynced_bytes = self.resynced_bytes.saturating_add(skipped);
+                if skipped > 0 {
+                    self.report_corruption(skipped, reason);
+                }
+                return Ok(false);
             }
         }
     }
@@ -291,6 +376,10 @@ impl Reader {
                         )));
                     }
                 }
+                // The writer never emits an Empty header (block padding is
+                // always shorter than a header), so this is a zeroed region
+                // left by a crash, not padding.
+                self.gap = true;
                 // Discard rest of buffer and continue (read_more will be called next iteration)
                 self.buffer_offset = self.buffer.len();
                 continue;
@@ -363,6 +452,37 @@ impl Reader {
 
         Ok(())
     }
+}
+
+/// Finds the next position that can start a record: a `Full`, `First` or
+/// `SetCompressionType` header whose checksum matches. The CRC covers the type
+/// byte and the payload, so a match is a real record start and not a
+/// coincidence.
+fn find_record_start(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < WAL_RECORD_HEADER_SIZE {
+        return None;
+    }
+    for pos in 0..=bytes.len() - WAL_RECORD_HEADER_SIZE {
+        let header = &bytes[pos..pos + WAL_RECORD_HEADER_SIZE];
+        let type_byte = header[6];
+        if type_byte != RecordType::Full as u8
+            && type_byte != RecordType::First as u8
+            && type_byte != RecordType::SetCompressionType as u8
+        {
+            continue;
+        }
+        let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let payload_start = pos + WAL_RECORD_HEADER_SIZE;
+        let payload_end = payload_start + length;
+        if payload_end > bytes.len() {
+            continue;
+        }
+        let crc = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if calculate_crc32(&[type_byte], &bytes[payload_start..payload_end]) == crc {
+            return Some(pos);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

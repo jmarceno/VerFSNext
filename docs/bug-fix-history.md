@@ -1036,3 +1036,86 @@ readable by older versions (owner decision: the existing data is test data).
 `src/fs/chunk.rs`, `src/fs/write.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`,
 `src/types/mod.rs`, `src/vault/mod.rs`
 
+## B033 - New WAL Records Were Appended Behind a Torn Tail and Then Truncated Away - Oct 16 2026
+
+### Root Cause
+A crash left a zeroed tail on the active segment
+`metadata/wal/00000000000000000002.wal` (offset 44471756). Replay treats a
+zeroed region (`Empty` header) and a partial record at the end as a clean end
+of segment, and `Wal::open_with_min_log_number` reopened that segment in append
+mode, so every transaction acknowledged after the restart was written *behind*
+the zeros, in the same block. At the next startup the strict reader failed with
+"non-zero byte in padding area", and `repair_corrupted_wal_segment` rewrote the
+segment with only the records before the zeros, dropping the ~180 KB of
+acknowledged records after them. Two chunk records were lost, one file read
+back with EIO, and the Overview health tile only showed counters.
+
+Two more defects sat on the same path:
+- The WAL writer was opened before replay and never reopened. When recovery
+  repaired (rename over) or removed the active segment, the writer kept
+  appending through a descriptor to the replaced inode, so everything written
+  until the next rotation would vanish on a crash.
+- The first fix attempt read past damage at the next CRC-valid record without
+  any ordering check. Records that survive *after* a crash-damaged region can be
+  older, never-acknowledged writes; replaying them without the destroyed ones
+  before them breaks prefix order (and repair copied them back into the file).
+
+Reproduced on a scratch mount: write 20 files, `kill -9`, append 3000 zero
+bytes to the segment, start the pre-fix binary, write 20 more files, `kill -9`,
+restart: the pre-fix binary returns mismatching content.
+
+### Fix
+- Torn tails (`recovery.rs`, `lsm.rs`): `replay_wal_outcome` reports the end of
+  the last replayed record of the highest segment and
+  `truncate_wal_segment_tail` cuts the non-record bytes after it (fsynced)
+  before anything is appended. `Core::reopen_wal_after_recovery` reopens the
+  writer after replay, at startup and after a restore.
+- Resync (`reader.rs`): `Reader::set_resyncing(true)` continues at the next
+  `Full`/`First`/`SetCompressionType` header whose CRC matches, and
+  `Reader::take_gap` reports that non-record bytes (a resync or an `Empty`
+  region) preceded a record. The replay accepts a record after a gap only when
+  its `starting_seq_num` continues the replayed sequence; others are logged and
+  rejected. This recovers segments damaged by older versions (records written
+  after the restart continue the recovered sequence) without replaying
+  unacknowledged leftovers.
+- Repair: every segment with skipped bytes, rejected records or a gap followed
+  by records is rewritten from exactly the records replay accepted, after an
+  fsynced copy to `<segment-id>.corrupt-<millis>` (ignored by segment listing).
+  A stale `repair_temp/` is removed first. A repair failure now fails startup
+  instead of continuing on a damaged active segment.
+- Records check (`src/fs/health.rs`, `verfsnext check`,
+  `ControlRequest::CheckRecords`, `RecordsCheckReport`): names the files behind
+  every consistency counter, including chunks whose stored copy is damaged,
+  with the path relative to the folder root (`null` when no folder entry
+  reaches the inode).
+- Desktop app: the Health tile is clickable and names the problem in words. The
+  dialog lists each affected file and can move it to `lost+found/<timestamp>/`
+  — `.vault/lost+found/<timestamp>/` for vault files, since a rename cannot
+  cross the vault boundary — and permanently delete files already waiting
+  there. Files the user cannot act on (in a read-only snapshot, in a locked
+  vault, or without a folder entry) show the reason instead of a button, and
+  the backend refuses them with the same message instead of counting a locked
+  vault as "already gone". Paths with `.`/`..` components are refused.
+
+### Validation
+- `cargo remote -h -- test -p verfsnext-surrealkv`: 928 passed, 2 ignored; only
+  the 4 `sstable_tests` that already fail on the base commit fail.
+- Scratch-mount crash simulation (`kill -9` + 3000 zero bytes appended to the
+  active segment, 2×20 files of 300 KB):
+  - pre-fix binary for all runs: content mismatch (the bug);
+  - pre-fix binary writes behind the torn tail, fixed binary recovers: all 40
+    files intact, the segment is rewritten from 124 replayed records after a
+    backup, records check consistent;
+  - fixed binary for all runs: the 3000-byte tail is cut at startup, no repair
+    needed, all 40 files intact.
+- The records check on the live mount named the file that had been failing
+  reads with EIO (2 lost pieces); the lost chunk records were already gone from
+  the earlier truncation and are unrecoverable.
+
+### Affected Files
+`crates/verfsnext-surrealkv/src/wal/reader.rs`,
+`crates/verfsnext-surrealkv/src/wal/recovery.rs`,
+`crates/verfsnext-surrealkv/src/lsm.rs`, `src/fs/health.rs`,
+`src/fs/mod.rs`, `src/control.rs`, `src/lib.rs`, `src/gui/controller.rs`,
+`qml/RecordsReport.qml`, `qml/RecordsFileRow.qml`, `qml/StatTile.qml`,
+`qml/OverviewPage.qml`

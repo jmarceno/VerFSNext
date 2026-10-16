@@ -24,7 +24,9 @@ use crate::transaction::{
     MergeMissingBehavior, MergeOp, Mode, PutIfAbsentResult, Transaction, TransactionOptions,
 };
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
+use crate::wal::recovery::{
+    repair_corrupted_wal_segment, replay_wal_outcome, truncate_wal_segment_tail,
+};
 use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::ensure_dir_with_mode;
 use crate::{
@@ -1163,16 +1165,15 @@ impl Core {
         F: FnMut(Arc<MemTable>, u64) -> Result<()>,
     {
         // Replay WAL - returns memtables per segment
-        let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
-            Ok(result) => result,
-            Err(Error::WalCorruption {
-                segment_id,
-                offset,
-                message,
-            }) => {
-                // Handle corruption based on recovery mode
-                match recovery_mode {
-                    WalRecoveryMode::AbsoluteConsistency => {
+        let outcome = match recovery_mode {
+            WalRecoveryMode::AbsoluteConsistency => {
+                match replay_wal_outcome(wal_path, min_wal_number, arena_size, false) {
+                    Ok(outcome) => outcome,
+                    Err(Error::WalCorruption {
+                        segment_id,
+                        offset,
+                        message,
+                    }) => {
                         log::error!(
                             "WAL corruption detected in segment {} at offset {}: {}. \
 							AbsoluteConsistency mode: failing immediately without repair.",
@@ -1186,46 +1187,46 @@ impl Core {
                             message,
                         });
                     }
-                    WalRecoveryMode::TolerateCorruptedWithRepair => {
-                        log::warn!(
-							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
-							segment_id,
-							offset,
-							message
-						);
-
-                        // Attempt repair
-                        if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
-                        {
-                            log::error!("Failed to repair WAL segment: {repair_err}");
-                            return Err(Error::Other(format!(
-								"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
-							)));
-                        }
-
-                        // Retry after repair
-                        match replay_wal(wal_path, min_wal_number, arena_size) {
-                            Ok(result) => result,
-                            Err(Error::WalCorruption {
-                                segment_id: seg_id,
-                                offset: off,
-                                message,
-                            }) => {
-                                return Err(Error::Other(format!(
-									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair: {message}"
-								)));
-                            }
-                            Err(retry_err) => {
-                                return Err(Error::Other(format!(
-                                    "{context} failed: WAL replay failed after repair. {retry_err}"
-                                )));
-                            }
-                        }
-                    }
+                    Err(e) => return Err(e),
                 }
             }
-            Err(e) => return Err(e),
+            WalRecoveryMode::TolerateCorruptedWithRepair => {
+                let outcome = replay_wal_outcome(wal_path, min_wal_number, arena_size, true)?;
+                for damaged in &outcome.damaged_segments {
+                    log::error!(
+                        "{context}: WAL segment {} is damaged ({} corrupted bytes skipped, {} records \
+						not replayed); rewriting it from the {} replayed records",
+                        damaged.segment_id,
+                        damaged.skipped_bytes,
+                        damaged.rejected_records,
+                        damaged.records.len()
+                    );
+                    repair_corrupted_wal_segment(wal_path, damaged.segment_id, &damaged.records)
+                        .map_err(|e| {
+                            Error::Other(format!(
+                                "{context} failed: WAL segment {} is damaged and could not be repaired: {e}",
+                                damaged.segment_id
+                            ))
+                        })?;
+                }
+                outcome
+            }
         };
+
+        // The writer appends to the highest segment; cut a torn or zeroed tail
+        // first so new records stay readable. A repaired segment has none.
+        if let Some((segment_id, valid_end)) = outcome.last_segment_end {
+            let repaired = outcome
+                .damaged_segments
+                .iter()
+                .any(|damaged| damaged.segment_id == segment_id);
+            if !repaired {
+                truncate_wal_segment_tail(wal_path, segment_id, valid_end)?;
+            }
+        }
+
+        let wal_seq_num_opt = outcome.max_seq_num;
+        let memtables = outcome.memtables;
 
         // If no memtables, nothing was recovered
         if memtables.is_empty() {
@@ -1266,6 +1267,20 @@ impl Core {
         );
 
         Ok((wal_seq_num_opt, Some(last_memtable)))
+    }
+
+    /// Replaces the WAL writer opened before replay with one opened on the
+    /// segments recovery left on disk.
+    pub(crate) fn reopen_wal_after_recovery(inner: &CoreInner) -> Result<()> {
+        let manifest_log_number = inner.level_manifest.read()?.get_log_number();
+        let mut wal_guard = inner.wal.write();
+        wal_guard.close()?;
+        *wal_guard = Wal::open_with_min_log_number(
+            &inner.opts.wal_dir(),
+            manifest_log_number,
+            wal::Options::default().with_durability_barrier(inner.opts.durability_barrier.clone()),
+        )?;
+        Ok(())
     }
 
     /// Creates a new LSM tree with background task management
@@ -1322,6 +1337,11 @@ impl Core {
                 Ok(())
             },
         )?;
+
+        // Recovery may have repaired, removed or cut the segment the writer
+        // opened before replay; reopen it so new records go to the file on
+        // disk instead of a replaced inode, at the right block offset.
+        Self::reopen_wal_after_recovery(&inner)?;
 
         // Set recovered memtable as active (if any)
         if let Some(memtable) = recovered_memtable {
@@ -1895,6 +1915,10 @@ impl Tree {
                 Ok(())
             },
         )?;
+
+        // Recovery may have repaired, removed or cut the segment the writer
+        // was reopened on; reopen it on what recovery left on disk.
+        Core::reopen_wal_after_recovery(&self.core.inner)?;
 
         // Set recovered memtable as active (if any)
         if let Some(memtable) = recovered_memtable {

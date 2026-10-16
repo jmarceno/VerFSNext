@@ -176,7 +176,9 @@ pub enum VLogChecksumLevel {
 /// WAL recovery mode to control consistency guarantees during crash recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalRecoveryMode {
-    /// Attempt automatic repair of corrupted WAL segments and retry replay.
+    /// Keep every record that passes its checksum. A corrupted region is
+    /// skipped (reported, and the segment is repaired in place afterwards)
+    /// instead of dropping the valid records that follow it.
     #[default]
     TolerateCorruptedWithRepair,
 

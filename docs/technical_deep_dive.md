@@ -27,6 +27,8 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - `verfsnext crypt -l`
 - Runtime stats control path:
   - `verfsnext stats`
+- Records check control path:
+  - `verfsnext check` names the files behind every consistency counter (see "Records Check and Damaged-File Cleanup")
 - Offline pack-size migration control path:
   - `verfsnext pack-size-migrate`
 - Global config-file CLI option:
@@ -244,6 +246,7 @@ The ordering now lives in the metadata WAL, similar to ext4 `data=ordered`:
 
 Crash behavior:
 - Power loss: the WAL on disk never references pack data that is not on disk. Un-fsynced work since the last durable WAL write may be lost, as before (the periodic sync cycle never fsynced the WAL).
+- WAL torn tails (B033): recovery cuts a torn or zeroed tail off the highest segment and reopens the writer afterwards, so new records are never appended behind unreadable bytes. Segments that already hold damage followed by records are read with resync; a record after a damaged region is replayed only when it continues the replayed sequence, and the segment is rewritten from the replayed records after a backup copy. See the SurrealKV architecture guide ("Why Damage Appears Mid-Segment").
 - Daemon crash (SIGKILL, panic): commits not yet handed off are lost. This is at most about 250 ms plus the duration of one pack sync. Before B016 each commit was handed to the OS immediately. Data still dirty in the kernel's FUSE page cache is lost on a daemon crash either way.
 
 `PackStore::sync` holds the active-pack mutex only to flush buffered index entries and duplicate the file handles; the `fdatasync` runs on the duplicates, so appends and reads continue during it.
@@ -468,6 +471,63 @@ still indexed in metadata. It is explicitly a partial garbage measure: obsolete
 pack entries whose chunk records have already been removed or relocated also
 consume disk until pack rewrite. It must not be presented as total reclaimable
 space. GUI and CLI use the daemon's same signed savings and percentage fields.
+
+## Records Check and Damaged-File Cleanup
+
+The Overview health tile reports counters (`missing_chunk_records_for_extents`,
+`chunk_refcount_mismatch_count`, `orphan_extent_records`,
+`pack_crc32_read_error_count`) but a counter does not tell the user which file
+they lost. `src/fs/health.rs` turns those counters into a report that names the
+files, and the desktop app shows it and can move the damaged files out of the
+way.
+
+- `verfsnext check` (socket only, like `stats`) sends `ControlRequest::CheckRecords`;
+  the daemon answers with the rendered text and the structured
+  `RecordsCheckReport` field. The desktop app calls the same request.
+- `FsCore::check_records` runs one read-only metadata transaction with four
+  passes: extents (reference count per hash, orphan extents), chunk records
+  (missing hashes, reference-count mismatches, and chunks whose stored copy is
+  damaged via `CHUNK_FLAG_CORRUPT` plus the in-memory `corrupt_chunks` set),
+  affected extents grouped per owning inode, and a namespace walk that attaches
+  the current path to every reachable affected inode (`path: null` when no
+  directory entry reaches the inode).
+- The counters are computed exactly like `collect_stats`, so the tile and the
+  report never disagree. Each file list is sorted by path and capped at 200
+  entries, with `list_truncated` set when the cap bites.
+- Files with missing pieces are unrecoverable by the filesystem: the chunk
+  record that told it where the data lived is gone. The report is therefore a
+  repair list for the user (restore the file from a backup, or discard it), not
+  something the filesystem can fix on its own. Reference-count drift and orphan
+  extents are reported without an action: the data is readable and the
+  bookkeeping is reclaimed by normal GC.
+
+Cleanup runs in the GUI process with plain `std::fs` against the mount, not in
+the daemon, so a move never has to read file data:
+
+- `moveDamagedFiles` (QML passes the relative paths from the report) renames
+  each file into `lost+found/<timestamp>/<relative path>` (created with
+  `create_dir_all`), keeping its place in the tree. Vault files go to
+  `.vault/lost+found/<timestamp>/…` instead, because a rename cannot cross the
+  vault boundary (EXDEV). A rename is metadata-only, so it works on a file that
+  cannot be read. Nothing is deleted. Paths with `.`/`..`/empty components are
+  refused.
+- The app only offers actions the user can carry out: files in `.snapshots/`
+  (read-only), vault files while the vault is locked, and inodes without a
+  folder entry show the reason instead of a button, and the backend refuses
+  them with the same explanation.
+- `deleteLostFoundFiles` permanently deletes files whose paths start with
+  `lost+found/` or `.vault/lost+found/` (anything else is refused), then
+  prunes the folders the move created, bottom-up, while they are empty.
+  Deleting a quarantined file is what releases its extents and chunk
+  references for GC.
+- Both actions report per-file results: files that were already gone (a stale
+  report) and files that could not be moved (for example one inside a read-only
+  snapshot) are listed with their error instead of failing the whole batch, and
+  the report and stats are refreshed afterwards.
+- `qml/RecordsReport.qml` (opened by the Health tile) lists the files, explains
+  what happened to each group and offers "Show in folder", "Move to
+  lost+found", and — for files already waiting there — "Open lost+found
+  folder" and "Delete permanently", both behind `ConfirmPopup`.
 
 ## Recent throughput
 

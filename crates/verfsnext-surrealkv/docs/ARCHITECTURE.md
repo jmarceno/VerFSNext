@@ -1199,6 +1199,7 @@ SurrealKV provides the following guarantees:
 - **Committed data is durable**: Any transaction that received a successful commit response will be recovered
 - **Uncommitted data may be lost**: Transactions that crashed before commit are not recovered
 - **Atomic recovery**: Either all of a transaction's writes are recovered, or none are
+- **Corruption is contained**: A damaged region costs only the records whose bytes it covers. The tolerant mode resyncs at the next record that passes its checksum and continues the replayed sequence, and a torn tail is cut before new records are appended (see "Recovery Modes")
 
 The strength of the durability guarantee depends on the `Durability` mode used at commit time:
 - **Immediate**: Data was fsynced before commit returned; it will survive any crash
@@ -1242,7 +1243,8 @@ Recovery proceeds in three phases:
 │  │         │                   │                   │                     │  │
 │  │         ▼                   ▼                   ▼                     │  │
 │  │  On corruption:       CRC mismatch:       Apply to MemTable           │  │
-│  │  - TolerateWithRepair: truncate & continue                            │  │
+│  │  - TolerateWithRepair: skip the corrupted bytes (resync) and          │  │
+│  │    keep every valid record after them                                 │  │
 │  │  - AbsoluteConsistency: return error                                  │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
@@ -1309,9 +1311,68 @@ SurrealKV supports two recovery modes that control behavior when WAL corruption 
 | Mode | Behavior |
 |------|----------|
 | **AbsoluteConsistency** | Return error on any corruption; do not start |
-| **TolerateWithRepair** | Truncate corrupted tail and continue recovery |
+| **TolerateCorruptedWithRepair** | Skip the corrupted bytes, keep the records that continue the replayed sequence, then rewrite the segment from them |
 
-`TolerateWithRepair` is useful for recovering from crashes that left partial writes. The corrupted data represents uncommitted transactions (they crashed before completing), so truncating them maintains consistency.
+### Why Damage Appears Mid-Segment: Appending Behind a Torn Tail
+
+The writer appends to the highest segment when the database opens
+(`Wal::create_writer`, block offset = file size % block size). A crash can
+leave a torn tail: a zeroed region (an `Empty` header, which the writer never
+emits — block padding is always shorter than a header) or a partial record.
+Replay accepts both as a clean end of segment. Before B033 the writer then
+appended new, acknowledged records right behind that tail, and the *next*
+replay stopped at the tail and repair truncated everything after it, losing
+those records. Recovery now closes this:
+
+- `replay_wal_outcome` reports `last_segment_end`, the offset right after the
+  last replayed record of the highest segment, and
+  `truncate_wal_segment_tail` cuts the bytes past it (they are not records)
+  before anything is appended.
+- `Core::reopen_wal_after_recovery` replaces the writer opened before replay
+  (startup and restore). Without it, a segment that recovery repaired, removed
+  or cut would keep receiving writes through a file descriptor to the replaced
+  inode, or at a stale block offset.
+
+### Resync: Reading Past a Corrupted Region
+
+Segments written by older versions can still hold damage followed by valid
+records, so the tolerant path reads past damage instead of stopping at it:
+
+- `Reader::set_resyncing(true)` makes `Reader::read` report the corruption and
+  continue instead of returning `Error::Corruption`.
+- The reader scans forward for a plausible record start (`find_record_start`):
+  a `Full`, `First` or `SetCompressionType` header whose CRC32 (over the type
+  byte and the payload) matches.
+- Everything skipped counts as `resynced_bytes` and is reported through the
+  `Reporter`. `Reader::take_gap` tells the replay that non-record bytes (a
+  resync or a zeroed `Empty` region) came before the record just returned.
+- When no valid record start is found before the end of the file, the reader
+  returns `UnexpectedEof` like any other end of segment.
+
+A record after a gap is replayed only when its batch's `starting_seq_num`
+equals the sequence the replay expects next (`starting_seq_num + count` of the
+last replayed batch; sequence numbers are allocated contiguously under the
+commit write mutex). The gap may have held records the crash destroyed, and the
+records after it may be older, never-acknowledged writes; replaying them
+without their predecessors would break prefix order (for example, keep a
+refcount update whose matching extent write was lost). Records written after a
+restart continue the recovered sequence, so they pass; mismatching records are
+counted as rejected, and the replay keeps looking for the expected sequence.
+
+### Repairing a Damaged Segment
+
+Every segment with skipped bytes, rejected records, or a gap followed by
+records is rewritten by `repair_corrupted_wal_segment` from exactly the
+records replay accepted (`DamagedSegment::records`), so the file on disk
+matches the memtables. The original is first copied to
+`<segment-id>.corrupt-<millis>` and fsynced (segment listing ignores it: only
+`.wal` is accepted). A segment with no replayed record is removed after the
+backup. A failed repair fails startup: continuing would append to a segment
+whose damage was never removed.
+
+`AbsoluteConsistency` keeps the strict reader (`set_resyncing(false)`, the
+default): the first corrupted record fails the replay and the database does not
+start, which is what a caller that must not accept partial recovery wants.
 
 ### Manifest's Role in Recovery
 

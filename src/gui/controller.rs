@@ -24,7 +24,7 @@ use super::tray::{TrayEvent, TrayHandle, TrayState};
 use super::{browse, daemon, desktop, paths, prefs, settings};
 use crate::config::Config;
 use crate::control::{self, require_daemon, ControlRequest};
-use crate::fs::{DaemonStatus, VerFsStats};
+use crate::fs::{DaemonStatus, RecordsCheckReport, VerFsStats};
 
 /// Startup state handed from `gui::run` to the QML-created controller.
 pub struct UiBootstrap {
@@ -88,6 +88,9 @@ mod qobject {
         #[qproperty(QString, stats_json)]
         #[qproperty(bool, stats_loading)]
         #[qproperty(QString, stats_error)]
+        #[qproperty(QString, records_json)]
+        #[qproperty(bool, records_loading)]
+        #[qproperty(QString, records_error)]
         #[qproperty(QString, snapshots_json)]
         #[qproperty(bool, snapshots_loading)]
         #[qproperty(QString, settings_json)]
@@ -162,6 +165,18 @@ mod qobject {
         fn refresh_stats(self: Pin<&mut Self>);
 
         #[qinvokable]
+        #[cxx_name = "checkRecords"]
+        fn refresh_records_check(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "moveDamagedFiles"]
+        fn move_damaged_files_to_lost_found(self: Pin<&mut Self>, paths_json: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteLostFoundFiles"]
+        fn delete_lost_found_files(self: Pin<&mut Self>, paths_json: &QString);
+
+        #[qinvokable]
         #[cxx_name = "refreshSnapshots"]
         fn refresh_snapshots(self: Pin<&mut Self>);
 
@@ -230,6 +245,8 @@ const STATS_INTERVAL: Duration = Duration::from_secs(30);
 enum Effect {
     ReloadConfig,
     RefreshSnapshots,
+    /// Re-reads the expensive reports (statistics and records check).
+    RefreshReports,
     RememberKeyFile(PathBuf),
     Quit,
 }
@@ -258,6 +275,7 @@ enum Event {
     OpDone(Result<Outcome, String>),
     Notice(Result<String, String>),
     Stats(Result<VerFsStats, String>),
+    Records(Result<RecordsCheckReport, String>),
     Snapshots(Result<Vec<String>, String>),
     Browse(Json),
     SetupDone(Result<Config, String>),
@@ -309,6 +327,9 @@ pub struct AppControllerRust {
     stats_error: QString,
     snapshots_json: QString,
     snapshots_loading: bool,
+    records_json: QString,
+    records_loading: bool,
+    records_error: QString,
     settings_json: QString,
     setup_settings_json: QString,
     restart_needed: bool,
@@ -367,6 +388,135 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// Folder where damaged files are moved for review: at the top of the mount,
+/// or at the top of the vault for vault files (renames cannot cross the vault
+/// boundary).
+const LOST_FOUND_DIR_NAME: &str = "lost+found";
+const VAULT_PREFIX: &str = ".vault/";
+const SNAPSHOTS_PREFIX: &str = ".snapshots/";
+
+/// The `lost+found` folder that holds files from `rel`'s side of the vault
+/// boundary, relative to the mount root.
+fn lost_found_root_for(rel: &str) -> String {
+    if rel.starts_with(VAULT_PREFIX) {
+        format!("{VAULT_PREFIX}{LOST_FOUND_DIR_NAME}")
+    } else {
+        LOST_FOUND_DIR_NAME.to_owned()
+    }
+}
+
+fn is_in_lost_found(rel: &str) -> bool {
+    rel.starts_with(&format!("{LOST_FOUND_DIR_NAME}/"))
+        || rel.starts_with(&format!("{VAULT_PREFIX}{LOST_FOUND_DIR_NAME}/"))
+}
+
+fn parse_path_list(paths_json: &QString) -> Result<Vec<String>> {
+    let paths: Vec<String> = serde_json::from_str(&paths_json.to_string())
+        .context("invalid file list from the interface")?;
+    for rel in &paths {
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            bail!("unexpected file path from the interface: {rel}");
+        }
+    }
+    Ok(paths)
+}
+
+/// Moves `rel` (relative to the mount root) into `lost+found/<stamp>/` on its
+/// side of the vault boundary, creating the folders needed to keep the file's
+/// place in the tree.
+fn move_into_lost_found(mount: &Path, stamp: &str, rel: &str) -> Result<()> {
+    if rel.starts_with(SNAPSHOTS_PREFIX) {
+        bail!("snapshots are read-only; delete the snapshot to release this file");
+    }
+    if rel.starts_with(VAULT_PREFIX) && !mount.join(VAULT_PREFIX).is_dir() {
+        bail!("the vault is locked; unlock it to move this file");
+    }
+    let tree_rel = rel.strip_prefix(VAULT_PREFIX).unwrap_or(rel);
+    let source = mount.join(rel);
+    let target = mount.join(lost_found_root_for(rel)).join(stamp).join(tree_rel);
+    let parent = target
+        .parent()
+        .with_context(|| format!("damaged file path has no folder: {rel}"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    std::fs::rename(&source, &target)
+        .with_context(|| format!("could not move {}", source.display()))?;
+    Ok(())
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<std::io::Error>(),
+        Some(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Removes the folders a deletion emptied, up to (and excluding)
+/// `lost+found/` itself.
+fn prune_empty_lost_found_dirs(mount: &Path, rel: &str, dir: &Path) -> Result<()> {
+    let boundary = mount.join(lost_found_root_for(rel));
+    let mut current = dir.to_path_buf();
+    while current != boundary && current.starts_with(&boundary) {
+        let mut entries = std::fs::read_dir(&current)
+            .with_context(|| format!("could not read {}", current.display()))?;
+        if entries.next().is_some() {
+            break;
+        }
+        let parent = current.parent().map(Path::to_path_buf);
+        std::fs::remove_dir(&current)
+            .with_context(|| format!("could not remove {}", current.display()))?;
+        match parent {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_message(
+    locations: &[String],
+    moved: usize,
+    already_gone: usize,
+    failures: &[String],
+) -> String {
+    let mut message = if moved > 0 {
+        format!("Moved {moved} file(s) to {}.", locations.join(" and "))
+    } else {
+        "No file was moved.".to_owned()
+    };
+    if already_gone > 0 {
+        message.push_str(&format!(
+            " {already_gone} file(s) were already gone (the check was out of date)."
+        ));
+    }
+    if !failures.is_empty() {
+        message.push_str(&format!(
+            " {} file(s) could not be moved: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    message
+}
+
+fn deletion_message(deleted: usize, already_gone: usize, failures: &[String]) -> String {
+    let mut message = format!("Deleted {deleted} damaged file(s).");
+    if already_gone > 0 {
+        message.push_str(&format!(" {already_gone} were already gone."));
+    }
+    if !failures.is_empty() {
+        message.push_str(&format!(
+            " {} file(s) could not be deleted: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    message
 }
 
 fn defaults_for(config: &Config) -> Result<Config> {
@@ -634,6 +784,18 @@ impl qobject::AppController {
                     Err(err) => self.as_mut().set_stats_error(qs(err)),
                 }
             }
+            Event::Records(result) => {
+                self.as_mut().set_records_loading(false);
+                match result {
+                    Ok(records) => {
+                        let mut value = json!(records);
+                        value["updatedAtMs"] = json!(now_ms());
+                        self.as_mut().set_records_json(qs(value.to_string()));
+                        self.as_mut().set_records_error(QString::default());
+                    }
+                    Err(err) => self.as_mut().set_records_error(qs(err)),
+                }
+            }
             Event::Snapshots(result) => {
                 self.as_mut().set_snapshots_loading(false);
                 match result {
@@ -677,6 +839,10 @@ impl qobject::AppController {
                 self.as_mut().refresh_integration();
             }
             Effect::RefreshSnapshots => self.as_mut().refresh_snapshots(),
+            Effect::RefreshReports => {
+                self.as_mut().refresh_stats();
+                self.as_mut().refresh_records_check();
+            }
             Effect::RememberKeyFile(path) => {
                 self.as_mut()
                     .set_vault_key_file(qs(path.to_string_lossy()));
@@ -998,6 +1164,133 @@ impl qobject::AppController {
             Ok(()) => self.as_mut().set_stats_loading(true),
             Err(err) => self.as_mut().notify(err_text(&err), true),
         }
+    }
+
+    /// Runs the full records check and publishes it for the details dialog.
+    fn refresh_records_check(mut self: Pin<&mut Self>) {
+        if *self.records_loading() {
+            return;
+        }
+        let rt = self.as_mut().rt_mut();
+        let Some(config) = rt.config.clone() else {
+            return;
+        };
+        let handle = rt.handle.clone();
+        let tx = rt.events_tx.clone();
+        let spawned = spawn_worker("records-check", tx, move || {
+            let result = handle
+                .block_on(require_daemon(&config, &ControlRequest::CheckRecords))
+                .and_then(|resp| {
+                    resp.records
+                        .context("the filesystem did not return a records report")
+                });
+            Event::Records(result.map_err(|e| err_text(&e)))
+        });
+        match spawned {
+            Ok(()) => self.as_mut().set_records_loading(true),
+            Err(err) => self.as_mut().notify(err_text(&err), true),
+        }
+    }
+
+    /// Moves damaged files out of the folder into a timestamped
+    /// `lost+found/` subfolder, keeping their relative paths. Nothing is
+    /// deleted: the user reviews them there and deletes them when ready.
+    fn move_damaged_files_to_lost_found(mut self: Pin<&mut Self>, paths_json: &QString) {
+        let paths = match parse_path_list(paths_json) {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.as_mut().notify(err_text(&err), true);
+                return;
+            }
+        };
+        if paths.is_empty() {
+            self.as_mut().notify("No damaged files to move.", true);
+            return;
+        }
+        self.as_mut().run_op(
+            "Moving damaged files to lost+found…",
+            None,
+            move |ctx| {
+                let mount = ctx.config.mount_point.clone();
+                let stamp = timestamp_name()?;
+                let mut moved = 0_usize;
+                let mut already_gone = 0_usize;
+                let mut failures = Vec::new();
+                let mut locations = Vec::new();
+                for rel in &paths {
+                    match move_into_lost_found(&mount, &stamp, rel) {
+                        Ok(()) => {
+                            moved += 1;
+                            let location = format!("{}/{stamp}", lost_found_root_for(rel));
+                            if !locations.contains(&location) {
+                                locations.push(location);
+                            }
+                        }
+                        Err(err) if is_not_found(&err) => already_gone += 1,
+                        Err(err) => failures.push(format!("{rel}: {err:#}")),
+                    }
+                }
+                let message = quarantine_message(&locations, moved, already_gone, &failures);
+                if moved == 0 && already_gone == 0 {
+                    bail!("{message}");
+                }
+                Ok(Outcome::message(message).with(Effect::RefreshReports))
+            },
+        );
+    }
+
+    /// Deletes files that were moved into `lost+found/`, then removes the
+    /// empty folders the move created. Only paths inside `lost+found/` are
+    /// accepted.
+    fn delete_lost_found_files(mut self: Pin<&mut Self>, paths_json: &QString) {
+        let paths = match parse_path_list(paths_json) {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.as_mut().notify(err_text(&err), true);
+                return;
+            }
+        };
+        if let Some(rel) = paths.iter().find(|rel| !is_in_lost_found(rel)) {
+            self.as_mut().notify(
+                format!("Refusing to delete {rel}: only files inside {LOST_FOUND_DIR_NAME}/ can be deleted here."),
+                true,
+            );
+            return;
+        }
+        if paths.is_empty() {
+            self.as_mut().notify("Nothing to delete.", true);
+            return;
+        }
+        self.as_mut()
+            .run_op("Deleting damaged files…", None, move |ctx| {
+                let mount = ctx.config.mount_point.clone();
+                let mut deleted = 0_usize;
+                let mut already_gone = 0_usize;
+                let mut failures = Vec::new();
+                for rel in &paths {
+                    if rel.starts_with(VAULT_PREFIX) && !mount.join(VAULT_PREFIX).is_dir() {
+                        failures.push(format!("{rel}: the vault is locked; unlock it to delete this file"));
+                        continue;
+                    }
+                    let path = mount.join(rel);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            deleted += 1;
+                            if let Some(parent) = path.parent() {
+                                prune_empty_lost_found_dirs(&mount, rel, parent)?;
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => already_gone += 1,
+                        Err(err) => failures.push(format!("{rel}: {err}")),
+                    }
+                }
+                let message =
+                    deletion_message(deleted, already_gone, &failures);
+                if deleted == 0 && already_gone == 0 {
+                    bail!("{message}");
+                }
+                Ok(Outcome::message(message).with(Effect::RefreshReports))
+            });
     }
 
     fn refresh_snapshots(mut self: Pin<&mut Self>) {

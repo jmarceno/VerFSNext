@@ -346,11 +346,24 @@ ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 label: "Health"
+                interactive: root.stats !== null
                 value: root.healthy && root.stats && root.stats.pack_crc32_read_error_count === 0 ? "All good" : "Check details"
                 valueColor: root.healthy && root.stats && root.stats.pack_crc32_read_error_count === 0 ? theme.statusGreen : theme.warning
-                caption: root.stats && root.stats.pack_crc32_read_error_count > 0
-                         ? root.stats.pack_crc32_read_error_count + " checksum errors while reading"
-                         : (root.healthy ? "Records are consistent" : "Records need attention")
+                caption: {
+                    if (!root.stats)
+                        return ""
+                    const s = root.stats
+                    if (s.pack_crc32_read_error_count > 0)
+                        return s.pack_crc32_read_error_count + " damaged copies found while reading — click for details"
+                    if (s.missing_chunk_records_for_extents > 0)
+                        return s.missing_chunk_records_for_extents + " lost data pieces — click to see the files"
+                    if (s.chunk_refcount_mismatch_count > 0)
+                        return s.chunk_refcount_mismatch_count + " records with wrong counts — click for details"
+                    if (s.orphan_extent_records > 0)
+                        return s.orphan_extent_records + " leftover records — click for details"
+                    return "Records are consistent — click for details"
+                }
+                onClicked: recordsReport.open()
             }
         }
 
@@ -487,5 +500,10 @@ ScrollView {
         }
 
         Item { Layout.preferredHeight: 8 }
+
+        RecordsReport {
+            id: recordsReport
+            controller: root.controller
+        }
     }
 }

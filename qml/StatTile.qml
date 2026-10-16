@@ -10,13 +10,25 @@ Rectangle {
     property string value: "—"
     property string caption: ""
     property color valueColor: theme.textPrimary
+    /// Makes the tile react to clicks and to the mouse pointer.
+    property bool interactive: false
+    signal clicked()
 
     radius: theme.radius
     color: theme.cardBg
     border.width: 1
-    border.color: "#1f242d"
+    border.color: pointer.containsMouse ? theme.accent : "#1f242d"
     implicitHeight: col.implicitHeight + 32
     implicitWidth: 150
+
+    MouseArea {
+        id: pointer
+        anchors.fill: parent
+        enabled: root.interactive
+        hoverEnabled: root.interactive
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.clicked()
+    }
 
     ColumnLayout {
         id: col

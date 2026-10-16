@@ -36,7 +36,10 @@ use verfsnext_async_fusex::{
 
 use crate::config::Config;
 use crate::control::{is_daemon_reachable, send_control_request, ControlRequest, ControlResponse};
-use crate::fs::{OfflineGcReport, PackCrc32ReadErrorCounters, VaultOwner, VerFs, VerFsStats};
+use crate::fs::{
+    AffectedFile, OfflineGcReport, PackCrc32ReadErrorCounters, RecordsCheckReport, VaultOwner,
+    VerFs, VerFsStats,
+};
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
 use crate::permissions::set_socket_mode;
@@ -233,6 +236,14 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
             }
             if !try_run_stats_via_socket(&config).await? {
                 bail!("stats requires a mounted daemon (control socket unavailable)");
+            }
+        }
+        "check" => {
+            if !args[1..].is_empty() {
+                bail!("check does not take arguments");
+            }
+            if !try_run_check_via_socket(&config).await? {
+                bail!("check requires a mounted daemon (control socket unavailable)");
             }
         }
         "crypt" => match parse_crypt_cmd(&args[1..])? {
@@ -675,6 +686,14 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
             },
             Err(err) => ControlResponse::failure(&err),
         },
+        ControlRequest::CheckRecords => match fs.check_records().await {
+            Ok(records) => ControlResponse {
+                message: format_records_report(&records),
+                records: Some(records),
+                ..ControlResponse::success()
+            },
+            Err(err) => ControlResponse::failure(&err),
+        },
         ControlRequest::Status => match fs.daemon_status() {
             Ok(status) => ControlResponse {
                 status: Some(status),
@@ -734,6 +753,98 @@ async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
         println!("{}", resp.message);
     }
     Ok(true)
+}
+
+async fn try_run_check_via_socket(config: &Config) -> Result<bool> {
+    let Some(resp) = send_control_request(
+        &config.control_socket_path(),
+        &ControlRequest::CheckRecords,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    if !resp.message.is_empty() {
+        println!("{}", resp.message);
+    }
+    Ok(true)
+}
+
+fn format_records_report(records: &RecordsCheckReport) -> String {
+    let mut out = String::new();
+    if records.is_clean() {
+        out.push_str("Records check: consistent (no missing data, no damaged copies, no reference-count mismatches, no orphan records).\n");
+    } else {
+        out.push_str("Records check: problems found.\n");
+    }
+    out.push_str(&format!(
+        "  missing chunk records for extents: {}\n  chunk refcount mismatches: {}\n  orphan extent records: {}\n  pack payload CRC32 read errors this mount: {}\n",
+        records.missing_chunk_records_for_extents,
+        records.chunk_refcount_mismatch_count,
+        records.orphan_extent_records,
+        records.pack_crc32_read_error_count,
+    ));
+
+    if !records.files_with_missing_pieces.is_empty() {
+        out.push_str(&format!(
+            "\nFiles with missing data ({}):\n",
+            records.files_with_missing_pieces.len()
+        ));
+        for file in &records.files_with_missing_pieces {
+            out.push_str(&format!(
+                "  {}  [{} bytes, {} pieces gone, first at offset {}]\n",
+                affected_file_label(file),
+                file.size_bytes,
+                file.pieces,
+                file.first_offset,
+            ));
+        }
+        out.push_str("Restore these files from a backup, or delete them to release the damaged records.\n");
+    }
+
+    if !records.files_with_damaged_copies.is_empty() {
+        out.push_str(&format!(
+            "\nFiles with damaged stored copies ({}):\n",
+            records.files_with_damaged_copies.len()
+        ));
+        for file in &records.files_with_damaged_copies {
+            out.push_str(&format!(
+                "  {}  [{} bytes, {} pieces damaged, first at offset {}]\n",
+                affected_file_label(file),
+                file.size_bytes,
+                file.pieces,
+                file.first_offset,
+            ));
+        }
+        out.push_str("Their stored copies failed a checksum; writing the content again stores a fresh copy.\n");
+    }
+
+    if !records.files_with_refcount_drift.is_empty() {
+        out.push_str(&format!(
+            "\nFiles referencing chunks with a drifted reference count ({}):\n",
+            records.files_with_refcount_drift.len()
+        ));
+        for file in &records.files_with_refcount_drift {
+            out.push_str(&format!(
+                "  {}  [{} bytes, {} pieces affected]\n",
+                affected_file_label(file),
+                file.size_bytes,
+                file.pieces,
+            ));
+        }
+    }
+
+    if records.list_truncated {
+        out.push_str("\n(file list truncated)\n");
+    }
+    out
+}
+
+fn affected_file_label(file: &AffectedFile) -> String {
+    match &file.path {
+        Some(path) => path.clone(),
+        None => format!("(inode {} has no folder entry)", file.ino),
+    }
 }
 
 fn format_stats_report(stats: &VerFsStats) -> String {

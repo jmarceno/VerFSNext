@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::config::Config;
-use crate::fs::{DaemonStatus, VaultOwner, VerFs, VerFsStats};
+use crate::fs::{DaemonStatus, RecordsCheckReport, VaultOwner, VerFs, VerFsStats};
 use crate::vault::{generate_key_file_material, read_key_file, resolve_create_key_path, write_key_file};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +42,8 @@ pub enum ControlRequest {
     VaultLock,
     /// Full report: scans all metadata, so it is expensive on large trees.
     Stats,
+    /// Consistency check that names the affected files; also scans all metadata.
+    CheckRecords,
     /// Cheap state for frequent polling.
     Status,
 }
@@ -54,6 +56,8 @@ pub struct ControlResponse {
     pub error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<VerFsStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<RecordsCheckReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<DaemonStatus>,
 }

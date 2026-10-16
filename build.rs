@@ -24,6 +24,8 @@ fn build_gui() {
         QmlFile::from("qml/Field.qml"),
         QmlFile::from("qml/PathField.qml"),
         QmlFile::from("qml/StatTile.qml"),
+        QmlFile::from("qml/RecordsFileRow.qml"),
+        QmlFile::from("qml/RecordsReport.qml"),
         QmlFile::from("qml/ChoiceCard.qml"),
         QmlFile::from("qml/StepDots.qml"),
         QmlFile::from("qml/FolderPicker.qml"),
