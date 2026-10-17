@@ -123,6 +123,7 @@ SurrealKV supports three LSM-native mutation types for counter workloads, optimi
 - Read behavior:
   - Point gets suppress keys covered by a newer `RangeDelete`.
   - Iterators return only keys whose final resolved point state remains visible after range tombstone checks.
+  - Forward scans in the VerFSNext vendor skip the per-key point lookup when the iterator state cannot hold a range tombstone and the newest visible version of the key is a plain `Set`/`Replace`: the merge iterator already yields that version first, so it is its own resolution. Merges (deltas to accumulate), unknown kinds, and any state that may hold a range tombstone still resolve each key through `Snapshot::get`. Without this, every entry of every range scan repeated the full level search, which made whole-tree scans (statistics, records check) an order of magnitude slower than the data warranted.
 
 ### Compaction Interaction
 

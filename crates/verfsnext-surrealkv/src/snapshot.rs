@@ -104,6 +104,30 @@ pub(crate) struct IterState {
     pub levels: Levels,
 }
 
+/// True when any component of this state may hold a range tombstone.
+///
+/// Range tombstones hide other keys, so a forward scan must resolve every key
+/// through [`Snapshot::get`] to check their coverage. When none can exist, the
+/// first visible version of a user key is already its final value.
+fn iter_state_may_have_range_deletes(iter_state: &IterState) -> bool {
+    if iter_state.active.may_have_range_deletes() {
+        return true;
+    }
+    if iter_state
+        .immutable
+        .iter()
+        .any(|memtable| memtable.may_have_range_deletes())
+    {
+        return true;
+    }
+    iter_state.levels.get_levels().iter().any(|level| {
+        level
+            .tables
+            .iter()
+            .any(|table| table.meta.properties.num_range_deletions > 0)
+    })
+}
+
 // ===== Snapshot Implementation =====
 /// A consistent point-in-time view of the LSM tree.
 ///
@@ -1011,6 +1035,11 @@ pub(crate) struct SnapshotIterator<'a> {
     forward_resolved_value: Vec<u8>,
     has_forward_resolved_value: bool,
 
+    /// True when the state this iterator walks may hold a range tombstone.
+    /// Without them a forward step does not need to resolve the key through a
+    /// point lookup: see `skip_to_valid_forward`.
+    range_deletes_possible: bool,
+
     /// Whether the iterator has been initialized
     initialized: bool,
 }
@@ -1024,6 +1053,7 @@ impl SnapshotIterator<'_> {
             seq_num,
         };
         let iter_state = snapshot.collect_iter_state()?;
+        let range_deletes_possible = iter_state_may_have_range_deletes(&iter_state);
         let merge_iter =
             KMergeIterator::new_from(iter_state, range, core.opts.compaction_tiered_levels);
 
@@ -1041,6 +1071,7 @@ impl SnapshotIterator<'_> {
             direction: MergeDirection::Forward,
             forward_resolved_value: Vec::new(),
             has_forward_resolved_value: false,
+            range_deletes_possible,
             initialized: false,
         })
     }
@@ -1077,6 +1108,20 @@ impl SnapshotIterator<'_> {
             if key_ref.is_tombstone() {
                 self.merge_iter.next()?;
                 continue;
+            }
+
+            // A plain assignment is its own resolution: the merge iterator
+            // already yields the newest version of this user key that the
+            // snapshot can see, and no range tombstone (the only thing that
+            // can hide a present key) can exist in this state. Re-reading the
+            // key through a point lookup would repeat the whole level search
+            // for every entry of the scan.
+            let kind = key_ref.kind();
+            if !self.range_deletes_possible
+                && matches!(kind, InternalKeyKind::Set | InternalKeyKind::Replace)
+            {
+                self.has_forward_resolved_value = false;
+                return Ok(true);
             }
 
             let snapshot = Snapshot {
