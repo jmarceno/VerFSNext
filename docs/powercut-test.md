@@ -184,3 +184,4 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   error, with the data still in the WAL. A harness artifact, not a VerFSNext finding: the
   ballast is now removed after the cold check, before the second life.
 - **2026-10-17 19:50, `4ac877e`**: stopped to grow the disks (origin and base 10 GiB, log 24 GiB) and to keep only logs and journals as evidence.
+- **2026-10-17 19:56, `852fccb`, all faults, 6 h**: started.
