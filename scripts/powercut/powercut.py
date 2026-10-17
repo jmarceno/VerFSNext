@@ -1446,6 +1446,12 @@ class Run:
             # The settle verifies the crash image against `expected` before adopting it.
             crew.settle('cold')
             daemon.check_records()
+            # A point inside an ENOSPC window has the ballast on its image. The cold
+            # check ran on that full disk; the second life gets the space back.
+            ballast = CHK / 'ballast'
+            if ballast.exists():
+                ballast.unlink()
+                self.events.write(kind='point_ballast_removed', **context)
             crew.resume(mmap_ok=False)
             time.sleep(rng.uniform(1, 6))
             crew.phase.window = 'kill'

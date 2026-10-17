@@ -177,4 +177,10 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   (all modes, 0 recovery errors, no finding), then the harness stopped at the 3 GiB
   guard: every point's second life and observations had added 9.3 GiB to the run's
   reference store. Each point now keeps its own store, removed with the point.
-- **2026-10-17 15:21, `69c9a03`, all faults, 6 h**: started.
+- **2026-10-17 15:21, `69c9a03`, all faults, 6 h**: 94 points and 44 nested points passed,
+  then `daemon_stop_failed`: the crash point lay inside an ENOSPC window, so the replayed
+  image still held the ballast (845 MiB of data plus a 2.2 GiB ballast on 2.9 GiB). The
+  cold check passed on the full disk; in the second life, SIGTERM shutdown could not flush
+  an 85 MB memtable to an SST ("No space left on device") and exited with an explicit
+  error, with the data still in the WAL. A harness artifact, not a VerFSNext finding: the
+  ballast is now removed after the cold check, before the second life.
