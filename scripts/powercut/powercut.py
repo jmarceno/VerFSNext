@@ -157,6 +157,17 @@ def teardown():
         dm_remove(name)
 
 
+ROOT_MIN_FREE = 3 << 30
+
+
+def check_root_space():
+    """The oracle (journal, reference store) lives on the VM root disk; stop before it fills."""
+    free = shutil.disk_usage(STATE).free
+    if free < ROOT_MIN_FREE:
+        raise HarnessError(f'VM root disk has {free >> 20} MiB free, below {ROOT_MIN_FREE >> 20} MiB; '
+                           f'remove old runs under {STATE / "runs"}')
+
+
 def device_sectors(dev):
     return int(run('blockdev', '--getsz', dev).stdout)
 
@@ -1224,6 +1235,7 @@ class Run:
         counts = {}
         try:
             while time.monotonic() < deadline and log_writes_usage('pc-log', dev['log']) < log_budget:
+                check_root_space()
                 event = self.rng.choices(faults, [FAULT_WEIGHTS[f] for f in faults])[0]
                 counts[event] = counts.get(event, 0) + 1
                 self.status(phase='record', event=event, events=counts,
@@ -1321,6 +1333,7 @@ class Run:
         stats = dict(points=0, nested=0, nested_points=0, modes={}, recovery_errors=0)
         self.status(phase='replay', points_planned=points, log_entries=log.count, replay=stats)
         for number, point in enumerate(sorted(chosen)):
+            check_root_space()
             mode = self.rng.choice(['prefix', 'drop', 'drop', 'torn', 'torn'])
             point_seed = f'{self.seed}:{point}:{mode}'
             nested = nested_every and number % nested_every == nested_every - 1
@@ -1494,6 +1507,7 @@ def cmd_run(args):
         run_dir.mkdir(parents=True)
         current = Run(run_dir, seed)
         try:
+            check_root_space()
             counts = current.record(args.record_seconds, args.log_budget, args.faults)
             stats = current.replay(args.points, args.nested_every)
         except Finding as finding:
