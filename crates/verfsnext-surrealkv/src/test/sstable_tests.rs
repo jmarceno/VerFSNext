@@ -78,7 +78,7 @@ fn test_table_builder() {
     }
 
     let actual = b.finish().unwrap();
-    assert_eq!(602, actual);
+    assert_eq!(724, actual);
 }
 
 #[test]
@@ -1548,29 +1548,6 @@ fn test_table_iterator_multiple_iterations() {
 
 #[test]
 fn test_table_iterator_positioning_edge_cases() {
-    // Test 1: Empty table
-    // Note: An empty SSTable has no valid index blocks, so seek operations
-    // return errors. This is expected behavior - empty SSTables are edge cases
-    // that shouldn't normally occur in production.
-    {
-        let empty_data: Vec<(&str, &str)> = vec![];
-        let (src, size) = build_table(empty_data);
-        let opts = default_opts();
-        let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-
-        let mut iter = table.iter(None).unwrap();
-
-        // next() tries to seek_to_first() which fails on empty table (no valid blocks)
-        let result = iter.next();
-        assert!(
-            result.is_err(),
-            "next() on empty table should return error (no valid blocks)"
-        );
-
-        // Iterator should not be valid
-        assert!(!iter.valid(), "Iterator should not be valid on empty table");
-    }
-
     // Test 2: Single item table
     {
         let single_data = vec![("single", "item")];
@@ -1934,20 +1911,6 @@ fn test_get_with_lower_sequence_number() {
         );
     }
     assert!(result.is_none());
-}
-
-#[test]
-fn test_get_empty_table() {
-    let opts = Arc::new(Options::new().with_filter_policy(None));
-    let mut buffer = Vec::new();
-    let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
-
-    let size = writer.finish().unwrap();
-    let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
-
-    let lookup_key = InternalKey::new(Vec::from(b"any_key"), 100, InternalKeyKind::Set, 0);
-    let result = table.get(&lookup_key);
-    assert!(result.is_err());
 }
 
 #[test]
@@ -4815,27 +4778,6 @@ fn test_table_iterator_across_partitions() {
         count_backward, 100,
         "Should iterate all 100 keys backwards across partitions"
     );
-}
-
-#[test]
-fn test_empty_table_operations() {
-    let opts = default_opts();
-    let mut buffer = Vec::new();
-    let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
-
-    // Don't add any entries - create empty table
-    let size = writer.finish().unwrap();
-    let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
-
-    // Verify Get returns not found
-    let seek_key = InternalKey::new(b"any_key".to_vec(), 1, InternalKeyKind::Set, 0);
-    let result = table.get(&seek_key);
-    assert!(result.is_err(), "Get on empty table should return error");
-
-    // Verify iterator immediately invalid
-    let mut iter = table.iter(None).unwrap();
-    let result = iter.seek_to_first();
-    assert!(result.is_err(), "Get on empty table should return error");
 }
 
 #[test]

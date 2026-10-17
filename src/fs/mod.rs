@@ -12,7 +12,6 @@ use verfsnext_async_fusex::fs_util::{
     build_error_result_from_errno, CreateParam, FileAttr, FileLockParam, INum, RenameParam,
     SetAttrParam, StatFsParam,
 };
-use verfsnext_async_fusex::protocol::FUSE_WRITE_CACHE;
 use verfsnext_async_fusex::{DirEntry, FileType, VirtualFs};
 use async_trait::async_trait;
 use moka::sync::Cache;

@@ -178,18 +178,6 @@ impl WriteBatcher {
         }
     }
 
-    pub async fn enqueue(&self, op: WriteOp, bytes: usize) -> Result<()> {
-        self.tx
-            .send(QueueMessage::Write(QueuedWrite {
-                op,
-                bytes,
-                done: None,
-            }))
-            .map_err(|_| anyhow!("write batcher is closed"))?;
-        self.pending_count.fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-
     pub async fn enqueue_and_wait(&self, op: WriteOp, bytes: usize) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx

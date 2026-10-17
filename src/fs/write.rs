@@ -253,6 +253,7 @@ impl FsCore {
     /// falls on the start of an old extent or on the end of the data (end of
     /// file or a hole), or at the old boundary that follows once the
     /// resynchronization budget is spent.
+    #[allow(clippy::too_many_arguments)]
     fn chunk_region(
         &self,
         inode: &InodeRecord,

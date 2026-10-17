@@ -2994,6 +2994,7 @@ async fn test_concurrent_flush_after_rotation() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[allow(clippy::await_holding_lock)] // the test deliberately holds the manifest lock across the sleep
 async fn test_rotate_memtable_waits_on_manifest_before_immutable_lock() {
     let temp_dir = TempDir::new("test").unwrap();
     let path = temp_dir.path().to_path_buf();

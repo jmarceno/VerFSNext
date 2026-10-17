@@ -587,7 +587,8 @@ impl PackStore {
         }
         let mut out = Vec::with_capacity(raw.len() / INDEX_ENTRY_LEN);
         let mut aligned = AlignedBytes::<INDEX_ENTRY_LEN>::zeroed();
-        for record in raw.chunks_exact(INDEX_ENTRY_LEN) {
+        let (records, _) = raw.as_chunks::<INDEX_ENTRY_LEN>();
+        for record in records {
             aligned.as_mut_slice().copy_from_slice(record);
             out.push(Self::decode_index_record(aligned.as_slice())?);
         }

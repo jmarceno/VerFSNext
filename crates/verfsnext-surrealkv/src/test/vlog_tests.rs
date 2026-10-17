@@ -786,7 +786,7 @@ async fn test_vlog_rotation_uses_projected_append_size() {
     let vlog = VLog::new(Arc::clone(&opts)).unwrap();
 
     // First write leaves room in file 1.
-    let pointer1 = vlog.append(b"small", &vec![1u8; 200]).unwrap();
+    let pointer1 = vlog.append(b"small", &[1u8; 200]).unwrap();
     assert_eq!(pointer1.file_id, 1);
 
     // This entry itself fits in a file, but would overflow if appended to file 1.
@@ -842,7 +842,7 @@ async fn test_vlog_single_oversized_entry_stays_atomic() {
     );
 
     // Next append should rotate away from the oversized active file.
-    let pointer2 = vlog.append(b"next", &vec![3u8; 64]).unwrap();
+    let pointer2 = vlog.append(b"next", &[3u8; 64]).unwrap();
     vlog.sync().unwrap();
     assert_eq!(pointer2.file_id, 2);
 

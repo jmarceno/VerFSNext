@@ -86,7 +86,7 @@ pub async fn umount(short_path: &Path) -> anyhow::Result<()> {
                 debug!("fusermount failed to umount, the error is: {}", &stderr);
                 Err(anyhow::anyhow!(
                     "fusermount failed to umount fuse device, the error is: {}",
-                    &stderr,
+                    stderr,
                 ))
             }
         }

@@ -1,5 +1,7 @@
 //! Implementation of FUSE library
 
+#![allow(clippy::double_must_use)] // async_trait expands a must_use onto every boxed-future method
+
 #[allow(clippy::tests_outside_test_module)]
 mod abi_marker;
 mod context;
