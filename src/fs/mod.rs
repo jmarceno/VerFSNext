@@ -65,6 +65,12 @@ use crate::write::batcher::{WriteApply, WriteBatcher, WriteOp};
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const RENAME_FLAG_NOREPLACE: u32 = libc::RENAME_NOREPLACE;
 const RENAME_FLAG_EXCHANGE: u32 = libc::RENAME_EXCHANGE;
+/// A kept statistics scan answers display requests until it is this old; the
+/// first request after that starts a background refresh.
+const STATS_REFRESH_MIN_AGE_MS: u64 = 30_000;
+/// File in the data directory that keeps the last completed scan across
+/// daemon restarts.
+const STATS_SNAPSHOT_FILE: &str = "stats-snapshot.json";
 
 pub mod chunk;
 mod fill_cache;
@@ -234,6 +240,27 @@ struct ThroughputSample {
     write_bps: f64,
 }
 
+/// A completed statistics scan kept for instant answers, including across
+/// daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsSnapshot {
+    /// When the scan finished, in milliseconds since the Unix epoch.
+    pub scanned_at_ms: u64,
+    pub stats: VerFsStats,
+}
+
+/// Answer to a statistics request: the scan to show and the state of a newer
+/// one.
+pub struct StatsAnswer {
+    pub stats: VerFsStats,
+    /// When the returned scan finished, in milliseconds since the Unix epoch.
+    pub scanned_at_ms: u64,
+    /// True while a newer scan runs in the background.
+    pub refreshing: bool,
+    /// Failure of the last background refresh, kept until one succeeds.
+    pub refresh_error: Option<String>,
+}
+
 /// What the last active sample measured, with the clock reading that ages it.
 #[derive(Clone, Copy)]
 struct ActivitySnapshot {
@@ -317,6 +344,11 @@ struct FsCore {
     chunk_data_cache_misses: AtomicU64,
     throughput: ParkingMutex<ThroughputSample>,
     last_activity: ParkingMutex<Option<ActivitySnapshot>>,
+    /// Last completed statistics scan, persisted so a fresh daemon (and a
+    /// fresh boot) can answer before its first scan finishes.
+    stats_snapshot: ParkingMutex<Option<StatsSnapshot>>,
+    stats_scan_in_progress: AtomicBool,
+    stats_refresh_error: ParkingMutex<String>,
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
     pack_crc32_read_error_count: AtomicU64,
@@ -434,6 +466,9 @@ impl VerFs {
             chunk_data_cache_misses: AtomicU64::new(0),
             throughput: ParkingMutex::new(ThroughputSample::default()),
             last_activity: ParkingMutex::new(None),
+            stats_snapshot: ParkingMutex::new(None),
+            stats_scan_in_progress: AtomicBool::new(false),
+            stats_refresh_error: ParkingMutex::new(String::new()),
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
             pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
@@ -460,6 +495,7 @@ impl VerFs {
             kernel_lookups: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
         });
+        core.load_stats_snapshot();
 
         let throughput_core = Arc::downgrade(&core);
         let throughput_worker = tokio::spawn(async move {
@@ -587,11 +623,59 @@ impl VerFs {
         self.core.lock_vault().await
     }
 
-    pub async fn collect_stats(&self) -> Result<VerFsStats> {
+    /// Runs a full statistics scan now, records it as the kept snapshot and
+    /// returns it. This is what the `stats` control command uses.
+    pub async fn collect_stats(&self) -> Result<StatsSnapshot> {
         let core = Arc::clone(&self.core);
         tokio::task::spawn_blocking(move || core.collect_stats())
             .await
             .unwrap_or_else(|e| Err(anyhow!("stats task panicked: {:?}", e)))
+    }
+
+    /// Statistics answer for a client that can show the kept scan while a
+    /// newer one is being taken (the desktop app). Without any kept scan — the
+    /// first run after setup — the request waits for the first scan.
+    pub async fn stats_for_display(self: &Arc<Self>) -> Result<StatsAnswer> {
+        let Some(kept) = self.core.stats_snapshot() else {
+            let snapshot = self.collect_stats().await?;
+            return Ok(StatsAnswer {
+                stats: snapshot.stats,
+                scanned_at_ms: snapshot.scanned_at_ms,
+                refreshing: false,
+                refresh_error: None,
+            });
+        };
+
+        if now_millis().saturating_sub(kept.scanned_at_ms) >= STATS_REFRESH_MIN_AGE_MS {
+            self.start_stats_refresh();
+        }
+        Ok(StatsAnswer {
+            stats: kept.stats,
+            scanned_at_ms: kept.scanned_at_ms,
+            refreshing: self.core.stats_scan_in_progress.load(Ordering::Relaxed),
+            refresh_error: self.core.stats_refresh_error(),
+        })
+    }
+
+    /// Starts a background scan unless one is already running. Its result
+    /// replaces the kept snapshot; a failure is kept for the next answer and
+    /// logged here.
+    fn start_stats_refresh(self: &Arc<Self>) {
+        if self.core.stats_scan_in_progress.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let fs = Arc::clone(self);
+        tokio::spawn(async move {
+            match fs.collect_stats().await {
+                Ok(_) => fs.core.clear_stats_refresh_error(),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    error!(error = %message, "background statistics refresh failed");
+                    fs.core.set_stats_refresh_error(message);
+                }
+            }
+            fs.core.stats_scan_in_progress.store(false, Ordering::Release);
+        });
     }
 
     /// Full records-consistency report naming the affected files. Expensive:
@@ -1075,7 +1159,7 @@ impl FsCore {
         Some(u64::from_be_bytes(ino))
     }
 
-    fn collect_stats(&self) -> Result<VerFsStats> {
+    fn collect_stats(&self) -> Result<StatsSnapshot> {
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
         let vault_locked = self.vault_locked();
@@ -1272,7 +1356,7 @@ impl FsCore {
         let uptime_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
         let throughput = *self.throughput.lock();
 
-        Ok(VerFsStats {
+        let stats = VerFsStats {
             live_logical_size_bytes,
             snapshots_logical_size_bytes,
             hidden_vault_logical_size_bytes,
@@ -1309,7 +1393,83 @@ impl FsCore {
             metadata_cache_entries: cache.metadata_entries,
             chunk_cache_entries: cache.chunk_entries,
             approx_cache_memory_bytes: cache.memory_bytes,
-        })
+        };
+        Ok(self.record_stats_snapshot(stats))
+    }
+
+    /// Records a completed scan as the kept snapshot and writes it to disk, so
+    /// a later daemon — or the same one after a reboot — answers instantly.
+    fn record_stats_snapshot(&self, stats: VerFsStats) -> StatsSnapshot {
+        let snapshot = StatsSnapshot {
+            scanned_at_ms: now_millis(),
+            stats,
+        };
+        *self.stats_snapshot.lock() = Some(snapshot.clone());
+        self.persist_stats_snapshot(&snapshot);
+        snapshot
+    }
+
+    /// Last completed scan, if any. Cheap: a lock and a clone.
+    pub(crate) fn stats_snapshot(&self) -> Option<StatsSnapshot> {
+        self.stats_snapshot.lock().clone()
+    }
+
+    pub(crate) fn stats_refresh_error(&self) -> Option<String> {
+        let error = self.stats_refresh_error.lock().clone();
+        if error.is_empty() {
+            None
+        } else {
+            Some(error)
+        }
+    }
+
+    pub(crate) fn clear_stats_refresh_error(&self) {
+        self.stats_refresh_error.lock().clear();
+    }
+
+    pub(crate) fn set_stats_refresh_error(&self, message: String) {
+        *self.stats_refresh_error.lock() = message;
+    }
+
+    /// Reads the persisted scan. Absent on the first run; a file that cannot be
+    /// read or parsed is reported and ignored because it is only a cache.
+    fn load_stats_snapshot(&self) {
+        let path = self.config.data_dir.join(STATS_SNAPSHOT_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "kept statistics scan is unreadable");
+                return;
+            }
+        };
+        match serde_json::from_slice::<StatsSnapshot>(&bytes) {
+            Ok(snapshot) => *self.stats_snapshot.lock() = Some(snapshot),
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "kept statistics scan does not parse");
+            }
+        }
+    }
+
+    /// Replaces the persisted scan. A failed write is reported: the file is a
+    /// cache, so the running daemon keeps answering from memory.
+    fn persist_stats_snapshot(&self, snapshot: &StatsSnapshot) {
+        let path = self.config.data_dir.join(STATS_SNAPSHOT_FILE);
+        let bytes = match serde_json::to_vec(snapshot) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(error = %err, "failed to encode the statistics scan");
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(err) = std::fs::write(&tmp, bytes) {
+            error!(path = %tmp.display(), error = %err, "failed to write the statistics scan");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            error!(path = %path.display(), error = %err, "failed to publish the statistics scan");
+        }
     }
 
     /// Last second that moved data, with the readings taken at that moment.

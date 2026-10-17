@@ -87,6 +87,7 @@ mod qobject {
         #[qproperty(QString, status_json)]
         #[qproperty(QString, stats_json)]
         #[qproperty(bool, stats_loading)]
+        #[qproperty(bool, stats_refreshing)]
         #[qproperty(QString, stats_error)]
         #[qproperty(QString, records_json)]
         #[qproperty(bool, records_loading)]
@@ -238,8 +239,12 @@ mod qobject {
 }
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
-/// The full stats report scans all metadata; keep auto-refresh rare.
+/// How long a completed statistics scan is shown before the app asks for a
+/// newer one.
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
+/// While the daemon measures a newer scan the app re-reads the kept one this
+/// often, so the fresh numbers appear as soon as the scan finishes.
+const STATS_REFRESH_POLL: Duration = Duration::from_secs(2);
 
 /// Side effects applied on the GUI thread after a worker operation.
 enum Effect {
@@ -274,11 +279,23 @@ enum Event {
     Probe(Result<(daemon::Probe, Option<DaemonStatus>), String>),
     OpDone(Result<Outcome, String>),
     Notice(Result<String, String>),
-    Stats(Result<VerFsStats, String>),
+    Stats(Result<StatsReport, String>),
     Records(Result<RecordsCheckReport, String>),
     Snapshots(Result<Vec<String>, String>),
     Browse(Json),
     SetupDone(Result<Config, String>),
+}
+
+/// One statistics answer from the daemon: the scan to show and the state of a
+/// newer one.
+struct StatsReport {
+    stats: VerFsStats,
+    /// When the shown scan finished; the app labels the numbers with it.
+    scanned_at_ms: u64,
+    /// True while the daemon measures a newer scan.
+    refreshing: bool,
+    /// Why the last background measurement failed, if it did.
+    refresh_error: String,
 }
 
 struct Runtime {
@@ -324,6 +341,7 @@ pub struct AppControllerRust {
     status_json: QString,
     stats_json: QString,
     stats_loading: bool,
+    stats_refreshing: bool,
     stats_error: QString,
     snapshots_json: QString,
     snapshots_loading: bool,
@@ -775,13 +793,17 @@ impl qobject::AppController {
                 self.as_mut().set_stats_loading(false);
                 self.as_mut().rt_mut().last_stats = Some(Instant::now());
                 match result {
-                    Ok(stats) => {
-                        let mut value = json!(stats);
-                        value["updatedAtMs"] = json!(now_ms());
+                    Ok(report) => {
+                        let mut value = json!(report.stats);
+                        value["updatedAtMs"] = json!(report.scanned_at_ms);
                         self.as_mut().set_stats_json(qs(value.to_string()));
-                        self.as_mut().set_stats_error(QString::default());
+                        self.as_mut().set_stats_refreshing(report.refreshing);
+                        self.as_mut().set_stats_error(qs(report.refresh_error));
                     }
-                    Err(err) => self.as_mut().set_stats_error(qs(err)),
+                    Err(err) => {
+                        self.as_mut().set_stats_refreshing(false);
+                        self.as_mut().set_stats_error(qs(err));
+                    }
                 }
             }
             Event::Records(result) => {
@@ -917,8 +939,17 @@ impl qobject::AppController {
             || *self.control_tab() != 0
             || *self.stats_loading()
             || self.daemon_state().to_string() != "running"
-            || self.rt().last_stats.is_some_and(|t| t.elapsed() < STATS_INTERVAL)
         {
+            return;
+        }
+        // While the daemon measures a newer scan the app re-reads the kept one
+        // often enough to show the fresh numbers as soon as they exist.
+        let interval = if *self.stats_refreshing() {
+            STATS_REFRESH_POLL
+        } else {
+            STATS_INTERVAL
+        };
+        if self.rt().last_stats.is_some_and(|t| t.elapsed() < interval) {
             return;
         }
         self.as_mut().refresh_stats();
@@ -1156,8 +1187,25 @@ impl qobject::AppController {
         let tx = rt.events_tx.clone();
         let spawned = spawn_worker("stats", tx, move || {
             let result = handle
-                .block_on(require_daemon(&config, &ControlRequest::Stats))
-                .and_then(|resp| resp.stats.context("the filesystem did not return statistics"));
+                .block_on(require_daemon(
+                    &config,
+                    &ControlRequest::Stats {
+                        allow_cached: true,
+                    },
+                ))
+                .and_then(|resp| {
+                    let stats = resp
+                        .stats
+                        .context("the filesystem did not return statistics")?;
+                    Ok(StatsReport {
+                        stats,
+                        // A daemon that predates the kept scan does not send a
+                        // timestamp: there the response is the just-taken scan.
+                        scanned_at_ms: resp.stats_scanned_at_ms.unwrap_or_else(now_ms),
+                        refreshing: resp.stats_refreshing,
+                        refresh_error: resp.stats_refresh_error.unwrap_or_default(),
+                    })
+                });
             Event::Stats(result.map_err(|e| err_text(&e)))
         });
         match spawned {

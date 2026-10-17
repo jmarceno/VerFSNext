@@ -270,8 +270,15 @@ ScrollView {
                     Label {
                         Layout.alignment: Qt.AlignRight
                         visible: root.stats !== null
-                        text: root.stats ? "Updated " + Qt.formatTime(new Date(root.stats.updatedAtMs), "hh:mm:ss") : ""
-                        color: theme.textDim
+                        text: {
+                            if (root.controller.stats_error.length > 0)
+                                return root.controller.stats_error
+                            if (!root.stats)
+                                return ""
+                            const at = "Updated " + Qt.formatTime(new Date(root.stats.updatedAtMs), "hh:mm:ss")
+                            return root.controller.stats_refreshing ? at + " · measuring again…" : at
+                        }
+                        color: root.controller.stats_error.length > 0 ? theme.dangerStrong : theme.textDim
                         font.pixelSize: 11
                     }
                 }

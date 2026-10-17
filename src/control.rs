@@ -41,7 +41,13 @@ pub enum ControlRequest {
     },
     VaultLock,
     /// Full report: scans all metadata, so it is expensive on large trees.
-    Stats,
+    /// `allow_cached` asks for the last completed scan right away and lets the
+    /// daemon refresh it in the background; without it the request waits for a
+    /// scan taken after the request arrived.
+    Stats {
+        #[serde(default)]
+        allow_cached: bool,
+    },
     /// Consistency check that names the affected files; also scans all metadata.
     CheckRecords,
     /// Cheap state for frequent polling.
@@ -56,6 +62,17 @@ pub struct ControlResponse {
     pub error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<VerFsStats>,
+    /// When the returned statistics scan finished, for clients that show how
+    /// old they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_scanned_at_ms: Option<u64>,
+    /// True while the daemon is taking a newer statistics scan in the
+    /// background; the response already carries the previous one.
+    #[serde(default)]
+    pub stats_refreshing: bool,
+    /// Why the last background statistics refresh failed, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_refresh_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records: Option<RecordsCheckReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

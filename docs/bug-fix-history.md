@@ -1263,3 +1263,68 @@ stale one.
 
 ### Affected Files
 `src/fs/mod.rs`, `qml/OverviewPage.qml`, `docs/technical_deep_dive.md`
+
+## B038 - Statistics Took Half a Minute to Appear in the UI - Oct 17 2026
+
+### Symptom
+Opening the Overview page after the app started showed empty statistics — the
+page kept "Measuring your space…" with a spinner for around half a minute and
+no numbers. The same delay hit the CLI (`verfsnext stats` took ~28 s, `check`
+~25 s). Every reboot repeated the wait from zero, because nothing about the last
+scan survived the app restart.
+
+### Root Cause
+Two independent problems compounded:
+
+1. **The scan itself was slow.** `StatsSnapshot` collection walks every
+   namespace, extent and chunk record through the SurrealKV range iterator.
+   `SnapshotIterator::skip_to_valid_forward` resolved each scanned key through
+   `Snapshot::get`, which repeats a full level search per key:
+   `may_have_any_range_deletes` (a scan of every level), then
+   `find_latest_covering_range_delete_seq` and `get_latest_point_entry_at_or_below`
+   (per-table lookups) — for a key the merge iterator had already produced. The
+   live ~200 MiB metadata set spent tens of seconds of CPU on lookups the scan
+   did not need.
+2. **Nothing was kept.** The `stats` control request always ran a fresh scan and
+   the daemon kept no result, so the app had nothing to show until the scan
+   finished, and the next daemon start began from nothing again.
+
+### Fix
+The SurrealKV vendor iterator gained a fast path: a forward scan resolves a user
+key without a point lookup when the iterator state cannot hold a range tombstone
+and the newest visible version is a plain `Set`/`Replace` — the merge iterator
+already yields that version first, so it is its own resolution. Merges, unknown
+kinds and any range-tombstone-capable state keep the previous `Snapshot::get`
+resolution, so semantics are unchanged. On the live dataset this cut the scan
+from ~28 s to ~2.5 s and `check` from ~25 s to ~1.2 s.
+
+The daemon now keeps the last completed scan as a `StatsSnapshot` (the
+`VerFsStats` plus the time it finished), in memory and persisted to
+`<data_dir>/stats-snapshot.json` through a temporary file and rename, so the
+file survives a reboot and is never read torn. The control protocol gained
+`Stats { allow_cached }`: with `true` the daemon answers from the kept snapshot
+immediately and starts one background scan when that snapshot is at least 30 s
+old, reporting `stats_scanned_at_ms`, `stats_refreshing` and
+`stats_refresh_error`; with `false` (the CLI) it still waits for a scan taken
+after the request arrived. With no kept snapshot at all the request waits for
+the first scan. The desktop app asks with `allow_cached: true`, shows the kept
+numbers with their "Updated hh:mm:ss" label, re-asks every 2 s while the daemon
+reports a refresh in progress, and shows a failed refresh in the label. The
+background scan runs on the blocking pool and never holds a FUSE lock.
+
+### Validation
+Release build on the remote builder. SurrealKV suite: 928 passed, the same 4
+pre-existing `sstable_tests` failures as before the change. On the live system:
+`stats` 28.0 s -> 2.5 s with identical numbers (live logical 6.63 GiB, metadata
+199.69 MiB, dedup 13.68%, compression 9.89%); `check` 25 s -> 1.2 s, consistent;
+a cached stats request answered in 0.2-0.3 ms; a request past 30 s returned the
+kept scan instantly with `refreshing: true` and the next polls showed the new
+scan ~2 s later; after an app restart the first request answered from the
+persisted scan in 0.3 ms with a background refresh. During a background refresh
+a 128 MiB read ran at 381 MB/s and a 22k-entry `find` completed in 1.9 s. The
+`last_activity` record from B037 kept working.
+
+### Affected Files
+`crates/verfsnext-surrealkv/src/snapshot.rs`, `src/fs/mod.rs`, `src/control.rs`,
+`src/lib.rs`, `src/gui/controller.rs`, `qml/OverviewPage.qml`,
+`crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`, `docs/technical_deep_dive.md`

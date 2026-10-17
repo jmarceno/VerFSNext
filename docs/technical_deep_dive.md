@@ -40,7 +40,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - The crate is a library (`src/lib.rs`, `verfsnext::run`) plus a thin `src/main.rs`. cxx-qt links its generated C++ objects into every target of the package, so the Qt bridge must live in a library that all targets (including `tests/`) link.
 - Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
   - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
-  - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate).
+  - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate). `Stats { allow_cached }` returns the last completed scan right away and lets the daemon refresh it in the background, reporting `stats_scanned_at_ms`, `stats_refreshing` and `stats_refresh_error`; without it the request waits for a scan taken after it arrived, which is what the CLI uses.
   - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals, RSS, cache hit rate and approximate cache memory, plus the last activity). It never scans metadata, unlike `stats`.
 - The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final sync, unmount) on SIGINT and on SIGTERM.
 - Auto config discovery order when `--config/-c` is not provided:
@@ -134,6 +134,8 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
     chunk refcount mismatches, extents referencing missing chunk records, and orphan extent records
   - stats output includes full `data_dir` size and disk delta `data_dir_size - live_logical_size`
   - stats are rendered as an aligned table for terminal readability
+  - every completed scan is kept as a snapshot (in memory and in `<data_dir>/stats-snapshot.json`), so `stats` requests that can use a kept scan answer instantly, including after a reboot; see "Kept statistics scan"
+  - range scans resolve each user key without a per-key point lookup when no range tombstone can exist (see the SurrealKV architecture guide), so whole-tree scans (statistics, records check, namespace walks) no longer repeat a full level search per key
   - read-only inode flag enforcement across mutating FUSE operations
   - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - enforces `.vault` lock-state visibility and access policy
@@ -299,7 +301,7 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 - `src/gui/tray.rs` — status line, open folder, take snapshot, start/stop, control center, quit. Quit leaves a user service running; in app mode it stops the daemon (final sync) before exiting.
 - `src/gui/desktop.rs` — app-menu and login-autostart entries (bare executable), icon install, desktop notifications for results that arrive while no window is open.
 - First run (no config): welcome → background service or app-only → recommended settings (customizable) → mount point and data folder (in-app folder picker with New Folder) → summary → start. The window closes once the folder is mounted; the app stays in the tray.
-- Control center pages: Overview (state, space saved, dedup/compression, health, activity, memory, every `stats` field; the full stats scan refreshes on demand and at most every 30 s while the page is visible), Snapshots, Vault (create with key file / unlock / lock), Folders & Startup (move folders, service mode, login autostart, stale-mount repair), Settings (all config options, restart prompt when running).
+- Control center pages: Overview (state, space saved, dedup/compression, health, activity, memory, every `stats` field; the page shows the daemon's last completed scan immediately — including after a reboot — and asks for a newer one at most every 30 s, re-reading every 2 s while the daemon measures it), Snapshots, Vault (create with key file / unlock / lock), Folders & Startup (move folders, service mode, login autostart, stale-mount repair), Settings (all config options, restart prompt when running).
 
 ## Metadata and Snapshot/GC Additions
 
@@ -481,6 +483,48 @@ still indexed in metadata. It is explicitly a partial garbage measure: obsolete
 pack entries whose chunk records have already been removed or relocated also
 consume disk until pack rewrite. It must not be presented as total reclaimable
 space. GUI and CLI use the daemon's same signed savings and percentage fields.
+
+## Kept statistics scan
+
+A whole-tree statistics scan reads every namespace, extent and chunk record.
+On the live dataset that scan was dominated by the metadata iterator: every
+entry of every range scan resolved its key through a full point lookup, so the
+scan took ~28 s of CPU for ~200 MiB of metadata. The iterator now skips that
+lookup when the state it walks cannot hold a range tombstone and the newest
+version the snapshot can see is a plain `Set`/`Replace` — the merge iterator
+already yields that version first, so it is its own resolution. Merges, unknown
+kinds and any state that may hold a range tombstone keep the old resolution (see
+the SurrealKV architecture guide, "Read behavior"). On the live dataset the scan
+now takes ~2.5 s.
+
+Because a scan over a large tree can still take seconds, the daemon keeps the
+last completed scan and answers from it:
+
+- `collect_stats` (on the blocking pool) records every completed scan as a
+  `StatsSnapshot` — `scanned_at_ms` plus the `VerFsStats` — in memory and in
+  `<data_dir>/stats-snapshot.json`, written to a temporary file and renamed into
+  place so a reader never sees a torn file. It is a cache, not metadata: a
+  missing file (first run after setup) is normal, and an unreadable or
+  unparseable one is logged and ignored, being replaced by the next scan.
+- `stats { allow_cached: true }` (the desktop app) answers from the kept
+  snapshot in milliseconds and starts one background scan when the kept one is
+  at least 30 s old (`STATS_REFRESH_MIN_AGE_MS`). At most one background scan
+  runs at a time; the answer carries the scan's timestamp, whether a refresh is
+  running (`stats_refreshing`) and the last refresh failure
+  (`stats_refresh_error`), which the app shows in place of the timestamp. The
+  app re-asks every 2 s while a refresh runs, so the fresh numbers appear as
+  soon as the scan finishes. With no kept snapshot at all — the first start
+  after setup — the request waits for the first scan.
+- `stats { allow_cached: false }` (the CLI `stats`) always waits for a scan
+  taken after the request arrived, so the printed table is never stale.
+- The file survives reboots, so the first window opened after a boot shows the
+  numbers of the last session's scan, labelled with their time, and the daemon
+  replaces them when the background scan finishes. A daemon restart loads the
+  file at startup.
+
+The scan is a read-only metadata transaction and runs on the blocking pool, so
+it never blocks FUSE reads; a 128 MiB read and a 22k-entry `find` during a
+background refresh were unaffected.
 
 ## Records Check and Damaged-File Cleanup
 

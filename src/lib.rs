@@ -37,8 +37,8 @@ use verfsnext_async_fusex::{
 use crate::config::Config;
 use crate::control::{is_daemon_reachable, send_control_request, ControlRequest, ControlResponse};
 use crate::fs::{
-    AffectedFile, OfflineGcReport, PackCrc32ReadErrorCounters, RecordsCheckReport, VaultOwner,
-    VerFs, VerFsStats,
+    AffectedFile, OfflineGcReport, PackCrc32ReadErrorCounters, RecordsCheckReport, StatsAnswer,
+    VaultOwner, VerFs, VerFsStats,
 };
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
@@ -678,14 +678,29 @@ async fn handle_control_client(fs: Arc<VerFs>, stream: UnixStream) -> Result<()>
             key_material,
         } => respond(fs.unlock_vault(&password, &key_material).await),
         ControlRequest::VaultLock => respond(fs.lock_vault().await),
-        ControlRequest::Stats => match fs.collect_stats().await {
-            Ok(stats) => ControlResponse {
-                message: format_stats_report(&stats),
-                stats: Some(stats),
-                ..ControlResponse::success()
-            },
-            Err(err) => ControlResponse::failure(&err),
-        },
+        ControlRequest::Stats { allow_cached } => {
+            let answer = if allow_cached {
+                fs.stats_for_display().await
+            } else {
+                fs.collect_stats().await.map(|snapshot| StatsAnswer {
+                    stats: snapshot.stats,
+                    scanned_at_ms: snapshot.scanned_at_ms,
+                    refreshing: false,
+                    refresh_error: None,
+                })
+            };
+            match answer {
+                Ok(answer) => ControlResponse {
+                    message: format_stats_report(&answer.stats),
+                    stats: Some(answer.stats),
+                    stats_scanned_at_ms: Some(answer.scanned_at_ms),
+                    stats_refreshing: answer.refreshing,
+                    stats_refresh_error: answer.refresh_error,
+                    ..ControlResponse::success()
+                },
+                Err(err) => ControlResponse::failure(&err),
+            }
+        }
         ControlRequest::CheckRecords => match fs.check_records().await {
             Ok(records) => ControlResponse {
                 message: format_records_report(&records),
@@ -744,8 +759,13 @@ async fn try_run_snapshot_via_socket(config: &Config, cmd: &SnapshotCommand) -> 
 }
 
 async fn try_run_stats_via_socket(config: &Config) -> Result<bool> {
-    let Some(resp) =
-        send_control_request(&config.control_socket_path(), &ControlRequest::Stats).await?
+    let Some(resp) = send_control_request(
+        &config.control_socket_path(),
+        &ControlRequest::Stats {
+            allow_cached: false,
+        },
+    )
+    .await?
     else {
         return Ok(false);
     };
