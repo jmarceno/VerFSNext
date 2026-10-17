@@ -184,3 +184,4 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   an 85 MB memtable to an SST ("No space left on device") and exited with an explicit
   error, with the data still in the WAL. A harness artifact, not a VerFSNext finding: the
   ballast is now removed after the cold check, before the second life.
+- **2026-10-17 19:50, `4ac877e`, all faults, 6 h**: started.
