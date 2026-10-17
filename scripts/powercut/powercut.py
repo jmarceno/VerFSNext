@@ -1485,14 +1485,16 @@ class Run:
                 run('umount', CHK)
 
     def preserve(self, point_dir, daemon, context):
-        """Keep the crash image's data directory before anything else touches it."""
+        """Keep the failing point's logs, journal and context."""
         save(point_dir / 'context.json', context)
         if daemon.proc and daemon.proc.poll() is None:
             daemon.kill()
-        run('tar', '-C', CHK, '-czf', point_dir / 'data-after.tar.gz', 'data', timeout=1800, check=False)
         keep = self.dir / 'failed-point'
         if not keep.exists():
-            shutil.copytree(point_dir, keep)
+            keep.mkdir()
+            for path in point_dir.iterdir():
+                if path.suffix in ('.log', '.json', '.jsonl'):
+                    shutil.copy2(path, keep)
 
 
 def digest_device(dev):
@@ -1516,6 +1518,8 @@ def cmd_run(args):
                            records_check=RECORDS_CHECK,
                            binary_sha256=file_sha(BIN),
                            harness_sha256=file_sha(__file__), runs_passed=0))
+    for old in (STATE / 'runs').glob('*'):
+        shutil.rmtree(old)
     passed = 0
     while time.monotonic() < deadline:
         seed = f'{time.time_ns()}'
@@ -1535,8 +1539,11 @@ def cmd_run(args):
         except BaseException:
             current.status(state='failed', phase='harness_error', error=traceback.format_exc()[-4000:])
             raise
+        finally:
+            for bulk in ('refs', 'points'):
+                if (run_dir / bulk).exists():
+                    shutil.rmtree(run_dir / bulk)
         passed += 1
-        shutil.rmtree(run_dir / 'refs')
         current.status(runs_passed=passed, last_run=dict(events=counts, replay=stats))
     status = json.loads(status_path.read_text())
     status.update(state='completed', finished=now())

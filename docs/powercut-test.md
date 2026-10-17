@@ -88,16 +88,15 @@ was recorded. Then a new run starts on fresh disks, until `--hours` have elapsed
 
 ## Failures
 
-The first finding stops the service. The VM keeps the disks and the run directory
-`/var/lib/powercut/runs/<run>/`:
+The first finding stops the service. The VM keeps the disks and a small run directory
+`/var/lib/powercut/runs/<run>/` (the next start deletes it):
 
 - `events.jsonl`: fault events, record summary, every passed point, and the finding
   with its full context (point, mode, seed, last flush, nested level-2 point);
-- `journal.jsonl`: every operation with its contents' hashes; `refs/` holds the
-  contents (64 KiB blocks, deduplicated);
-- `failed-point/`: the daemon log of the failing point, its level-2 journal,
-  `context.json`, and `data-after.tar.gz`, the daemon's data directory as the
-  failing check left it;
+- `journal.jsonl`: every operation with its contents' hashes (the contents themselves,
+  `refs/`, are deleted when the run ends);
+- `failed-point/`: the daemon logs of the failing point, its level-2 journal and
+  `context.json`;
 - `record-daemon.log`: the daemon log of the recording.
 
 Replay is deterministic for a level-1 point: base disk at the last flush, then
@@ -107,8 +106,8 @@ rebuild the image, as long as no new run has started.
 ## Deployment
 
 - VM **103** `verfsnext-powercut` on `pve`: Debian 13 cloud image, 4 vCPU, 6 GiB
-  RAM, `local-lvm` thin disks with discard: root 16 GiB, origin 3 GiB, log 12 GiB,
-  base 3 GiB, cow 2 GiB, log2 4 GiB, cow2 2 GiB (virtio serials `pc-*`, listed in
+  RAM, `local-lvm` thin disks with discard: root 32 GiB, origin 10 GiB, log 24 GiB,
+  base 10 GiB, cow 4 GiB, log2 8 GiB, cow2 4 GiB (virtio serials `pc-*`, listed in
   `/etc/powercut/devices.json`). It does not start on boot.
 - `provision-vm.sh` creates the VM (once). `deploy.sh --setup` installs packages,
   loads `dm_log_writes`/`dm_snapshot` and installs `powercut.service`.
@@ -184,4 +183,4 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   an 85 MB memtable to an SST ("No space left on device") and exited with an explicit
   error, with the data still in the WAL. A harness artifact, not a VerFSNext finding: the
   ballast is now removed after the cold check, before the second life.
-- **2026-10-17 19:50, `4ac877e`, all faults, 6 h**: started.
+- **2026-10-17 19:50, `4ac877e`**: stopped to grow the disks (origin and base 10 GiB, log 24 GiB) and to keep only logs and journals as evidence.

@@ -32,12 +32,12 @@ qm create "$VMID" --name "$NAME" --memory 6144 --cores 4 --cpu host --ostype l26
     --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-single --agent enabled=1 \
     --serial0 socket --vga serial0 --onboot 0
 qm set "$VMID" --scsi0 "$STORAGE:0,import-from=$CACHE/$IMAGE,discard=on,iothread=1"
-qm resize "$VMID" scsi0 16G
+qm resize "$VMID" scsi0 32G
 qm set "$VMID" --ide2 "$STORAGE:cloudinit" --boot order=scsi0 --ciuser powercut \
     --sshkeys /tmp/powercut-key.pub --ipconfig0 ip=dhcp
-# Origin and base must have the same size. Thin-provisioned: about 42 GiB at most.
-for spec in "virtio1 3 pc-origin" "virtio2 12 pc-log" "virtio3 3 pc-base" \
-            "virtio4 2 pc-cow" "virtio5 4 pc-log2" "virtio6 2 pc-cow2"; do
+# Origin and base must have the same size. Thin-provisioned: about 92 GiB at most.
+for spec in "virtio1 10 pc-origin" "virtio2 24 pc-log" "virtio3 10 pc-base" \
+            "virtio4 4 pc-cow" "virtio5 8 pc-log2" "virtio6 4 pc-cow2"; do
     read -r bus size serial <<<"$spec"
     qm set "$VMID" "--$bus" "$STORAGE:$size,discard=on,detect_zeroes=on,serial=$serial"
 done
