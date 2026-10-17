@@ -169,3 +169,8 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   tail on a nested power cut: "corrupt pack record magic at offset 4137010 in
   .../pack-00000000000000000052.vpk", and the daemon did not start. **Open: HEAD cannot
   mount after a power loss that leaves a zeroed pack tail.**
+- **2026-10-16 20:00, `9b03d72`, all faults, 6 h**: the harness died after 15 minutes of
+  recording, when the VM root disk filled (the reference stores of earlier failed
+  runs). It was not a VerFSNext finding. The harness now stops explicitly below
+  3 GiB free.
+- **2026-10-17 08:21, `1c0a0d2`, all faults, 6 h**: started.
