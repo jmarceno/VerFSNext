@@ -173,4 +173,8 @@ data), silent bit rot of data the disk reported as written, other host filesyste
   recording, when the VM root disk filled (the reference stores of earlier failed
   runs). It was not a VerFSNext finding. The harness now stops explicitly below
   3 GiB free.
-- **2026-10-17 08:21, `1c0a0d2`, all faults, 6 h**: started.
+- **2026-10-17 08:21, `1c0a0d2`, all faults, 6 h**: 141 points and 68 nested points passed
+  (all modes, 0 recovery errors, no finding), then the harness stopped at the 3 GiB
+  guard: every point's second life and observations had added 9.3 GiB to the run's
+  reference store. Each point now keeps its own store, removed with the point.
+- **2026-10-17 15:21, `69c9a03`, all faults, 6 h**: started.
