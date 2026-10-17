@@ -370,11 +370,14 @@ class Refs:
 
     A version is addressed by the SHA-256 of its bytes and stored as a list of
     64 KiB block hashes, so the many versions of a rewritten file share blocks.
+    A crash point stores what it writes and observes in its own store over the
+    run's, so it is removed with the point.
     """
     BLOCK = 65536
 
-    def __init__(self, root):
+    def __init__(self, root, parent=None):
         self.root = root
+        self.parent = parent
         (root / 'blocks').mkdir(parents=True, exist_ok=True)
         (root / 'versions').mkdir(parents=True, exist_ok=True)
 
@@ -385,22 +388,28 @@ class Refs:
             tmp.write_bytes(data)
             os.replace(tmp, path)
 
+    def _find(self, kind, name):
+        path = self.root / kind / name
+        if path.exists() or self.parent is None:
+            return path
+        return self.parent._find(kind, name)
+
     def put(self, data):
         digest = sha(data)
-        version = self.root / 'versions' / digest
-        if not version.exists():
+        if not self._find('versions', digest).exists():
             blocks = []
             for offset in range(0, len(data), self.BLOCK):
                 block = data[offset:offset + self.BLOCK]
                 block_sha = sha(block)
-                self._store(self.root / 'blocks' / block_sha, block)
+                if not self._find('blocks', block_sha).exists():
+                    self._store(self.root / 'blocks' / block_sha, block)
                 blocks.append(block_sha)
-            self._store(version, json.dumps(dict(size=len(data), blocks=blocks)).encode())
+            self._store(self.root / 'versions' / digest, json.dumps(dict(size=len(data), blocks=blocks)).encode())
         return digest
 
     def get(self, digest):
-        version = json.loads((self.root / 'versions' / digest).read_text())
-        data = b''.join((self.root / 'blocks' / block).read_bytes() for block in version['blocks'])
+        version = json.loads(self._find('versions', digest).read_text())
+        data = b''.join(self._find('blocks', block).read_bytes() for block in version['blocks'])
         if len(data) != version['size'] or sha(data) != digest:
             raise HarnessError(f'reference store damaged for {digest}')
         return data
@@ -1362,11 +1371,12 @@ class Run:
                        nested=bool(nested))
         point_dir = self.dir / 'points' / f'{point:010d}'
         point_dir.mkdir(parents=True, exist_ok=True)
+        refs = Refs(point_dir / 'refs', self.refs)
         overlay = build_overlay('pc-ovl', dev['base'], dev['cow'], [(log, tail)])
         fs_dev = dm_create('pc-log2', f"0 {device_sectors(overlay)} log-writes {overlay} {dev['log2']}") \
             if nested else overlay
         try:
-            self.live_check(fs_dev, point_dir, expected, rng, context, 'pc-log2' if nested else None)
+            self.live_check(fs_dev, point_dir, refs, expected, rng, context, 'pc-log2' if nested else None)
         except Finding as finding:
             raise Finding(finding.kind, context=context, **finding.details)
         finally:
@@ -1384,7 +1394,7 @@ class Run:
                 ctx2 = dict(context, level2_point=p2, level2_mode=mode2, level2_tail=len(tail2))
                 overlay2 = build_overlay('pc-ovl2', dev['base'], dev['cow2'], [(log, tail), (log2, head2 + tail2)])
                 try:
-                    self.cold_check(overlay2, point_dir, expected2, ctx2)
+                    self.cold_check(overlay2, point_dir, refs, expected2, ctx2)
                 except Finding as finding:
                     raise Finding(finding.kind, context=ctx2, **finding.details)
                 finally:
@@ -1401,14 +1411,14 @@ class Run:
             raise HarnessError(f'ext4 did not mount a replayed crash state: {result.stderr}; '
                                f'dmesg: {run("dmesg").stdout[-3000:]}')
 
-    def cold_check(self, fs_dev, point_dir, expected, context):
+    def cold_check(self, fs_dev, point_dir, refs, expected, context):
         """Start on a crash image, check the oracle and the records, stop."""
         self.mount_check_fs(fs_dev)
         daemon = Daemon(CHK, point_dir / 'cold-daemon.log')
         try:
             daemon.start()
             daemon.unlock()
-            verify_all(expected, self.refs)
+            verify_all(expected, refs)
             daemon.check_records()
             daemon.stop()
             recovery, failures = daemon.log_problems()
@@ -1422,7 +1432,7 @@ class Run:
                 daemon.kill()
             run('umount', CHK)
 
-    def live_check(self, fs_dev, point_dir, expected, rng, context, dm_name):
+    def live_check(self, fs_dev, point_dir, refs, expected, rng, context, dm_name):
         """Cold check, then a second life: settle, more ops, SIGKILL, restart, check again."""
         self.mount_check_fs(fs_dev)
         daemon = Daemon(CHK, point_dir / 'daemon.log')
@@ -1432,7 +1442,7 @@ class Run:
             daemon.start()
             daemon.unlock()
             seq_base = 10 ** 9 + context['point'] * 1000
-            crew = Crew(daemon, timeline, self.refs, expected, rng, seq_base)
+            crew = Crew(daemon, timeline, refs, expected, rng, seq_base)
             # The settle verifies the crash image against `expected` before adopting it.
             crew.settle('cold')
             daemon.check_records()
@@ -1446,8 +1456,8 @@ class Run:
             daemon.unlock()
             # Process crash: the kernel kept every write, so everything acknowledged must be there.
             after = fold(expected, read_journal(point_dir / 'journal.jsonl'), timeline.marks.__contains__)
-            observed = verify_all(after, self.refs)
-            if observed != verify_all(crew.state(), self.refs):
+            observed = verify_all(after, refs)
+            if observed != verify_all(crew.state(), refs):
                 raise HarnessError('journal fold and live worker models disagree')
             daemon.check_records()
             crew.finish()
