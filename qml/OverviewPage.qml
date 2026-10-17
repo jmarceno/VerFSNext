@@ -12,27 +12,26 @@ ScrollView {
     readonly property var stats: controller.stats_json.length > 0 ? JSON.parse(controller.stats_json) : null
     readonly property var status: controller.status_json.length > 0 ? JSON.parse(controller.status_json) : null
     property bool showAll: false
-    /// Speed of the most recent read/write activity. Kept after the transfer
-    /// ends so the user can still see how fast the last copy ran.
-    property real lastReadBps: 0
-    property real lastWriteBps: 0
-    onStatusChanged: {
-        if (!status)
-            return
-        if (status.read_throughput_bps > 0)
-            lastReadBps = status.read_throughput_bps
-        if (status.write_throughput_bps > 0)
-            lastWriteBps = status.write_throughput_bps
-    }
-
-    /// Current speed while data moves, otherwise the last measured one.
-    function speedText(current, last) {
-        if (current > 0)
-            return theme.bytes(current) + "/s"
-        if (last > 0)
-            return theme.bytes(last) + "/s (last)"
-        return theme.bytes(0) + "/s"
-    }
+    /// The daemon keeps the last activity — the speeds and the memory and
+    /// cache readings taken with them — so the Memory card still shows numbers
+    /// after a transfer ends, even if this window was closed while it ran.
+    readonly property var lastActivity: status ? status.last_activity : null
+    /// True while the daemon's latest one-second sample moved data.
+    readonly property bool moving: status !== null && (status.read_throughput_bps > 0 || status.write_throughput_bps > 0)
+    /// The daemon's kept readings, all zero until its first activity.
+    readonly property real keptReadBps: lastActivity ? lastActivity.read_bps : 0
+    readonly property real keptWriteBps: lastActivity ? lastActivity.write_bps : 0
+    readonly property real keptCacheHitRate: lastActivity ? lastActivity.cache_hit_rate : 0
+    readonly property real keptCacheMemoryBytes: lastActivity ? lastActivity.cache_memory_bytes : 0
+    readonly property real keptRssBytes: lastActivity ? lastActivity.process_rss_bytes : 0
+    readonly property string lastActivityAgo: lastActivity ? theme.duration(lastActivity.ago_secs) + " ago" : ""
+    /// True while the Memory card shows the readings kept from the last
+    /// activity instead of live ones.
+    readonly property bool showingLastActivity: !moving && lastActivity !== null
+    /// Speeds for the statistics list: live while data moves, otherwise the
+    /// rates kept from the last activity.
+    readonly property real shownReadBps: moving ? status.read_throughput_bps : keptReadBps
+    readonly property real shownWriteBps: moving ? status.write_throughput_bps : keptWriteBps
 
     readonly property real logicalAll: stats ? stats.all_logical_size_bytes : 0
     readonly property real onDisk: stats ? stats.data_dir_size_bytes : 0
@@ -81,8 +80,9 @@ ScrollView {
             ["Cached data pieces", String(stats.chunk_cache_entries)],
             ["Read since start", b(stats.read_bytes_total)],
             ["Written since start", b(stats.write_bytes_total)],
-            ["Recent read speed", status ? speedText(status.read_throughput_bps, lastReadBps) : "—"],
-            ["Recent write speed", status ? speedText(status.write_throughput_bps, lastWriteBps) : "—"],
+            ["Last activity", root.lastActivity ? root.lastActivityAgo : "none since VerFSNext started"],
+            ["Recent read speed", status ? b(root.shownReadBps) + "/s" : "—"],
+            ["Recent write speed", status ? b(root.shownWriteBps) + "/s" : "—"],
             ["Throughput sample", status ? status.throughput_sample_secs.toFixed(3) + " s (every second)" : "—"],
             ["Running for", theme.duration(stats.uptime_secs)],
         ]
@@ -429,7 +429,14 @@ ScrollView {
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignTop
                 title: "Memory"
-                subtitle: root.stats ? "Cache hit rate " + theme.percent(root.stats.cache_hit_rate) : "Waiting for statistics"
+                subtitle: {
+                    if (!root.status)
+                        return "Waiting for the daemon"
+                    if (root.showingLastActivity)
+                        return "Cache hit rate " + theme.percent(root.keptCacheHitRate)
+                               + " — kept from the last activity " + root.lastActivityAgo
+                    return "Cache hit rate " + theme.percent(root.status.cache_hit_rate)
+                }
 
                 GridLayout {
                     width: parent.width
@@ -438,20 +445,22 @@ ScrollView {
                     Label { text: "In use"; color: theme.textMuted; font.pixelSize: 13 }
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: root.stats ? theme.bytes(root.stats.process_rss_bytes) : "—"
+                        text: root.status ? theme.bytes(root.showingLastActivity ? root.keptRssBytes
+                                                                                  : root.status.process_rss_bytes) : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
                     Label { text: "Cache"; color: theme.textMuted; font.pixelSize: 13 }
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: root.stats ? theme.bytes(root.stats.approx_cache_memory_bytes) : "—"
+                        text: root.status ? theme.bytes(root.showingLastActivity ? root.keptCacheMemoryBytes
+                                                                                  : root.status.approx_cache_memory_bytes) : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
                     Label { text: "Speed"; color: theme.textMuted; font.pixelSize: 13 }
                     Label {
                         Layout.alignment: Qt.AlignRight
-                        text: root.status ? "↓ " + root.speedText(root.status.read_throughput_bps, root.lastReadBps)
-                                           + "  ↑ " + root.speedText(root.status.write_throughput_bps, root.lastWriteBps) : "—"
+                        text: root.status ? "↓ " + theme.bytes(root.shownReadBps) + "/s  ↑ "
+                                            + theme.bytes(root.shownWriteBps) + "/s" : "—"
                         color: theme.textPrimary; font.pixelSize: 13; font.bold: true
                     }
                 }

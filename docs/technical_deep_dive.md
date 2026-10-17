@@ -41,7 +41,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Mounted control-plane socket at `<data_dir>/verfsnext.sock` accepts snapshot/crypt/stats commands from CLI control mode.
   - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
   - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate).
-  - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals). It never scans metadata, unlike `stats`.
+  - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals, RSS, cache hit rate and approximate cache memory, plus the last activity). It never scans metadata, unlike `stats`.
 - The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final sync, unmount) on SIGINT and on SIGTERM.
 - Auto config discovery order when `--config/-c` is not provided:
   - `./config.toml`
@@ -552,6 +552,17 @@ traffic, and multiple clients do not reset each other's baselines. Before the
 first sample, the interval and rates are zero. A new daemon creates a fresh
 baseline; idle samples return zero. These are FUSE transfer rates: reads served
 by the kernel page cache do not increment the daemon's counters.
+
+The same sampler keeps the last second that moved data — its two rates plus the
+RSS, cache hit rate and approximate cache memory read at that moment — in
+`DaemonStatus.last_activity`, with `ago_secs` computed when the response is
+built. Cheap status therefore carries the live rates, the RSS, the cache hit
+rate and the approximate cache memory as well. The desktop app shows the live
+readings while a sample moves data and the kept ones afterwards, labelled with
+how long ago they were taken, so the Memory card still shows the numbers of the
+last copy after it ends and after the window is closed and reopened. The record
+lives for the daemon's lifetime: restarting the daemon (or the app that owns it)
+clears it, exactly like the cumulative totals.
 
 The GUI reads rates from its existing two-second status poll, retaining the
 30-second full metadata refresh. CLI stats displays the latest completed sample

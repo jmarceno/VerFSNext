@@ -1215,3 +1215,51 @@ Release build; deployed to the live desktop app. Not yet clicked through in the 
 
 ### Affected Files
 `qml/RecordsFileRow.qml`, `qml/RecordsReport.qml`
+
+## B037 - Memory and Speed Readings Disappeared as Soon as the Folder Went Idle - Oct 17 2026
+
+### Symptom
+The Overview page's Memory card showed "Cache hit rate 0.0%", "Cache 0 B" and
+"↓ 0 B/s ↑ 0 B/s" whenever nothing was moving. The numbers of the last copy
+could not be looked at afterwards, not even after closing and reopening the app:
+those readings only existed while data was being read or written.
+
+### Root Cause
+`read_throughput_bps` and `write_throughput_bps` in `DaemonStatus` are the deltas
+of the most recent one-second sample (B021's design), so an idle sample reports
+zero and the previous values are gone. RSS and approximate cache memory came from
+the 30-second full `stats` scan only, and the cache hit rate there is a running
+total that reads 0% until the first request. Nothing kept what the last activity
+had measured. The window's own QML properties for the last speeds helped only
+while that window stayed open, and only for samples the two-second status poll
+happened to catch.
+
+### Fix
+The daemon's one-second throughput sampler now also records the last sample that
+moved data: both rates plus the RSS, cache hit rate and approximate cache memory
+read at that moment, with the timestamp used to age them. Cheap `status` reports
+that record as `last_activity` (`read_bps`, `write_bps`, `cache_hit_rate`,
+`cache_memory_bytes`, `process_rss_bytes`, `ago_secs`) and now carries RSS, cache
+hit rate and approximate cache memory directly, so the Memory card no longer waits
+for the 30-second scan. The desktop app shows the live readings while a sample is
+moving data and the kept ones after it ends, labelled with how long ago they were
+taken ("kept from the last activity 4m ago"); the statistics list gained a "Last
+activity" row and its speed rows use the kept rates too. The QML-side last-speed
+properties were removed. Cache accounting moved into a single `cache_totals()`
+helper shared by `collect_stats` and the sampler, so both agree. The record lives
+for the daemon's lifetime and is cleared by a daemon restart, exactly like the
+cumulative totals. No storage change and no migration: new JSON fields only, and
+an older client still parses a newer status.
+
+### Validation
+Release build on the remote builder; deployed to the live desktop app running
+from this checkout. Status over the mounted control socket carried `last_activity`
+with the speeds and the memory and cache readings of the sampled second. The
+Overview page was rendered with that status: the Memory card showed the live
+rates while a copy ran and the same numbers with "kept from the last activity
+5s ago" after it finished and the live sample returned to zero. A check with no
+activity since daemon start showed the card without a kept record instead of a
+stale one.
+
+### Affected Files
+`src/fs/mod.rs`, `qml/OverviewPage.qml`, `docs/technical_deep_dive.md`

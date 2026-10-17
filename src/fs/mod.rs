@@ -204,6 +204,27 @@ pub struct DaemonStatus {
     pub throughput_sample_secs: f64,
     pub read_throughput_bps: f64,
     pub write_throughput_bps: f64,
+    pub process_rss_bytes: u64,
+    pub cache_hit_rate: f64,
+    pub approx_cache_memory_bytes: u64,
+    /// Rates and readings of the last second that moved data, kept after the
+    /// transfer ends. `None` until the first activity of this daemon.
+    pub last_activity: Option<LastActivity>,
+}
+
+/// The most recent one-second sample that moved data. Its rates are reported
+/// live by the fields above while the transfer runs and through this record
+/// afterwards, together with the memory and cache readings taken with it, so
+/// clients can still show how the last copy ran.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LastActivity {
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub cache_hit_rate: f64,
+    pub cache_memory_bytes: u64,
+    pub process_rss_bytes: u64,
+    /// Seconds since the sample was taken; grows while the folder is idle.
+    pub ago_secs: f64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -211,6 +232,28 @@ struct ThroughputSample {
     interval_secs: f64,
     read_bps: f64,
     write_bps: f64,
+}
+
+/// What the last active sample measured, with the clock reading that ages it.
+#[derive(Clone, Copy)]
+struct ActivitySnapshot {
+    read_bps: f64,
+    write_bps: f64,
+    cache_hit_rate: f64,
+    cache_memory_bytes: u64,
+    process_rss_bytes: u64,
+    at_ms: u64,
+}
+
+/// Cache bookkeeping shared by the stats scan and the activity sampler.
+#[derive(Clone, Copy)]
+struct CacheTotals {
+    hits: u64,
+    requests: u64,
+    hit_rate: f64,
+    metadata_entries: u64,
+    chunk_entries: u64,
+    memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +316,7 @@ struct FsCore {
     chunk_data_cache_hits: AtomicU64,
     chunk_data_cache_misses: AtomicU64,
     throughput: ParkingMutex<ThroughputSample>,
+    last_activity: ParkingMutex<Option<ActivitySnapshot>>,
     read_bytes_total: AtomicU64,
     write_bytes_total: AtomicU64,
     pack_crc32_read_error_count: AtomicU64,
@@ -389,6 +433,7 @@ impl VerFs {
             chunk_data_cache_hits: AtomicU64::new(0),
             chunk_data_cache_misses: AtomicU64::new(0),
             throughput: ParkingMutex::new(ThroughputSample::default()),
+            last_activity: ParkingMutex::new(None),
             read_bytes_total: AtomicU64::new(0),
             write_bytes_total: AtomicU64::new(0),
             pack_crc32_read_error_count: AtomicU64::new(persisted_pack_crc32_read_error_count),
@@ -430,11 +475,24 @@ impl VerFs {
                 let interval_secs = now.duration_since(sampled_at).as_secs_f64();
                 let read = core.read_bytes_total.load(Ordering::Relaxed);
                 let written = core.write_bytes_total.load(Ordering::Relaxed);
+                let read_bps = (read - previous_read) as f64 / interval_secs;
+                let write_bps = (written - previous_write) as f64 / interval_secs;
                 *core.throughput.lock() = ThroughputSample {
                     interval_secs,
-                    read_bps: (read - previous_read) as f64 / interval_secs,
-                    write_bps: (written - previous_write) as f64 / interval_secs,
+                    read_bps,
+                    write_bps,
                 };
+                if read_bps > 0.0 || write_bps > 0.0 {
+                    let cache = core.cache_totals();
+                    *core.last_activity.lock() = Some(ActivitySnapshot {
+                        read_bps,
+                        write_bps,
+                        cache_hit_rate: cache.hit_rate,
+                        cache_memory_bytes: cache.memory_bytes,
+                        process_rss_bytes: read_process_rss_bytes().unwrap_or(0),
+                        at_ms: now_millis(),
+                    });
+                }
                 sampled_at = now;
                 previous_read = read;
                 previous_write = written;
@@ -571,6 +629,7 @@ impl VerFs {
         let elapsed_ms =
             now_millis().saturating_sub(self.core.stats_started_ms.load(Ordering::Relaxed));
         let throughput = *self.core.throughput.lock();
+        let cache = self.core.cache_totals();
         Ok(DaemonStatus {
             vault_enabled: self.core.config.vault_enabled,
             vault_initialized,
@@ -582,6 +641,10 @@ impl VerFs {
             throughput_sample_secs: throughput.interval_secs,
             read_throughput_bps: throughput.read_bps,
             write_throughput_bps: throughput.write_bps,
+            process_rss_bytes: read_process_rss_bytes().unwrap_or(0),
+            cache_hit_rate: cache.hit_rate,
+            approx_cache_memory_bytes: cache.memory_bytes,
+            last_activity: self.core.last_activity(),
         })
     }
 
@@ -1197,27 +1260,7 @@ impl FsCore {
             net_saved_bytes as f64 / all_logical_size_bytes as f64
         };
 
-        let cache_hits = self
-            .chunk_meta_cache_hits
-            .load(Ordering::Relaxed)
-            .saturating_add(self.chunk_data_cache_hits.load(Ordering::Relaxed));
-        let cache_requests = cache_hits
-            .saturating_add(self.chunk_meta_cache_misses.load(Ordering::Relaxed))
-            .saturating_add(self.chunk_data_cache_misses.load(Ordering::Relaxed));
-        let cache_hit_rate = if cache_requests == 0 {
-            0.0
-        } else {
-            cache_hits as f64 / cache_requests as f64
-        };
-
-        let metadata_cache_entries = self.chunk_meta_cache.entry_count();
-        let chunk_cache_entries = self.chunk_data_cache.entry_count();
-        let approx_cache_memory_bytes = metadata_cache_entries
-            .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
-            .saturating_add(
-                chunk_cache_entries.saturating_mul(size_of::<([u8; 16], Arc<Vec<u8>>)>() as u64),
-            )
-            .saturating_add(self.chunk_data_cache.weighted_size());
+        let cache = self.cache_totals();
 
         let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
         let process_private_memory_bytes =
@@ -1252,9 +1295,9 @@ impl FsCore {
             missing_chunk_records_for_extents,
             orphan_extent_records,
             pack_crc32_read_error_count,
-            cache_hits,
-            cache_requests,
-            cache_hit_rate,
+            cache_hits: cache.hits,
+            cache_requests: cache.requests,
+            cache_hit_rate: cache.hit_rate,
             process_private_memory_bytes,
             process_rss_bytes,
             read_bytes_total,
@@ -1263,10 +1306,55 @@ impl FsCore {
             throughput_sample_secs: throughput.interval_secs,
             read_throughput_bps: throughput.read_bps,
             write_throughput_bps: throughput.write_bps,
-            metadata_cache_entries,
-            chunk_cache_entries,
-            approx_cache_memory_bytes,
+            metadata_cache_entries: cache.metadata_entries,
+            chunk_cache_entries: cache.chunk_entries,
+            approx_cache_memory_bytes: cache.memory_bytes,
         })
+    }
+
+    /// Last second that moved data, with the readings taken at that moment.
+    /// `None` until the first activity of this daemon.
+    fn last_activity(&self) -> Option<LastActivity> {
+        let snapshot = (*self.last_activity.lock())?;
+        Some(LastActivity {
+            read_bps: snapshot.read_bps,
+            write_bps: snapshot.write_bps,
+            cache_hit_rate: snapshot.cache_hit_rate,
+            cache_memory_bytes: snapshot.cache_memory_bytes,
+            process_rss_bytes: snapshot.process_rss_bytes,
+            ago_secs: now_millis().saturating_sub(snapshot.at_ms) as f64 / 1000.0,
+        })
+    }
+
+    /// Cache counters, entries and approximate memory in one place, so the
+    /// stats scan and the one-second activity sampler agree on them.
+    fn cache_totals(&self) -> CacheTotals {
+        let hits = self
+            .chunk_meta_cache_hits
+            .load(Ordering::Relaxed)
+            .saturating_add(self.chunk_data_cache_hits.load(Ordering::Relaxed));
+        let requests = hits
+            .saturating_add(self.chunk_meta_cache_misses.load(Ordering::Relaxed))
+            .saturating_add(self.chunk_data_cache_misses.load(Ordering::Relaxed));
+        let metadata_entries = self.chunk_meta_cache.entry_count();
+        let chunk_entries = self.chunk_data_cache.entry_count();
+        CacheTotals {
+            hits,
+            requests,
+            hit_rate: if requests == 0 {
+                0.0
+            } else {
+                hits as f64 / requests as f64
+            },
+            metadata_entries,
+            chunk_entries,
+            memory_bytes: metadata_entries
+                .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
+                .saturating_add(
+                    chunk_entries.saturating_mul(size_of::<([u8; 16], Arc<Vec<u8>>)>() as u64),
+                )
+                .saturating_add(self.chunk_data_cache.weighted_size()),
+        }
     }
 
     /// Bytes of chunk payloads already recorded in `.DISCARD` and still sitting
