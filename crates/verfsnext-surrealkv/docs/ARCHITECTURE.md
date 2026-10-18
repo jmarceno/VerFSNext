@@ -840,12 +840,18 @@ Each level still uses size targets, with each level approximately 10x larger tha
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           FINISH                                            │
 │                                                                             │
-│  1. Write new SSTable to disk                                               │
+│  1. Write new SSTable to disk, fsync contents and directory entry           │
 │  2. Update manifest atomically (add new, remove old)                        │
 │  3. Delete old SSTable files                                                │
 │  4. Flush VLog discard stats                                                │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Compaction Output Durability
+
+The manifest update that publishes a compaction's merged table is itself fsynced, and the input tables are unlinked immediately after it. The merged table must therefore be durable before that update runs: `Compactor::write_merged_table` reopens the output, fsyncs its contents and then fsyncs the SSTable directory entry that names the file, and only then does the manifest reference it. A power loss can no longer leave a durable manifest naming a table whose bytes - or whose name - never reached the disk while the inputs it replaced are already deleted.
+
+`MemTable::flush` applies the same rule to flushed tables before the manifest update that publishes them: the table's contents and the directory entry that names it are durable first.
 
 ### Compaction Scoring
 
@@ -1200,6 +1206,7 @@ SurrealKV provides the following guarantees:
 - **Committed data is durable**: Any transaction that received a successful commit response will be recovered
 - **Uncommitted data may be lost**: Transactions that crashed before commit are not recovered
 - **Atomic recovery**: Either all of a transaction's writes are recovered, or none are
+- **A durable manifest never names a non-durable table**: compaction outputs and memtable flushes fsync the table contents and the directory entry that names the file before the manifest update that publishes them runs
 - **Corruption is contained**: A damaged region costs only the records whose bytes it covers. The tolerant mode resyncs at the next record that passes its checksum and continues the replayed sequence, and a torn tail is cut before new records are appended (see "Recovery Modes")
 
 The strength of the durability guarantee depends on the `Durability` mode used at commit time:

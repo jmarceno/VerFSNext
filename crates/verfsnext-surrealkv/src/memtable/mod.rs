@@ -11,6 +11,7 @@ use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 use crate::batch::Batch;
 use crate::error::Result;
 use crate::ensure_file_mode;
+use crate::lsm::fsync_directory;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
@@ -259,12 +260,15 @@ impl MemTable {
                 table_writer.add(iter.key().to_owned(), iter.value_encoded()?)?;
                 iter.next()?;
             }
-            // TODO: Check how to fsync this file
             table_writer.finish()?;
         }
 
+        // The manifest update that publishes this table is fsynced, so the
+        // table contents and the directory entry that names the file must be
+        // durable before it runs.
         let file = SysFile::open(&table_file_path)?;
         file.sync_all()?;
+        fsync_directory(lsm_opts.sstable_dir())?;
         let file: Arc<dyn File> = Arc::new(file);
         let file_size = file.size()?;
 

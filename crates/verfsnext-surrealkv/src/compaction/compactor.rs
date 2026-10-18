@@ -8,7 +8,7 @@ use crate::error::{BackgroundErrorHandler, Result};
 use crate::ensure_file_mode;
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
-use crate::lsm::{cleanup_vlog_and_index, resolve_vlog_cleanup_floor, CoreInner};
+use crate::lsm::{cleanup_vlog_and_index, fsync_directory, resolve_vlog_cleanup_floor, CoreInner};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
@@ -246,6 +246,14 @@ impl Compactor {
                 );
             }
         }
+
+        // The manifest update that publishes this table is fsynced, and the
+        // input tables are unlinked immediately after it: sync the output
+        // contents and the directory entry that names the file first, so a
+        // power loss cannot leave a durable manifest pointing at a table whose
+        // bytes (or whose name) never reached the disk.
+        SysFile::open(path)?.sync_all()?;
+        fsync_directory(self.options.lopts.sstable_dir())?;
 
         Ok(true)
     }

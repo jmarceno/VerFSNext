@@ -1407,3 +1407,52 @@ verification on a release binary:
 `src/migration/vault_chunk_keys.rs`, `src/migration/pack_size.rs`,
 `src/migration/mod.rs`, `src/lib.rs`, `docs/migration-guide.md`,
 `docs/technical_deep_dive.md`
+
+## B040 - Compaction Output SSTables Were Not Durable Before the Manifest Published Them - Oct 18 2026
+
+### Root Cause
+
+`write_merged_table` (`crates/verfsnext-surrealkv/src/compaction/compactor.rs`)
+created the compaction output with `SysFile::create` and called
+`TableWriter::finish`, which only writes through the file descriptor and flushes
+the userspace buffer: the output bytes stayed in the page cache. The manifest
+update that followed is fsynced, and the input SSTs are unlinked immediately
+after it, so a power loss in between left a durable manifest naming a table
+whose bytes - or whose directory entry - never reached the disk, with the
+inputs it replaced already gone. Startup then either fails to load the table
+(the store does not mount, no repair path) or silently loses every key in its
+range, including acknowledged metadata (inodes, extents, chunk records).
+Verified by syscall trace at commit 885b3d8: every memtable-flush SST got an
+fsync right after creation and every compaction output got none. This is the
+same class as VerFS B030 (new pack files not made durable in their directory).
+
+The memtable flush path (`crates/verfsnext-surrealkv/src/memtable/mod.rs`)
+fsynced the table contents but not the directory entry that names the file, so
+the same power-loss window applied to flushed tables.
+
+### Fix
+
+- `write_merged_table` reopens the output, calls `sync_all` and fsyncs the
+  SSTable directory before returning, so the merged table's contents and
+  directory entry are durable before the manifest can reference it and before
+  the inputs are unlinked.
+- `MemTable::flush` fsyncs the SSTable directory after syncing the reopened
+  file contents, so a durable manifest never names a flushed table whose name
+  can be lost. No format change; no migration.
+
+### Validation
+
+`cargo remote -h -- clippy -p verfsnext-surrealkv --all-targets` is clean.
+Library tests on the remote builder: `cargo remote -h -- test -p verfsnext-surrealkv
+compaction` (66 passed) and `cargo remote -h -- test -p verfsnext-surrealkv
+memtable` (44 passed).
+
+The power-loss sequence itself cannot be simulated with OS commands; the
+durability ordering is by construction (contents and directory entry fsynced
+before the manifest write and before the input unlink).
+
+### Affected Files
+
+`crates/verfsnext-surrealkv/src/compaction/compactor.rs`,
+`crates/verfsnext-surrealkv/src/memtable/mod.rs`,
+`crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`
