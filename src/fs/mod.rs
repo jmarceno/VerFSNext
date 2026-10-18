@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use verfsnext_async_fusex::session::SessionNotifier;
 use verfsnext_async_fusex::fs_util::{
@@ -418,6 +418,13 @@ impl VerFs {
             .get_sys(SYS_VAULT_WRAP)?
             .map(|raw| !raw.is_empty())
             .unwrap_or(false);
+        if vault_initialized && !vault::vault_namespace_present(&meta)? {
+            const REPAIR_HINT: &str = "vault record exists but the /.vault namespace is missing; \
+                 run `verfsnext crypt -c -p <password> -k <key file>` with the original credentials \
+                 to rebuild the namespace";
+            warn!(REPAIR_HINT);
+            eprintln!("VerFSNext: {REPAIR_HINT}");
+        }
         // No kernel holds references before the mount, so every indexed orphan
         // left by a crash or an unclean stop is unreachable.
         let reclaimed_orphans = FsCore::reclaim_orphans(&meta).await?;
@@ -562,9 +569,29 @@ impl VerFs {
         }
 
         self.throughput_worker.abort();
-        self.batcher.shutdown().await?;
-        self.sync_service.shutdown_with_full_sync().await?;
-        self.core.meta.close().await?;
+        // The batcher reports per-write failures to their own waiters, so a
+        // shutdown error here only means its worker is gone; it must not skip
+        // the stages below. Skipping the final full sync or the metadata close
+        // would leave acknowledged writes only in the page cache after a clean
+        // stop, so every stage runs and every failure is reported.
+        if let Err(err) = self.batcher.shutdown().await {
+            warn!(error = %format!("{err:#}"), "write batcher shutdown reported an error");
+        }
+        let mut failures = Vec::new();
+        for (stage, result) in [
+            (
+                "final full sync",
+                self.sync_service.shutdown_with_full_sync().await,
+            ),
+            ("metadata close", self.core.meta.close().await),
+        ] {
+            if let Err(err) = result {
+                failures.push(format!("{stage}: {err:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "));
+        }
         Ok(())
     }
 
@@ -1684,10 +1711,6 @@ mod tests {
                 .map_err(|e| anyhow!("write failed: {:?}", e))?;
         }
 
-        fs.batcher
-            .drain()
-            .await
-            .map_err(|e| anyhow!("drain failed: {:?}", e))?;
         fs.core.sync_cycle(true).await?;
 
         fs.core.chunk_meta_cache.invalidate_all();
@@ -1702,11 +1725,6 @@ mod tests {
                 .await
                 .map_err(|e| anyhow!("overwrite failed: {:?}", e))?;
         }
-        fs.batcher
-            .drain()
-            .await
-            .map_err(|e| anyhow!("drain overwrite failed: {:?}", e))?;
-
         let duration = start.elapsed();
         println!("Overwrite took: {:?}", duration);
 

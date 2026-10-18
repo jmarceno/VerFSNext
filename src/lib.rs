@@ -250,9 +250,16 @@ async fn run_control_command(config_path: PathBuf, args: Vec<String>) -> Result<
             }
         }
         "crypt" => match parse_crypt_cmd(&args[1..])? {
-            CryptCommand::Create { password, key_path } => {
-                let key_file =
-                    control::create_vault(&config, &password, key_path.as_deref()).await?;
+            CryptCommand::Create {
+                password,
+                key_path,
+                existing_key,
+            } => {
+                let key = match existing_key {
+                    Some(path) => control::CreateKey::ExistingFile(path),
+                    None => control::CreateKey::NewFile(key_path),
+                };
+                let key_file = control::create_vault(&config, &password, key).await?;
                 println!("{}", key_file.display());
             }
             CryptCommand::Unlock { password, key_file } => {
@@ -286,6 +293,7 @@ enum CryptCommand {
     Create {
         password: String,
         key_path: Option<PathBuf>,
+        existing_key: Option<PathBuf>,
     },
     Unlock {
         password: String,
@@ -370,7 +378,14 @@ fn parse_crypt_cmd(args: &[String]) -> Result<CryptCommand> {
 
     if create {
         let password = password.context("missing -p password for -c")?;
-        return Ok(CryptCommand::Create { password, key_path });
+        if key_path.is_some() && unlock_key.is_some() {
+            bail!("crypt -c takes either -path (write a new key file there) or -k (reuse an existing key file), not both");
+        }
+        return Ok(CryptCommand::Create {
+            password,
+            key_path,
+            existing_key: unlock_key,
+        });
     }
     if unlock {
         let password = password.context("missing -p password for -u")?;

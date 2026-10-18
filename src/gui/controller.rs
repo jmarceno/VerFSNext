@@ -1407,9 +1407,11 @@ impl qobject::AppController {
         }
         self.as_mut()
             .run_op("Creating your vault…", None, move |ctx| {
-                let key_file = ctx
-                    .handle
-                    .block_on(control::create_vault(&ctx.config, &password, Some(&key_dir)))?;
+                let key_file = ctx.handle.block_on(control::create_vault(
+                    &ctx.config,
+                    &password,
+                    control::CreateKey::NewFile(Some(key_dir)),
+                ))?;
                 Ok(Outcome::message(format!(
                     "Vault created. Your key file is {}. Keep a copy somewhere safe: without it the vault can't be opened.",
                     key_file.display()

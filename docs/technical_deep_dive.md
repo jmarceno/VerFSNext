@@ -42,7 +42,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
   - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate). `Stats { allow_cached }` returns the last completed scan right away and lets the daemon refresh it in the background, reporting `stats_scanned_at_ms`, `stats_refreshing` and `stats_refresh_error`; without it the request waits for a scan taken after it arrived, which is what the CLI uses.
   - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals, RSS, cache hit rate and approximate cache memory, plus the last activity). It never scans metadata, unlike `stats`.
-- The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final sync, unmount) on SIGINT and on SIGTERM.
+- The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final full sync, metadata close, unmount) on SIGINT and on SIGTERM. Every stage runs even when an earlier one fails, and each failure is reported (B042).
 - Auto config discovery order when `--config/-c` is not provided:
   - `./config.toml`
   - `~/.config/verfsnext/config.toml`
@@ -155,7 +155,7 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - read-only inode flag enforcement across mutating FUSE operations
   - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - enforces `.vault` lock-state visibility and access policy
-  - blocks rename of top-level `/.vault` and blocks cross-boundary rename/link between vault and non-vault trees
+  - blocks removal (`unlink`/`rmdir`) and rename of the top-level `/.vault` namespace (`INODE_FLAG_VAULT_ROOT`, `EPERM`) and blocks cross-boundary rename/link between vault and non-vault trees
   - marks vault inodes using inode flags and applies data encryption/decryption only for those inodes
   - provides `create_vault`, `unlock_vault`, and `lock_vault` runtime operations
   - background GC trigger integrated into periodic sync cycles with strict idle gating (recent activity checks plus write-lock contention checks before pack rewrite work)
@@ -180,9 +180,8 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - ingestion flushes pending ops into an internal apply queue and immediately resumes receiving FUSE writes
   - apply worker preserves batch order, applies each batch, and resolves per-write completion channels
   - group commit: before applying, the apply worker merges every batch already queued (up to `batch_max_size_mb`) into one `apply_batch` call, so writes that arrived during the previous commit share the next one
-  - `drain` and `shutdown` are implemented as ordered barriers in the apply queue; a control message ends a merged group and runs right after it
-  - FUSE `read` drains the batcher only when fire-and-forget writes are pending (the same check as `flush`/`fsync`/`release`); every write is acknowledged after its commit, so an unconditional drain only stalled reads behind unrelated commits
-
+  - `shutdown` is an ordered barrier in the apply queue: the ingest worker dispatches everything queued before it, and the apply worker finishes the merged group in flight before it answers
+  - every write goes through `enqueue_and_wait`, which resolves only after the batch containing it was applied, so reads need no drain barrier and there is no fire-and-forget producer; the former `drain`/`pending_count` safety net was removed with B042
 - `crates/verfsnext-async-fusex/src/fuse_fs.rs`
   - fixed `readdir`/`readdirplus` cookie progression to use monotonic entry index cookies (`i + 1`)
   - `readdir` now stops filling once the reply buffer is full, matching `readdirplus` behavior and preserving correct continuation semantics
@@ -354,10 +353,12 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 ## Vault Data Path
 
 1. `verfsnext crypt -c`:
-   - the CLI process generates the key material and writes `verfsnext.vault.key` itself (`create_new`, mode `0600`, fsynced with its directory), so the file belongs to the calling user even when the daemon runs as another user; an existing key file is never overwritten, and the new file is removed if vault creation fails
+   - the CLI process generates the key material and writes `verfsnext.vault.key` itself (`create_new`, mode `0600`, fsynced with its directory), so the file belongs to the calling user even when the daemon runs as another user; an existing key file is never overwritten, and the new file is removed if vault creation fails. With `-k <key file>` it reads the key material of an existing file instead of generating one (`-path` and `-k` are mutually exclusive)
    - the key material is sent to the daemon in the `vault_create` control request (or used directly in offline metadata mode)
    - the daemon generates a random 256-bit vault folder key and persists the wrapped folder key under `SYS:vault.wrap`
    - the daemon creates the top-level `/.vault` inode+dirent (root-only reserved path), mode `0700`, owned by the requesting user: the control socket peer credentials (`SO_PEERCRED`) in mounted mode, the CLI process's uid/gid in offline mode
+   - `/.vault` is a reserved namespace entry: `unlink`, `rmdir` and `rename` of an inode carrying `INODE_FLAG_VAULT_ROOT`, and of the root entry itself, fail with `EPERM` — including for an `rm -rf` walk. Vault contents stay ordinary files. Before B041 an empty unlocked vault could be removed with `rmdir`, which left the wrap record without a namespace and every later vault command failing (EEXIST on create, no `/.vault` for unlock)
+   - when the wrap record exists and `/.vault` does not (a vault damaged by a pre-B041 version), `crypt -c` rebuilds the `/.vault` inode+dirent from that record instead of failing with `EEXIST`: it unwraps the record with the supplied password and key file first, keeps the record untouched, and recreates the namespace owned by the caller, so the original credentials and every vault chunk stay valid. A caller that cannot unwrap the record gets `EPERM` with an explicit message. Mount logs and prints a warning for that missing-namespace state, and the rebuild itself is logged
 2. While vault is locked:
    - `/.vault` is hidden from root `readdir`
    - `lookup` and direct inode operations against vault entries return inaccessible/not-found semantics
@@ -426,7 +427,7 @@ Mirrors the I/O profile of a typical ComfyUI installation folder (72K small file
 | `sync_barrier` | — | — | System-wide `sync()` final barrier |
 
 **Key design for accurate measurement:**
-- Each file is written with `dd conv=fsync`, which triggers `batcher.drain()` + `sync_cycle()` through FUSE — guaranteeing data is on disk before the timer stops.
+- Each file is written with `dd conv=fsync`, which triggers the FUSE `fsync` path (`sync_durably`: packs synced, WAL written and fsynced) — guaranteeing data is on disk before the timer stops.
 - A system-wide `sync()` at the end acts as a final barrier against kernel writeback caching.
 - File sizes are deterministic (index-based formulas) and content uses a seeded LCG so dedup cannot collapse payloads.
 

@@ -289,6 +289,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "unlink")?;
+                FsCore::ensure_entry_removable(parent, name, &inode, "unlink")?;
 
                 if inode.kind == INODE_KIND_DIR {
                     return Err(anyhow_errno(Errno::EISDIR, "cannot unlink directory"));
@@ -344,6 +345,7 @@ impl VirtualFs for VerFs {
                 };
                 let target_inode: InodeRecord = decode_rkyv(&raw)?;
                 FsCore::ensure_inode_writable(&target_inode, "rmdir")?;
+                FsCore::ensure_entry_removable(parent, dir_name, &target_inode, "rmdir")?;
                 if target_inode.kind != INODE_KIND_DIR {
                     return Err(anyhow_errno(
                         Errno::ENOTDIR,
@@ -513,6 +515,12 @@ impl VirtualFs for VerFs {
                 };
                 let mut source_inode: InodeRecord = decode_rkyv(&source_inode_raw)?;
                 FsCore::ensure_inode_writable(&source_inode, "rename")?;
+                FsCore::ensure_entry_removable(
+                    param.old_parent,
+                    &param.old_name,
+                    &source_inode,
+                    "rename source",
+                )?;
                 let source_is_dir = source_inode.kind == INODE_KIND_DIR;
                 let target =
                     match txn.get(dirent_key(param.new_parent, param.new_name.as_bytes()))? {
@@ -545,6 +553,12 @@ impl VirtualFs for VerFs {
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
+                    FsCore::ensure_entry_removable(
+                        param.new_parent,
+                        &param.new_name,
+                        &target_inode,
+                        "rename target",
+                    )?;
                     target_inode.ctime_sec = sec;
                     target_inode.ctime_nsec = nsec;
 
@@ -614,6 +628,12 @@ impl VirtualFs for VerFs {
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
+                    FsCore::ensure_entry_removable(
+                        param.new_parent,
+                        &param.new_name,
+                        &target_inode,
+                        "rename target",
+                    )?;
                     let target_is_dir = target_inode.kind == INODE_KIND_DIR;
 
                     if source_is_dir && !target_is_dir {
@@ -747,15 +767,6 @@ impl VirtualFs for VerFs {
         self.core
             .validate_file_handle(fh, ino)
             .map_err(map_anyhow_to_fuse)?;
-        // Writes are acknowledged only after their commit, so only writes
-        // queued without waiting can be missing from committed state. Draining
-        // unconditionally would stall every read behind an unrelated commit.
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "read")
@@ -869,12 +880,6 @@ impl VirtualFs for VerFs {
                 .ensure_inode_vault_access(&inode, "flush")
                 .map_err(map_anyhow_to_fuse)?;
         }
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
         Ok(())
     }
 
@@ -890,12 +895,6 @@ impl VirtualFs for VerFs {
         if let Ok(inode) = self.core.load_inode_or_errno(ino, "release") {
             self.core
                 .ensure_inode_vault_access(&inode, "release")
-                .map_err(map_anyhow_to_fuse)?;
-        }
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
                 .map_err(map_anyhow_to_fuse)?;
         }
         self.core.unregister_file_handle(fh);
@@ -915,12 +914,6 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsync")
             .map_err(map_anyhow_to_fuse)?;
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
         self.core
             .sync_durably(datasync)
             .await
@@ -1024,12 +1017,6 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(_ino, "fsyncdir")
             .map_err(map_anyhow_to_fuse)?;
-        if self.batcher.pending_write_count() > 0 {
-            self.batcher
-                .drain()
-                .await
-                .map_err(map_anyhow_to_fuse)?;
-        }
         self.core
             .sync_durably(datasync)
             .await

@@ -227,6 +227,29 @@ Stats namespace behavior:
 If `-path` is omitted, the key is created in the current working directory.
 Losing the key file means losing access to the vault: keep a copy somewhere safe.
 
+With `-k <key file>` the command uses the key material of an existing key file
+instead of generating one (`-path` and `-k` cannot be combined). `/.vault` is a
+filesystem-managed namespace: `rmdir`, `unlink` and `rename` of it fail with
+`EPERM`, including for `rm -rf`; files and directories inside the vault behave
+normally.
+
+### Rebuild a missing `/.vault` namespace
+
+Versions before B041 let `rmdir <mount>/.vault` remove an empty vault directory
+while keeping the vault record, so `crypt -c` failed with "vault is already
+initialized" and the vault could not be used any more. Mounting such a data
+directory logs a warning; rebuild the namespace with the vault's original
+password and key file:
+
+```bash
+./target/release/verfsnext crypt -c -p "your-password" -k /secure/key/dir/verfsnext.vault.key
+```
+
+The rebuilt namespace keeps the original vault record, so that same password and
+key file unlock it and all vault content stays readable. Any other password or
+key file is refused with `EPERM`, and without the original credentials the data
+cannot be recovered.
+
 ### Unlock vault
 
 ```bash

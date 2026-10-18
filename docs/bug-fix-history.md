@@ -1456,3 +1456,148 @@ before the manifest write and before the input unlink).
 `crates/verfsnext-surrealkv/src/compaction/compactor.rs`,
 `crates/verfsnext-surrealkv/src/memtable/mod.rs`,
 `crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`
+
+## B041 - `rmdir /.vault` Removed the Vault Namespace - Oct 18 2026
+
+### Symptom
+
+An unlocked, empty `/.vault` could be removed like any other directory:
+`rmdir <mount>/.vault` returned 0 and the entry disappeared. The vault record
+(`SYS:vault.wrap`) stayed behind, so `crypt -c` failed with "vault is already
+initialized" from then on, `crypt -u` still unwrapped the key in memory but
+`/.vault` never came back, and no supported command could recreate the
+namespace. Reachable by the vault owner with one shell command.
+
+### Root Cause
+
+The vault root inode is created with `INODE_FLAG_VAULT_ROOT`
+(`src/fs/vault.rs`), but nothing read the flag (grep: only the definition, the
+import and the assignment). `rename` refused to move `/.vault`
+(`src/fs/fuse.rs`), `create`/`mknod`/`mkdir` refused to create it
+(`src/fs/inode.rs`), and `check_vault_parent_name_gate` hid it while locked, but
+`rmdir` and `unlink` had no vault gate: they checked only the read-only flag and
+the inode kind, so an empty unlocked vault directory was removed with its inode.
+`/.snapshots` has the same shape but is protected by its read-only inode, which
+every removal already refuses.
+
+### Fix
+
+- `FsCore::ensure_entry_removable` refuses, with `EPERM`, a removal or rename of
+  an inode that carries `INODE_FLAG_VAULT_ROOT`, and of the reserved root entry
+  `/.vault` itself. It runs inside the metadata transaction of `unlink`, `rmdir`
+  and `rename` (source and target), next to the deletion it prevents. Vault
+  contents stay ordinary files (`rm /.vault/file` and `rmdir /.vault/dir` still
+  work), and so does every operation on other directories.
+- The namespace can be rebuilt. `create_vault` used to stop at `EEXIST` when
+  `SYS:vault.wrap` existed. It now looks at the namespace itself: with a wrap
+  record but no `/.vault`, it verifies the caller's password and key material by
+  unwrapping that record (Argon2id + AEAD), then recreates the `/.vault` inode
+  and dirent (mode `0700`, owned by the calling user,
+  `INODE_FLAG_VAULT | INODE_FLAG_VAULT_ROOT`) and leaves the wrap record
+  untouched, so the original credentials and every vault chunk stay valid. A
+  caller that cannot unwrap the record gets `EPERM` with an explicit message
+  instead of taking over a namespace it could never open.
+- `crypt -c` accepts `-k <key file>` to use an existing key file instead of
+  generating one (`-path` and `-k` are mutually exclusive). That is the command
+  that rebuilds a lost namespace with the vault's original credentials:
+  `verfsnext crypt -c -p <password> -k <key file>`.
+- Mount logs (and prints to stderr) a warning naming that command when the wrap
+  record exists without its namespace, and the rebuild itself is logged too.
+
+### Validation
+
+Release build, scratch mounts, vault enabled (the default) with small Argon2
+parameters, every step driven by OS commands.
+
+Fixed binary, one mounted instance:
+- `rmdir .vault` -> `EPERM` ("Operation not permitted"), `.vault` still there.
+- `unlink .vault` -> refused ("Is a directory", checked by the kernel before the
+  filesystem is called), `.vault` still there.
+- `mv .vault elsewhere` -> `EPERM`; `mv -T other .vault` -> `EPERM`.
+- `rm -rf .vault` -> `EPERM`, `.vault` survives the walk.
+- Files inside the vault stay writable and deletable; `rmdir`/`rename` of other
+  directories keep their POSIX behaviour (`ENOTEMPTY` for non-empty).
+- While locked, `/.vault` is still hidden (`ENOENT` from `rmdir`, absent from
+  the root listing).
+- `crypt -u` after all refused operations unlocks normally, and a second
+  `crypt -c` is refused with `EEXIST`. `stats` reports clean metadata
+  consistency (0 refcount mismatches, 0 missing chunks, 0 orphan extents).
+
+Pre-fix binary, then the fixed binary on the same data directory:
+- Pre-fix: `crypt -c`, `crypt -u`, `rmdir .vault` succeeded (bug reproduced);
+  `crypt -c` then failed with "vault is already initialized".
+- Fixed: mount printed/logged the missing-namespace warning; a rebuild with a
+  new key file and a wrong password was refused with the explicit `EPERM`
+  message and left the namespace missing; `crypt -c -p <password> -k
+  <original key file>` rebuilt `/.vault`; `crypt -u` with the original password
+  and key file unlocked it, a file written inside read back, `rmdir .vault` was
+  then refused, and a second `crypt -c` was refused with `EEXIST`.
+
+### Affected Files
+
+`src/fs/vault.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`, `src/control.rs`,
+`src/lib.rs`, `src/gui/controller.rs`, `README.md`,
+`docs/technical_deep_dive.md`
+
+## B042 - One Failed Write Poisoned the Batcher and Every Later Clean Stop - Oct 18 2026
+
+### Symptom
+
+A/B on scratch mounts (release build at commit 885b3d8): after one write failed
+(pack rotation inside the batcher hitting `EACCES`), every later clean stop
+skipped the final full sync and the metadata close. The daemon exited 1 with
+that old, unrelated write error, `metadata/wal/` kept a segment that was never
+fsynced and `metadata/sstables/` stayed empty, so metadata acknowledged after
+the failure lived only in the process and page cache. The identical workload
+without the induced failure exited 0 with an SST and an empty WAL.
+
+### Root Cause
+
+1. `WriteBatcher::pending_count` was never incremented: its only producer,
+   `enqueue()`, was removed with the B005/B016 rewrite (every write goes through
+   `enqueue_and_wait`), and `drain()` only stored 0 back. Every drain gate
+   (`read`, `flush`, `release`, `fsync`, `fsyncdir`) tested
+   `pending_write_count() > 0`, so no gate ever fired and `drain()` never ran.
+2. `pending_error` was set by any failed write and consumed only by a
+   `Drain`/`Shutdown` message. With drains dead, the first failed write of a
+   daemon's lifetime stayed latched until shutdown.
+3. `graceful_shutdown` returned early on the batcher error
+   (`batcher.shutdown().await?`), so `shutdown_with_full_sync()` (the final
+   `packs.sync(true)` plus `flush_wal(true)`) and `meta.close()` (memtable
+   flush plus WAL close) never ran. `shutdown_started` was already set, so a
+   second call returned `Ok` while nothing had been synced.
+
+### Fix
+
+- Every write is submitted with `enqueue_and_wait`, which resolves only after
+  the batch containing it was applied, so a read never needs a barrier. The dead
+  `pending_count`/`pending_write_count`/`drain` mechanism and its five gates are
+  gone, and `WriteBatcher` offers exactly one write entry point.
+- `pending_error` is gone with it: a failed write reports its error to its own
+  waiter, which the FUSE write handler logs with inode, offset, length and
+  flags, so nothing can latch. Shutdown still reports a dead apply worker, but
+  no earlier write error can fail a later shutdown.
+- `graceful_shutdown` always runs the final full sync and the metadata close and
+  reports every stage that failed; a batcher shutdown error is logged as a
+  warning. No stop can skip the stages that make acknowledged metadata durable.
+
+### Validation
+
+Release build, scratch mounts, `pack_max_size_mb = 1`: induced failure =
+`chmod 500 data/packs/*`, `dd if=/dev/urandom of=<mount>/big.bin bs=1M count=4`
+(the `dd` writes fail when the pack rotates), restore the modes, canary write,
+`SIGTERM`. The harness samples the kernel's retained writeback error with one
+`sync -f <mount>` first, so the daemon's own shutdown `syncfs` does not report
+the injected error again.
+- Fixed: exit 0; `metadata/sstables/` holds the flushed table, the WAL directory
+  holds nothing but an empty active segment, and the canary written after the
+  failure reads back after a remount.
+- Pre-fix (identical steps): exit 1 with the latched pack error from
+  `batcher.shutdown()` ("final filesystem sync: failed to open next pack file
+  ..."), a 26 KB WAL segment that was never handed off and an empty
+  `sstables/` directory, the reproduction described in the report.
+
+### Affected Files
+
+`src/write/batcher.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`,
+`docs/technical_deep_dive.md`

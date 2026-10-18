@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,18 +22,18 @@ pub trait WriteApply: Send + Sync {
 struct QueuedWrite {
     op: WriteOp,
     bytes: usize,
-    done: Option<oneshot::Sender<Result<()>>>,
+    /// Resolves this write's own result. Every queued write has one: there is
+    /// no fire-and-forget producer, so no error can be left unowned (B042).
+    done: oneshot::Sender<Result<()>>,
 }
 
 enum QueueMessage {
     Write(QueuedWrite),
-    Drain(oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<Result<()>>),
 }
 
 enum ApplyMessage {
     Batch(Vec<QueuedWrite>),
-    Drain(oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<Result<()>>),
 }
 
@@ -42,18 +41,6 @@ pub struct WriteBatcher {
     tx: mpsc::UnboundedSender<QueueMessage>,
     ingest_worker: Mutex<Option<JoinHandle<()>>>,
     apply_worker: Mutex<Option<JoinHandle<()>>>,
-    /// Tracks the number of fire-and-forget writes enqueued since the last drain.
-    /// Incremented atomically after each enqueue, reset after each drain completes.
-    /// Used by readers to decide whether a drain is necessary before reading.
-    pending_count: Arc<AtomicU64>,
-}
-
-impl WriteBatcher {
-    /// Returns the number of fire-and-forget writes enqueued since the last drain.
-    /// A return value of 0 means no writes are pending and the drain can be skipped.
-    pub fn pending_write_count(&self) -> u64 {
-        self.pending_count.load(Ordering::Acquire)
-    }
 }
 
 impl WriteBatcher {
@@ -62,16 +49,14 @@ impl WriteBatcher {
         max_size_bytes: usize,
         flush_interval: Duration,
     ) -> Self {
-        // Use an unbounded channel so Write and Drain messages are never reordered.
-        // A bounded channel could cause a Drain to overtake a suspended Write
-        // when the channel is full, breaking the FIFO ordering that the drain
-        // mechanism relies on for read-after-write coherency.
+        // Use an unbounded channel so a Write never waits for capacity and a
+        // Shutdown can never overtake a Write that is still queued: the ingest
+        // worker must dispatch every write before it answers the shutdown.
         let (tx, mut rx) = mpsc::unbounded_channel::<QueueMessage>();
         let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ApplyMessage>();
 
         let apply_sink = Arc::clone(&sink);
         let apply_handle = tokio::spawn(async move {
-            let mut pending_error: Option<anyhow::Error> = None;
             let mut deferred: Option<ApplyMessage> = None;
 
             loop {
@@ -101,13 +86,10 @@ impl WriteBatcher {
                                 Err(_) => break,
                             }
                         }
-                        apply_queued_batch(&apply_sink, batch, &mut pending_error).await;
-                    }
-                    ApplyMessage::Drain(done_tx) => {
-                        let _ = done_tx.send(take_pending_error(&mut pending_error));
+                        apply_queued_batch(&apply_sink, batch).await;
                     }
                     ApplyMessage::Shutdown(done_tx) => {
-                        let _ = done_tx.send(take_pending_error(&mut pending_error));
+                        let _ = done_tx.send(Ok(()));
                         break;
                     }
                 }
@@ -125,23 +107,12 @@ impl WriteBatcher {
                     maybe_msg = rx.recv() => {
                         match maybe_msg {
                             Some(QueueMessage::Write(msg)) => {
-                                let needs_immediate_flush = msg.done.is_some();
                                 pending_bytes = pending_bytes.saturating_add(msg.bytes);
                                 pending.push(msg);
-                                if needs_immediate_flush || pending_bytes >= max_size_bytes {
-                                    dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
-                                }
-                            }
-                            Some(QueueMessage::Drain(done_tx)) => {
+                                // Dispatch right away: every write carries a
+                                // waiter, and the apply worker's group commit
+                                // merges whatever queued up meanwhile.
                                 dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
-                                if let Err(err) = apply_tx.send(ApplyMessage::Drain(done_tx)) {
-                                    match err.0 {
-                                        ApplyMessage::Drain(done_tx) => {
-                                            let _ = done_tx.send(Err(anyhow!("write apply worker is closed")));
-                                        }
-                                        _ => unreachable!("apply control channel mismatch"),
-                                    }
-                                }
                             }
                             Some(QueueMessage::Shutdown(done_tx)) => {
                                 dispatch_pending(&apply_tx, &mut pending, &mut pending_bytes);
@@ -169,40 +140,30 @@ impl WriteBatcher {
             drop(apply_tx);
         });
 
-        let pending_count = Arc::new(AtomicU64::new(0));
         Self {
             tx,
             ingest_worker: Mutex::new(Some(ingest_handle)),
             apply_worker: Mutex::new(Some(apply_handle)),
-            pending_count,
         }
     }
 
+    /// Applies one write and resolves only after the batch containing it was
+    /// applied, so a successful return means the write is committed and its
+    /// error, if any, is reported to this caller. This is the batcher's only
+    /// write entry point: there is no fire-and-forget path (B042).
     pub async fn enqueue_and_wait(&self, op: WriteOp, bytes: usize) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
             .send(QueueMessage::Write(QueuedWrite {
                 op,
                 bytes,
-                done: Some(done_tx),
+                done: done_tx,
             }))
             .map_err(|_| anyhow!("write batcher is closed"))?;
 
         done_rx
             .await
             .map_err(|_| anyhow!("write batcher worker exited before replying"))?
-    }
-
-    pub async fn drain(&self) -> Result<()> {
-        let (done_tx, done_rx) = oneshot::channel();
-        self.tx
-            .send(QueueMessage::Drain(done_tx))
-            .map_err(|_| anyhow!("write batcher is closed"))?;
-        let result = done_rx
-            .await
-            .map_err(|_| anyhow!("write batcher worker exited before drain reply"))?;
-        self.pending_count.store(0, Ordering::Release);
-        result
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -247,23 +208,13 @@ fn dispatch_pending(
 fn fail_batch(batch: Vec<QueuedWrite>, err: anyhow::Error) {
     let err_text = err.to_string();
     for entry in batch {
-        if let Some(done) = entry.done {
-            let _ = done.send(Err(anyhow!(err_text.clone())));
-        }
-    }
-}
-
-fn take_pending_error(pending_error: &mut Option<anyhow::Error>) -> Result<()> {
-    match pending_error.take() {
-        Some(err) => Err(err),
-        None => Ok(()),
+        let _ = entry.done.send(Err(anyhow!(err_text.clone())));
     }
 }
 
 async fn apply_queued_batch(
     sink: &Arc<dyn WriteApply>,
     mut batch: Vec<QueuedWrite>,
-    pending_error: &mut Option<anyhow::Error>,
 ) {
     if batch.is_empty() {
         return;
@@ -287,12 +238,7 @@ async fn apply_queued_batch(
             batch.len()
         );
         for entry in batch {
-            if let Some(done) = entry.done {
-                let _ = done.send(Err(anyhow!(err.to_string())));
-            }
-        }
-        if pending_error.is_none() {
-            *pending_error = Some(err);
+            let _ = entry.done.send(Err(anyhow!(err.to_string())));
         }
         return;
     }
@@ -300,17 +246,10 @@ async fn apply_queued_batch(
     for (entry, result) in batch.into_iter().zip(results) {
         match result {
             Ok(()) => {
-                if let Some(done) = entry.done {
-                    let _ = done.send(Ok(()));
-                }
+                let _ = entry.done.send(Ok(()));
             }
             Err(err) => {
-                if pending_error.is_none() {
-                    *pending_error = Some(anyhow!(err.to_string()));
-                }
-                if let Some(done) = entry.done {
-                    let _ = done.send(Err(err));
-                }
+                let _ = entry.done.send(Err(err));
             }
         }
     }

@@ -171,26 +171,47 @@ pub async fn is_daemon_reachable(config: &Config) -> Result<bool> {
     }
 }
 
-/// Creates the vault and its key file, returning the key file path. Key files
-/// are always written by this process, i.e. by the calling user, never by the
-/// daemon, which may run as a different system user. Without a running daemon
-/// the vault is created directly in the metadata store, owned by the caller.
-pub async fn create_vault(
-    config: &Config,
-    password: &str,
-    key_path: Option<&Path>,
-) -> Result<PathBuf> {
-    let key_file = resolve_create_key_path(key_path)?;
-    let key_material = generate_key_file_material();
-    write_key_file(&key_file, &key_material)?;
+/// Where `crypt -c` takes its vault key from.
+pub enum CreateKey {
+    /// Generate key material and write a new key file in this directory
+    /// (`None`: the current directory).
+    NewFile(Option<PathBuf>),
+    /// Read the key material of an existing key file. It is the only way to
+    /// rebuild a `/.vault` namespace that an older version removed: the
+    /// rebuilt namespace keeps the vault's original wrap record, so it needs
+    /// the original key file rather than a new one.
+    ExistingFile(PathBuf),
+}
+
+/// Creates the vault and returns the path of the key file that unlocks it.
+/// A new key file is generated and written by this process, i.e. by the calling
+/// user, never by the daemon, which may run as a different system user; with
+/// [`CreateKey::ExistingFile`] the key material is read from a file that already
+/// exists. Without a running daemon the vault is created directly in the
+/// metadata store, owned by the caller.
+pub async fn create_vault(config: &Config, password: &str, key: CreateKey) -> Result<PathBuf> {
+    let (key_file, key_material, new_key_file) = match key {
+        CreateKey::NewFile(dir) => {
+            let key_file = resolve_create_key_path(dir.as_deref())?;
+            let key_material = generate_key_file_material();
+            write_key_file(&key_file, &key_material)?;
+            (key_file, key_material, true)
+        }
+        CreateKey::ExistingFile(path) => {
+            let key_material = read_key_file(&path)?;
+            (path, key_material, false)
+        }
+    };
     if let Err(err) = create_vault_with_key(config, password, &key_material).await {
-        // The key file only unlocks the vault this call failed to create, so
-        // it must not be left behind.
-        if let Err(remove_err) = std::fs::remove_file(&key_file) {
-            return Err(err.context(format!(
-                "also failed to remove the unused key file {}: {remove_err}",
-                key_file.display()
-            )));
+        if new_key_file {
+            // The key file only unlocks the vault this call failed to create, so
+            // it must not be left behind.
+            if let Err(remove_err) = std::fs::remove_file(&key_file) {
+                return Err(err.context(format!(
+                    "also failed to remove the unused key file {}: {remove_err}",
+                    key_file.display()
+                )));
+            }
         }
         return Err(err);
     }
