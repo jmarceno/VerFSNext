@@ -15,8 +15,9 @@ use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::{ensure_dir, set_file_mode};
 use crate::types::{
     chunk_key, decode_chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkId,
-    ChunkRecord, KEY_PREFIX_CHUNK,
+    ChunkRecord, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
 };
+use crate::vault::CHUNK_FLAG_INLINE;
 
 pub const SYS_PACK_MAX_SIZE_MB: &str = "pack_max_size_mb";
 
@@ -25,6 +26,14 @@ struct ChunkRewritePlan {
     id: ChunkId,
     chunk: ChunkRecord,
     new_pack_id: u64,
+}
+
+/// Chunk records split by where their payload lives: the packed ones must move
+/// to another pack, the inline ones live in metadata and have no pack copy to
+/// rewrite.
+struct ChunkRewritePlans {
+    plans: Vec<ChunkRewritePlan>,
+    inline_records: u64,
 }
 
 pub fn read_stored_pack_size_mb(meta: &MetaStore) -> Result<Option<u64>> {
@@ -119,9 +128,16 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     let max_pack_size_bytes = target_pack_size_mb.saturating_mul(1024 * 1024);
 
     println!("Scanning chunk metadata...");
-    let mut plans = collect_chunk_rewrite_plans(meta)?;
+    let ChunkRewritePlans {
+        mut plans,
+        inline_records,
+    } = collect_chunk_rewrite_plans(meta)?;
     plans.sort_by_key(|plan| (plan.chunk.pack_id, plan.id.hash, plan.id.vault));
-    println!("Found {} chunk records to rewrite.", plans.len());
+    println!(
+        "Found {} chunk records to rewrite ({} inline records need no rewrite).",
+        plans.len(),
+        inline_records
+    );
 
     println!("Rewriting chunks into new packs...");
     let packs = PackStore::open(
@@ -203,24 +219,47 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     Ok(())
 }
 
-fn collect_chunk_rewrite_plans(meta: &MetaStore) -> Result<Vec<ChunkRewritePlan>> {
+fn collect_chunk_rewrite_plans(meta: &MetaStore) -> Result<ChunkRewritePlans> {
     meta.read_txn(|txn| {
         let prefix = vec![KEY_PREFIX_CHUNK];
         let end = prefix_end(&prefix);
-        let mut out = Vec::new();
+        let mut plans = Vec::new();
+        let mut inline_records = 0_u64;
         for pair in scan_range_pairs(txn, prefix, end)? {
             let (key, value) = pair?;
             let Some(id) = decode_chunk_key(&key) else {
                 continue;
             };
             let chunk: ChunkRecord = decode_rkyv(&value)?;
-            out.push(ChunkRewritePlan {
+            if chunk.pack_id == INLINE_PACK_ID {
+                // The payload of an inline chunk lives in metadata, not in a
+                // pack, so the rewritten pack layout does not apply to it.
+                if (chunk.flags & CHUNK_FLAG_INLINE) == 0 {
+                    bail!(
+                        "chunk {:x?} names the inline pack id but is not marked inline",
+                        id.hash
+                    );
+                }
+                inline_records += 1;
+                continue;
+            }
+            if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+                bail!(
+                    "chunk {:x?} is marked inline but names pack {}",
+                    id.hash,
+                    chunk.pack_id
+                );
+            }
+            plans.push(ChunkRewritePlan {
                 id,
                 chunk,
                 new_pack_id: 0,
             });
         }
-        Ok(out)
+        Ok(ChunkRewritePlans {
+            plans,
+            inline_records,
+        })
     })
 }
 
@@ -230,7 +269,7 @@ fn describe_and_confirm(current_mb: u64, target_mb: u64, data_dir: &Path) -> Res
     println!("Target config pack size    : {} MiB", target_mb);
     println!("This operation will:");
     println!("  1. Read every chunk payload from existing packs.");
-    println!("  2. Rewrite all chunks into new packs using the target size.");
+    println!("  2. Rewrite every packed chunk into new packs using the target size.");
     println!("  3. Update metadata chunk records to the new pack IDs.");
     println!(
         "  4. Move previous pack files to a backup directory under {}.",

@@ -287,6 +287,7 @@ Notes:
 - It rewrites all packs and updates chunk metadata pack mappings.
 - Old packs are moved to a backup directory under `data_dir`; remove that backup only after validation.
 - Every stored copy of a chunk is migrated, and all copies of one chunk land in the same new pack, which may then exceed the new size target.
+- Chunks stored inline in metadata (the provisional end-of-file chunks of recent writes) are skipped: their payload does not live in a pack, and the daemon promotes them into the new active pack later as usual.
 
 ## Offline GC Recovery / Full Rebuild
 

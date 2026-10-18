@@ -122,6 +122,7 @@ The chunk that ends a region at the end of the file is not a content-defined cut
 - Reads take the record and the inline payload in one read transaction and verify the content hash.
 - When an inline chunk's refcount drops to zero in a commit, the record and its payload are deleted in that commit; zero-ref inline records left by snapshot delete are deleted with their payload by the GC scan, which emits no discard record for them.
 - Promotion: in the idle GC window, before the GC cycle, inline chunks that already existed at the previous pass (still alive and unchanged) are compressed (vault: moved as stored) and appended to the active pack under the read side of the write lock, and their records are repointed in one transaction per batch of 256. Chunks created since the previous pass stay inline, since they are probably still the open end of a file being written.
+- Pack-size migration leaves inline chunks alone: their payload lives in metadata, so the rewrite skips those records and reports the count, and the daemon that starts after the migration promotes them into the new active pack as usual.
 
 Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -> 1.002, 128 KiB 1.122 -> 1.000, 32 KiB 1.503 -> 1.002, 8 KiB about 5 -> 1.002. The provisional tails go through the metadata WAL once instead of being compressed, packed and later compacted by GC.
 
@@ -244,7 +245,8 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
 - `src/migration/pack_size.rs`
   - Compatibility guard for persisted `SYS:pack_max_size_mb`
   - Offline pack rewrite flow for pack-size changes:
-    - rewrites all chunk payloads into new packs using configured size
+    - rewrites every packed chunk payload into new packs using the configured size
+    - inline chunks (`pack_id == INLINE_PACK_ID`) have no pack copy and are skipped, with the count reported; a record whose inline flag and pack id disagree fails the scan before anything is copied
     - updates chunk metadata `pack_id` mappings
     - resets GC discard cursor/phase and truncates discard file
     - moves old pack/index files into a backup directory for manual cleanup

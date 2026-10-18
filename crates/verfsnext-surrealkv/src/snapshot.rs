@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipSet;
-use parking_lot::RwLockReadGuard;
+use parking_lot::{Mutex, RwLockReadGuard};
 
 use crate::bplustree::tree::{BPlusTreeIterator, DiskBPlusTree};
 use crate::error::{Error, Result};
@@ -25,6 +25,15 @@ use crate::{
 /// enabling snapshot-aware compaction. During compaction, versions that are
 /// visible to any active snapshot must be preserved.
 ///
+/// Sequence numbers are not unique per snapshot: a reader and any read-write
+/// transaction that begins at the same visible sequence both register that
+/// sequence, and the protection must last until the last of them is dropped.
+/// Each tracked sequence therefore carries a reference count, raised on
+/// register and lowered on unregister; the entry is removed only when its
+/// last holder is gone. Tracking values alone (in a set) let the first drop
+/// remove the protection of every other snapshot at that sequence, and a
+/// compaction could then drop a version a live snapshot still needs.
+///
 /// # Compaction Integration
 ///
 /// The compaction iterator uses `get_all_snapshots()` to obtain a sorted list
@@ -33,7 +42,9 @@ use crate::{
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
 pub(crate) struct SnapshotTracker {
-    snapshots: Arc<SkipSet<u64>>,
+    /// Active snapshots by sequence number, with the number of snapshots
+    /// holding each sequence.
+    snapshots: Arc<Mutex<BTreeMap<u64, u32>>>,
 }
 
 impl Clone for SnapshotTracker {
@@ -62,26 +73,39 @@ impl SnapshotTracker {
     /// Creates a new empty snapshot tracker.
     pub(crate) fn new() -> Self {
         Self {
-            snapshots: Arc::new(SkipSet::new()),
+            snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     /// Registers a new snapshot with the given sequence number.
     ///
     /// Called when a new snapshot is created. The sequence number is added
-    /// to the tracking set, ensuring compaction will preserve versions
+    /// to the tracking map, or its reference count is raised when another
+    /// snapshot already holds it, ensuring compaction will preserve versions
     /// visible to this snapshot.
     pub(crate) fn register(&self, seq_num: u64) {
-        self.snapshots.insert(seq_num);
+        *self.snapshots.lock().entry(seq_num).or_insert(0) += 1;
     }
 
     /// Unregisters a snapshot with the given sequence number.
     ///
-    /// Called when a snapshot is dropped. Once all snapshots at or above
-    /// a certain sequence number are dropped, older versions become eligible
-    /// for garbage collection during compaction.
+    /// Called when a snapshot is dropped. The sequence stays protected while
+    /// any other snapshot at that sequence is alive; once the last holder is
+    /// gone, versions that only it needed become eligible for garbage
+    /// collection during compaction.
     pub(crate) fn unregister(&self, seq_num: u64) {
-        self.snapshots.remove(&seq_num);
+        let mut snapshots = self.snapshots.lock();
+        let Some(count) = snapshots.get_mut(&seq_num) else {
+            log::error!(
+                "snapshot at sequence {} was unregistered without a registered holder",
+                seq_num
+            );
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            snapshots.remove(&seq_num);
+        }
     }
 
     /// Returns all active snapshots as a sorted vector.
@@ -89,7 +113,7 @@ impl SnapshotTracker {
     /// This is the primary method used by compaction. The returned vector
     /// is sorted in ascending order.
     pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-        self.snapshots.iter().map(|entry| *entry).collect()
+        self.snapshots.lock().keys().copied().collect()
     }
 }
 
@@ -143,6 +167,11 @@ pub(crate) struct Snapshot {
     /// Sequence number defining this snapshot's view of the data
     /// Only data with seq_num <= this value is visible
     pub(crate) seq_num: u64,
+
+    /// True when this snapshot registered its sequence with the tracker and
+    /// must unregister it on drop. Iterator helper views borrow the visibility
+    /// of an existing snapshot and must not touch the tracker.
+    registered: bool,
 }
 
 impl Snapshot {
@@ -368,7 +397,23 @@ impl Snapshot {
         // to preserve versions visible to this snapshot
         core.snapshot_tracker.register(seq_num);
 
-        Self { core, seq_num }
+        Self {
+            core,
+            seq_num,
+            registered: true,
+        }
+    }
+
+    /// A read-only view with the visibility of an existing snapshot, used
+    /// only by the iterators a snapshot spawns. It does not register, because
+    /// the parent snapshot keeps the sequence protected for as long as its
+    /// iterators exist, and it must not unregister on drop.
+    fn view(core: Arc<Core>, seq_num: u64) -> Self {
+        Self {
+            core,
+            seq_num,
+            registered: false,
+        }
     }
 
     /// Collects the iterator state from all LSM components
@@ -642,7 +687,9 @@ impl Drop for Snapshot {
     fn drop(&mut self) {
         // Unregister this snapshot's sequence number so compaction can
         // clean up versions no longer visible to any snapshot
-        self.core.snapshot_tracker.unregister(self.seq_num);
+        if self.registered {
+            self.core.snapshot_tracker.unregister(self.seq_num);
+        }
     }
 }
 
@@ -1048,10 +1095,7 @@ impl SnapshotIterator<'_> {
     /// Creates a new iterator over a specific key range
     fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
         // Create a temporary snapshot to use the helper method
-        let snapshot = Snapshot {
-            core: Arc::clone(&core),
-            seq_num,
-        };
+        let snapshot = Snapshot::view(Arc::clone(&core), seq_num);
         let iter_state = snapshot.collect_iter_state()?;
         let range_deletes_possible = iter_state_may_have_range_deletes(&iter_state);
         let merge_iter =
@@ -1124,10 +1168,7 @@ impl SnapshotIterator<'_> {
                 return Ok(true);
             }
 
-            let snapshot = Snapshot {
-                core: Arc::clone(&self.core),
-                seq_num: self.snapshot_seq_num,
-            };
+            let snapshot = Snapshot::view(Arc::clone(&self.core), self.snapshot_seq_num);
 
             match snapshot.get(user_key)? {
                 Some((resolved, _)) => {
@@ -1216,10 +1257,7 @@ impl SnapshotIterator<'_> {
         }
 
         if let (Some(key_bytes), Some(_value_bytes)) = (latest_key, latest_value) {
-            let snapshot = Snapshot {
-                core: Arc::clone(&self.core),
-                seq_num: self.snapshot_seq_num,
-            };
+            let snapshot = Snapshot::view(Arc::clone(&self.core), self.snapshot_seq_num);
 
             if let Some((resolved, _)) = snapshot.get(&current_user_key)? {
                 self.current_back_key.clear();

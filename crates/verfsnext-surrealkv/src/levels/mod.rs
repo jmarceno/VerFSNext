@@ -267,7 +267,15 @@ impl LevelManifest {
 			levels_vec.len()
 		);
 
-        // Validate last_sequence matches the maximum sequence number across all tables
+        // `last_sequence` is a high-water mark of the sequence numbers that
+        // have been handed out, not the maximum sequence present in the
+        // tables: a bottom-level compaction legitimately drops the globally
+        // newest entry when it is a hard delete, lowering the tables' maximum
+        // without lowering the sequences already used. The invariant recovery
+        // needs is that new writes start at or above every live sequence, so a
+        // stored value at or above the tables' maximum is valid and must be
+        // kept as is. A stored value below it would let a new write reuse the
+        // sequence of a live version, and the two would shadow each other.
         let computed_max_seq = levels_vec
             .iter()
             .flat_map(|level| level.tables.iter())
@@ -275,11 +283,19 @@ impl LevelManifest {
             .max()
             .unwrap_or(0);
 
-        if computed_max_seq != last_sequence {
+        if computed_max_seq > last_sequence {
             return Err(Error::LoadManifestFail(format!(
-                "Manifest last_sequence mismatch: stored={}, computed from tables={}",
+                "Manifest last_sequence is below the newest sequence in the tables: stored={}, computed from tables={}",
                 last_sequence, computed_max_seq
             )));
+        }
+
+        if computed_max_seq < last_sequence {
+            log::warn!(
+                "Manifest last_sequence {} is above the newest sequence present in the tables {}; a bottom-level compaction can drop the newest version of a deleted key, so the stored value is kept",
+                last_sequence,
+                computed_max_seq
+            );
         }
 
         Ok(Self {

@@ -1601,3 +1601,175 @@ the injected error again.
 
 `src/write/batcher.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`,
 `docs/technical_deep_dive.md`
+
+## B043 - `pack-size-migrate` Aborted on Inline Chunks After Copying the Dataset - Oct 18 2026
+
+### Symptom
+
+`verfsnext pack-size-migrate`, the documented path for changing
+`pack_max_size_mb`, failed with `missing pack index entry for pack
+18446744073709551615` on any data directory that held an inline end-of-file
+chunk - that is, any recently written file's tail, because promotion only runs
+in the idle GC window. The error surfaced after every pack-backed chunk had
+already been copied into brand-new packs: the metadata transaction, the backup
+move and the discard reset never ran, the old packs stayed in place and the
+copy packs became orphans. The report observed the next mount adopting the
+highest existing pack id as the active pack and appending new writes into it
+(196,883 -> 230,884 bytes), temporarily doubling disk usage and writing live
+data into a pack the migration would have replaced.
+
+Reproduced with the release binary of the pre-fix tree on a scratch mount
+(4 KB file + 200 KB file, `pack_max_size_mb` 5000 -> 100):
+
+```
+Found 8 chunk records to rewrite.
+Error: missing pack index entry for pack 18446744073709551615 hash [15, e3, 51, ae, ...]
+```
+
+### Root Cause
+
+`collect_chunk_rewrite_plans` collected every chunk record, including inline
+end-of-file chunks whose `pack_id` is `INLINE_PACK_ID` (`u64::MAX`). An inline
+chunk has no pack copy: its payload lives in metadata under the `T` key. The
+rewrite nevertheless called `PackStore::read_indexed_copies(INLINE_PACK_ID,
+hash)`, which looked for a pack index file that cannot exist, found no entry
+and bailed. Plans are sorted by `(pack_id, hash)`, so `INLINE_PACK_ID` was
+processed last, after all pack-backed chunks had already been copied.
+
+### Fix
+
+- `collect_chunk_rewrite_plans` skips inline records: `pack_id ==
+  INLINE_PACK_ID` means the payload lives in metadata, so the rewritten pack
+  layout does not apply and the record is left untouched. The scan reports how
+  many records were skipped next to the rewrite count.
+- A record that names the inline pack id without carrying `CHUNK_FLAG_INLINE`,
+  or carries the flag while naming a real pack, is refused with an explicit
+  error while plans are collected, before anything is copied.
+
+### Validation
+
+Release build, scratch mounts, OS commands only. Dataset per run: one 4 KB
+file (single inline chunk) and one 200 KB file (pack-backed chunks), then
+`pack_max_size_mb` 5000 -> 100.
+
+- Pre-fix binary (same tree with only `src/migration/pack_size.rs` reverted):
+  `Found 8 chunk records to rewrite.` then the exact `missing pack index entry
+  for pack 18446744073709551615` error, exit 1; no backup directory, no
+  metadata update.
+- Fixed binary: `Found 7 chunk records to rewrite (2 inline records need no
+  rewrite).`, migration completed, old pack moved to
+  `data/packs.backup.pack-size-migration.<stamp>`, new active pack
+  `pack-00000000000000000002` created; `sha256sum` of both files matches after
+  a remount, a file written after the migration matches after a further
+  remount, and `verfsnext check` reports `consistent` (0 missing records, 0
+  damaged copies, 0 reference-count mismatches, 0 orphan records).
+
+### Affected Files
+
+`src/migration/pack_size.rs`
+
+## B044 - A Bottom-Level Compaction Lowered the Newest Sequence and the Metadata Store Refused to Open - Oct 18 2026
+
+### Symptom
+
+After a bottom-level compaction dropped the globally newest entry (a hard
+delete), every later start of the metadata store failed with
+`Failed to load manifest: Manifest last_sequence mismatch: stored=1201,
+computed from tables=1199`. The daemon could not start, the mount was gone,
+and no repair path existed: the manifest had to be edited by hand. Data was
+intact but inaccessible, i.e. perceived as total data loss. With the
+filesystem's configuration (6 levels, 256 MiB level target, versioning off)
+the bottom level is reached by any large metadata set, so the condition was
+time-dependent and would eventually hit production data directories.
+
+### Root Cause
+
+`LevelManifest::load_from_file` required the stored `last_sequence` to equal
+the maximum `largest_seq_num` over all live tables. `last_sequence` is only
+raised when a table is added, and a bottom-level compaction legitimately drops
+the newest version of a key when it is a hard delete: the tombstone and every
+version of that key are removed, so the tables' maximum sequence drops below
+the sequences already handed out while the manifest keeps the old value.
+
+### Fix
+
+- `last_sequence` is treated as what it is: a monotonic high-water mark of
+  handed-out sequence numbers. At load, a stored value *at or above* the
+  tables' maximum is accepted and kept (logged at `warn` when it is above,
+  because that is the normal sign of a bottom-level delete drop).
+- Only a stored value *below* the tables' maximum is refused: new writes would
+  then reuse the sequence of a live version and the two would shadow each
+  other. The error message names both values.
+
+### Validation
+
+Store-level harness on the vendored crate (temporary registration, removed
+after validation), 1200 keys, the newest one deleted, `level_count = 2`,
+auto compaction disabled, one explicit L0 -> bottom compaction:
+
+- Pre-fix: phase-3 reopen failed with the exact reported error
+  `LoadManifestFail("Manifest last_sequence mismatch: stored=1201, computed
+  from tables=1199")`.
+- Fixed: the manifest stores `stored > computed` after the compaction and
+  reopen succeeds; all 1199 live keys read back with their values and the
+  deleted key stays absent.
+
+### Affected Files
+
+`crates/verfsnext-surrealkv/src/levels/mod.rs`
+
+## B045 - Two Snapshots at One Sequence Shared a Tracker Entry, so a Drop Unprotected a Live Reader - Oct 18 2026
+
+### Symptom
+
+A long-lived reader could observe a missing key or an older value after a
+background compaction whenever another transaction that had started at the
+same visible sequence ended first. In the filesystem this feeds the write
+planner (chunk refcount deltas, extent lists, dedup decisions) and surfaced as
+"missing chunk metadata" (EIO), "inode not found", duplicate chunk stores or
+lost refcount updates - the corruption class the audits keep finding.
+
+### Root Cause
+
+`SnapshotTracker` kept sequence numbers in a set and unregistered by value.
+Every read-capable transaction creates a snapshot registered at
+`core.seq_num()` and unregisters it on `Drop`, so two live snapshots at the
+same visible sequence shared one set entry: the first drop removed it, and
+compaction then believed no snapshot needed the versions that the remaining
+reader still required. A separate defect made it worse: the helper snapshots
+inside `SnapshotIterator` were constructed without registering but still
+unregistered on drop, so creating and dropping an iterator also removed its
+parent snapshot's protection.
+
+### Fix
+
+- `SnapshotTracker` counts holders per sequence (`BTreeMap<u64, u32>` behind a
+  `parking_lot::Mutex`): `register` raises the count, `unregister` lowers it
+  and removes the entry only when the last holder is gone. An unregister
+  without a registered holder is logged as an error.
+- `Snapshot` carries a `registered` flag: `Snapshot::new` registers and
+  unregisters on drop; the iterator helper snapshots use the new
+  `Snapshot::view` constructor, which neither registers nor unregisters
+  because the snapshot they were created from keeps the sequence protected
+  for as long as its iterators exist.
+- The now-unused `crossbeam-skiplist` dependency was removed from the vendored
+  crate.
+
+### Validation
+
+Store-level harness on the vendored crate (temporary registration, removed
+after validation): `k=v1` flushed, a long-lived reader opened at sequence S,
+`k=v2` written through a read-write transaction that begins at S and is then
+dropped, a second flush, then one explicit L0 -> bottom compaction.
+
+- Pre-fix: the tracker read `[]` after the writer's drop (the reader's
+  sequence was gone) and the reader read back no value for `k` after the
+  compaction.
+- Fixed: the tracker still lists S, the compaction preserves v1, the reader
+  reads `v1`, a fresh read reads `v2`, and S is gone from the tracker only
+  after the reader itself is dropped.
+
+### Affected Files
+
+`crates/verfsnext-surrealkv/src/snapshot.rs`,
+`crates/verfsnext-surrealkv/Cargo.toml`

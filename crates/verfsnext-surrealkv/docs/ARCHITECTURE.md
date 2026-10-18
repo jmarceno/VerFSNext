@@ -629,6 +629,8 @@ By default, compaction drops old versions as soon as they are no longer visible 
 
 This enables time-travel queries where applications can read the database state at any historical timestamp within the retention window.
 
+**Snapshot tracking.** Whether a version may be dropped is decided from the sequence numbers that live snapshots still need. Sequence numbers are not unique per snapshot: a reader and any read-write transaction that begins at the same visible sequence both register that sequence, so `SnapshotTracker` (`src/snapshot.rs`) keeps a reference count per sequence and removes the entry only when the last holder is dropped. Tracking bare values would let the first drop remove the protection of every other snapshot at that sequence, and a background compaction could then drop a version a live reader still needs. The helper snapshots the iterators create (`Snapshot::view`) do not register: the snapshot they are created from keeps the sequence protected for as long as its iterators exist.
+
 ### Versioned Storage Architecture
 
 When versioning is enabled, SurrealKV automatically configures the storage layer to support efficient historical queries. The key insight is that all values are stored in the VLog, and indexes (both LSM and optional B+tree) store only value pointers. This architecture enables multiple index structures on top of a single value store.
@@ -1388,6 +1390,14 @@ The manifest tracks the durable state of the LSM tree:
 - Which SSTables exist at each level
 - Their key ranges and file sizes
 - The `min_wal_number`: WALs older than this have been fully flushed to SSTables
+- `last_sequence`: a high-water mark of the sequence numbers handed out, raised
+  when a new table is added and never lowered. A bottom-level compaction
+  legitimately drops the globally newest entry when it is a hard delete, so
+  the tables' maximum sequence can sit below `last_sequence`; that state is
+  valid and the stored value is kept, because new writes must start above every
+  sequence that was ever handed out. Only a stored value *below* the newest
+  sequence present in the tables is refused at load: it would let a new write
+  reuse the sequence of a live version and the two would shadow each other.
 
 During recovery, SurrealKV only replays WALs with `id >= min_wal_number`. Older WALs contain data that is already in SSTables and can be safely deleted.
 
