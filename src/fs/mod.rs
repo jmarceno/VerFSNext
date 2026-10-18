@@ -40,18 +40,19 @@ use crate::migration::pack_index_crc32::{
     ensure_pack_index_crc32_compat, SYS_PACK_CRC32_READ_ERRORS,
 };
 use crate::migration::pack_size::ensure_pack_size_metadata_compat;
+use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::normalize_data_tree;
 use crate::snapshot::SnapshotManager;
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
-    chunk_key, decode_dirent_name, inline_chunk_key, decode_rkyv, decode_xattr_name, dirent_key, dirent_prefix,
-    encode_rkyv, extent_key, extent_prefix, inode_key, parts_to_system_time, prefix_end,
-    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT,
-    INODE_FLAG_VAULT_ROOT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
-    KEY_PREFIX_INLINE_CHUNK,
-    MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY, ROOT_INODE, SNAPSHOTS_DIR_NAME,
-    SYS_MAX_EXTENT_LEN, VAULT_DIR_NAME,
+    chunk_key, decode_chunk_key, decode_dirent_name, decode_inline_chunk_key, decode_rkyv,
+    decode_xattr_name, dirent_key, dirent_prefix, encode_rkyv, extent_key, extent_prefix,
+    inode_key, inline_chunk_key, parts_to_system_time, prefix_end, symlink_target_key, sys_key,
+    system_time_to_parts, xattr_key, xattr_prefix, ChunkId, ChunkRecord, DirentRecord,
+    ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT, INODE_FLAG_VAULT_ROOT,
+    INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
+    KEY_PREFIX_INLINE_CHUNK, MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY,
+    ROOT_INODE, SNAPSHOTS_DIR_NAME, SYS_MAX_EXTENT_LEN, VAULT_DIR_NAME, VAULT_DOMAIN_BYTE,
 };
 use crate::vault::{
     build_wrap_record, decrypt_chunk_payload, encrypt_chunk_payload, generate_folder_key,
@@ -148,7 +149,7 @@ struct FileHandleState {
 
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
-    hash: [u8; 16],
+    id: ChunkId,
     pack_id: u64,
     block_size_bytes: u32,
 }
@@ -327,8 +328,8 @@ struct FsCore {
     max_extent_len: u64,
     meta: MetaStore,
     packs: Arc<PackStore>,
-    chunk_meta_cache: FillCache<[u8; 16], ChunkRecord>,
-    chunk_data_cache: Cache<[u8; 16], Arc<Vec<u8>>>,
+    chunk_meta_cache: FillCache<ChunkId, ChunkRecord>,
+    chunk_data_cache: Cache<ChunkId, Arc<Vec<u8>>>,
     uid_groups_cache: Cache<u32, Arc<Vec<u32>>>,
     inode_cache: FillCache<u64, Option<InodeRecord>>,
     dirent_cache: FillCache<DirentCacheKey, Option<DirentRecord>>,
@@ -354,11 +355,11 @@ struct FsCore {
     /// Chunks whose every stored copy failed verification on read. Writes
     /// store such content again instead of deduplicating against it; the
     /// sync cycle persists the mark as `CHUNK_FLAG_CORRUPT`.
-    corrupt_chunks: ParkingMutex<HashSet<[u8; 16]>>,
+    corrupt_chunks: ParkingMutex<HashSet<ChunkId>>,
     /// Inline chunks created since the last promotion pass. They are likely
     /// still the open end of a file being written, so that pass leaves them
     /// inline; the next one moves them to a pack if they are still alive.
-    young_inline_chunks: ParkingMutex<HashSet<[u8; 16]>>,
+    young_inline_chunks: ParkingMutex<HashSet<ChunkId>>,
     stats_started_ms: AtomicU64,
     last_mutation_ms: AtomicU64,
     last_activity_ms: AtomicU64,
@@ -398,6 +399,7 @@ impl VerFs {
             );
             return Err(err);
         }
+        ensure_vault_chunk_keys_migrated(&meta).await?;
         let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
         let persisted_pack_crc32_read_error_count =
             meta.get_u64_sys(SYS_PACK_CRC32_READ_ERRORS).unwrap_or(0);
@@ -1232,10 +1234,10 @@ impl FsCore {
                 .copied()
                 .chain(hidden_vault_seen_inodes.iter().copied())
                 .collect();
-            let mut reachable_chunks = HashSet::<[u8; 16]>::new();
+            let mut reachable_chunks = HashSet::<ChunkId>::new();
             let mut referenced_data_bytes = 0_u64;
-            let mut all_extent_refcounts = HashMap::<[u8; 16], u64>::new();
-            let mut inode_present_cache = HashMap::<u64, bool>::new();
+            let mut all_extent_refcounts = HashMap::<ChunkId, u64>::new();
+            let mut inode_domain_cache = HashMap::<u64, Option<bool>>::new();
             let mut orphan_extent_records = 0_u64;
             let extent_prefix_all = vec![crate::types::KEY_PREFIX_EXTENT];
             let extent_end_all = prefix_end(&extent_prefix_all);
@@ -1245,23 +1247,35 @@ impl FsCore {
                     continue;
                 };
 
-                let owner_exists = if let Some(exists) = inode_present_cache.get(&owner_ino) {
-                    *exists
+                let owner_vault = if let Some(vault) = inode_domain_cache.get(&owner_ino) {
+                    *vault
                 } else {
-                    let exists = txn.get(inode_key(owner_ino))?.is_some();
-                    inode_present_cache.insert(owner_ino, exists);
-                    exists
+                    let vault = match txn.get(inode_key(owner_ino))? {
+                        Some(raw) => Some(
+                            decode_rkyv::<InodeRecord>(&raw)?.flags & INODE_FLAG_VAULT != 0,
+                        ),
+                        None => None,
+                    };
+                    inode_domain_cache.insert(owner_ino, vault);
+                    vault
                 };
-                if !owner_exists {
+                // An extent whose inode is gone cannot be read and its domain
+                // is unknowable, so it counts as an orphan only.
+                let Some(vault) = owner_vault else {
                     orphan_extent_records = orphan_extent_records.saturating_add(1);
-                }
+                    continue;
+                };
 
                 let extent: ExtentRecord = decode_rkyv(&value)?;
+                let id = ChunkId {
+                    vault,
+                    hash: extent.chunk_hash,
+                };
                 if reachable_inodes.contains(&owner_ino) {
                     referenced_data_bytes += u64::from(extent.len);
-                    reachable_chunks.insert(extent.chunk_hash);
+                    reachable_chunks.insert(id);
                 }
-                let counter = all_extent_refcounts.entry(extent.chunk_hash).or_insert(0);
+                let counter = all_extent_refcounts.entry(id).or_insert(0);
                 *counter = counter.saturating_add(1);
             }
 
@@ -1269,36 +1283,34 @@ impl FsCore {
             let mut stored_unique_compressed_bytes = 0_u64;
             let mut unreachable_chunk_compressed_bytes = 0_u64;
             let mut chunk_refcount_mismatch_count = 0_u64;
-            let mut seen_chunk_records = HashSet::<[u8; 16]>::new();
+            let mut seen_chunk_records = HashSet::<ChunkId>::new();
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
             let chunk_end = prefix_end(&chunk_prefix);
             for pair in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
                 let (key, value) = pair?;
-                if key.len() != 17 {
+                let Some(id) = decode_chunk_key(&key) else {
                     continue;
-                }
-                let mut hash = [0_u8; 16];
-                hash.copy_from_slice(&key[1..17]);
+                };
                 let chunk: ChunkRecord = decode_rkyv(&value)?;
 
                 let chunk_uncompressed = chunk.uncompressed_len as u64;
                 let chunk_compressed = chunk.compressed_len as u64;
-                if reachable_chunks.contains(&hash) {
+                if reachable_chunks.contains(&id) {
                     stored_unique_uncompressed_bytes += chunk_uncompressed;
                     stored_unique_compressed_bytes += chunk_compressed;
                 } else {
                     unreachable_chunk_compressed_bytes += chunk_compressed;
                 }
-                let expected_refcount = all_extent_refcounts.get(&hash).copied().unwrap_or(0);
+                let expected_refcount = all_extent_refcounts.get(&id).copied().unwrap_or(0);
                 if chunk.refcount != expected_refcount {
                     chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
                 }
-                seen_chunk_records.insert(hash);
+                seen_chunk_records.insert(id);
             }
 
             let missing_chunk_records_for_extents = all_extent_refcounts
                 .keys()
-                .filter(|hash| !seen_chunk_records.contains(*hash))
+                .filter(|id| !seen_chunk_records.contains(*id))
                 .count() as u64;
 
             Ok((
@@ -1508,9 +1520,9 @@ impl FsCore {
             metadata_entries,
             chunk_entries,
             memory_bytes: metadata_entries
-                .saturating_mul(size_of::<([u8; 16], ChunkRecord)>() as u64)
+                .saturating_mul(size_of::<(ChunkId, ChunkRecord)>() as u64)
                 .saturating_add(
-                    chunk_entries.saturating_mul(size_of::<([u8; 16], Arc<Vec<u8>>)>() as u64),
+                    chunk_entries.saturating_mul(size_of::<(ChunkId, Arc<Vec<u8>>)>() as u64),
                 )
                 .saturating_add(self.chunk_data_cache.weighted_size()),
         }

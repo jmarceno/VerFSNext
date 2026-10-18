@@ -1328,3 +1328,82 @@ a 128 MiB read ran at 381 MB/s and a 22k-entry `find` completed in 1.9 s. The
 `crates/verfsnext-surrealkv/src/snapshot.rs`, `src/fs/mod.rs`, `src/control.rs`,
 `src/lib.rs`, `src/gui/controller.rs`, `qml/OverviewPage.qml`,
 `crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`, `docs/technical_deep_dive.md`
+
+## B039 - Vault and Plain Chunks Shared One Hash Domain, Losing the Second Write - Oct 18 2026
+
+### Symptom
+A plain file and a vault file could interfere when the plain file's content was
+the single byte `0xA7` followed by the vault file's content. Writing the second
+file was acknowledged, but reading the pair failed: in-session one of the two
+returned `EIO`, and after a remount the vault file failed with
+`chunk length does not match the extent that maps it` or
+`encrypted chunk referenced by non-vault inode`. The acknowledged bytes of the
+second writer existed nowhere on disk.
+
+### Root Cause
+`hash128_with_domain(0xA7, V)` feeds the domain byte into the same xxh3 stream
+as the data, so it equals `hash128(0xA7 || V)`. The vault hash of `V` and the
+plain hash of `0xA7 || V` are therefore the same 128-bit value by construction,
+with no hash collision needed.
+
+Chunk metadata, inline payloads, both chunk caches, `corrupt_chunks`,
+`young_inline_chunks` and reference counts were keyed by that hash alone.
+`stage_chunk_if_missing` deduplicated against whatever record it found and never
+compared the writer's domain with the record's `CHUNK_FLAG_ENCRYPTED`. A vault
+write could deduplicate onto a plain chunk (and the reverse); the extent then
+mapped a chunk with the other domain's length and bytes. The hash-keyed data
+cache also let a vault file be served plaintext and made the victim depend on
+which writer ran last in the same session.
+
+### Fix
+Chunk identity is now the pair `ChunkId { vault, hash }` and the metadata key
+encodes the domain: plain records keep `C` + hash, vault records use
+`C` + `0xA7` + hash, and inline payloads follow the same rule under `T`. Every
+map, set, cache and reference-count delta is keyed by the pair, so the two
+domains can never share a record, a cached payload or a count, even when their
+content hashes are equal. Writes and reads compare the record's
+`CHUNK_FLAG_ENCRYPTED` with the key's domain; a disagreement is treated as
+damaged metadata (a write stores a fresh copy, a read fails explicitly).
+`materialize_pending_chunks` takes the domain from each `ChunkId`, so a staged
+vault chunk is always encrypted.
+
+Because plain data keeps the historical key, only vault records move. A
+startup migration (`vault_chunk_keys_migration_v1`, `src/migration/vault_chunk_keys.rs`)
+scans chunk records in 10,000-record transactions and moves encrypted records
+(and their inline payloads) to the tagged key. It never decrypts a payload, so
+it runs while the vault is locked, and it is idempotent. Offline snapshot,
+pack-size and GC commands run the same migration before touching chunks. The
+pack index remains hash-keyed; copies are still validated by CRC, AEAD nonce,
+length and content hash, and GC keeps every indexed copy of a hash that is live
+in either domain. The records check now matches extents to records by
+`ChunkId`, so a file damaged by the old alias is reported as a missing piece
+instead of a refcount coincidence.
+
+### Validation
+Release build on the remote builder; library suite 43 passed. Scratch-mount
+verification on a release binary:
+
+- Both write orders (`0xA7`-prefixed plain file first, then vault file; vault
+  file first, then plain) now read each file's own bytes, in-session and after
+  a remount, with `verfsnext check` clean.
+- Idle GC promoted both inline chunks into the active pack (same hash in both
+  domains, one pack); both files still read correctly before and after a
+  remount, and `check` stayed clean.
+- A data directory written by the previous release with inline and pack-backed
+  vault files migrated automatically and every vault file read back
+  byte-identical; `check` was clean afterwards.
+- On previous-release directories that had hit the alias in either write order,
+  the migration kept the surviving domain's record. `verfsnext check` reported
+  the file whose bytes were never stored as missing at offset 0 (for example
+  `.vault/alias-victim.txt` when the plain file wrote first, `plain.bin` when
+  the vault file wrote first) and named its twin with a drifted count. The lost
+  bytes cannot be recovered, which matches the defect; the report tells the
+  user what to restore.
+
+### Affected Files
+`src/types/mod.rs`, `src/fs/chunk.rs`, `src/fs/vault.rs`, `src/fs/write.rs`,
+`src/fs/inode.rs`, `src/fs/mod.rs`, `src/fs/gc.rs`, `src/fs/health.rs`,
+`src/snapshot/mod.rs`, `src/data/compress.rs`, `src/data/hash.rs`,
+`src/migration/vault_chunk_keys.rs`, `src/migration/pack_size.rs`,
+`src/migration/mod.rs`, `src/lib.rs`, `docs/migration-guide.md`,
+`docs/technical_deep_dive.md`

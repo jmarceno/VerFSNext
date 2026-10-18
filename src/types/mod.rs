@@ -31,6 +31,11 @@ pub const KEY_PREFIX_ORPHAN: u8 = b'O';
 pub const KEY_PREFIX_INLINE_CHUNK: u8 = b'T';
 /// `ChunkRecord::pack_id` of a chunk stored inline in metadata.
 pub const INLINE_PACK_ID: u64 = u64::MAX;
+/// Domain byte of the vault chunk space. Vault chunk metadata keys carry it
+/// so a vault chunk can never share a record, cache entry or reference count
+/// with a plain chunk even when their content hashes collide (the vault hash
+/// of `V` is the plain hash of `[VAULT_DOMAIN_BYTE] ++ V`).
+pub const VAULT_DOMAIN_BYTE: u8 = 0xA7;
 
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
@@ -185,10 +190,34 @@ pub fn extent_key(ino: u64, start: u64) -> Vec<u8> {
     key
 }
 
-pub fn chunk_key(hash: &[u8; 16]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + 16);
+/// Domain and content hash of a chunk record. Chunk records live in one key
+/// space per domain ([`chunk_key`]): the plain hash of `[0xA7] ++ V` and the
+/// vault hash of `V` are the same 128-bit value, so keying the record by the
+/// hash alone let a vault write deduplicate onto a plain chunk and lose its
+/// bytes. Every lookup, cache and reference count is keyed by this pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkId {
+    pub vault: bool,
+    pub hash: [u8; 16],
+}
+
+impl ChunkId {
+    pub fn plain(hash: [u8; 16]) -> Self {
+        Self { vault: false, hash }
+    }
+
+    pub fn vault(hash: [u8; 16]) -> Self {
+        Self { vault: true, hash }
+    }
+}
+
+pub fn chunk_key(id: &ChunkId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(if id.vault { 2 + 16 } else { 1 + 16 });
     key.push(KEY_PREFIX_CHUNK);
-    key.extend_from_slice(hash);
+    if id.vault {
+        key.push(VAULT_DOMAIN_BYTE);
+    }
+    key.extend_from_slice(&id.hash);
     key
 }
 
@@ -213,10 +242,40 @@ pub fn symlink_target_key(ino: u64) -> Vec<u8> {
     key
 }
 
-pub fn inline_chunk_key(hash: &[u8; 16]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + 16);
+/// Domain and hash of a chunk metadata key, or `None` for any other key.
+/// Plain keys are `C` + hash; vault keys are `C` + [`VAULT_DOMAIN_BYTE`] + hash.
+pub fn decode_chunk_key(key: &[u8]) -> Option<ChunkId> {
+    decode_chunk_like_key(key, KEY_PREFIX_CHUNK)
+}
+
+/// Domain and hash of an inline chunk payload key, or `None` for any other
+/// key. Plain keys are `T` + hash; vault keys are `T` + [`VAULT_DOMAIN_BYTE`]
+/// + hash.
+pub fn decode_inline_chunk_key(key: &[u8]) -> Option<ChunkId> {
+    decode_chunk_like_key(key, KEY_PREFIX_INLINE_CHUNK)
+}
+
+fn decode_chunk_like_key(key: &[u8], prefix: u8) -> Option<ChunkId> {
+    if key.len() == 1 + 16 && key[0] == prefix {
+        let mut hash = [0_u8; 16];
+        hash.copy_from_slice(&key[1..17]);
+        return Some(ChunkId::plain(hash));
+    }
+    if key.len() == 2 + 16 && key[0] == prefix && key[1] == VAULT_DOMAIN_BYTE {
+        let mut hash = [0_u8; 16];
+        hash.copy_from_slice(&key[2..18]);
+        return Some(ChunkId::vault(hash));
+    }
+    None
+}
+
+pub fn inline_chunk_key(id: &ChunkId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(if id.vault { 2 + 16 } else { 1 + 16 });
     key.push(KEY_PREFIX_INLINE_CHUNK);
-    key.extend_from_slice(hash);
+    if id.vault {
+        key.push(VAULT_DOMAIN_BYTE);
+    }
+    key.extend_from_slice(&id.hash);
     key
 }
 

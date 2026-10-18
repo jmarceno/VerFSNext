@@ -343,6 +343,7 @@ storage engine together as the project evolves.
 ## Documentation and development
 
 - [Technical deep dive](docs/technical_deep_dive.md) — storage layout, write and read paths, snapshots, vault, garbage collection, and the desktop architecture.
+- [Migration guide](docs/migration-guide.md) — one-time on-disk format migrations, what they change, and validation/rollback steps.
 - [Bug-fix history](docs/bug-fix-history.md) — fixes, their impact, and regression context.
 - [Resilience validation](docs/resilience-test.md) — workload and fault-injection procedures, scope, and recorded results.
 - [Power-cut test](docs/powercut-test.md) — crash images rebuilt from a block-level write log, checked against fsync-acknowledged operations.

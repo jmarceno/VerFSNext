@@ -44,6 +44,7 @@ use crate::fs::{
 };
 use crate::meta::MetaStore;
 use crate::migration::pack_size::run_pack_size_migration;
+use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::set_socket_mode;
 use crate::snapshot::SnapshotManager;
 
@@ -1168,6 +1169,7 @@ fn human_bytes_signed(bytes: i128) -> String {
 
 async fn run_snapshot_via_metadata(config: &Config, cmd: &SnapshotCommand) -> Result<()> {
     let meta = MetaStore::open(&config.metadata_dir()).await?;
+    ensure_vault_chunk_keys_migrated(&meta).await?;
     let snapshots = SnapshotManager::new(&meta);
 
     let action_result = match cmd {

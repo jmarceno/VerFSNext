@@ -85,6 +85,22 @@ File data is stored as variable-length, content-defined chunks. Chunk boundaries
 - `SYS:max_extent_len` is the largest maximum chunk size any mount of the data directory has used. At startup it is raised to the configured `ultracdc_max_size_bytes` if lower and is then fixed for the session (every extent written is at most the configured maximum). The extent covering an offset is found with a forward range scan that starts `max_extent_len - 1` bytes before it, so lookups need no reverse iteration.
 - Snapshots copy extent records verbatim; GC, pack format and chunk records are unchanged, since the pack store was already chunk-size agnostic (one record per chunk hash).
 
+### Chunk identity and domains
+
+A chunk is identified by `ChunkId { vault, hash }` (`src/types/mod.rs`), and its
+metadata key encodes the domain: plain records use `C` + hash, vault records
+`C` + `0xA7` + hash; inline payloads use the same rule under `T`. The vault
+content hash is `xxh3_128(0xA7 || plaintext)`, which equals the plain hash of
+`0xA7 || plaintext`; the hash alone therefore does not separate the domains, so
+everything keyed by a chunk — record, inline payload, metadata and data caches,
+`corrupt_chunks`, `young_inline_chunks`, refcount deltas and the records check —
+uses the pair. A vault write can never deduplicate onto a plain chunk (or the
+reverse), and readers verify that a record's `CHUNK_FLAG_ENCRYPTED` agrees with
+the domain of its key. The pack index remains keyed by hash alone (copies are
+validated by CRC, AEAD nonce, codec/length and content hash before use), so a
+hash that is live in either domain keeps every indexed copy during GC.
+
+
 ### Write planning
 
 `prepare_write_plan` processes the sorted, disjoint segments of a write group as regions:
@@ -350,8 +366,10 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
    - chunk payload is compressed
    - compressed bytes are encrypted with XChaCha20-Poly1305 and random 192-bit nonce
    - encrypted payload is appended to pack
-   - nonce + encryption flag are persisted in chunk metadata
+   - nonce + encryption flag are persisted in the vault-domain chunk record (`C` + `0xA7` + hash), which can never share a record with a plain chunk
 5. Vault reads:
+   - the vault-domain record is loaded from the pack (a plain record with the same 128-bit hash is a different record and is never consulted)
+   - the record must carry `CHUNK_FLAG_ENCRYPTED`; otherwise the read fails as inconsistent metadata
    - encrypted payload is read from pack
    - payload is decrypted using in-memory folder key and the record's nonce; if the most recent copy of the chunk in its pack fails authentication, the other indexed copies are tried (see `src/data/pack.rs`)
    - decrypted compressed bytes are decompressed and returned
@@ -386,6 +404,14 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 3. The CRC32 is computed from the stored payload bytes in the pack record (so migration works even when `/.vault` is locked).
 4. Each rewritten index is written to a temporary file and atomically renamed into place.
 5. After all indexes are rewritten, VerFS writes the migration marker and initializes `SYS:pack_crc32_read_errors` if it does not already exist.
+
+## Vault Chunk Key Compatibility Migration
+
+1. On startup (and before offline snapshot/pack-size/GC commands touch chunks), VerFS checks `SYS:vault_chunk_keys_migration_v1`.
+2. If the marker is missing and a vault exists (`SYS:vault.wrap` present), it scans chunk records in batches of 10,000. Records with `CHUNK_FLAG_ENCRYPTED` are moved from the plain key (`C` + hash) to the vault key (`C` + `0xA7` + hash) in the same transaction that removes the old key; an inline payload (`T` + hash) moves with its record.
+3. No payload is decrypted, so the migration runs while the vault is locked. The plain key space is untouched, so plain chunks need no migration.
+4. Each batch is atomic and already-tagged records are skipped, so a crash or a failed startup resumes safely on the next run. The marker is written only after the scan completes.
+5. Files whose bytes were lost to the old cross-domain alias cannot be recovered by the migration; `verfsnext check` reports them as missing pieces after the upgrade. See `docs/migration-guide.md`.
 
 ## Benchmark: ComfyUI Profile (`bench_comfyui_profile`)
 
@@ -539,12 +565,15 @@ way.
   the daemon answers with the rendered text and the structured
   `RecordsCheckReport` field. The desktop app calls the same request.
 - `FsCore::check_records` runs one read-only metadata transaction with four
-  passes: extents (reference count per hash, orphan extents), chunk records
-  (missing hashes, reference-count mismatches, and chunks whose stored copy is
-  damaged via `CHUNK_FLAG_CORRUPT` plus the in-memory `corrupt_chunks` set),
-  affected extents grouped per owning inode, and a namespace walk that attaches
-  the current path to every reachable affected inode (`path: null` when no
-  directory entry reaches the inode).
+  passes: extents (reference count per chunk id — the owning inode's vault flag
+  plus the extent hash — and orphan extents), chunk records (missing ids,
+  reference-count mismatches, and chunks whose stored copy is damaged via
+  `CHUNK_FLAG_CORRUPT` plus the in-memory `corrupt_chunks` set), affected
+  extents grouped per owning inode, and a namespace walk that attaches the
+  current path to every reachable affected inode (`path: null` when no
+  directory entry reaches the inode). Matching extents and records by id is
+  what reports a vault file whose chunk was aliased onto a plain record as a
+  missing piece instead of a refcount coincidence.
 - The counters are computed exactly like `collect_stats`, so the tile and the
   report never disagree. Each file list is sorted by path and capped at 200
   entries, with `list_truncated` set when the cap bites.

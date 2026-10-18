@@ -11,16 +11,18 @@ use crate::data::pack::PackStore;
 use crate::fs::utils::scan_range_pairs;
 use crate::meta::MetaStore;
 use crate::migration::pack_index_crc32::ensure_pack_index_crc32_compat;
+use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::{ensure_dir, set_file_mode};
 use crate::types::{
-    chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkRecord, KEY_PREFIX_CHUNK,
+    chunk_key, decode_chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkId,
+    ChunkRecord, KEY_PREFIX_CHUNK,
 };
 
 pub const SYS_PACK_MAX_SIZE_MB: &str = "pack_max_size_mb";
 
 #[derive(Clone)]
 struct ChunkRewritePlan {
-    hash: [u8; 16],
+    id: ChunkId,
     chunk: ChunkRecord,
     new_pack_id: u64,
 }
@@ -77,6 +79,7 @@ pub async fn run_pack_size_migration(config: &Config) -> Result<()> {
 
 async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Result<()> {
     ensure_pack_index_crc32_compat(config, meta).await?;
+    ensure_vault_chunk_keys_migrated(meta).await?;
     let target_pack_size_mb = config.pack_max_size_mb;
     let Some(current_pack_size_mb) = read_stored_pack_size_mb(meta)? else {
         meta.write_txn(|txn| {
@@ -117,7 +120,7 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
 
     println!("Scanning chunk metadata...");
     let mut plans = collect_chunk_rewrite_plans(meta)?;
-    plans.sort_by_key(|plan| (plan.chunk.pack_id, plan.hash));
+    plans.sort_by_key(|plan| (plan.chunk.pack_id, plan.id.hash, plan.id.vault));
     println!("Found {} chunk records to rewrite.", plans.len());
 
     println!("Rewriting chunks into new packs...");
@@ -127,13 +130,30 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
         config.pack_index_cache_capacity_entries,
         max_pack_size_bytes,
     )?;
-    for (idx, plan) in plans.iter_mut().enumerate() {
+    let mut idx = 0;
+    while idx < plans.len() {
+        // Both domains can hold a record for the same pack and hash. Every
+        // indexed copy of the hash is moved once, and every record that names
+        // the hash is repointed at the pack that now holds them.
+        let pack_id = plans[idx].chunk.pack_id;
+        let hash = plans[idx].id.hash;
+        let mut end = idx + 1;
+        while end < plans.len()
+            && plans[end].chunk.pack_id == pack_id
+            && plans[end].id.hash == hash
+        {
+            end += 1;
+        }
         // Every indexed copy is carried over in order: duplicate vault copies
         // differ by nonce and cannot be told apart while the vault is locked.
-        let copies = packs.read_indexed_copies(plan.chunk.pack_id, plan.hash)?;
-        plan.new_pack_id = packs.append_chunk_copies(plan.hash, &copies)?;
-        if (idx + 1) % 10_000 == 0 {
-            println!("  rewritten {} chunks...", idx + 1);
+        let copies = packs.read_indexed_copies(pack_id, hash)?;
+        let new_pack_id = packs.append_chunk_copies(hash, &copies)?;
+        for plan in &mut plans[idx..end] {
+            plan.new_pack_id = new_pack_id;
+        }
+        idx = end;
+        if idx % 10_000 == 0 {
+            println!("  rewritten {} chunks...", idx);
         }
     }
     packs.sync(true)?;
@@ -145,7 +165,7 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
         for plan in plans.iter() {
             let mut updated = plan.chunk;
             updated.pack_id = plan.new_pack_id;
-            txn.set(chunk_key(&plan.hash), encode_rkyv(&updated)?)?;
+            txn.set(chunk_key(&plan.id), encode_rkyv(&updated)?)?;
         }
         txn.set(
             sys_key("active_pack_id"),
@@ -190,14 +210,12 @@ fn collect_chunk_rewrite_plans(meta: &MetaStore) -> Result<Vec<ChunkRewritePlan>
         let mut out = Vec::new();
         for pair in scan_range_pairs(txn, prefix, end)? {
             let (key, value) = pair?;
-            if key.len() != 17 {
+            let Some(id) = decode_chunk_key(&key) else {
                 continue;
-            }
-            let mut hash = [0_u8; 16];
-            hash.copy_from_slice(&key[1..17]);
+            };
             let chunk: ChunkRecord = decode_rkyv(&value)?;
             out.push(ChunkRewritePlan {
-                hash,
+                id,
                 chunk,
                 new_pack_id: 0,
             });

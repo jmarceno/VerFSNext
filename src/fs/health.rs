@@ -11,9 +11,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    decode_dirent_name, decode_rkyv, dirent_prefix, inode_key, prefix_end, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, INODE_KIND_DIR, KEY_PREFIX_CHUNK, KEY_PREFIX_EXTENT,
-    ROOT_INODE,
+    decode_chunk_key, decode_dirent_name, decode_rkyv, dirent_prefix, inode_key, prefix_end,
+    ChunkId, ChunkRecord, DirentRecord, ExtentRecord, InodeRecord, INODE_FLAG_VAULT,
+    INODE_KIND_DIR, KEY_PREFIX_CHUNK, KEY_PREFIX_EXTENT, ROOT_INODE,
 };
 use crate::vault::CHUNK_FLAG_CORRUPT;
 
@@ -86,7 +86,7 @@ impl FsCore {
     pub(crate) fn check_records(&self) -> Result<RecordsCheckReport> {
         // Chunks found damaged by a read before the sync cycle persisted the
         // `CHUNK_FLAG_CORRUPT` mark.
-        let freshly_damaged: HashSet<[u8; 16]> = self.corrupt_chunks.lock().clone();
+        let freshly_damaged: HashSet<ChunkId> = self.corrupt_chunks.lock().clone();
 
         let (
             missing_chunk_records_for_extents,
@@ -101,94 +101,114 @@ impl FsCore {
             // extents whose owning inode is gone.
             let extent_prefix = vec![KEY_PREFIX_EXTENT];
             let extent_end = prefix_end(&extent_prefix);
-            let mut extent_refs = HashMap::<[u8; 16], u64>::new();
+            let mut extent_refs = HashMap::<ChunkId, u64>::new();
             let mut orphan_extent_records = 0_u64;
-            let mut inode_present_cache = HashMap::<u64, bool>::new();
+            let mut inode_domain_cache = HashMap::<u64, Option<bool>>::new();
             for pair in scan_range_pairs(txn, extent_prefix.clone(), extent_end.clone())? {
                 let (key, value) = pair?;
                 let Some(owner_ino) = FsCore::extent_owner_ino_from_key(&key) else {
                     continue;
                 };
-                let owner_exists = match inode_present_cache.get(&owner_ino) {
-                    Some(exists) => *exists,
+                let owner_vault = match inode_domain_cache.get(&owner_ino) {
+                    Some(vault) => *vault,
                     None => {
-                        let exists = txn.get(inode_key(owner_ino))?.is_some();
-                        inode_present_cache.insert(owner_ino, exists);
-                        exists
+                        let vault = match txn.get(inode_key(owner_ino))? {
+                            Some(raw) => Some(
+                                decode_rkyv::<InodeRecord>(&raw)?.flags & INODE_FLAG_VAULT != 0,
+                            ),
+                            None => None,
+                        };
+                        inode_domain_cache.insert(owner_ino, vault);
+                        vault
                     }
                 };
-                if !owner_exists {
+                // An extent whose inode is gone cannot be read and its domain
+                // is unknowable, so it counts as an orphan only.
+                let Some(vault) = owner_vault else {
                     orphan_extent_records = orphan_extent_records.saturating_add(1);
-                }
+                    continue;
+                };
                 let extent: ExtentRecord = decode_rkyv(&value)?;
-                let counter = extent_refs.entry(extent.chunk_hash).or_insert(0);
+                let id = ChunkId {
+                    vault,
+                    hash: extent.chunk_hash,
+                };
+                let counter = extent_refs.entry(id).or_insert(0);
                 *counter = counter.saturating_add(1);
             }
 
             // Pass 2: compare every chunk record with the extents that point
-            // at it. Extents whose hash has no chunk record lost their data;
+            // at it. Extents whose id has no chunk record lost their data;
             // a corrupt flag means the stored copy is damaged.
             let chunk_prefix = vec![KEY_PREFIX_CHUNK];
             let chunk_end = prefix_end(&chunk_prefix);
-            let mut missing_hashes = HashSet::<[u8; 16]>::new();
-            let mut damaged_hashes = HashSet::<[u8; 16]>::new();
-            let mut drifted_hashes = HashSet::<[u8; 16]>::new();
-            let mut seen_hashes = HashSet::<[u8; 16]>::new();
+            let mut missing_ids = HashSet::<ChunkId>::new();
+            let mut damaged_ids = HashSet::<ChunkId>::new();
+            let mut drifted_ids = HashSet::<ChunkId>::new();
+            let mut seen_ids = HashSet::<ChunkId>::new();
             let mut chunk_refcount_mismatch_count = 0_u64;
             for pair in scan_range_pairs(txn, chunk_prefix, chunk_end)? {
                 let (key, value) = pair?;
-                if key.len() != 17 {
+                let Some(id) = decode_chunk_key(&key) else {
                     continue;
-                }
-                let mut hash = [0_u8; 16];
-                hash.copy_from_slice(&key[1..17]);
+                };
                 let chunk: ChunkRecord = decode_rkyv(&value)?;
-                seen_hashes.insert(hash);
-                if (chunk.flags & CHUNK_FLAG_CORRUPT) != 0 || freshly_damaged.contains(&hash) {
-                    damaged_hashes.insert(hash);
+                seen_ids.insert(id);
+                if (chunk.flags & CHUNK_FLAG_CORRUPT) != 0 || freshly_damaged.contains(&id) {
+                    damaged_ids.insert(id);
                 }
-                let expected_refcount = extent_refs.get(&hash).copied().unwrap_or(0);
+                let expected_refcount = extent_refs.get(&id).copied().unwrap_or(0);
                 if chunk.refcount != expected_refcount {
                     chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
-                    drifted_hashes.insert(hash);
+                    drifted_ids.insert(id);
                 }
             }
-            for hash in extent_refs.keys() {
-                if !seen_hashes.contains(hash) {
-                    missing_hashes.insert(*hash);
+            for id in extent_refs.keys() {
+                if !seen_ids.contains(id) {
+                    missing_ids.insert(*id);
                 }
             }
-            let missing_chunk_records_for_extents = missing_hashes.len() as u64;
+            let missing_chunk_records_for_extents = missing_ids.len() as u64;
 
             // Pass 3: group the affected extents by owning file.
             let mut damaged = HashMap::<u64, InodeDamage>::new();
-            if !missing_hashes.is_empty() || !damaged_hashes.is_empty() || !drifted_hashes.is_empty()
-            {
+            if !missing_ids.is_empty() || !damaged_ids.is_empty() || !drifted_ids.is_empty() {
                 for pair in scan_range_pairs(txn, extent_prefix, extent_end)? {
                     let (key, value) = pair?;
                     let Some(owner_ino) = FsCore::extent_owner_ino_from_key(&key) else {
                         continue;
                     };
                     let extent: ExtentRecord = decode_rkyv(&value)?;
+                    let owner_vault = match inode_domain_cache.get(&owner_ino) {
+                        Some(vault) => *vault,
+                        None => continue,
+                    };
+                    let Some(vault) = owner_vault else {
+                        continue;
+                    };
+                    let id = ChunkId {
+                        vault,
+                        hash: extent.chunk_hash,
+                    };
                     let start = u64::from_be_bytes(
                         key[9..17].try_into().expect("extent key holds a u64 offset"),
                     );
                     let entry = damaged.entry(owner_ino).or_default();
-                    if missing_hashes.contains(&extent.chunk_hash) {
+                    if missing_ids.contains(&id) {
                         entry.missing_pieces = entry.missing_pieces.saturating_add(1);
                         entry.first_missing_offset = Some(
                             entry
                                 .first_missing_offset
                                 .map_or(start, |offset| offset.min(start)),
                         );
-                    } else if damaged_hashes.contains(&extent.chunk_hash) {
+                    } else if damaged_ids.contains(&id) {
                         entry.damaged_pieces = entry.damaged_pieces.saturating_add(1);
                         entry.first_damaged_offset = Some(
                             entry
                                 .first_damaged_offset
                                 .map_or(start, |offset| offset.min(start)),
                         );
-                    } else if drifted_hashes.contains(&extent.chunk_hash) {
+                    } else if drifted_ids.contains(&id) {
                         entry.drifted_pieces = entry.drifted_pieces.saturating_add(1);
                         entry.first_drifted_offset = Some(
                             entry

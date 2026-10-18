@@ -1,8 +1,6 @@
 use super::*;
 use crate::fs::FsCore;
 
-const VAULT_HASH_DOMAIN: u8 = 0xA7;
-
 impl FsCore {
     pub(crate) fn vault_locked(&self) -> bool {
         !self.vault.read().unlocked()
@@ -17,10 +15,17 @@ impl FsCore {
     /// domain so they never deduplicate against plain chunks.
     pub(crate) fn chunk_content_hash(vault: bool, data: &[u8]) -> [u8; 16] {
         if vault {
-            hash128_with_domain(VAULT_HASH_DOMAIN, data)
+            hash128_with_domain(VAULT_DOMAIN_BYTE, data)
         } else {
             hash128(data)
         }
+    }
+    /// True when a chunk record belongs to the domain its key names. The key
+    /// space separates the domains ([`ChunkId`]); a disagreement means the
+    /// record was damaged or written by a buggy version, and its copy must not
+    /// be deduplicated against or served.
+    pub(crate) fn chunk_record_matches_domain(id: &ChunkId, record: &ChunkRecord) -> bool {
+        ((record.flags & CHUNK_FLAG_ENCRYPTED) != 0) == id.vault
     }
     pub(crate) fn check_vault_parent_name_gate(&self, parent: u64, name: &str) -> Result<()> {
         if self.vault_locked() && parent == ROOT_INODE && name == VAULT_DIR_NAME {

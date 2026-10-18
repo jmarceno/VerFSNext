@@ -94,8 +94,8 @@ impl FsCore {
             if !candidates.is_empty() {
                 self.delete_zero_ref_candidates(&candidates).await?;
                 for candidate in candidates.iter() {
-                    self.chunk_meta_cache.invalidate(&candidate.hash);
-                    self.chunk_data_cache.invalidate(&candidate.hash);
+                    self.chunk_meta_cache.invalidate(&candidate.id);
+                    self.chunk_data_cache.invalidate(&candidate.id);
                 }
 
                 let epoch = self.next_gc_epoch().await?;
@@ -105,7 +105,7 @@ impl FsCore {
                     .map(|candidate| DiscardRecord {
                         epoch_id: epoch,
                         pack_id: candidate.pack_id,
-                        chunk_hash128: candidate.hash,
+                        chunk_hash128: candidate.id.hash,
                         block_size_bytes: candidate.block_size_bytes,
                     })
                     .collect::<Vec<_>>();
@@ -217,13 +217,19 @@ impl FsCore {
             let mut seen_dead_hashes = HashSet::<[u8; 16]>::new();
             self.meta.read_txn(|txn| {
                 for (hash, index_entry) in entries.iter() {
-                    let is_live = match txn.get(chunk_key(hash))? {
-                        Some(raw) => {
-                            let chunk: ChunkRecord = decode_rkyv(&raw)?;
-                            chunk.refcount > 0 && chunk.pack_id == pack_id
+                    // Pack copies are indexed by hash alone: the copy is live
+                    // when a record of either domain still points at this pack.
+                    let mut is_live = false;
+                    for id in [ChunkId::plain(*hash), ChunkId::vault(*hash)] {
+                        let Some(raw) = txn.get(chunk_key(&id))? else {
+                            continue;
+                        };
+                        let chunk: ChunkRecord = decode_rkyv(&raw)?;
+                        if chunk.refcount > 0 && chunk.pack_id == pack_id {
+                            is_live = true;
+                            break;
                         }
-                        None => false,
-                    };
+                    }
 
                     if is_live {
                         report.live_entries_found = report.live_entries_found.saturating_add(1);
@@ -285,7 +291,7 @@ impl FsCore {
         let mut start = prefix;
         let mut deleted = 0_u64;
         loop {
-            let (hashes, next_start) = self.meta.read_txn(|txn| {
+            let (ids, next_start) = self.meta.read_txn(|txn| {
                 let (pairs, has_more) = scan_range_pairs_limited(txn, start.clone(), end.clone(), BATCH)?;
                 let next_start = match (has_more, pairs.last()) {
                     (true, Some((key, _))) => {
@@ -295,33 +301,31 @@ impl FsCore {
                     }
                     _ => None,
                 };
-                let mut hashes = Vec::new();
+                let mut ids = Vec::new();
                 for (key, value) in pairs {
-                    if key.len() != 17 {
+                    let Some(id) = decode_chunk_key(&key) else {
                         continue;
-                    }
+                    };
                     let chunk: ChunkRecord = decode_rkyv(&value)?;
                     if chunk.refcount == 0 {
-                        let mut hash = [0_u8; 16];
-                        hash.copy_from_slice(&key[1..17]);
-                        hashes.push(hash);
+                        ids.push(id);
                     }
                 }
-                Ok((hashes, next_start))
+                Ok((ids, next_start))
             })?;
 
-            if !hashes.is_empty() {
+            if !ids.is_empty() {
                 let mut batch_deleted = 0_u64;
                 self.meta
                     .write_txn(|txn| {
                         batch_deleted = 0;
-                        for hash in hashes.iter() {
-                            let key = chunk_key(hash);
+                        for id in ids.iter() {
+                            let key = chunk_key(id);
                             if let Some(raw) = txn.get(key.clone())? {
                                 let chunk: ChunkRecord = decode_rkyv(&raw)?;
                                 if chunk.refcount == 0 {
                                     if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
-                                        txn.delete(inline_chunk_key(hash))?;
+                                        txn.delete(inline_chunk_key(id))?;
                                     }
                                     txn.delete(key)?;
                                     batch_deleted += 1;
@@ -331,9 +335,9 @@ impl FsCore {
                         Ok(())
                     })
                     .await?;
-                for hash in hashes.iter() {
-                    self.chunk_meta_cache.invalidate(hash);
-                    self.chunk_data_cache.invalidate(hash);
+                for id in ids.iter() {
+                    self.chunk_meta_cache.invalidate(id);
+                    self.chunk_data_cache.invalidate(id);
                 }
                 deleted += batch_deleted;
             }
@@ -517,15 +521,13 @@ impl FsCore {
                     next_cursor = Some(next);
                 }
 
-                if key.len() != 17 {
+                let Some(id) = decode_chunk_key(&key) else {
                     continue;
-                }
-                let mut hash = [0_u8; 16];
-                hash.copy_from_slice(&key[1..17]);
+                };
                 let chunk: ChunkRecord = decode_rkyv(&value)?;
                 if chunk.refcount == 0 {
                     out.push(ZeroRefCandidate {
-                        hash,
+                        id,
                         pack_id: chunk.pack_id,
                         block_size_bytes: chunk.compressed_len,
                     });
@@ -541,19 +543,19 @@ impl FsCore {
         if candidates.is_empty() {
             return Ok(());
         }
-        let hashes = candidates
+        let ids = candidates
             .iter()
-            .map(|entry| entry.hash)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>();
         self.meta
             .write_txn(|txn| {
-                for hash in hashes.iter() {
-                    let key = chunk_key(hash);
+                for id in ids.iter() {
+                    let key = chunk_key(id);
                     if let Some(raw) = txn.get(key.clone())? {
                         let chunk: ChunkRecord = decode_rkyv(&raw)?;
                         if chunk.refcount == 0 {
                             if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
-                                txn.delete(inline_chunk_key(hash))?;
+                                txn.delete(inline_chunk_key(id))?;
                             }
                             txn.delete(key)?;
                         }
@@ -642,16 +644,19 @@ impl FsCore {
                 };
                 let mut batch = Vec::new();
                 for (key, payload) in pairs {
-                    let hash: [u8; 16] = key[1..]
-                        .try_into()
-                        .map_err(|_| anyhow!("malformed inline chunk key {key:?}"))?;
-                    if young.contains(&hash) {
-                        continue;
-                    }
-                    let Some(raw) = txn.get(chunk_key(&hash))? else {
+                    let Some(id) = decode_inline_chunk_key(&key) else {
                         return Err(anyhow_errno(
                             Errno::EIO,
-                            format!("inline payload of chunk {:x?} has no chunk record", hash),
+                            format!("malformed inline chunk key {key:?}"),
+                        ));
+                    };
+                    if young.contains(&id) {
+                        continue;
+                    }
+                    let Some(raw) = txn.get(chunk_key(&id))? else {
+                        return Err(anyhow_errno(
+                            Errno::EIO,
+                            format!("inline payload of chunk {:x?} has no chunk record", id.hash),
                         ));
                     };
                     let chunk: ChunkRecord = decode_rkyv(&raw)?;
@@ -659,7 +664,15 @@ impl FsCore {
                     if chunk.refcount == 0 {
                         continue;
                     }
-                    batch.push((hash, chunk, payload));
+                    if !FsCore::chunk_record_matches_domain(&id, &chunk) {
+                        tracing::error!(
+                            chunk_hash = ?id.hash,
+                            chunk_vault = id.vault,
+                            "inline chunk record does not belong to its domain key; leaving it for the records check"
+                        );
+                        continue;
+                    }
+                    batch.push((id, chunk, payload));
                 }
                 Ok((batch, next_start))
             })?;
@@ -667,10 +680,10 @@ impl FsCore {
             if !batch.is_empty() {
                 let _mutation_guard = self.write_lock.read().await;
                 let mut moved = Vec::with_capacity(batch.len());
-                for (hash, inline, payload) in batch {
+                for (id, inline, payload) in batch {
                     // Vault payloads are already encrypted and are moved as
                     // they are; plain payloads are compressed on the way.
-                    let (codec, stored) = if (inline.flags & CHUNK_FLAG_ENCRYPTED) != 0 {
+                    let (codec, stored) = if id.vault {
                         (inline.codec, payload)
                     } else {
                         let compressed = compress_chunk(&payload, self.config.zstd_compression_level)?;
@@ -679,7 +692,7 @@ impl FsCore {
                     let payload_crc32 = crc32c::crc32c(&stored);
                     let pack_id = tokio::task::block_in_place(|| {
                         self.packs.append_chunk_with_crc32(
-                            hash,
+                            id.hash,
                             codec,
                             inline.uncompressed_len,
                             &stored,
@@ -687,7 +700,7 @@ impl FsCore {
                         )
                     })?;
                     moved.push((
-                        hash,
+                        id,
                         inline,
                         ChunkRecord {
                             refcount: 0,
@@ -704,8 +717,8 @@ impl FsCore {
                 self.meta
                     .write_txn(|txn| {
                         committed = 0;
-                        for (hash, inline, packed) in &moved {
-                            let key = chunk_key(hash);
+                        for (id, inline, packed) in &moved {
+                            let key = chunk_key(id);
                             let Some(raw) = txn.get(key.clone())? else {
                                 continue;
                             };
@@ -723,14 +736,14 @@ impl FsCore {
                                     ..*packed
                                 })?,
                             )?;
-                            txn.delete(inline_chunk_key(hash))?;
+                            txn.delete(inline_chunk_key(id))?;
                             committed += 1;
                         }
                         Ok(())
                     })
                     .await?;
-                for (hash, _, _) in &moved {
-                    self.chunk_meta_cache.invalidate(hash);
+                for (id, _, _) in &moved {
+                    self.chunk_meta_cache.invalidate(id);
                 }
                 promoted += committed;
             }
@@ -756,11 +769,11 @@ impl FsCore {
         }
         self.meta
             .write_txn(|txn| {
-                for hash in &pending {
-                    if !self.corrupt_chunks.lock().contains(hash) {
+                for id in &pending {
+                    if !self.corrupt_chunks.lock().contains(id) {
                         continue;
                     }
-                    let key = chunk_key(hash);
+                    let key = chunk_key(id);
                     let Some(raw) = txn.get(key.clone())? else {
                         continue;
                     };
@@ -775,14 +788,15 @@ impl FsCore {
             })
             .await?;
         let mut corrupt = self.corrupt_chunks.lock();
-        for hash in &pending {
-            corrupt.remove(hash);
-            self.chunk_meta_cache.invalidate(hash);
+        for id in &pending {
+            corrupt.remove(id);
+            self.chunk_meta_cache.invalidate(id);
         }
         Ok(())
     }
     /// Hashes whose chunk record still points at `pack_id`, whatever their
-    /// refcount.
+    /// refcount or domain. Pack copies are indexed by hash alone, so a hash
+    /// that is live in either domain keeps every indexed copy.
     pub(crate) fn live_hashes_for_pack(&self, pack_id: u64) -> Result<HashSet<[u8; 16]>> {
         self.meta.read_txn(|txn| {
             let mut out = HashSet::new();
@@ -790,9 +804,9 @@ impl FsCore {
             let end = prefix_end(&prefix);
             for pair in scan_range_pairs(txn, prefix, end)? {
                 let (key, value) = pair?;
-                if key.len() != 17 {
+                let Some(id) = decode_chunk_key(&key) else {
                     continue;
-                }
+                };
                 let chunk: ChunkRecord = decode_rkyv(&value)?;
                 // Zero-ref records are kept: a writer can still dedup against a
                 // chunk until the scan phase deletes its record, so only chunks
@@ -800,9 +814,7 @@ impl FsCore {
                 if chunk.pack_id != pack_id {
                     continue;
                 }
-                let mut hash = [0_u8; 16];
-                hash.copy_from_slice(&key[1..17]);
-                out.insert(hash);
+                out.insert(id.hash);
             }
             Ok(out)
         })

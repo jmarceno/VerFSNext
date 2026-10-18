@@ -18,6 +18,8 @@ pub struct CompressedChunk {
 #[derive(Debug, Clone)]
 pub struct PendingChunk {
     pub hash: [u8; 16],
+    /// Domain of the chunk; the compressed bytes are the same in both.
+    pub vault: bool,
     /// Shared with the chunk data cache, so staging a chunk copies nothing.
     pub data: Arc<Vec<u8>>,
 }
@@ -25,6 +27,7 @@ pub struct PendingChunk {
 #[derive(Debug, Clone)]
 pub struct ReadyChunk {
     pub hash: [u8; 16],
+    pub vault: bool,
     pub chunk: CompressedChunk,
 }
 
@@ -57,6 +60,7 @@ pub fn compress_parallel(chunks: Vec<PendingChunk>, zstd_level: i32) -> Result<V
             let chunk = compress_chunk(&pending.data, zstd_level)?;
             Ok(ReadyChunk {
                 hash: pending.hash,
+                vault: pending.vault,
                 chunk,
             })
         })
@@ -164,14 +168,17 @@ mod tests {
         let inputs = vec![
             PendingChunk {
                 hash: [1_u8; 16],
+                vault: false,
                 data: Arc::new(vec![0_u8; 32 * 1024]),
             },
             PendingChunk {
                 hash: [2_u8; 16],
+                vault: true,
                 data: Arc::new(b"second chunk payload".to_vec()),
             },
             PendingChunk {
                 hash: [3_u8; 16],
+                vault: false,
                 data: Arc::new(vec![5_u8; 8 * 1024]),
             },
         ];
@@ -181,6 +188,7 @@ mod tests {
 
         for (i, out) in ready.iter().enumerate() {
             assert_eq!(out.hash, inputs[i].hash);
+            assert_eq!(out.vault, inputs[i].vault);
             let plain = decompress_chunk(
                 out.chunk.codec,
                 &out.chunk.compressed,

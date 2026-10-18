@@ -239,20 +239,24 @@ impl FsCore {
         txn: &mut verfsnext_surrealkv::Transaction,
         inode: &InodeRecord,
     ) -> Result<()> {
+        let vault = FsCore::inode_is_vault(inode);
         let extent_prefix_bytes = extent_prefix(inode.ino);
         let extent_end = prefix_end(&extent_prefix_bytes);
         let mut extent_keys = Vec::new();
-        let mut hashes = Vec::new();
+        let mut ids = Vec::new();
         for pair in scan_range_pairs(txn, extent_prefix_bytes, extent_end)? {
             let (key, value) = pair?;
             let extent: ExtentRecord = decode_rkyv(&value)?;
             extent_keys.push(key);
-            hashes.push(extent.chunk_hash);
+            ids.push(ChunkId {
+                vault,
+                hash: extent.chunk_hash,
+            });
         }
         for key in extent_keys {
             txn.delete(key)?;
         }
-        FsCore::decrement_chunk_refcounts_in_txn(txn, &hashes)?;
+        FsCore::decrement_chunk_refcounts_in_txn(txn, &ids)?;
 
         let xattr_prefix_bytes = xattr_prefix(inode.ino);
         let xattr_end = prefix_end(&xattr_prefix_bytes);

@@ -9,9 +9,10 @@ use crate::meta::MetaStore;
 use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_snapshot_name, dirent_key, dirent_prefix,
     encode_rkyv, extent_prefix, inode_key, orphan_key, prefix_end, snapshot_key, snapshot_prefix,
-    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, SnapshotRecord, INODE_FLAG_READONLY, INODE_KIND_DIR,
-    INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkId,
+    ChunkRecord, DirentRecord, ExtentRecord, InodeRecord, SnapshotRecord, INODE_FLAG_READONLY,
+    INODE_FLAG_VAULT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE,
+    SNAPSHOTS_DIR_NAME,
 };
 
 pub struct SnapshotManager<'a> {
@@ -71,7 +72,7 @@ impl<'a> SnapshotManager<'a> {
                 }
 
                 let mut next_inode = read_next_inode(txn)?;
-                let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
+                let mut ref_deltas = HashMap::<ChunkId, i64>::new();
 
                 let snap_root_ino = allocate_inode(&mut next_inode)?;
                 let mut snap_root = root;
@@ -137,7 +138,7 @@ impl<'a> SnapshotManager<'a> {
                 };
                 let snapshot_dirent: DirentRecord = decode_rkyv(&snapshot_dirent_raw)?;
 
-                let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
+                let mut ref_deltas = HashMap::<ChunkId, i64>::new();
                 let mut visited = HashSet::<u64>::new();
                 remove_snapshot_subtree(
                     txn,
@@ -225,7 +226,7 @@ fn clone_dir_children(
     src_dir_ino: u64,
     dst_dir_ino: u64,
     next_inode: &mut u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
     cloned_links: &mut HashMap<u64, u64>,
     src_is_root: bool,
 ) -> Result<()> {
@@ -289,7 +290,8 @@ fn clone_dir_children(
                 )?;
             }
             INODE_KIND_FILE => {
-                clone_file_extents(txn, src_inode.ino, dst_ino, ref_deltas)?;
+                let vault = (src_inode.flags & INODE_FLAG_VAULT) != 0;
+                clone_file_extents(txn, src_inode.ino, dst_ino, ref_deltas, vault)?;
             }
             INODE_KIND_SYMLINK => {
                 if let Some(target) = txn.get(symlink_target_key(src_inode.ino))? {
@@ -337,7 +339,8 @@ fn clone_file_extents(
     txn: &mut verfsnext_surrealkv::Transaction,
     src_ino: u64,
     dst_ino: u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
+    vault: bool,
 ) -> Result<()> {
     let prefix = extent_prefix(src_ino);
     let end = prefix_end(&prefix);
@@ -347,7 +350,11 @@ fn clone_file_extents(
         dst_key.extend_from_slice(&key[9..]);
         txn.set(dst_key, value.clone())?;
         let extent: ExtentRecord = decode_rkyv(&value)?;
-        *ref_deltas.entry(extent.chunk_hash).or_insert(0) += 1;
+        let id = ChunkId {
+            vault,
+            hash: extent.chunk_hash,
+        };
+        *ref_deltas.entry(id).or_insert(0) += 1;
     }
     Ok(())
 }
@@ -358,7 +365,7 @@ fn clone_file_extents(
 fn remove_snapshot_subtree(
     txn: &mut verfsnext_surrealkv::Transaction,
     ino: u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
     visited: &mut HashSet<u64>,
     referenced: &impl Fn(u64) -> bool,
 ) -> Result<()> {
@@ -366,6 +373,7 @@ fn remove_snapshot_subtree(
         return Ok(());
     }
     let mut inode = load_inode(txn, ino, "snapshot delete")?;
+    let vault = (inode.flags & INODE_FLAG_VAULT) != 0;
 
     if inode.kind == INODE_KIND_DIR {
         let children = list_dirents(txn, ino)?;
@@ -395,7 +403,11 @@ fn remove_snapshot_subtree(
             let pairs = scan_range_pairs(txn, ext_prefix, ext_end)?.collect::<Result<Vec<_>>>()?;
             for (key, value) in pairs {
                 let extent: ExtentRecord = decode_rkyv(&value)?;
-                *ref_deltas.entry(extent.chunk_hash).or_insert(0) -= 1;
+                let id = ChunkId {
+                    vault,
+                    hash: extent.chunk_hash,
+                };
+                *ref_deltas.entry(id).or_insert(0) -= 1;
                 txn.delete(key)?;
             }
         }
@@ -411,13 +423,13 @@ fn remove_snapshot_subtree(
 
 fn apply_ref_deltas_in_txn(
     txn: &mut verfsnext_surrealkv::Transaction,
-    ref_deltas: &HashMap<[u8; 16], i64>,
+    ref_deltas: &HashMap<ChunkId, i64>,
 ) -> Result<()> {
-    for (hash, delta) in ref_deltas {
+    for (id, delta) in ref_deltas {
         if *delta == 0 {
             continue;
         }
-        let key = chunk_key(hash);
+        let key = chunk_key(id);
         let Some(raw) = txn.get(key.clone())? else {
             if *delta < 0 {
                 continue;
@@ -425,8 +437,8 @@ fn apply_ref_deltas_in_txn(
             return Err(anyhow_errno(
                 Errno::EIO,
                 format!(
-                    "missing chunk metadata while applying snapshot delta for {:x?}",
-                    hash
+                    "missing chunk metadata while applying snapshot delta for hash {:x?}",
+                    id.hash
                 ),
             ));
         };
@@ -437,8 +449,8 @@ fn apply_ref_deltas_in_txn(
             return Err(anyhow_errno(
                 Errno::EIO,
                 format!(
-                    "negative chunk refcount while applying snapshot delta for {:x?}",
-                    hash
+                    "negative chunk refcount while applying snapshot delta for hash {:x?}",
+                    id.hash
                 ),
             ));
         }

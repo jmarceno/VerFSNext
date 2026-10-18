@@ -50,34 +50,30 @@ impl FsCore {
             ),
         ))
     }
-    pub(crate) fn load_chunk_record(&self, hash: [u8; 16]) -> Result<ChunkRecord> {
-        if let Some(cached) = self.chunk_meta_cache.get(&hash) {
+    pub(crate) fn load_chunk_record(&self, id: ChunkId) -> Result<ChunkRecord> {
+        if let Some(cached) = self.chunk_meta_cache.get(&id) {
             self.chunk_meta_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
         self.chunk_meta_cache_misses.fetch_add(1, Ordering::Relaxed);
-        let ticket = self.chunk_meta_cache.ticket(&hash);
+        let ticket = self.chunk_meta_cache.ticket(&id);
         let chunk = self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(chunk_key(&hash))? else {
+            let Some(raw) = txn.get(chunk_key(&id))? else {
                 return Err(anyhow_errno(
                     Errno::EIO,
-                    format!("missing chunk metadata for hash {:x?}", hash),
+                    format!("missing chunk metadata for hash {:x?}", id.hash),
                 ));
             };
             let chunk: ChunkRecord = decode_rkyv(&raw)?;
             Ok(chunk)
         })?;
-        self.chunk_meta_cache.insert_if_current(hash, chunk, ticket);
+        self.chunk_meta_cache.insert_if_current(id, chunk, ticket);
         Ok(chunk)
     }
-    /// Returns the plaintext of chunk `hash`, from the chunk cache or the
+    /// Returns the plaintext of chunk `id`, from the chunk cache or the
     /// pack store.
-    pub(crate) fn load_chunk_payload(
-        &self,
-        hash: [u8; 16],
-        vault_encrypted: bool,
-    ) -> Result<Arc<Vec<u8>>> {
-        if let Some(cached) = self.chunk_data_cache.get(&hash) {
+    pub(crate) fn load_chunk_payload(&self, id: ChunkId) -> Result<Arc<Vec<u8>>> {
+        if let Some(cached) = self.chunk_data_cache.get(&id) {
             self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
@@ -85,32 +81,31 @@ impl FsCore {
         // The pack read and decompression block, so they run off the async
         // workers.
         let payload = Arc::new(tokio::task::block_in_place(|| {
-            self.read_chunk_from_pack(hash, vault_encrypted)
+            self.read_chunk_from_pack(id)
         })?);
-        self.chunk_data_cache.insert(hash, Arc::clone(&payload));
+        self.chunk_data_cache.insert(id, Arc::clone(&payload));
         Ok(payload)
     }
 
-    /// Returns the plaintext of every chunk in `hashes`. Chunks missing from
+    /// Returns the plaintext of every chunk in `ids`. Chunks missing from
     /// the cache are read and decompressed in parallel, so a read that spans
     /// many small chunks does not pay for them one after another.
     pub(crate) fn load_chunk_payloads(
         &self,
-        hashes: &[[u8; 16]],
-        vault_encrypted: bool,
-    ) -> Result<HashMap<[u8; 16], Arc<Vec<u8>>>> {
-        let mut out = HashMap::with_capacity(hashes.len());
+        ids: &[ChunkId],
+    ) -> Result<HashMap<ChunkId, Arc<Vec<u8>>>> {
+        let mut out = HashMap::with_capacity(ids.len());
         let mut missing = Vec::new();
-        for hash in hashes {
-            if out.contains_key(hash) || missing.contains(hash) {
+        for id in ids {
+            if out.contains_key(id) || missing.contains(id) {
                 continue;
             }
-            match self.chunk_data_cache.get(hash) {
+            match self.chunk_data_cache.get(id) {
                 Some(cached) => {
                     self.chunk_data_cache_hits.fetch_add(1, Ordering::Relaxed);
-                    out.insert(*hash, cached);
+                    out.insert(*id, cached);
                 }
-                None => missing.push(*hash),
+                None => missing.push(*id),
             }
         }
         if missing.is_empty() {
@@ -121,65 +116,68 @@ impl FsCore {
         let loaded = tokio::task::block_in_place(|| {
             missing
                 .par_iter()
-                .map(|hash| {
-                    self.read_chunk_from_pack(*hash, vault_encrypted)
-                        .map(|payload| (*hash, Arc::new(payload)))
+                .map(|id| {
+                    self.read_chunk_from_pack(*id)
+                        .map(|payload| (*id, Arc::new(payload)))
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
-        for (hash, payload) in loaded {
-            self.chunk_data_cache.insert(hash, Arc::clone(&payload));
-            out.insert(hash, payload);
+        for (id, payload) in loaded {
+            self.chunk_data_cache.insert(id, Arc::clone(&payload));
+            out.insert(id, payload);
         }
         Ok(out)
     }
 
-    /// Reads, authenticates, decompresses and verifies chunk `hash` from its
+    /// Reads, authenticates, decompresses and verifies chunk `id` from its
     /// pack. Blocks on the disk.
     ///
     /// A copy is accepted only if its payload matches the index CRC32, it
     /// authenticates with the record's nonce (vault), it decompresses to the
-    /// recorded length and its plaintext hashes to `hash`. When every copy
+    /// recorded length and its plaintext hashes to `id.hash`. When every copy
     /// is rejected and at least one was damaged (CRC or content hash), the
     /// chunk is marked corrupt so the next write of the same content stores
     /// a fresh copy instead of deduplicating against the damaged one.
-    fn read_chunk_from_pack(&self, hash: [u8; 16], vault_encrypted: bool) -> Result<Vec<u8>> {
-        let mut chunk = self.load_chunk_record(hash)?;
+    fn read_chunk_from_pack(&self, id: ChunkId) -> Result<Vec<u8>> {
+        let mut chunk = self.load_chunk_record(id)?;
+        if !FsCore::chunk_record_matches_domain(&id, &chunk) {
+            return Err(anyhow_errno(
+                Errno::EIO,
+                format!(
+                    "chunk {:x?} record does not belong to its {} domain key",
+                    id.hash,
+                    if id.vault { "vault" } else { "plain" }
+                ),
+            ));
+        }
         if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
             // Record and payload are read together: a promotion may have
             // moved the chunk to a pack since the record was cached.
             let (current, inline_payload) = self.meta.read_txn(|txn| {
-                let Some(raw) = txn.get(chunk_key(&hash))? else {
+                let Some(raw) = txn.get(chunk_key(&id))? else {
                     return Err(anyhow_errno(
                         Errno::EIO,
-                        format!("missing chunk metadata for hash {:x?}", hash),
+                        format!("missing chunk metadata for hash {:x?}", id.hash),
                     ));
                 };
                 let current: ChunkRecord = decode_rkyv(&raw)?;
                 if (current.flags & CHUNK_FLAG_INLINE) == 0 {
                     return Ok((current, None));
                 }
-                let payload = txn.get(inline_chunk_key(&hash))?.ok_or_else(|| {
+                let payload = txn.get(inline_chunk_key(&id))?.ok_or_else(|| {
                     anyhow_errno(
                         Errno::EIO,
-                        format!("missing inline payload of chunk {:x?}", hash),
+                        format!("missing inline payload of chunk {:x?}", id.hash),
                     )
                 })?;
                 Ok((current, Some(payload)))
             })?;
             chunk = current;
             if let Some(stored) = inline_payload {
-                return self.decode_inline_chunk(hash, &chunk, &stored, vault_encrypted);
+                return self.decode_inline_chunk(id, &chunk, &stored);
             }
         }
-        let encrypted = (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0;
-        let folder_key = if encrypted {
-            if !vault_encrypted {
-                return Err(anyhow_errno(
-                    Errno::EIO,
-                    "encrypted chunk referenced by non-vault inode",
-                ));
-            }
+        let folder_key = if id.vault {
             Some(self.current_vault_key()?)
         } else {
             None
@@ -187,14 +185,17 @@ impl FsCore {
         let mut damaged = false;
         let result = self.packs.read_chunk_with(
             chunk.pack_id,
-            hash,
+            id.hash,
             chunk.codec,
             chunk.uncompressed_len,
             chunk.compressed_len,
             |stored, index| {
-                if let Err(err) =
-                    self.validate_pack_payload_crc32(chunk.pack_id, hash, index.payload_crc32, stored)
-                {
+                if let Err(err) = self.validate_pack_payload_crc32(
+                    chunk.pack_id,
+                    id.hash,
+                    index.payload_crc32,
+                    stored,
+                ) {
                     damaged = true;
                     return Err(err);
                 }
@@ -213,11 +214,11 @@ impl FsCore {
                         chunk.uncompressed_len,
                     )?,
                 };
-                if FsCore::chunk_content_hash(encrypted, &plaintext) != hash {
+                if FsCore::chunk_content_hash(id.vault, &plaintext) != id.hash {
                     damaged = true;
                     tracing::error!(
                         pack_id = chunk.pack_id,
-                        chunk_hash = ?hash,
+                        chunk_hash = ?id.hash,
                         offset = index.offset,
                         "chunk plaintext does not match its content hash"
                     );
@@ -225,7 +226,7 @@ impl FsCore {
                         Errno::EIO,
                         format!(
                             "stored copy of chunk {:x?} in pack {} decodes to different content",
-                            hash, chunk.pack_id
+                            id.hash, chunk.pack_id
                         ),
                     ));
                 }
@@ -236,10 +237,10 @@ impl FsCore {
             Ok(plaintext) => Ok(plaintext),
             Err(err) => {
                 if damaged {
-                    self.corrupt_chunks.lock().insert(hash);
+                    self.corrupt_chunks.lock().insert(id);
                     tracing::error!(
                         pack_id = chunk.pack_id,
-                        chunk_hash = ?hash,
+                        chunk_hash = ?id.hash,
                         "no stored copy of chunk is intact; it is marked corrupt and the next write of the same content will store it again"
                     );
                 }
@@ -251,19 +252,11 @@ impl FsCore {
     /// Decodes the payload of an inline chunk and verifies its content hash.
     fn decode_inline_chunk(
         &self,
-        hash: [u8; 16],
+        id: ChunkId,
         chunk: &ChunkRecord,
         stored: &[u8],
-        vault_encrypted: bool,
     ) -> Result<Vec<u8>> {
-        let encrypted = (chunk.flags & CHUNK_FLAG_ENCRYPTED) != 0;
-        let plaintext = if encrypted {
-            if !vault_encrypted {
-                return Err(anyhow_errno(
-                    Errno::EIO,
-                    "encrypted chunk referenced by non-vault inode",
-                ));
-            }
+        let plaintext = if id.vault {
             let key = self.current_vault_key()?;
             decrypt_chunk_payload(&key, &chunk.nonce, stored)?
         } else {
@@ -271,15 +264,15 @@ impl FsCore {
         };
         let plaintext =
             crate::data::compress::decompress_chunk(chunk.codec, &plaintext, chunk.uncompressed_len)?;
-        if FsCore::chunk_content_hash(encrypted, &plaintext) != hash {
-            self.corrupt_chunks.lock().insert(hash);
+        if FsCore::chunk_content_hash(id.vault, &plaintext) != id.hash {
+            self.corrupt_chunks.lock().insert(id);
             tracing::error!(
-                chunk_hash = ?hash,
+                chunk_hash = ?id.hash,
                 "inline chunk does not match its content hash; it is marked corrupt and the next write of the same content will store it again"
             );
             return Err(anyhow_errno(
                 Errno::EIO,
-                format!("inline chunk {:x?} decodes to different content", hash),
+                format!("inline chunk {:x?} decodes to different content", id.hash),
             ));
         }
         Ok(plaintext)
@@ -291,7 +284,11 @@ impl FsCore {
         extent: &FileExtent,
         vault_encrypted: bool,
     ) -> Result<Arc<Vec<u8>>> {
-        let payload = self.load_chunk_payload(extent.record.chunk_hash, vault_encrypted)?;
+        let id = ChunkId {
+            vault: vault_encrypted,
+            hash: extent.record.chunk_hash,
+        };
+        let payload = self.load_chunk_payload(id)?;
         FsCore::check_extent_payload_len(extent, &payload)?;
         Ok(payload)
     }
@@ -335,17 +332,25 @@ impl FsCore {
         let overlapping = &extents[first..];
         let overlapping =
             &overlapping[..overlapping.partition_point(|extent| extent.start < read_end)];
-        let hashes = overlapping
+        let vault = FsCore::inode_is_vault(inode);
+        let ids = overlapping
             .iter()
-            .map(|extent| extent.record.chunk_hash)
+            .map(|extent| ChunkId {
+                vault,
+                hash: extent.record.chunk_hash,
+            })
             .collect::<Vec<_>>();
-        let payloads = self.load_chunk_payloads(&hashes, FsCore::inode_is_vault(inode))?;
+        let payloads = self.load_chunk_payloads(&ids)?;
 
         let initial_len = buf.len();
         buf.reserve((read_end - offset) as usize);
         let mut cursor = offset;
         for extent in overlapping {
-            let payload = payloads.get(&extent.record.chunk_hash).ok_or_else(|| {
+            let id = ChunkId {
+                vault,
+                hash: extent.record.chunk_hash,
+            };
+            let payload = payloads.get(&id).ok_or_else(|| {
                 anyhow_errno(
                     Errno::EIO,
                     format!("chunk {:x?} was not loaded", extent.record.chunk_hash),
@@ -415,7 +420,7 @@ impl FsCore {
         }
         Ok(out)
     }
-    /// Decides whether `chunk_hash` must be stored as a new chunk.
+    /// Decides whether `id` must be stored as a new chunk.
     ///
     /// The decision is taken against `txn`, the transaction that will commit
     /// the refcount change. A chunk that GC deletes, or that another writer
@@ -434,58 +439,62 @@ impl FsCore {
     pub(crate) fn stage_chunk_if_missing(
         &self,
         txn: &verfsnext_surrealkv::Transaction,
-        chunk_hash: [u8; 16],
+        id: ChunkId,
         data: Arc<Vec<u8>>,
         inline: bool,
-        checked_hashes: &mut HashSet<[u8; 16]>,
-        pending_chunks: &mut HashMap<[u8; 16], StagedChunk>,
+        checked_ids: &mut HashSet<ChunkId>,
+        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
     ) -> Result<bool> {
-        if !checked_hashes.insert(chunk_hash) {
+        if !checked_ids.insert(id) {
             return Ok(false);
         }
 
-        self.chunk_data_cache.insert(chunk_hash, Arc::clone(&data));
-        if let Some(raw) = txn.get(chunk_key(&chunk_hash))? {
+        self.chunk_data_cache.insert(id, Arc::clone(&data));
+        if let Some(raw) = txn.get(chunk_key(&id))? {
             let existing: ChunkRecord = decode_rkyv(&raw)?;
-            let damaged = (existing.flags & CHUNK_FLAG_CORRUPT) != 0
-                || self.corrupt_chunks.lock().contains(&chunk_hash);
+            let damaged = !FsCore::chunk_record_matches_domain(&id, &existing)
+                || (existing.flags & CHUNK_FLAG_CORRUPT) != 0
+                || self.corrupt_chunks.lock().contains(&id);
             if !damaged {
                 return Ok(false);
             }
             tracing::warn!(
-                chunk_hash = ?chunk_hash,
-                "storing a fresh copy of a chunk whose stored copy is damaged"
+                chunk_hash = ?id.hash,
+                chunk_vault = id.vault,
+                "storing a fresh copy of a chunk whose stored copy is damaged or in the wrong domain"
             );
         }
 
-        pending_chunks.insert(chunk_hash, StagedChunk { data, inline });
+        pending_chunks.insert(id, StagedChunk { data, inline });
         Ok(true)
     }
     /// Stores the staged chunks: pack chunks are compressed in parallel and
     /// appended to the active pack; inline chunks keep their bytes (vault:
-    /// encrypted) for the commit to write into metadata.
+    /// encrypted) for the commit to write into metadata. The domain of each
+    /// chunk comes from its [`ChunkId`], so a staged vault chunk is always
+    /// encrypted.
     pub(crate) async fn materialize_pending_chunks(
         &self,
-        pending_chunks: HashMap<[u8; 16], StagedChunk>,
-        encrypt_for_vault: bool,
-    ) -> Result<HashMap<[u8; 16], NewChunk>> {
+        pending_chunks: HashMap<ChunkId, StagedChunk>,
+    ) -> Result<HashMap<ChunkId, NewChunk>> {
         if pending_chunks.is_empty() {
             return Ok(HashMap::new());
         }
 
         let mut out = HashMap::with_capacity(pending_chunks.len());
         let mut pending = Vec::with_capacity(pending_chunks.len());
-        for (hash, staged) in pending_chunks {
+        for (id, staged) in pending_chunks {
             if !staged.inline {
                 pending.push(PendingChunk {
-                    hash,
+                    hash: id.hash,
+                    vault: id.vault,
                     data: staged.data,
                 });
                 continue;
             }
             let uncompressed_len = u32::try_from(staged.data.len())
                 .map_err(|_| anyhow!("chunk too large for u32 length: {}", staged.data.len()))?;
-            let (payload, nonce, flags) = if encrypt_for_vault {
+            let (payload, nonce, flags) = if id.vault {
                 let folder_key = self.current_vault_key()?;
                 let (ciphertext, nonce) = encrypt_chunk_payload(&folder_key, &staged.data)?;
                 (ciphertext, nonce, CHUNK_FLAG_INLINE | CHUNK_FLAG_ENCRYPTED)
@@ -493,7 +502,7 @@ impl FsCore {
                 (staged.data.as_ref().clone(), [0_u8; 24], CHUNK_FLAG_INLINE)
             };
             out.insert(
-                hash,
+                id,
                 NewChunk {
                     record: ChunkRecord {
                         refcount: 0,
@@ -517,7 +526,7 @@ impl FsCore {
             .await
             .map_err(|e| anyhow!("compression task failed: {}", e))??;
         for ready_chunk in ready {
-            let chunk = if encrypt_for_vault {
+            let chunk = if ready_chunk.vault {
                 let folder_key = self.current_vault_key()?;
                 let (ciphertext, nonce) =
                     encrypt_chunk_payload(&folder_key, &ready_chunk.chunk.compressed)?;
@@ -558,7 +567,10 @@ impl FsCore {
                 }
             };
             out.insert(
-                ready_chunk.hash,
+                ChunkId {
+                    vault: ready_chunk.vault,
+                    hash: ready_chunk.hash,
+                },
                 NewChunk {
                     record: chunk,
                     inline_payload: None,
@@ -575,35 +587,36 @@ impl FsCore {
     /// with its payload right away: it has no pack copy for GC to reclaim.
     pub(crate) fn apply_ref_deltas_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
-        ref_deltas: &HashMap<[u8; 16], i64>,
-        new_chunks: &HashMap<[u8; 16], NewChunk>,
+        ref_deltas: &HashMap<ChunkId, i64>,
+        new_chunks: &HashMap<ChunkId, NewChunk>,
     ) -> Result<()> {
-        let hashes = ref_deltas
+        let ids = ref_deltas
             .iter()
             .filter(|(_, delta)| **delta != 0)
-            .map(|(hash, _)| *hash)
+            .map(|(id, _)| *id)
             .chain(new_chunks.keys().copied())
             .collect::<HashSet<_>>();
-        for hash in hashes {
-            let delta = ref_deltas.get(&hash).copied().unwrap_or(0);
-            let fresh = new_chunks.get(&hash);
+        for id in ids {
+            let delta = ref_deltas.get(&id).copied().unwrap_or(0);
+            let fresh = new_chunks.get(&id);
 
-            let key = chunk_key(&hash);
+            let key = chunk_key(&id);
             if let Some(raw) = txn.get(key.clone())? {
                 let existing: ChunkRecord = decode_rkyv(&raw)?;
                 let mut chunk = match fresh {
                     Some(fresh) => {
                         tracing::warn!(
-                            chunk_hash = ?hash,
+                            chunk_hash = ?id.hash,
+                            chunk_vault = id.vault,
                             old_pack_id = existing.pack_id,
                             new_pack_id = fresh.record.pack_id,
                             "repointing damaged chunk record at a fresh copy"
                         );
                         if (existing.flags & CHUNK_FLAG_INLINE) != 0 {
-                            txn.delete(inline_chunk_key(&hash))?;
+                            txn.delete(inline_chunk_key(&id))?;
                         }
                         if let Some(payload) = &fresh.inline_payload {
-                            txn.set(inline_chunk_key(&hash), payload.clone())?;
+                            txn.set(inline_chunk_key(&id), payload.clone())?;
                         }
                         ChunkRecord {
                             refcount: existing.refcount,
@@ -615,7 +628,8 @@ impl FsCore {
                 let next_ref = chunk.refcount as i64 + delta;
                 if next_ref < 0 {
                     tracing::error!(
-                        chunk_hash = ?hash,
+                        chunk_hash = ?id.hash,
+                        chunk_vault = id.vault,
                         refcount = chunk.refcount,
                         delta,
                         "chunk refcount underflow: metadata refcounts are inconsistent, clamping to zero"
@@ -624,7 +638,7 @@ impl FsCore {
                 chunk.refcount = next_ref.max(0) as u64;
                 if chunk.refcount == 0 && (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
                     txn.delete(key)?;
-                    txn.delete(inline_chunk_key(&hash))?;
+                    txn.delete(inline_chunk_key(&id))?;
                     continue;
                 }
                 txn.set(key, encode_rkyv(&chunk)?)?;
@@ -633,7 +647,8 @@ impl FsCore {
 
             if delta < 0 {
                 tracing::error!(
-                    chunk_hash = ?hash,
+                    chunk_hash = ?id.hash,
+                    chunk_vault = id.vault,
                     delta,
                     "refcount decrement for a chunk without metadata: metadata refcounts are inconsistent"
                 );
@@ -643,7 +658,7 @@ impl FsCore {
             let Some(fresh) = fresh else {
                 return Err(anyhow_errno(
                     Errno::EIO,
-                    format!("missing staged chunk metadata for hash {:x?}", hash),
+                    format!("missing staged chunk metadata for hash {:x?}", id.hash),
                 ));
             };
             if delta == 0 && fresh.inline_payload.is_some() {
@@ -651,7 +666,7 @@ impl FsCore {
                 continue;
             }
             if let Some(payload) = &fresh.inline_payload {
-                txn.set(inline_chunk_key(&hash), payload.clone())?;
+                txn.set(inline_chunk_key(&id), payload.clone())?;
             }
             let mut chunk = fresh.record;
             chunk.refcount = delta as u64;
@@ -663,17 +678,17 @@ impl FsCore {
     /// commit became visible: a damaged chunk that got a fresh copy is no
     /// longer corrupt. The metadata cache entry is dropped rather than
     /// filled, since the committed refcount is not known here.
-    pub(crate) fn publish_committed_chunk_records(&self, new_chunks: &HashMap<[u8; 16], NewChunk>) {
+    pub(crate) fn publish_committed_chunk_records(&self, new_chunks: &HashMap<ChunkId, NewChunk>) {
         if new_chunks.is_empty() {
             return;
         }
         let mut corrupt = self.corrupt_chunks.lock();
         let mut young_inline = self.young_inline_chunks.lock();
-        for (hash, chunk) in new_chunks {
-            self.chunk_meta_cache.invalidate(hash);
-            corrupt.remove(hash);
+        for (id, chunk) in new_chunks {
+            self.chunk_meta_cache.invalidate(id);
+            corrupt.remove(id);
             if chunk.inline_payload.is_some() {
-                young_inline.insert(*hash);
+                young_inline.insert(*id);
             }
         }
     }
@@ -687,15 +702,15 @@ impl FsCore {
     }
     pub(crate) fn decrement_chunk_refcounts_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
-        hashes: &[[u8; 16]],
+        ids: &[ChunkId],
     ) -> Result<()> {
-        if hashes.is_empty() {
+        if ids.is_empty() {
             return Ok(());
         }
 
-        let mut ref_deltas = HashMap::<[u8; 16], i64>::with_capacity(hashes.len());
-        for hash in hashes {
-            *ref_deltas.entry(*hash).or_insert(0) -= 1;
+        let mut ref_deltas = HashMap::<ChunkId, i64>::with_capacity(ids.len());
+        for id in ids {
+            *ref_deltas.entry(*id).or_insert(0) -= 1;
         }
 
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &HashMap::new())
