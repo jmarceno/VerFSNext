@@ -1,4 +1,19 @@
-# AGENTS.md - VerFS3
+DO NOT CREATE NEW TESTS IF YOU ARE NOT EXPLICITLY ASKED TO DO SO.
+DO NOT COMMENT OUT OR KEEP LEGACY CODE IN THE CODEBASE, IF YOU NEED TO CHANGE SOMETHING, CHANGE IT AND REMOVE THE OLD CODE.
+DO NOT USE PIP, ALWAYS USE UV AND GIVE INSTRUCTIONS ON HOW TO USE IT.
+DO NOT ADD FALLBACKS
+DO NOT WRITE DEFENSIVE CODE
+DO NOT SWALLOW ERRORS, ALWAYS MAKE THEM EXPLICIT AND LOG THEM
+
+# AGENTS.md - VerFSNext
+
+## Architecture
+VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-128 hashed) in zstd-seekable packs, with a KV-only metadata layer. Chunks are deduplicated and compressed in-line, and persisted to packs.Space is reclaimed by a GC when the system is idle.
+### Features
+    - Deduplication - in-line
+    - Compression - in-line
+    - Snapshots - Snapshots can be seem and interacted through the .snapshots folder at root
+    - Encrypted .vault folder at root
 
 # IMPORTANT NOTICE ABOUT COMPATIBILITY
 We are now in production and any change that breaks compatibility with previous versions must provide a one time migration path.
@@ -13,6 +28,9 @@ This migration path must be documented in the migration guide and must be run au
 
 ## Commands
 - Build: `cargo build --release`
+- Run benchmark (normal version): `VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test bench_comfyui_profile --test rsync_integration -- --nocapture`
+- Run benchmark (fast version, used for debugging only, not for real benchmarks): `VERFSNEXT_RUN_MOUNT_TESTS=1 cargo test bench_comfyui_profile_fast --test rsync_integration -- --nocapture` 
+  - Only on Linux with FUSE; requires `mountpoint`, `fusermount`, `bash`, `dd`, `sync`, `sha256sum`, `python3`
 
 ## Testing Policy
 - Prefer writing integration tests over unit tests and always use OS commands when dealing with the filesystem, never write tests that interact with the internal API of the system.
@@ -20,15 +38,8 @@ This migration path must be documented in the migration guide and must be run au
 - Run focused tests on small changes.
 - Don't write tests for what the type system already guarantees.
 
-## Architecture
-VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-128 hashed) in zstd-seekable packs, with a KV-only metadata layer. Chunks are deduplicated and compressed in-line, and persisted to packs.Space is reclaimed by a GC when the system is idle.
-### Features
-    - Deduplication - in-line
-    - Compression - in-line
-    - Snapshots - Snapshots can be seem and interacted through the .snapshots folder at root
-    - Encrypted .vault folder at root
 ### Code Organization
-- **VENDOR**: code under `vendor/` has been hard forked and you must treat as our own code, making any needed fixes and modifications.
+- **VENDOR**: code under `crates/` are hard-forked internal packages that are part of the project. Treat them as our own code, making any needed fixes and modifications.
 
 ## Reference Documentation (create if it does not exist)
 - [VerFS Technical Deep Dive](docs/technical_deep_dive.md)
@@ -37,4 +48,31 @@ VerFSNext is a Rust COW FUSE filesystem storing files as UltraCDC chunks (XXH3-1
 - [VerFS Technical Deep Dive](docs/technical_deep_dive.md)
 
 ## Update SurrealKV Architecture Documentation after any change to SurrealKV code
-- [SurrealKV Architecture](vendor/surrealkv/docs/ARCHITECTURE.md)
+- [SurrealKV Architecture](crates/verfsnext-surrealkv/docs/ARCHITECTURE.md)
+
+## When working on issues/bugs, consult our Bug Fix history to better undertand impact and possible regressions
+- [Bug fix history](docs/bug-fix-history.md)
+- Always update this document after solving a bug or an issue
+
+
+## Remote Rust builds
+
+Compile with `cargo remote` instead of a local `cargo build`, `cargo test`, or `cargo clippy`. One command syncs the sources, builds on the shared builder, and copies back only the finished executable into `target/<profile>/`. Crates, incremental files, and the rest of `target/` stay on the builder.
+
+```bash
+cargo remote -h -- build --release
+cargo remote -h -- test
+cargo remote -h -- clippy --all-targets -- -D warnings
+```
+
+`cargo fmt` stays local. Dotfiles are not synced; pass `-h` only when the build needs them. This project needs it: `.cargo/config.toml` makes the link use `lld`, because the builder's default `mold` drops the Qt bridge (cxx-qt) symbols of the desktop app (`gui` feature, on by default). Pass `-c <path-under-target>` only when you explicitly want a different file copied back.
+
+
+The builder is already set up. Do not compile locally because a host is missing from Cargo's config. `cargo remote` does not read `~/.cargo/config.toml` for the host. That file only sets the `kache` wrapper, and a host will not be there.
+
+Read these two files directly. A search that stays inside this repo will not see them, and that is not evidence that the builder is unconfigured.
+
+- `~/.config/cargo-remote/cargo-remote.toml` — the only config `cargo remote` uses. The filename is `cargo-remote.toml`, not `config.toml`. It defines one remote, `rust-builder`, so `cargo remote -- build` uses it with no `-H` and no `-r`. Builds land in `~/remote-builds` on that machine.
+- `~/.ssh/config`, host `rust-builder` — `192.168.0.65`, user `builder`, key `~/.ssh/id_ed25519`.
+
+If `cargo remote` fails, report the command's error. Do not switch to a local `cargo build`, `cargo test`, or `cargo clippy`.

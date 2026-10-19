@@ -1,26 +1,101 @@
+use std::io;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use nix::unistd::{getgid, getuid};
-use surrealkv::{Mode, Tree, TreeBuilder};
+use verfsnext_surrealkv::{DurabilityBarrier, Mode, Tree, TreeBuilder};
+
+use crate::data::pack::PackStore;
 
 use crate::types::{
     decode_rkyv, dirent_key, encode_rkyv, inode_key, sys_key, system_time_to_parts, DirentRecord,
-    InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, PERM_DIRECTORY_DEFAULT, ROOT_INODE,
-    SNAPSHOTS_DIR_NAME,
+    InodeRecord, INODE_FLAG_READONLY, INODE_KIND_DIR, PERM_DIRECTORY_DEFAULT, PERM_DIRECTORY_ROOT,
+    ROOT_INODE, SNAPSHOTS_DIR_NAME, STORAGE_FORMAT_VERSION, SYS_STORAGE_FORMAT,
 };
 use crate::vault::{SYS_VAULT_POLICY, SYS_VAULT_STATE, VAULT_STATE_LOCKED};
+
+/// Upper bound on commit attempts for one logical metadata update.
+pub const MAX_COMMIT_ATTEMPTS: u32 = 16;
+
+/// True when a commit failed only because a concurrent transaction won the
+/// race, so re-running the whole transaction on fresh state is correct.
+pub fn is_retryable_commit_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<verfsnext_surrealkv::Error>(),
+            Some(verfsnext_surrealkv::Error::TransactionWriteConflict)
+                | Some(verfsnext_surrealkv::Error::TransactionRetry)
+        )
+    })
+}
 
 pub struct MetaStore {
     tree: Tree,
 }
 
+/// WAL durability barrier backed by the pack store; see
+/// [`MetaStore::open_with_pack_barrier`].
+struct PackBarrier(Arc<OnceLock<Arc<PackStore>>>);
+
+impl DurabilityBarrier for PackBarrier {
+    fn watermark(&self) -> u64 {
+        self.0.get().map_or(0, |packs| packs.append_watermark())
+    }
+
+    fn durable(&self) -> u64 {
+        self.0.get().map_or(0, |packs| packs.durable_watermark())
+    }
+
+    fn make_durable(&self, watermark: u64) -> io::Result<()> {
+        let Some(packs) = self.0.get() else {
+            return Ok(());
+        };
+        packs.sync_to(watermark).map_err(|err| {
+            tracing::error!(error = %format!("{err:#}"), "pack sync before WAL write failed");
+            io::Error::other(format!("pack sync before WAL write failed: {err:#}"))
+        })
+    }
+}
+
 impl MetaStore {
     pub async fn open(path: &Path) -> Result<Self> {
-        let tree = TreeBuilder::new()
+        Self::open_with_builder(path, TreeBuilder::new()).await
+    }
+
+    /// Opens the store so that no WAL record reaches the OS before the pack
+    /// data it may reference is durable: the WAL buffers records in the
+    /// process and syncs the active pack before each hand-off. Writes thus
+    /// commit without a pack fsync of their own while a crash still never
+    /// leaves durable metadata pointing at pack data that is not on disk.
+    ///
+    /// The pack store needs metadata to open, so it is put into `packs` once
+    /// open. Until then this process cannot have appended to any pack and the
+    /// barrier has nothing to sync.
+    pub async fn open_with_pack_barrier(
+        path: &Path,
+        packs: Arc<OnceLock<Arc<PackStore>>>,
+    ) -> Result<Self> {
+        Self::open_with_builder(
+            path,
+            TreeBuilder::new().with_durability_barrier(Arc::new(PackBarrier(packs))),
+        )
+        .await
+    }
+
+    /// Hands committed WAL records whose pack data is already durable to the
+    /// OS. Records waiting on a pack sync stay buffered in the process.
+    pub fn write_durable_wal_prefix(&self) -> Result<()> {
+        self.tree
+            .write_durable_wal_prefix()
+            .context("failed to hand off durable WAL records")
+    }
+
+    async fn open_with_builder(path: &Path, builder: TreeBuilder) -> Result<Self> {
+        let tree = builder
             .with_path(path.to_path_buf())
-            .with_max_memtable_size(32 * 1024 * 1024)
+            .with_max_memtable_size(128 * 1024 * 1024)
             .with_flush_on_close(true)
             .build()
             .context("failed to open SurrealKV tree")?;
@@ -36,7 +111,7 @@ impl MetaStore {
             ino: ROOT_INODE,
             parent: ROOT_INODE,
             kind: INODE_KIND_DIR,
-            perm: PERM_DIRECTORY_DEFAULT,
+            perm: PERM_DIRECTORY_ROOT,
             uid: getuid().as_raw(),
             gid: getgid().as_raw(),
             nlink: 2,
@@ -52,42 +127,77 @@ impl MetaStore {
         };
 
         self.write_txn(|txn| {
-            if txn.get(inode_key(ROOT_INODE))?.is_none() {
-                txn.set(inode_key(ROOT_INODE), encode_rkyv(&root)?)?;
-            }
-            if txn.get(sys_key("next_inode"))?.is_none() {
-                txn.set(sys_key("next_inode"), 2_u64.to_le_bytes().to_vec())?;
-            }
-            if txn.get(sys_key("active_pack_id"))?.is_none() {
-                txn.set(sys_key("active_pack_id"), 1_u64.to_le_bytes().to_vec())?;
-            }
-            if txn.get(sys_key("pack_crc32_read_errors"))?.is_none() {
+            let root_inode_key = inode_key(ROOT_INODE);
+            let next_inode_key = sys_key("next_inode");
+            let active_pack_id_key = sys_key("active_pack_id");
+            let pack_crc32_read_errors_key = sys_key("pack_crc32_read_errors");
+            let gc_discard_checkpoint_key = sys_key("gc.discard_checkpoint");
+            let gc_epoch_key = sys_key("gc.epoch");
+            let vault_state_key = sys_key(SYS_VAULT_STATE);
+            let vault_policy_key = sys_key(SYS_VAULT_POLICY);
+
+            let storage_format_key = sys_key(SYS_STORAGE_FORMAT);
+            if txn.get(root_inode_key.clone())?.is_none() {
+                txn.set(root_inode_key.clone(), encode_rkyv(&root)?)?;
                 txn.set(
-                    sys_key("pack_crc32_read_errors"),
+                    storage_format_key,
+                    STORAGE_FORMAT_VERSION.to_le_bytes().to_vec(),
+                )?;
+            } else {
+                let stored = txn
+                    .get(storage_format_key)?
+                    .map(|raw| {
+                        <[u8; 8]>::try_from(raw.as_slice())
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| {
+                                anyhow::anyhow!("invalid SYS:{SYS_STORAGE_FORMAT} length {}", raw.len())
+                            })
+                    })
+                    .transpose()?;
+                if stored != Some(STORAGE_FORMAT_VERSION) {
+                    anyhow::bail!(
+                        "data directory uses storage format {} but this version only reads format {}; \
+                         the fixed 1 MiB block layout (no format marker) is not supported, \
+                         recreate the data directory",
+                        stored.map_or_else(|| "1 (fixed 1 MiB blocks)".to_owned(), |v| v.to_string()),
+                        STORAGE_FORMAT_VERSION
+                    );
+                }
+            }
+            if txn.get(next_inode_key.clone())?.is_none() {
+                txn.set(next_inode_key.clone(), 2_u64.to_le_bytes().to_vec())?;
+            }
+            if txn.get(active_pack_id_key.clone())?.is_none() {
+                txn.set(active_pack_id_key, 1_u64.to_le_bytes().to_vec())?;
+            }
+            if txn.get(pack_crc32_read_errors_key.clone())?.is_none() {
+                txn.set(
+                    pack_crc32_read_errors_key,
                     0_u64.to_le_bytes().to_vec(),
                 )?;
             }
-            if txn.get(sys_key("gc.discard_checkpoint"))?.is_none() {
+            if txn.get(gc_discard_checkpoint_key.clone())?.is_none() {
                 txn.set(
-                    sys_key("gc.discard_checkpoint"),
+                    gc_discard_checkpoint_key,
                     0_u64.to_le_bytes().to_vec(),
                 )?;
             }
-            if txn.get(sys_key("gc.epoch"))?.is_none() {
-                txn.set(sys_key("gc.epoch"), 0_u64.to_le_bytes().to_vec())?;
+            if txn.get(gc_epoch_key.clone())?.is_none() {
+                txn.set(gc_epoch_key, 0_u64.to_le_bytes().to_vec())?;
             }
-            if txn.get(sys_key(SYS_VAULT_STATE))?.is_none() {
-                txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
+            if txn.get(vault_state_key.clone())?.is_none() {
+                txn.set(vault_state_key, vec![VAULT_STATE_LOCKED])?;
             }
-            if txn.get(sys_key(SYS_VAULT_POLICY))?.is_none() {
-                txn.set(sys_key(SYS_VAULT_POLICY), vec![0_u8])?;
+            if txn.get(vault_policy_key.clone())?.is_none() {
+                txn.set(vault_policy_key, vec![0_u8])?;
             }
 
             let snapshots_name = SNAPSHOTS_DIR_NAME.as_bytes();
             let snapshots_entry_key = dirent_key(ROOT_INODE, snapshots_name);
+            let snapshots_dirent_raw = txn.get(snapshots_entry_key.clone())?;
             let mut next_inode = {
                 let raw = txn
-                    .get(sys_key("next_inode"))?
+                    .get(next_inode_key.clone())?
                     .context("missing SYS:next_inode after bootstrap initialization")?;
                 if raw.len() != 8 {
                     anyhow::bail!("invalid SYS:next_inode length {}", raw.len());
@@ -97,9 +207,9 @@ impl MetaStore {
                 u64::from_le_bytes(bytes)
             };
 
-            if txn.get(snapshots_entry_key.clone())?.is_none() {
+            if snapshots_dirent_raw.is_none() {
                 let mut root_inode: InodeRecord = decode_rkyv(
-                    &txn.get(inode_key(ROOT_INODE))?
+                    &txn.get(root_inode_key.clone())?
                         .context("missing root inode during snapshots bootstrap")?,
                 )?;
                 let snapshots_ino = next_inode;
@@ -130,7 +240,7 @@ impl MetaStore {
                 root_inode.ctime_sec = sec;
                 root_inode.ctime_nsec = nsec;
 
-                txn.set(inode_key(ROOT_INODE), encode_rkyv(&root_inode)?)?;
+                txn.set(root_inode_key.clone(), encode_rkyv(&root_inode)?)?;
                 txn.set(inode_key(snapshots_ino), encode_rkyv(&snapshots_inode)?)?;
                 txn.set(
                     snapshots_entry_key,
@@ -139,8 +249,8 @@ impl MetaStore {
                         kind: INODE_KIND_DIR,
                     })?,
                 )?;
-                txn.set(sys_key("next_inode"), next_inode.to_le_bytes().to_vec())?;
-            } else if let Some(raw_dirent) = txn.get(snapshots_entry_key)? {
+                txn.set(next_inode_key, next_inode.to_le_bytes().to_vec())?;
+            } else if let Some(raw_dirent) = snapshots_dirent_raw {
                 let dirent: DirentRecord = decode_rkyv(&raw_dirent)?;
                 if let Some(raw_inode) = txn.get(inode_key(dirent.ino))? {
                     let mut inode: InodeRecord = decode_rkyv(&raw_inode)?;
@@ -157,7 +267,7 @@ impl MetaStore {
 
     pub fn read_txn<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&surrealkv::Transaction) -> Result<R>,
+        F: FnOnce(&verfsnext_surrealkv::Transaction) -> Result<R>,
     {
         let txn = self
             .tree
@@ -166,45 +276,82 @@ impl MetaStore {
         f(&txn)
     }
 
-    pub async fn write_txn<F>(&self, f: F) -> Result<()>
+    /// Lightweight point-read without creating a full transaction.
+    ///
+    /// Uses the Tree's `get_value` method which creates a temporary snapshot
+    /// for a single key lookup, avoiding the overhead of Transaction creation.
+    /// Use this for simple existence checks or metadata lookups where full
+    /// transaction isolation is not required.
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.tree
+            .get_value(key)
+            .context("failed to get value from SurrealKV")
+    }
+
+    /// Runs `f` in a write transaction and commits it.
+    ///
+    /// SurrealKV transactions are optimistic: a commit fails when another
+    /// transaction wrote one of our keys after we started. In that case `f` is
+    /// run again on a fresh transaction, so it must derive everything it writes
+    /// from what it reads through `txn` and must not have other side effects.
+    pub async fn write_txn<F>(&self, mut f: F) -> Result<()>
     where
-        F: FnOnce(&mut surrealkv::Transaction) -> Result<()>,
+        F: FnMut(&mut verfsnext_surrealkv::Transaction) -> Result<()>,
     {
-        let mut txn = self
-            .tree
-            .begin()
-            .context("failed to start write transaction")?;
-        f(&mut txn)?;
+        let mut attempt = 1;
+        loop {
+            let mut txn = self
+                .tree
+                .begin()
+                .context("failed to start write transaction")?;
+            f(&mut txn)?;
+            let result = self.commit_write_txn(&mut txn).await;
+            match result {
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(attempt, error = %format!("{err:#}"), "retrying metadata transaction");
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Begin a write transaction with deferred commit.
+    /// Caller must call `commit_write_txn()` when done.
+    pub fn begin_write(&self) -> Result<verfsnext_surrealkv::Transaction> {
+        self.tree.begin().context("failed to start write transaction")
+    }
+
+    /// Commit a write transaction started with `begin_write()`.
+    pub async fn commit_write_txn(&self, txn: &mut verfsnext_surrealkv::Transaction) -> Result<()> {
         txn.commit().await.context("failed to commit transaction")
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeRecord>> {
-        self.read_txn(|txn| {
-            let Some(raw) = txn.get(inode_key(ino))? else {
-                return Ok(None);
-            };
-            let inode: InodeRecord = decode_rkyv(&raw)?;
-            Ok(Some(inode))
-        })
+        // Use lightweight point-read instead of full transaction for simple lookup
+        let Some(raw) = self.get_value(&inode_key(ino))? else {
+            return Ok(None);
+        };
+        let inode: InodeRecord = decode_rkyv(&raw)?;
+        Ok(Some(inode))
     }
 
     pub fn get_u64_sys(&self, name: &str) -> Result<u64> {
-        self.read_txn(|txn| {
-            let key = sys_key(name);
-            let raw = txn
-                .get(key)?
-                .with_context(|| format!("missing system key SYS:{}", name))?;
-            if raw.len() != 8 {
-                anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
-            }
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(&raw);
-            Ok(u64::from_le_bytes(bytes))
-        })
+        let key = sys_key(name);
+        let raw = self
+            .get_value(&key)?
+            .with_context(|| format!("missing system key SYS:{}", name))?;
+        if raw.len() != 8 {
+            anyhow::bail!("invalid SYS:{} length {}, expected 8", name, raw.len());
+        }
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&raw);
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn get_sys(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.read_txn(|txn| txn.get(sys_key(name)).context("failed reading SYS key"))
+        self.get_value(&sys_key(name)).context("failed reading SYS key")
     }
 
     pub fn flush_wal(&self, sync: bool) -> Result<()> {

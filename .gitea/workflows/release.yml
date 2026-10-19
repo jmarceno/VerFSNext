@@ -1,0 +1,87 @@
+name: release
+
+# MANUAL ONLY: start it from the Actions tab ("Run workflow") on the branch
+# to release. Never add push / tag / schedule / pull_request triggers.
+#
+# Everything else is automatic: the version (Cargo.toml when newer than every
+# release tag, otherwise the latest tag with the patch bumped), the build on
+# Ubuntu 22.04 (glibc 2.35), and the release with tag v<version> on the
+# dispatched commit, copied to the GitHub repository afterwards. A commit
+# that already has a release tag is refused.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Plan version
+        id: plan
+        run: .gitea/scripts/release-plan.sh "$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
+
+      - name: Stamp version
+        run: .gitea/scripts/release-stamp-cargo.sh Cargo.toml Cargo.lock verfsnext "${{ steps.plan.outputs.version }}"
+
+      - name: Build desktop and headless binaries (Ubuntu 22.04)
+        run: |
+          set -euo pipefail
+          image=verfsnext-release-builder:22.04
+          docker build -t "$image" -f packaging/release/Containerfile packaging/release
+          .gitea/scripts/container-build.sh "$image" build/release \
+            -v verfsnext-release-cargo:/opt/cargo/registry \
+            -v verfsnext-release-target:/workspace-target \
+            -e CARGO_TARGET_DIR=/workspace-target \
+            -- bash -euo pipefail -c '
+              cargo build --locked --release
+              cargo build --locked --profile headless --no-default-features
+              mkdir -p build/release
+              install -m 0755 /workspace-target/release/verfsnext build/release/verfsnext
+              install -m 0755 /workspace-target/headless/verfsnext build/release/verfsnext-headless
+              for bin in build/release/verfsnext build/release/verfsnext-headless; do
+                if ldd "$bin" | grep "not found"; then echo "missing libraries for $bin" >&2; exit 1; fi
+              done
+              if ldd build/release/verfsnext-headless | grep -i qt; then echo "headless binary links Qt" >&2; exit 1; fi
+              ldd build/release/verfsnext | grep -q libQt6Quick || { echo "desktop binary does not link Qt" >&2; exit 1; }
+            '
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for flavor in desktop headless; do
+            name="verfsnext-$VERSION-x86_64-linux-$flavor"
+            mkdir -p "build/pkg/$name"
+            bin=build/release/verfsnext
+            [ "$flavor" = desktop ] || bin=build/release/verfsnext-headless
+            install -m 0755 "$bin" "build/pkg/$name/verfsnext"
+            cp README.md LICENSE.txt config.toml.example "build/pkg/$name/"
+            tar -C build/pkg -czf "dist/$name.tar.gz" "$name"
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GITEA_API: ${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          RELEASE_SHA: ${{ gitea.sha }}
+        run: .gitea/scripts/release-publish.sh "${{ steps.plan.outputs.tag }}" "VerFSNext ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist
+
+      - name: Copy release to GitHub
+        env:
+          GH_REPO: jmarceno/VerFSNext
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          RELEASE_SHA: ${{ gitea.sha }}
+        run: .gitea/scripts/github-publish.sh "${{ steps.plan.outputs.tag }}" "VerFSNext ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist

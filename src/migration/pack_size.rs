@@ -11,18 +11,29 @@ use crate::data::pack::PackStore;
 use crate::fs::utils::scan_range_pairs;
 use crate::meta::MetaStore;
 use crate::migration::pack_index_crc32::ensure_pack_index_crc32_compat;
+use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::{ensure_dir, set_file_mode};
 use crate::types::{
-    chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkRecord, KEY_PREFIX_CHUNK,
+    chunk_key, decode_chunk_key, decode_rkyv, encode_rkyv, prefix_end, sys_key, ChunkId,
+    ChunkRecord, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
 };
+use crate::vault::CHUNK_FLAG_INLINE;
 
 pub const SYS_PACK_MAX_SIZE_MB: &str = "pack_max_size_mb";
 
 #[derive(Clone)]
 struct ChunkRewritePlan {
-    hash: [u8; 16],
+    id: ChunkId,
     chunk: ChunkRecord,
     new_pack_id: u64,
+}
+
+/// Chunk records split by where their payload lives: the packed ones must move
+/// to another pack, the inline ones live in metadata and have no pack copy to
+/// rewrite.
+struct ChunkRewritePlans {
+    plans: Vec<ChunkRewritePlan>,
+    inline_records: u64,
 }
 
 pub fn read_stored_pack_size_mb(meta: &MetaStore) -> Result<Option<u64>> {
@@ -77,6 +88,7 @@ pub async fn run_pack_size_migration(config: &Config) -> Result<()> {
 
 async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Result<()> {
     ensure_pack_index_crc32_compat(config, meta).await?;
+    ensure_vault_chunk_keys_migrated(meta).await?;
     let target_pack_size_mb = config.pack_max_size_mb;
     let Some(current_pack_size_mb) = read_stored_pack_size_mb(meta)? else {
         meta.write_txn(|txn| {
@@ -116,9 +128,16 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     let max_pack_size_bytes = target_pack_size_mb.saturating_mul(1024 * 1024);
 
     println!("Scanning chunk metadata...");
-    let mut plans = collect_chunk_rewrite_plans(meta)?;
-    plans.sort_by_key(|plan| (plan.chunk.pack_id, plan.hash));
-    println!("Found {} chunk records to rewrite.", plans.len());
+    let ChunkRewritePlans {
+        mut plans,
+        inline_records,
+    } = collect_chunk_rewrite_plans(meta)?;
+    plans.sort_by_key(|plan| (plan.chunk.pack_id, plan.id.hash, plan.id.vault));
+    println!(
+        "Found {} chunk records to rewrite ({} inline records need no rewrite).",
+        plans.len(),
+        inline_records
+    );
 
     println!("Rewriting chunks into new packs...");
     let packs = PackStore::open(
@@ -127,23 +146,30 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
         config.pack_index_cache_capacity_entries,
         max_pack_size_bytes,
     )?;
-    for (idx, plan) in plans.iter_mut().enumerate() {
-        let payload = packs.read_chunk_payload(
-            plan.chunk.pack_id,
-            plan.hash,
-            plan.chunk.codec,
-            plan.chunk.uncompressed_len,
-            plan.chunk.compressed_len,
-        )?;
-        let new_pack_id = packs.append_chunk(
-            plan.hash,
-            plan.chunk.codec,
-            plan.chunk.uncompressed_len,
-            &payload,
-        )?;
-        plan.new_pack_id = new_pack_id;
-        if (idx + 1) % 10_000 == 0 {
-            println!("  rewritten {} chunks...", idx + 1);
+    let mut idx = 0;
+    while idx < plans.len() {
+        // Both domains can hold a record for the same pack and hash. Every
+        // indexed copy of the hash is moved once, and every record that names
+        // the hash is repointed at the pack that now holds them.
+        let pack_id = plans[idx].chunk.pack_id;
+        let hash = plans[idx].id.hash;
+        let mut end = idx + 1;
+        while end < plans.len()
+            && plans[end].chunk.pack_id == pack_id
+            && plans[end].id.hash == hash
+        {
+            end += 1;
+        }
+        // Every indexed copy is carried over in order: duplicate vault copies
+        // differ by nonce and cannot be told apart while the vault is locked.
+        let copies = packs.read_indexed_copies(pack_id, hash)?;
+        let new_pack_id = packs.append_chunk_copies(hash, &copies)?;
+        for plan in &mut plans[idx..end] {
+            plan.new_pack_id = new_pack_id;
+        }
+        idx = end;
+        if idx % 10_000 == 0 {
+            println!("  rewritten {} chunks...", idx);
         }
     }
     packs.sync(true)?;
@@ -153,9 +179,9 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     println!("Updating metadata to point chunks to rewritten packs...");
     meta.write_txn(|txn| {
         for plan in plans.iter() {
-            let mut updated = plan.chunk.clone();
+            let mut updated = plan.chunk;
             updated.pack_id = plan.new_pack_id;
-            txn.set(chunk_key(&plan.hash), encode_rkyv(&updated)?)?;
+            txn.set(chunk_key(&plan.id), encode_rkyv(&updated)?)?;
         }
         txn.set(
             sys_key("active_pack_id"),
@@ -193,26 +219,47 @@ async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Res
     Ok(())
 }
 
-fn collect_chunk_rewrite_plans(meta: &MetaStore) -> Result<Vec<ChunkRewritePlan>> {
+fn collect_chunk_rewrite_plans(meta: &MetaStore) -> Result<ChunkRewritePlans> {
     meta.read_txn(|txn| {
         let prefix = vec![KEY_PREFIX_CHUNK];
         let end = prefix_end(&prefix);
-        let mut out = Vec::new();
+        let mut plans = Vec::new();
+        let mut inline_records = 0_u64;
         for pair in scan_range_pairs(txn, prefix, end)? {
             let (key, value) = pair?;
-            if key.len() != 17 {
+            let Some(id) = decode_chunk_key(&key) else {
+                continue;
+            };
+            let chunk: ChunkRecord = decode_rkyv(&value)?;
+            if chunk.pack_id == INLINE_PACK_ID {
+                // The payload of an inline chunk lives in metadata, not in a
+                // pack, so the rewritten pack layout does not apply to it.
+                if (chunk.flags & CHUNK_FLAG_INLINE) == 0 {
+                    bail!(
+                        "chunk {:x?} names the inline pack id but is not marked inline",
+                        id.hash
+                    );
+                }
+                inline_records += 1;
                 continue;
             }
-            let mut hash = [0_u8; 16];
-            hash.copy_from_slice(&key[1..17]);
-            let chunk: ChunkRecord = decode_rkyv(&value)?;
-            out.push(ChunkRewritePlan {
-                hash,
+            if (chunk.flags & CHUNK_FLAG_INLINE) != 0 {
+                bail!(
+                    "chunk {:x?} is marked inline but names pack {}",
+                    id.hash,
+                    chunk.pack_id
+                );
+            }
+            plans.push(ChunkRewritePlan {
+                id,
                 chunk,
                 new_pack_id: 0,
             });
         }
-        Ok(out)
+        Ok(ChunkRewritePlans {
+            plans,
+            inline_records,
+        })
     })
 }
 
@@ -222,7 +269,7 @@ fn describe_and_confirm(current_mb: u64, target_mb: u64, data_dir: &Path) -> Res
     println!("Target config pack size    : {} MiB", target_mb);
     println!("This operation will:");
     println!("  1. Read every chunk payload from existing packs.");
-    println!("  2. Rewrite all chunks into new packs using the target size.");
+    println!("  2. Rewrite every packed chunk into new packs using the target size.");
     println!("  3. Update metadata chunk records to the new pack IDs.");
     println!(
         "  4. Move previous pack files to a backup directory under {}.",
@@ -355,19 +402,10 @@ fn parse_pack_id_from_filename(name: &str) -> Option<u64> {
     if !name.starts_with("pack-") {
         return None;
     }
-    let number = if let Some(n) = name
+    let number = name
         .strip_prefix("pack-")
         .and_then(|n| n.strip_suffix(".vpk"))
-    {
-        n
-    } else if let Some(n) = name
-        .strip_prefix("pack-")
-        .and_then(|n| n.strip_suffix(".idx"))
-    {
-        n
-    } else {
-        return None;
-    };
+        .or_else(|| name.strip_prefix("pack-").and_then(|n| n.strip_suffix(".idx")))?;
     number.parse::<u64>().ok()
 }
 

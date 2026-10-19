@@ -8,13 +8,14 @@ chunk_cache_capacity_mb = 512 # Chunk metadata cache capacity in megabytes.
 pack_index_cache_capacity_entries = 524288 # Pack index cache capacity (entry count).
 pack_max_size_mb = 5000 # Maximum size for a pack file in megabytes.
 zstd_compression_level = 3 # Zstd compression level (-7..22).
-ultracdc_min_size_bytes = 16384 # UltraCDC minimum chunk size in bytes.
+ultracdc_min_size_bytes = 16384 # UltraCDC minimum chunk size in bytes (>= 64).
 ultracdc_avg_size_bytes = 32768 # UltraCDC target average chunk size in bytes.
-ultracdc_max_size_bytes = 65536 # UltraCDC maximum chunk size in bytes.
-fuse_max_write_bytes = 1048576 # Maximum FUSE write request size in bytes.
+ultracdc_max_size_bytes = 65536 # UltraCDC maximum chunk size in bytes (<= 4194304).
+fuse_max_write_bytes = 1048576 # Maximum FUSE write request size in bytes (throughput only; stored chunk boundaries come from the ultracdc_* settings).
 fuse_direct_io = false # DO NOT USE - VERY SLOW - Enable FUSE direct_io to bypass kernel page cache.
 fuse_fsname = "verfsnext" # FUSE fsname mount option shown by mount tools/desktop integrations.
 fuse_subtype = "verfsnext" # FUSE subtype mount option (driver identity).
+fuse_allow_other = false # Let users other than the one running the daemon access the mount (needs `user_allow_other` in /etc/fuse.conf when not running as root).
 gc_idle_min_ms = 15000 # Minimum idle time before GC work in milliseconds.
 gc_pack_rewrite_min_reclaim_bytes = 67108864 # Minimum reclaimable bytes to trigger pack rewrite GC.
 gc_pack_rewrite_min_reclaim_percent = 25.0 # Minimum reclaimable percent to trigger pack rewrite GC.
@@ -23,3 +24,5 @@ vault_enabled = true # Enable encrypted .vault support.
 vault_argon2_mem_kib = 131072 # Argon2 memory cost for vault key derivation (KiB).
 vault_argon2_iters = 3 # Argon2 iterations for vault key derivation.
 vault_argon2_parallelism = 1 # Argon2 parallelism for vault key derivation.
+fuse_attr_ttl_ms = 150 # Inode attribute cache TTL in milliseconds.
+fuse_entry_ttl_ms = 0 # Directory entry cache TTL in milliseconds (keep 0 until namespace invalidation is fully verified).

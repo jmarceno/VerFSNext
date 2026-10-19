@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::MetadataExt;
 
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
@@ -32,7 +33,7 @@ pub(crate) fn anyhow_errno(message_errno: Errno, message: impl Into<String>) -> 
     anyhow::Error::new(message_errno).context(message.into())
 }
 pub(crate) fn scan_range_pairs<'a>(
-    txn: &'a surrealkv::Transaction,
+    txn: &'a verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
 ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {
@@ -54,8 +55,9 @@ pub(crate) fn scan_range_pairs<'a>(
         Some(Ok((key, value)))
     }))
 }
+#[allow(clippy::type_complexity)]
 pub(crate) fn scan_range_pairs_limited(
-    txn: &surrealkv::Transaction,
+    txn: &verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
     limit: usize,
@@ -80,14 +82,14 @@ pub(crate) fn dir_size_recursive(path: &Path) -> Result<u64> {
     };
 
     if metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(metadata.len());
+        return Ok(metadata.blocks() * 512);
     }
 
     if !metadata.is_dir() {
         return Ok(0);
     }
 
-    let mut total = 0_u64;
+    let mut total = metadata.blocks() * 512;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         total = total.saturating_add(dir_size_recursive(&entry.path())?);
@@ -98,7 +100,7 @@ pub(crate) fn read_process_rss_bytes() -> Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     for line in status.lines() {
         if let Some(bytes) = parse_proc_kib_line(line, "VmRSS:") {
-            return Ok(bytes?);
+            return bytes;
         }
     }
     Ok(0)
@@ -156,6 +158,17 @@ pub(crate) fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
     let merged_end = existing_end.max(incoming_end);
     let merged_len = merged_end.saturating_sub(merged_start) as usize;
 
+    // Fast path: incoming immediately follows existing (sequential append).
+    // Avoid allocating a new merged buffer — just extend the existing Vec.
+    // This eliminates O(n²) memory copies for sequential writes (e.g. dd bs=1M
+    // coalesced into hundreds of 1MB blocks).
+    if incoming_start == existing_end {
+        existing.data.extend_from_slice(&incoming.data);
+        return;
+    }
+
+    // Fast path: incoming is fully within existing (same start, same or smaller size).
+    // Just overwrite the overlapping portion of the existing buffer.
     if merged_start == existing_start && merged_len == existing.data.len() {
         let dst_start = (incoming_start.saturating_sub(merged_start)) as usize;
         let dst_end = dst_start.saturating_add(incoming.data.len());
@@ -163,6 +176,8 @@ pub(crate) fn merge_write_op(existing: &mut WriteOp, incoming: WriteOp) {
         return;
     }
 
+    // General case: allocate new merged buffer (for overlapping writes with
+    // different starting offsets, or non-contiguous writes).
     let mut merged = vec![0_u8; merged_len];
     let existing_dst_start = (existing_start.saturating_sub(merged_start)) as usize;
     let existing_dst_end = existing_dst_start.saturating_add(existing.data.len());
@@ -199,7 +214,7 @@ async fn bench_scan_range_pairs_baseline() -> Result<()> {
         .unwrap()
         .as_nanos();
     let db_path = std::env::temp_dir().join(format!("verfs_bench_scan_{}", t));
-    let tree = surrealkv::TreeBuilder::new()
+    let tree = verfsnext_surrealkv::TreeBuilder::new()
         .with_path(db_path.clone())
         .build()?;
 
@@ -211,7 +226,7 @@ async fn bench_scan_range_pairs_baseline() -> Result<()> {
     }
     txn.commit().await?;
 
-    let txn = tree.begin_with_mode(surrealkv::Mode::ReadOnly)?;
+    let txn = tree.begin_with_mode(verfsnext_surrealkv::Mode::ReadOnly)?;
     let start_time = std::time::Instant::now();
     let res =
         scan_range_pairs(&txn, b"KEY_".to_vec(), b"KEY_a".to_vec())?.collect::<Result<Vec<_>>>()?;

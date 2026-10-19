@@ -1,17 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use nix::errno::Errno;
-use surrealkv::LSMIterator;
+use verfsnext_surrealkv::LSMIterator;
 
 use crate::meta::MetaStore;
 use crate::types::{
     chunk_key, decode_dirent_name, decode_rkyv, decode_snapshot_name, dirent_key, dirent_prefix,
-    encode_rkyv, extent_prefix, inode_key, prefix_end, snapshot_key, snapshot_prefix,
-    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkRecord,
-    DirentRecord, ExtentRecord, InodeRecord, SnapshotRecord, INODE_FLAG_READONLY, INODE_KIND_DIR,
-    INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE, SNAPSHOTS_DIR_NAME,
+    encode_rkyv, extent_prefix, inode_key, orphan_key, prefix_end, snapshot_key, snapshot_prefix,
+    symlink_target_key, sys_key, system_time_to_parts, xattr_key, xattr_prefix, ChunkId,
+    ChunkRecord, DirentRecord, ExtentRecord, InodeRecord, SnapshotRecord, INODE_FLAG_READONLY,
+    INODE_FLAG_VAULT, INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, ROOT_INODE,
+    SNAPSHOTS_DIR_NAME,
 };
 
 pub struct SnapshotManager<'a> {
@@ -71,10 +72,10 @@ impl<'a> SnapshotManager<'a> {
                 }
 
                 let mut next_inode = read_next_inode(txn)?;
-                let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
+                let mut ref_deltas = HashMap::<ChunkId, i64>::new();
 
                 let snap_root_ino = allocate_inode(&mut next_inode)?;
-                let mut snap_root = root.clone();
+                let mut snap_root = root;
                 snap_root.ino = snap_root_ino;
                 snap_root.parent = snapshots_dir;
                 snap_root.flags |= INODE_FLAG_READONLY;
@@ -87,12 +88,14 @@ impl<'a> SnapshotManager<'a> {
                     })?,
                 )?;
 
+                let mut cloned_links = HashMap::<u64, u64>::new();
                 clone_dir_children(
                     txn,
                     ROOT_INODE,
                     snap_root_ino,
                     &mut next_inode,
                     &mut ref_deltas,
+                    &mut cloned_links,
                     true,
                 )?;
 
@@ -115,7 +118,11 @@ impl<'a> SnapshotManager<'a> {
             .await
     }
 
-    pub async fn delete(&self, name: &str) -> Result<()> {
+    /// Deletes snapshot `name`. A file of the snapshot for which `referenced`
+    /// is true (open handles or kernel lookups) loses its name but keeps its
+    /// inode and data as an orphan, like an unlinked open file; its final
+    /// delete runs when the last reference goes away, or at the next start.
+    pub async fn delete(&self, name: &str, referenced: impl Fn(u64) -> bool) -> Result<()> {
         validate_snapshot_name(name)?;
 
         self.meta
@@ -131,8 +138,15 @@ impl<'a> SnapshotManager<'a> {
                 };
                 let snapshot_dirent: DirentRecord = decode_rkyv(&snapshot_dirent_raw)?;
 
-                let mut ref_deltas = HashMap::<[u8; 16], i64>::new();
-                remove_snapshot_subtree(txn, snapshot_dirent.ino, &mut ref_deltas)?;
+                let mut ref_deltas = HashMap::<ChunkId, i64>::new();
+                let mut visited = HashSet::<u64>::new();
+                remove_snapshot_subtree(
+                    txn,
+                    snapshot_dirent.ino,
+                    &mut ref_deltas,
+                    &mut visited,
+                    &referenced,
+                )?;
                 apply_ref_deltas_in_txn(txn, &ref_deltas)?;
 
                 txn.delete(dirent_key(snapshots_dir, name.as_bytes()))?;
@@ -165,7 +179,7 @@ fn validate_snapshot_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_snapshots_dir_ino(txn: &surrealkv::Transaction) -> Result<u64> {
+fn load_snapshots_dir_ino(txn: &verfsnext_surrealkv::Transaction) -> Result<u64> {
     let Some(raw) = txn.get(dirent_key(ROOT_INODE, SNAPSHOTS_DIR_NAME.as_bytes()))? else {
         return Err(anyhow_errno(
             Errno::EIO,
@@ -176,7 +190,7 @@ fn load_snapshots_dir_ino(txn: &surrealkv::Transaction) -> Result<u64> {
     Ok(dirent.ino)
 }
 
-fn read_next_inode(txn: &surrealkv::Transaction) -> Result<u64> {
+fn read_next_inode(txn: &verfsnext_surrealkv::Transaction) -> Result<u64> {
     let raw = txn
         .get(sys_key("next_inode"))?
         .context("missing SYS:next_inode")?;
@@ -197,7 +211,7 @@ fn allocate_inode(next_inode: &mut u64) -> Result<u64> {
     Ok(ino)
 }
 
-fn load_inode(txn: &surrealkv::Transaction, ino: u64, ctx: &str) -> Result<InodeRecord> {
+fn load_inode(txn: &verfsnext_surrealkv::Transaction, ino: u64, ctx: &str) -> Result<InodeRecord> {
     let Some(raw) = txn.get(inode_key(ino))? else {
         return Err(anyhow_errno(
             Errno::ENOENT,
@@ -208,11 +222,12 @@ fn load_inode(txn: &surrealkv::Transaction, ino: u64, ctx: &str) -> Result<Inode
 }
 
 fn clone_dir_children(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     src_dir_ino: u64,
     dst_dir_ino: u64,
     next_inode: &mut u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
+    cloned_links: &mut HashMap<u64, u64>,
     src_is_root: bool,
 ) -> Result<()> {
     let entries = list_dirents(txn, src_dir_ino)?;
@@ -221,12 +236,35 @@ fn clone_dir_children(
             continue;
         }
 
+        // A hard-linked file already cloned under another name gets only a
+        // dirent to that clone, which counts one more link.
+        if let Some(dst_ino) = cloned_links.get(&dirent.ino).copied() {
+            let mut dst_inode = load_inode(txn, dst_ino, "snapshot hard link clone")?;
+            dst_inode.nlink += 1;
+            txn.set(inode_key(dst_ino), encode_rkyv(&dst_inode)?)?;
+            txn.set(
+                dirent_key(dst_dir_ino, &name_bytes),
+                encode_rkyv(&DirentRecord {
+                    ino: dst_ino,
+                    kind: dst_inode.kind,
+                })?,
+            )?;
+            continue;
+        }
+
         let src_inode = load_inode(txn, dirent.ino, "snapshot clone source")?;
         let dst_ino = allocate_inode(next_inode)?;
-        let mut dst_inode = src_inode.clone();
+        let mut dst_inode = src_inode;
         dst_inode.ino = dst_ino;
         dst_inode.parent = dst_dir_ino;
         dst_inode.flags |= INODE_FLAG_READONLY;
+        if src_inode.kind != INODE_KIND_DIR {
+            // Links are counted as the snapshot's names are cloned.
+            dst_inode.nlink = 1;
+            if src_inode.nlink > 1 {
+                cloned_links.insert(src_inode.ino, dst_ino);
+            }
+        }
 
         txn.set(inode_key(dst_ino), encode_rkyv(&dst_inode)?)?;
         txn.set(
@@ -241,10 +279,19 @@ fn clone_dir_children(
 
         match src_inode.kind {
             INODE_KIND_DIR => {
-                clone_dir_children(txn, src_inode.ino, dst_ino, next_inode, ref_deltas, false)?;
+                clone_dir_children(
+                    txn,
+                    src_inode.ino,
+                    dst_ino,
+                    next_inode,
+                    ref_deltas,
+                    cloned_links,
+                    false,
+                )?;
             }
             INODE_KIND_FILE => {
-                clone_file_extents(txn, src_inode.ino, dst_ino, ref_deltas)?;
+                let vault = (src_inode.flags & INODE_FLAG_VAULT) != 0;
+                clone_file_extents(txn, src_inode.ino, dst_ino, ref_deltas, vault)?;
             }
             INODE_KIND_SYMLINK => {
                 if let Some(target) = txn.get(symlink_target_key(src_inode.ino))? {
@@ -258,7 +305,7 @@ fn clone_dir_children(
 }
 
 fn list_dirents(
-    txn: &surrealkv::Transaction,
+    txn: &verfsnext_surrealkv::Transaction,
     dir_ino: u64,
 ) -> Result<Vec<(Vec<u8>, DirentRecord)>> {
     let mut out = Vec::new();
@@ -275,7 +322,7 @@ fn list_dirents(
     Ok(out)
 }
 
-fn clone_xattrs(txn: &mut surrealkv::Transaction, src_ino: u64, dst_ino: u64) -> Result<()> {
+fn clone_xattrs(txn: &mut verfsnext_surrealkv::Transaction, src_ino: u64, dst_ino: u64) -> Result<()> {
     let prefix = xattr_prefix(src_ino);
     let end = prefix_end(&prefix);
     let pairs = scan_range_pairs(txn, prefix, end)?.collect::<Result<Vec<_>>>()?;
@@ -289,10 +336,11 @@ fn clone_xattrs(txn: &mut surrealkv::Transaction, src_ino: u64, dst_ino: u64) ->
 }
 
 fn clone_file_extents(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     src_ino: u64,
     dst_ino: u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
+    vault: bool,
 ) -> Result<()> {
     let prefix = extent_prefix(src_ino);
     let end = prefix_end(&prefix);
@@ -302,24 +350,42 @@ fn clone_file_extents(
         dst_key.extend_from_slice(&key[9..]);
         txn.set(dst_key, value.clone())?;
         let extent: ExtentRecord = decode_rkyv(&value)?;
-        *ref_deltas.entry(extent.chunk_hash).or_insert(0) += 1;
+        let id = ChunkId {
+            vault,
+            hash: extent.chunk_hash,
+        };
+        *ref_deltas.entry(id).or_insert(0) += 1;
     }
     Ok(())
 }
 
+/// Removes the subtree rooted at `ino`. Each inode is handled once even when
+/// several names (hard links) reach it. A non-directory inode that is still
+/// `referenced` is kept with nlink 0 and an orphan record instead.
 fn remove_snapshot_subtree(
-    txn: &mut surrealkv::Transaction,
+    txn: &mut verfsnext_surrealkv::Transaction,
     ino: u64,
-    ref_deltas: &mut HashMap<[u8; 16], i64>,
+    ref_deltas: &mut HashMap<ChunkId, i64>,
+    visited: &mut HashSet<u64>,
+    referenced: &impl Fn(u64) -> bool,
 ) -> Result<()> {
-    let inode = load_inode(txn, ino, "snapshot delete")?;
+    if !visited.insert(ino) {
+        return Ok(());
+    }
+    let mut inode = load_inode(txn, ino, "snapshot delete")?;
+    let vault = (inode.flags & INODE_FLAG_VAULT) != 0;
 
     if inode.kind == INODE_KIND_DIR {
         let children = list_dirents(txn, ino)?;
         for (name, dirent) in children {
-            remove_snapshot_subtree(txn, dirent.ino, ref_deltas)?;
+            remove_snapshot_subtree(txn, dirent.ino, ref_deltas, visited, referenced)?;
             txn.delete(dirent_key(ino, &name))?;
         }
+    } else if referenced(ino) {
+        inode.nlink = 0;
+        txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
+        txn.set(orphan_key(ino), Vec::new())?;
+        return Ok(());
     }
 
     let xattr_prefix_bytes = xattr_prefix(ino);
@@ -337,7 +403,11 @@ fn remove_snapshot_subtree(
             let pairs = scan_range_pairs(txn, ext_prefix, ext_end)?.collect::<Result<Vec<_>>>()?;
             for (key, value) in pairs {
                 let extent: ExtentRecord = decode_rkyv(&value)?;
-                *ref_deltas.entry(extent.chunk_hash).or_insert(0) -= 1;
+                let id = ChunkId {
+                    vault,
+                    hash: extent.chunk_hash,
+                };
+                *ref_deltas.entry(id).or_insert(0) -= 1;
                 txn.delete(key)?;
             }
         }
@@ -352,14 +422,14 @@ fn remove_snapshot_subtree(
 }
 
 fn apply_ref_deltas_in_txn(
-    txn: &mut surrealkv::Transaction,
-    ref_deltas: &HashMap<[u8; 16], i64>,
+    txn: &mut verfsnext_surrealkv::Transaction,
+    ref_deltas: &HashMap<ChunkId, i64>,
 ) -> Result<()> {
-    for (hash, delta) in ref_deltas {
+    for (id, delta) in ref_deltas {
         if *delta == 0 {
             continue;
         }
-        let key = chunk_key(hash);
+        let key = chunk_key(id);
         let Some(raw) = txn.get(key.clone())? else {
             if *delta < 0 {
                 continue;
@@ -367,8 +437,8 @@ fn apply_ref_deltas_in_txn(
             return Err(anyhow_errno(
                 Errno::EIO,
                 format!(
-                    "missing chunk metadata while applying snapshot delta for {:x?}",
-                    hash
+                    "missing chunk metadata while applying snapshot delta for hash {:x?}",
+                    id.hash
                 ),
             ));
         };
@@ -379,8 +449,8 @@ fn apply_ref_deltas_in_txn(
             return Err(anyhow_errno(
                 Errno::EIO,
                 format!(
-                    "negative chunk refcount while applying snapshot delta for {:x?}",
-                    hash
+                    "negative chunk refcount while applying snapshot delta for hash {:x?}",
+                    id.hash
                 ),
             ));
         }
@@ -391,7 +461,7 @@ fn apply_ref_deltas_in_txn(
 }
 
 fn scan_range_pairs<'a>(
-    txn: &'a surrealkv::Transaction,
+    txn: &'a verfsnext_surrealkv::Transaction,
     start: Vec<u8>,
     end: Vec<u8>,
 ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {

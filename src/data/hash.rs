@@ -4,6 +4,12 @@ pub fn hash128(bytes: &[u8]) -> [u8; 16] {
     xxh3_128(bytes).to_le_bytes()
 }
 
+/// Content hash of a vault chunk: the domain byte is fed to the same xxh3
+/// stream as the data. This is a cheap domain salt, not collision isolation:
+/// `hash128_with_domain(0xA7, V)` equals `hash128(&[0xA7] ++ V)`. Storage
+/// identity is separated by the chunk key space instead ([`crate::types::ChunkId`]),
+/// so the two domains can never share a chunk record, cache entry or
+/// reference count.
 pub fn hash128_with_domain(domain: u8, bytes: &[u8]) -> [u8; 16] {
     let mut hasher = Xxh3::new();
     hasher.update(&[domain]);
@@ -69,10 +75,11 @@ mod tests {
 
     #[test]
     fn test_no_simple_prefix_collision() {
-        // If domain isn't cleanly separated, hash_with_domain(1, &[2, 3]) might
-        // collide with hash128(&[1, 2, 3]). Here we verify they do produce the same underlying
-        // bytes in xxh3_128, which is the current expected behavior for how the bytes are combined.
-        // The main point of domain hashing is to prevent collisions *between domains*.
+        // The domain byte is part of the same xxh3 stream as the data, so
+        // hash128_with_domain(1, &[2, 3]) equals hash128(&[1, 2, 3]). That is
+        // expected: the hash alone does not separate the domains (a vault
+        // hash of V is the plain hash of [0xA7] ++ V). The chunk key space
+        // separates them; see crate::types::ChunkId.
         let h_domain = hash128_with_domain(1, &[2, 3]);
         let h_raw = hash128(&[1, 2, 3]);
         assert_eq!(

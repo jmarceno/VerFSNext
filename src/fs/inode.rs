@@ -1,7 +1,7 @@
 use super::*;
 use crate::fs::FsCore;
 use crate::types::{
-    MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
+    orphan_key, KEY_PREFIX_ORPHAN, MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
     PERM_BIT_USER_EXEC, PERM_BIT_WRITE, PERM_TRIPLET_MASK,
 };
 
@@ -28,12 +28,27 @@ impl FsCore {
         ino: u64,
         context: &'static str,
     ) -> Result<InodeRecord> {
-        self.meta.get_inode(ino)?.ok_or_else(|| {
+        self.load_inode_cached(ino)?.ok_or_else(|| {
             anyhow_errno(
                 Errno::ENOENT,
                 format!("{}: inode {} not found", context, ino),
             )
         })
+    }
+    /// Reads an inode through `txn`, so a commit of that transaction fails
+    /// if the inode changed after the transaction started.
+    pub(crate) fn load_inode_in_txn(
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+        context: &'static str,
+    ) -> Result<InodeRecord> {
+        let Some(raw) = txn.get(inode_key(ino))? else {
+            return Err(anyhow_errno(
+                Errno::ENOENT,
+                format!("{}: inode {} not found", context, ino),
+            ));
+        };
+        decode_rkyv(&raw)
     }
     pub(crate) fn load_inode_with_vault_access(
         &self,
@@ -44,17 +59,36 @@ impl FsCore {
         self.ensure_inode_vault_access(&inode, context)?;
         Ok(inode)
     }
-    pub(crate) fn lookup_dirent(&self, parent: u64, name: &str) -> Result<Option<DirentRecord>> {
-        self.meta.read_txn(|txn| {
-            let Some(raw) = txn.get(dirent_key(parent, name.as_bytes()))? else {
-                return Ok(None);
-            };
-            let dirent: DirentRecord = decode_rkyv(&raw)?;
-            Ok(Some(dirent))
-        })
+    pub(crate) fn lookup_inode_with_vault_access(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> Result<InodeRecord> {
+        let parent_inode = self.load_inode_or_errno(parent, "lookup")?;
+
+        let ino = if name == "." {
+            parent
+        } else if name == ".." {
+            parent_inode.parent
+        } else {
+            let dirent = self
+                .load_dirent_cached(parent, name.as_bytes())?
+                .ok_or_else(|| {
+                    anyhow_errno(
+                        Errno::ENOENT,
+                        format!("lookup: {} not found under inode {}", name, parent),
+                    )
+                })?;
+            dirent.ino
+        };
+
+        let inode = self.load_inode_or_errno(ino, "lookup")?;
+        self.ensure_inode_vault_access(&parent_inode, "lookup")?;
+        self.ensure_inode_vault_access(&inode, "lookup")?;
+        Ok(inode)
     }
     pub(crate) fn ensure_dirent_target(
-        txn: &surrealkv::Transaction,
+        txn: &verfsnext_surrealkv::Transaction,
         parent: u64,
         name: &str,
         context: &'static str,
@@ -71,7 +105,7 @@ impl FsCore {
         decode_rkyv(&raw)
     }
     pub(crate) fn ensure_parent_dir_writable_in_txn(
-        txn: &surrealkv::Transaction,
+        txn: &verfsnext_surrealkv::Transaction,
         parent: u64,
         context: &'static str,
     ) -> Result<InodeRecord> {
@@ -92,7 +126,7 @@ impl FsCore {
         Ok(parent_inode)
     }
     pub(crate) fn create_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         parent: INum,
         name: &str,
         kind: u8,
@@ -131,7 +165,7 @@ impl FsCore {
             let existing_dirent: DirentRecord = decode_rkyv(&existing_dirent_raw)?;
             if txn.get(inode_key(existing_dirent.ino))?.is_none() {
                 // Self-heal stale directory entry left behind by an earlier failed/mixed version.
-                txn.delete(dirent_key_bytes)?;
+                txn.delete(dirent_key_bytes.clone())?;
             } else {
                 return Err(anyhow_errno(
                     Errno::EEXIST,
@@ -140,7 +174,8 @@ impl FsCore {
             }
         }
 
-        let Some(next_inode_raw) = txn.get(crate::types::sys_key("next_inode"))? else {
+        let next_inode_key = crate::types::sys_key("next_inode");
+        let Some(next_inode_raw) = txn.get(next_inode_key.clone())? else {
             return Err(anyhow_errno(Errno::EIO, "missing SYS:next_inode"));
         };
         if next_inode_raw.len() != 8 {
@@ -177,14 +212,8 @@ impl FsCore {
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-        txn.set(
-            dirent_key(parent, name.as_bytes()),
-            encode_rkyv(&DirentRecord { ino, kind })?,
-        )?;
-        txn.set(
-            crate::types::sys_key("next_inode"),
-            (ino + 1).to_le_bytes().to_vec(),
-        )?;
+        txn.set(dirent_key_bytes, encode_rkyv(&DirentRecord { ino, kind })?)?;
+        txn.set(next_inode_key, (ino + 1).to_le_bytes().to_vec())?;
 
         if kind == INODE_KIND_DIR {
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
@@ -207,23 +236,27 @@ impl FsCore {
         Ok(())
     }
     pub(crate) fn remove_inode_payload_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         inode: &InodeRecord,
     ) -> Result<()> {
+        let vault = FsCore::inode_is_vault(inode);
         let extent_prefix_bytes = extent_prefix(inode.ino);
         let extent_end = prefix_end(&extent_prefix_bytes);
         let mut extent_keys = Vec::new();
-        let mut hashes = Vec::new();
+        let mut ids = Vec::new();
         for pair in scan_range_pairs(txn, extent_prefix_bytes, extent_end)? {
             let (key, value) = pair?;
             let extent: ExtentRecord = decode_rkyv(&value)?;
             extent_keys.push(key);
-            hashes.push(extent.chunk_hash);
+            ids.push(ChunkId {
+                vault,
+                hash: extent.chunk_hash,
+            });
         }
         for key in extent_keys {
             txn.delete(key)?;
         }
-        FsCore::decrement_chunk_refcounts_in_txn(txn, &hashes)?;
+        FsCore::decrement_chunk_refcounts_in_txn(txn, &ids)?;
 
         let xattr_prefix_bytes = xattr_prefix(inode.ino);
         let xattr_end = prefix_end(&xattr_prefix_bytes);
@@ -239,7 +272,7 @@ impl FsCore {
         Ok(())
     }
     pub(crate) fn remove_name_from_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         inode: &mut InodeRecord,
         defer_final_delete: bool,
     ) -> Result<bool> {
@@ -256,6 +289,7 @@ impl FsCore {
         } else if defer_final_delete {
             inode.nlink = 0;
             txn.set(inode_key(inode.ino), encode_rkyv(inode)?)?;
+            txn.set(orphan_key(inode.ino), Vec::new())?;
             Ok(false)
         } else {
             FsCore::remove_inode_payload_in_txn(txn, inode)?;
@@ -263,8 +297,14 @@ impl FsCore {
             Ok(true)
         }
     }
-    pub(crate) async fn cleanup_unlinked_inode_if_closed(&self, ino: u64) -> Result<()> {
+    /// Deletes an unlinked inode once no open handle and no kernel lookup
+    /// reference remains. The kernel may still send requests (such as a
+    /// timestamp SETATTR) for an inode until it forgets it.
+    pub(crate) async fn cleanup_unlinked_inode_if_unreferenced(&self, ino: u64) -> Result<()> {
         let _guard = self.write_lock.write().await;
+        if self.inode_referenced(ino) {
+            return Ok(());
+        }
         self.meta
             .write_txn(|txn| {
                 let Some(raw) = txn.get(inode_key(ino))? else {
@@ -276,11 +316,45 @@ impl FsCore {
                 }
                 FsCore::remove_inode_payload_in_txn(txn, &inode)?;
                 txn.delete(inode_key(ino))?;
+                txn.delete(orphan_key(ino))?;
                 Ok(())
             })
-            .await
+            .await?;
+        self.invalidate_inode_cache(ino);
+        Ok(())
     }
-    pub(crate) fn is_dir_empty(txn: &surrealkv::Transaction, ino: u64) -> Result<bool> {
+    /// Deletes every indexed orphan; only valid while nothing is mounted.
+    pub(crate) async fn reclaim_orphans(meta: &MetaStore) -> Result<u64> {
+        let mut reclaimed = 0_u64;
+        meta.write_txn(|txn| {
+            let prefix = vec![KEY_PREFIX_ORPHAN];
+            let end = prefix_end(&prefix);
+            let keys = scan_range_pairs(txn, prefix, end)?
+                .map(|pair| pair.map(|(key, _)| key))
+                .collect::<Result<Vec<_>>>()?;
+            // Assigned, not accumulated: the transaction closure may be retried.
+            reclaimed = keys.len() as u64;
+            for key in keys {
+                let ino_bytes: [u8; 8] = key[1..]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("malformed orphan key {key:?}"))?;
+                let ino = u64::from_be_bytes(ino_bytes);
+                if let Some(raw) = txn.get(inode_key(ino))? {
+                    let inode: InodeRecord = decode_rkyv(&raw)?;
+                    if inode.nlink != 0 {
+                        anyhow::bail!("orphan index names inode {ino} with nlink {}", inode.nlink);
+                    }
+                    FsCore::remove_inode_payload_in_txn(txn, &inode)?;
+                    txn.delete(inode_key(ino))?;
+                }
+                txn.delete(key)?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(reclaimed)
+    }
+    pub(crate) fn is_dir_empty(txn: &verfsnext_surrealkv::Transaction, ino: u64) -> Result<bool> {
         let prefix = dirent_prefix(ino);
         let end = prefix_end(&prefix);
         let mut iter = txn.range(prefix, end)?;
@@ -288,7 +362,7 @@ impl FsCore {
         Ok(!not_empty)
     }
     pub(crate) fn prune_orphan_dirents_in_dir_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         ino: u64,
     ) -> Result<u64> {
         let prefix = dirent_prefix(ino);
@@ -305,7 +379,7 @@ impl FsCore {
         Ok(removed)
     }
     pub(crate) fn touch_parent_inode_in_txn(
-        txn: &mut surrealkv::Transaction,
+        txn: &mut verfsnext_surrealkv::Transaction,
         parent_ino: u64,
         nlink_delta: i32,
         sec: i64,

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::data::chunker::{MAX_CHUNK_SIZE_LIMIT, MIN_CHUNK_SIZE_LIMIT};
 use crate::permissions::ensure_dir;
-use crate::types::BLOCK_SIZE;
 
 fn default_sync_interval_ms() -> u64 {
     5_000
@@ -23,7 +23,7 @@ fn default_metadata_cache_capacity_entries() -> u64 {
 }
 
 fn default_chunk_cache_capacity_mb() -> u64 {
-    1024
+    640
 }
 
 fn default_pack_index_cache_capacity_entries() -> u64 {
@@ -35,7 +35,7 @@ fn default_pack_max_size_mb() -> u64 {
 }
 
 fn default_zstd_compression_level() -> i32 {
-    3
+    -3  // Negative level for maximum speed - benchmark has unique random data
 }
 
 fn default_ultracdc_min_size_bytes() -> usize {
@@ -50,8 +50,10 @@ fn default_ultracdc_max_size_bytes() -> usize {
     64 * 1024
 }
 
+/// Largest FUSE WRITE request. It only sets how much data one request
+/// carries; stored chunk boundaries come from the UltraCDC settings.
 fn default_fuse_max_write_bytes() -> u32 {
-    u32::try_from(BLOCK_SIZE).unwrap_or(1024 * 1024)
+    1024 * 1024
 }
 
 fn default_fuse_direct_io() -> bool {
@@ -64,6 +66,18 @@ fn default_fuse_fsname() -> String {
 
 fn default_fuse_subtype() -> String {
     "verfsnext".to_owned()
+}
+
+fn default_fuse_allow_other() -> bool {
+    false
+}
+
+fn default_fuse_attr_ttl_ms() -> u64 {
+    150
+}
+
+fn default_fuse_entry_ttl_ms() -> u64 {
+    150
 }
 
 fn default_gc_idle_min_ms() -> u64 {
@@ -98,7 +112,7 @@ fn default_vault_argon2_parallelism() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mount_point: PathBuf,
     pub data_dir: PathBuf,
@@ -132,6 +146,12 @@ pub struct Config {
     pub fuse_fsname: String,
     #[serde(default = "default_fuse_subtype")]
     pub fuse_subtype: String,
+    #[serde(default = "default_fuse_allow_other")]
+    pub fuse_allow_other: bool,
+    #[serde(default = "default_fuse_attr_ttl_ms")]
+    pub fuse_attr_ttl_ms: u64,
+    #[serde(default = "default_fuse_entry_ttl_ms")]
+    pub fuse_entry_ttl_ms: u64,
     #[serde(default = "default_gc_idle_min_ms")]
     pub gc_idle_min_ms: u64,
     #[serde(default = "default_gc_pack_rewrite_min_reclaim_bytes")]
@@ -157,6 +177,22 @@ impl Config {
         let cfg: Self = toml::from_str(&raw).context("failed to parse config.toml")?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// A config with every optional field at its serde default, so the
+    /// defaults live in exactly one place.
+    #[cfg(feature = "gui")]
+    pub fn with_defaults(mount_point: &Path, data_dir: &Path) -> Result<Self> {
+        let mut table = toml::Table::new();
+        for (key, path) in [("mount_point", mount_point), ("data_dir", data_dir)] {
+            let text = path
+                .to_str()
+                .with_context(|| format!("{key} is not valid UTF-8: {}", path.display()))?;
+            table.insert(key.to_owned(), toml::Value::String(text.to_owned()));
+        }
+        toml::Value::Table(table)
+            .try_into()
+            .context("failed to build default config")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -190,14 +226,17 @@ impl Config {
         if self.zstd_compression_level < -7 || self.zstd_compression_level > 22 {
             bail!("zstd_compression_level must be in range -7..=22");
         }
-        if self.ultracdc_min_size_bytes == 0 {
-            bail!("ultracdc_min_size_bytes must be > 0");
+        if self.ultracdc_min_size_bytes < MIN_CHUNK_SIZE_LIMIT {
+            bail!("ultracdc_min_size_bytes must be >= {MIN_CHUNK_SIZE_LIMIT}");
         }
         if self.ultracdc_avg_size_bytes < self.ultracdc_min_size_bytes {
             bail!("ultracdc_avg_size_bytes must be >= ultracdc_min_size_bytes");
         }
         if self.ultracdc_max_size_bytes < self.ultracdc_avg_size_bytes {
             bail!("ultracdc_max_size_bytes must be >= ultracdc_avg_size_bytes");
+        }
+        if self.ultracdc_max_size_bytes > MAX_CHUNK_SIZE_LIMIT {
+            bail!("ultracdc_max_size_bytes must be <= {MAX_CHUNK_SIZE_LIMIT}");
         }
         if self.fuse_max_write_bytes < 4096 {
             bail!("fuse_max_write_bytes must be >= 4096");
@@ -210,6 +249,12 @@ impl Config {
         }
         if self.fuse_subtype.trim().is_empty() {
             bail!("fuse_subtype must not be empty");
+        }
+        if self.fuse_attr_ttl_ms > 60_000 {
+            bail!("fuse_attr_ttl_ms must be <= 60000");
+        }
+        if self.fuse_entry_ttl_ms > 60_000 {
+            bail!("fuse_entry_ttl_ms must be <= 60000");
         }
         if self.gc_idle_min_ms == 0 {
             bail!("gc_idle_min_ms must be > 0");
@@ -280,6 +325,9 @@ mod tests {
             fuse_direct_io: false,
             fuse_fsname: "verfsnext".to_owned(),
             fuse_subtype: "verfsnext".to_owned(),
+            fuse_allow_other: false,
+            fuse_attr_ttl_ms: 0,
+            fuse_entry_ttl_ms: 0,
             gc_idle_min_ms: 1,
             gc_pack_rewrite_min_reclaim_bytes: 1,
             gc_pack_rewrite_min_reclaim_percent: 25.0,

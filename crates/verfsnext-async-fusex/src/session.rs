@@ -1,0 +1,1126 @@
+//! The implementation of FUSE session
+
+use std::fs::File;
+use std::io::Read;
+use std::io::{IoSlice, Write};
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
+
+use aligned_utils::bytes::AlignedBytes;
+use anyhow::{anyhow, Context};
+use clippy_utilities::Cast;
+use crossbeam_channel::{Receiver, Sender};
+use crossbeam_utils::atomic::AtomicCell;
+use nix::errno::Errno;
+use nix::sys::stat::SFlag;
+use nix::unistd;
+use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, warn};
+
+use super::context::ProtoVersion;
+use super::file_system::FileSystem;
+#[cfg(feature = "abi-7-21")]
+use super::fuse_reply::ReplyDirectoryPlus;
+use super::fuse_reply::{
+    ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyInit, ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+};
+use super::fuse_request::{Operation, Request};
+#[cfg(feature = "abi-7-23")]
+use super::protocol::FATTR_CTIME;
+#[cfg(feature = "abi-7-9")]
+use super::protocol::FATTR_LOCKOWNER; // {FATTR_ATIME_NOW, FATTR_MTIME_NOW};
+#[cfg(feature = "abi-7-9")]
+use super::protocol::FUSE_BIG_WRITES;
+#[cfg(feature = "abi-7-28")]
+use super::protocol::FUSE_MAX_PAGES;
+#[cfg(feature = "abi-7-23")]
+use super::protocol::FUSE_WRITEBACK_CACHE;
+use super::protocol::{
+    FuseInitIn, FuseInitOut, FuseOutHeader, FuseSetXAttrIn, FATTR_ATIME, FATTR_FH, FATTR_GID,
+    FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
+    FUSE_KERNEL_VERSION, FUSE_RELEASE_FLUSH,
+};
+#[cfg(feature = "abi-7-12")]
+use super::protocol::{
+    FuseNotifyCode::{FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE},
+    FuseNotifyInvalEntryOut, FuseNotifyInvalINodeOut,
+};
+use super::{mount, FuseFs};
+use crate::abi_marker;
+use crate::fs_util::{CreateParam, FileLockParam, RenameParam, SetAttrParam};
+
+/// Per-request metadata slack above payload bytes.
+const REQUEST_FRAME_SLACK_BYTES: u32 = 512;
+/// The absolute minimum max write accepted by FUSE.
+const MIN_MAX_WRITE_BYTES: u32 = 4 * 1024;
+/// The practical Linux upper-bound for max write negotiation.
+const MAX_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+/// Default max write if caller does not provide a session config.
+const DEFAULT_MAX_WRITE_BYTES: u32 = 1024 * 1024;
+/// Max background requests (writeback writes, readahead) the kernel keeps in
+/// flight. Every in-flight writeback write can join the same metadata commit,
+/// so this bounds how much data one commit and its pack sync can cover.
+const MAX_BACKGROUND: u16 = 32;
+/// Kernel marks the mount congested once this many background requests queue.
+const CONGESTION_THRESHOLD: u16 = 24;
+/// Request buffers. Requests run concurrently and each holds its buffer until
+/// it replies, so the pool exceeds `MAX_BACKGROUND`: foreground requests
+/// (lookup, getattr, readdir) always find a buffer while every background slot
+/// is waiting on a write commit.
+const REQUEST_BUFFER_COUNT: usize = MAX_BACKGROUND as usize + 16;
+/// The max number of FUSE device reader threads.
+const MAX_FUSE_READER: usize = 2; // TODO: make it custom
+
+/// Runtime config for FUSE session negotiation.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub max_write_bytes: u32,
+    pub mount_config: crate::mount::MountConfig,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            max_write_bytes: DEFAULT_MAX_WRITE_BYTES,
+            mount_config: crate::mount::MountConfig::default(),
+        }
+    }
+}
+
+fn supported_init_flags() -> u32 {
+    let mut flags = FUSE_ASYNC_READ;
+    #[cfg(feature = "abi-7-9")]
+    {
+        flags |= FUSE_BIG_WRITES;
+    }
+    #[cfg(feature = "abi-7-23")]
+    {
+        flags |= FUSE_WRITEBACK_CACHE;
+    }
+    #[cfg(feature = "abi-7-28")]
+    {
+        flags |= FUSE_MAX_PAGES;
+    }
+    flags
+}
+
+fn system_page_size() -> usize {
+    unistd::sysconf(unistd::SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+#[cfg(feature = "abi-7-28")]
+fn compute_max_pages(max_write_bytes: u32) -> u16 {
+    let page_size = system_page_size().max(1) as u64;
+    let max_write = u64::from(max_write_bytes.max(MIN_MAX_WRITE_BYTES));
+    let pages = ((max_write.saturating_sub(1)) / page_size).saturating_add(1);
+    pages.min(u64::from(u16::MAX)) as u16
+}
+
+/// The implementation of fuse fd clone.
+/// This module is just for avoiding the `missing_docs` of `ioctl_read` macro.
+#[allow(missing_docs)] // Raised by `ioctl_read!`
+mod _fuse_fd_clone {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+
+    use clippy_utilities::Cast;
+    use nix::fcntl::{self, FcntlArg, FdFlag, OFlag};
+    use nix::ioctl_read;
+    use nix::sys::stat::Mode;
+    ioctl_read!(fuse_fd_clone_impl, 229, 0, u32);
+
+    /// Clones a FUSE session fd into a FUSE worker fd.
+    ///
+    /// # Safety
+    /// Behavior is undefined if any of the following conditions are violated:
+    ///
+    /// - `session_fd` must be a valid file descriptor to an open FUSE device.
+    #[allow(clippy::unnecessary_safety_comment)]
+    pub unsafe fn fuse_fd_clone(session_fd: RawFd) -> nix::Result<RawFd> {
+        let devname = "/dev/fuse";
+        let cloned_fd = fcntl::open(devname, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())?;
+        // use `OwnedFd` here is just to release the fd when error occurs
+        // SAFETY: the `cloned_fd` is just opened
+        let cloned_fd = unsafe { OwnedFd::from_raw_fd(cloned_fd) };
+
+        fcntl::fcntl(cloned_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+
+        let mut result_fd: u32 = session_fd.cast();
+        // SAFETY: `cloned_fd` is ensured to be valid, and `&mut result_fd` is a valid
+        // pointer to a value on stack
+        unsafe { fuse_fd_clone_impl(cloned_fd.as_raw_fd(), &mut result_fd)? };
+        Ok(cloned_fd.into_raw_fd()) // use `into_raw_fd` to transfer the
+                                    // ownership of the fd
+    }
+}
+
+use crate::de::DeserializeError;
+use _fuse_fd_clone::fuse_fd_clone;
+
+#[derive(Debug)]
+pub struct SessionNotifier {
+    device: std::sync::Mutex<File>,
+}
+
+impl SessionNotifier {
+    fn new(device: File) -> Self {
+        Self {
+            device: std::sync::Mutex::new(device),
+        }
+    }
+
+    #[cfg(feature = "abi-7-12")]
+    pub fn invalidate_inode(&self, ino: u64, off: i64, len: i64) -> nix::Result<usize> {
+        let payload = FuseNotifyInvalINodeOut { ino, off, len };
+        #[allow(clippy::as_conversions)]
+        self.send_notify(
+            FUSE_NOTIFY_INVAL_INODE as i32,
+            &[abi_marker::as_abi_bytes(&payload)],
+        )
+    }
+
+    #[cfg(not(feature = "abi-7-12"))]
+    pub fn invalidate_inode(&self, _ino: u64, _off: i64, _len: i64) -> nix::Result<usize> {
+        Err(nix::errno::Errno::ENOSYS)
+    }
+
+    #[cfg(feature = "abi-7-12")]
+    pub fn invalidate_entry(&self, parent: u64, name: &str) -> nix::Result<usize> {
+        let name_bytes = name.as_bytes();
+        let payload = FuseNotifyInvalEntryOut {
+            parent,
+            namelen: name_bytes.len() as u32,
+            padding: 0,
+        };
+        #[allow(clippy::as_conversions)]
+        self.send_notify(
+            FUSE_NOTIFY_INVAL_ENTRY as i32,
+            &[abi_marker::as_abi_bytes(&payload), name_bytes],
+        )
+    }
+
+    #[cfg(not(feature = "abi-7-12"))]
+    pub fn invalidate_entry(&self, _parent: u64, _name: &str) -> nix::Result<usize> {
+        Err(nix::errno::Errno::ENOSYS)
+    }
+
+    fn send_notify(&self, code: i32, payload_parts: &[&[u8]]) -> nix::Result<usize> {
+        let payload_len = payload_parts
+            .iter()
+            .fold(0_usize, |acc, p| acc.saturating_add(p.len()));
+        let header = FuseOutHeader {
+            len: (mem::size_of::<FuseOutHeader>() + payload_len) as u32,
+            error: code,
+            unique: 0,
+        };
+
+        let header_bytes = abi_marker::as_abi_bytes(&header);
+        let mut slices = Vec::with_capacity(payload_parts.len().saturating_add(1));
+        slices.push(IoSlice::new(header_bytes));
+        for part in payload_parts {
+            slices.push(IoSlice::new(part));
+        }
+
+        let mut device = self
+            .device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        device
+            .write_vectored(&slices)
+            .map_err(|err| nix::errno::Errno::try_from(err).unwrap_or(nix::errno::Errno::EIO))
+    }
+}
+
+/// A loop to read requests from FUSE device continuously
+#[allow(clippy::needless_pass_by_value)]
+/// Admits FUSE requests until shutdown starts, then lets admitted requests finish.
+///
+/// Requests read after the gate closes are left unanswered; the kernel aborts them
+/// with a connection error when the daemon releases the FUSE device. No request
+/// reaches the filesystem once its final sync may have started.
+#[derive(Default)]
+struct RequestGate {
+    state: Mutex<GateState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    in_flight: usize,
+}
+
+/// Marks one admitted request; dropping it (also while unwinding) releases the gate.
+struct Admission(Arc<RequestGate>);
+
+impl RequestGate {
+    fn admit(self: &Arc<Self>) -> Option<Admission> {
+        let mut state = self.state.lock().expect("FUSE request gate lock poisoned");
+        if state.closed {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(Admission(Arc::clone(self)))
+    }
+
+    fn close_and_drain(&self) {
+        let mut state = self.state.lock().expect("FUSE request gate lock poisoned");
+        state.closed = true;
+        while state.in_flight > 0 {
+            state = self
+                .idle
+                .wait(state)
+                .expect("FUSE request gate lock poisoned");
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().expect("FUSE request gate lock poisoned");
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+fn fuse_device_reader(
+    buffer_tx: Sender<(File, AlignedBytes)>,
+    buffer_rx: Receiver<(File, AlignedBytes)>,
+    runtime_handle: Handle,
+    proto_version: ProtoVersion,
+    fs: Arc<dyn FileSystem + Send + Sync>,
+    gate: Arc<RequestGate>,
+) {
+    loop {
+        let Ok((mut file, mut buffer)) = buffer_rx.recv() else {
+            error!("The channel of buffer is exhausted and closed.");
+            return;
+        };
+
+        let size = match file.read(&mut buffer) {
+            Ok(size) => size,
+            Err(e) => {
+                let errno = e.raw_os_error().map(Errno::from_i32);
+                match errno {
+                    None => {
+                        panic!("Failed to get the errno on reading failure. The error is {e}");
+                    }
+                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
+                    Some(Errno::ENOENT) => {
+                        info!("operation interrupted, retry.");
+                        buffer_tx.send((file, buffer)).unwrap_or_else(|_| {
+                            unreachable!("The buffer channel is not to be closed.")
+                        });
+                        continue;
+                    }
+                    // Interrupted system call, retry
+                    Some(Errno::EINTR) => {
+                        info!("interrupted system call, retry");
+                        buffer_tx.send((file, buffer)).unwrap_or_else(|_| {
+                            unreachable!("The buffer channel is not to be closed.")
+                        });
+                        continue;
+                    }
+                    // Explicitly try again
+                    Some(Errno::EAGAIN) => {
+                        info!("Explicitly retry");
+                        buffer_tx.send((file, buffer)).unwrap_or_else(|_| {
+                            unreachable!("The buffer channel is not to be closed.")
+                        });
+                        continue;
+                    }
+                    // Filesystem was unmounted, quit the loop
+                    Some(Errno::ENODEV) => {
+                        info!("filesystem destroyed, quit the run loop");
+                        return;
+                    }
+                    // Unhandled error
+                    Some(errno) => {
+                        panic!(
+                            "non-recoverable io error when read FUSE device, \
+                            the error is: {errno}",
+                        );
+                    }
+                }
+            }
+        };
+
+        let Some(admission) = gate.admit() else {
+            info!("FUSE session is shutting down; request left for the kernel to abort");
+            return;
+        };
+        // Requests run as independent tasks so a write waiting on its commit
+        // never holds up lookups, getattrs or reads queued behind it, and
+        // concurrent writeback writes reach the batcher together.
+        let fs = Arc::clone(&fs);
+        let buffer_tx = buffer_tx.clone();
+        runtime_handle.spawn(async move {
+            let _admission = admission;
+            process_fuse_request(buffer, size, file, fs, buffer_tx, proto_version).await;
+        });
+    }
+}
+
+/// Process one FUSE request
+async fn process_fuse_request(
+    byte_buffer: AlignedBytes,
+    read_size: usize,
+    mut file: File,
+    fs: Arc<dyn FileSystem + Send + Sync + 'static>,
+    sender: Sender<(File, AlignedBytes)>,
+    proto_version: ProtoVersion,
+) {
+    let bytes = byte_buffer
+        .get(..read_size)
+        .unwrap_or_else(|| panic!("failed to read {read_size} bytes from the buffer",));
+    let fuse_req = match Request::new(bytes, proto_version) {
+        // Dispatch request
+        Ok(r) => r,
+        // Quit on illegal request
+        Err(e) => {
+            if let &DeserializeError::UnknownOpCode { code, unique } = &e {
+                error!("Unknown operation code found: {code}, with context: {e}");
+                let unique = unique.unwrap_or_else(|| {
+                    unreachable!("A `unique` must be filled in by deserializer.")
+                });
+                ReplyEmpty::new(unique, &mut file)
+                    .error_code(Errno::ENOSYS)
+                    .await
+                    .unwrap_or_else(|reply_err| {
+                        panic!("Failed to reply an error code: {reply_err}.")
+                    });
+                return_buffer(&sender, file, byte_buffer);
+                return;
+            }
+
+            // TODO: graceful handle request build failure
+            panic!("failed to build FUSE request, the error is: {e}");
+        }
+    };
+    debug!("received FUSE req={}", fuse_req);
+    let res = dispatch(&fuse_req, &mut file, fs).await;
+    if let Err(e) = res {
+        panic!(
+            "failed to process req={:?}, the error is: {}",
+            fuse_req,
+            crate::util::format_nix_error(e), // TODO: refactor format_nix_error()
+        );
+    }
+    return_buffer(&sender, file, byte_buffer);
+}
+
+/// Return a request buffer to the pool. `Session::run` holds a receiver until every
+/// admitted request has finished, so a closed pool is a broken shutdown invariant.
+fn return_buffer(sender: &Sender<(File, AlignedBytes)>, file: File, buffer: AlignedBytes) {
+    if let Err(e) = sender.send((file, buffer)) {
+        panic!("failed to put the buffer back to buffer pool, the error is: {e}");
+    }
+}
+
+/// FUSE session
+#[allow(missing_debug_implementations)]
+pub struct Session<F: FileSystem + Send + Sync + 'static> {
+    /// FUSE device fd
+    fuse_fd: Arc<FuseFd>,
+    /// Kernel FUSE protocol version
+    proto_version: AtomicCell<ProtoVersion>,
+    /// Mount path (relative)
+    mount_path: Option<PathBuf>,
+    /// The underlying FUSE file system
+    filesystem: Arc<F>,
+    session_config: SessionConfig,
+    /// Stops request dispatch before the filesystem's final sync
+    gate: Arc<RequestGate>,
+}
+pub async fn new_session(
+    mount_path: &Path,
+    fs: FuseFs,
+    session_config: SessionConfig,
+) -> anyhow::Result<Session<FuseFs>> {
+    let fuse_fd = mount::mount(mount_path, &session_config.mount_config)
+        .await
+        .context("Failed to mount FUSE")?;
+
+    Ok(Session {
+        fuse_fd: Arc::new(FuseFd(fuse_fd)),
+        proto_version: AtomicCell::new(ProtoVersion::UNSPECIFIED),
+        mount_path: Some(mount_path.to_owned()),
+        filesystem: Arc::new(fs),
+        session_config,
+        gate: Arc::default(),
+    })
+}
+
+/// FUSE device fd
+#[derive(Debug)]
+struct FuseFd(RawFd);
+
+impl Drop for FuseFd {
+    fn drop(&mut self) {
+        if let Err(err) = unistd::close(self.0) {
+            error!(fd = self.0, error = %err, "failed to close FUSE descriptor");
+        }
+    }
+}
+
+impl<F: FileSystem + Send + Sync + 'static> Drop for Session<F> {
+    fn drop(&mut self) {
+        if let Some(mount_path) = self.mount_path.take() {
+            // A session abandoned before explicit shutdown still owns its mount.
+            let result = futures::executor::block_on(mount::umount(&mount_path));
+            if let Err(err) = result {
+                error!(path = %mount_path.display(), error = %err,
+                       "failed to unmount abandoned FUSE session");
+            }
+        }
+    }
+}
+
+impl<F: FileSystem + Send + Sync + 'static> Session<F> {
+    /// Detach the mount after the filesystem has completed its final sync.
+    pub async fn unmount(mut self) -> anyhow::Result<()> {
+        let mount_path = self.mount_path.take().expect("session owns its mount");
+        mount::umount(&mount_path).await?;
+        info!(path = %mount_path.display(), "FUSE mount detached");
+        Ok(())
+    }
+
+    /// Get FUSE device fd
+    #[inline]
+    pub fn dev_fd(&self) -> RawFd {
+        self.fuse_fd.0
+    }
+
+    pub fn notifier(&self) -> anyhow::Result<Arc<SessionNotifier>> {
+        let session_fd = self.dev_fd();
+        let worker_fd = unsafe {
+            // SAFETY: session fd is owned by this live session.
+            fuse_fd_clone(session_fd)?
+        };
+        let device = unsafe {
+            // SAFETY: worker fd is freshly cloned and owned here.
+            File::from_raw_fd(worker_fd)
+        };
+        Ok(Arc::new(SessionNotifier::new(device)))
+    }
+
+    /// Run the FUSE session
+    #[allow(clippy::arithmetic_side_effects, clippy::pattern_type_mismatch)] // The `select!` macro will generate code that goes against these rules.
+    pub async fn run(&self, token: CancellationToken) -> anyhow::Result<()> {
+        // For recycling the buffers used by process_fuse_request.
+        let (pool_sender, pool_receiver) = self
+            .setup_buffer_pool()
+            .await
+            .context("failed to setup buffer pool")?;
+
+        for _ in 0..MAX_FUSE_READER {
+            let pool_tx = pool_sender.clone();
+            let pool_rx = pool_receiver.clone();
+            let handle = Handle::current();
+            let fs = Arc::clone(&self.filesystem);
+            let protocol_version = self.proto_version.load();
+            let gate = Arc::clone(&self.gate);
+            // Readers stop at the request gate; their `JoinHandle`s are not needed.
+            thread::spawn(move || {
+                fuse_device_reader(pool_tx, pool_rx, handle, protocol_version, fs, gate);
+            });
+        }
+
+        token.cancelled().await;
+        // Pages held by the kernel writeback cache reach the filesystem only while
+        // requests are still served. A sync failure is returned after draining so the
+        // caller still performs its final filesystem sync.
+        let sync_result = self.sync_mount().await;
+        let gate = Arc::clone(&self.gate);
+        tokio::task::spawn_blocking(move || gate.close_and_drain())
+            .await
+            .context("FUSE request drain task failed")?;
+        // Readers return at the closed gate and drop their receivers while admitted
+        // requests are still running; this receiver keeps the pool open until every
+        // admitted request has returned its buffer.
+        drop(pool_receiver);
+        info!("Async FUSE session exits; in-flight requests drained.");
+
+        sync_result
+    }
+
+    /// Flush the kernel's dirty pages for this mount into the filesystem.
+    async fn sync_mount(&self) -> anyhow::Result<()> {
+        let mount_path = self
+            .mount_path
+            .clone()
+            .context("FUSE session has no mount path to sync")?;
+        tokio::task::spawn_blocking(move || {
+            let root = File::open(&mount_path).with_context(|| {
+                format!("failed to open {} for shutdown sync", mount_path.display())
+            })?;
+            unistd::syncfs(root.as_raw_fd()).with_context(|| {
+                format!("syncfs of {} failed during shutdown", mount_path.display())
+            })
+        })
+        .await
+        .context("FUSE mount sync task failed")?
+    }
+
+    /// Setup buffer pool
+    async fn setup_buffer_pool(
+        &self,
+    ) -> anyhow::Result<(Sender<(File, AlignedBytes)>, Receiver<(File, AlignedBytes)>)> {
+        let max_write = self
+            .session_config
+            .max_write_bytes
+            .clamp(MIN_MAX_WRITE_BYTES, MAX_MAX_WRITE_BYTES);
+        let buffer_size = max_write.saturating_add(REQUEST_FRAME_SLACK_BYTES);
+        let page_size = system_page_size();
+
+        let (pool_sender, pool_receiver) =
+            crossbeam_channel::bounded::<(File, AlignedBytes)>(REQUEST_BUFFER_COUNT);
+
+        for _ in 0..REQUEST_BUFFER_COUNT {
+            let buf = AlignedBytes::new_zeroed(buffer_size.cast(), page_size);
+            let session_fd = self.dev_fd();
+
+            let file = unsafe {
+                // SAFETY: We assume that the fuse session fd is valid.
+                let worker_fd = fuse_fd_clone(session_fd)?;
+                // SAFETY: The worker fd is just cloned.
+                File::from_raw_fd(worker_fd)
+            };
+
+            let res = pool_sender.send((file, buf));
+            if let Err(e) = res {
+                panic!(
+                    "failed to insert buffer to buffer pool when initializing, the error is: {e}",
+                );
+            }
+        }
+
+        let (mut file, mut byte_buf) = pool_receiver.recv()?;
+        let (read_result, mut file, byte_buf) = tokio::task::spawn_blocking(move || {
+            let res = file.read(&mut byte_buf);
+            (res, file, byte_buf)
+        })
+        .await?;
+        if let Ok(read_size) = read_result {
+            debug!("read successfully {} byte data from FUSE device", read_size);
+            let bytes = byte_buf.get(..read_size).unwrap_or_else(|| {
+                panic!(
+                    "read_size is greater than buffer size: read_size = {}, buffer size = {}",
+                    read_size,
+                    byte_buf.len()
+                )
+            });
+            if let Ok(req) = Request::new(bytes, self.proto_version.load()) {
+                if let Operation::Init { arg } = *req.operation() {
+                    let filesystem = Arc::clone(&self.filesystem);
+                    self.init(arg, &req, &*filesystem, &mut file).await?;
+                }
+            }
+        }
+        pool_sender
+            .send((file, byte_buf))
+            .context("failed to put buffer back to buffer pool after FUSE init")?;
+
+        Ok((pool_sender, pool_receiver))
+    }
+
+    /// Initialize FUSE session
+    #[allow(single_use_lifetimes)] // false positive
+    async fn init<'a>(
+        &self,
+        arg: &'_ FuseInitIn,
+        req: &'_ Request<'a>,
+        fs: &'_ (dyn FileSystem + Send + Sync + 'static),
+        file: &mut File,
+    ) -> anyhow::Result<()> {
+        debug!("Init args={:?}", arg);
+        // TODO: rewrite init based on do_init() in fuse_lowlevel.c
+        // https://github.com/libfuse/libfuse/blob/master/lib/fuse_lowlevel.c#L1892
+        let reply = ReplyInit::new(req.unique(), file);
+        // We don't support ABI versions before 7.8
+        if arg.major < 7 || (arg.major == 7 && arg.minor < 8) {
+            error!("Unsupported FUSE ABI version={}.{}", arg.major, arg.minor);
+            reply.error_code(Errno::EPROTO).await?;
+            return Err(anyhow!("FUSE ABI version too low"));
+        }
+        // Call filesystem init method and give it a chance to return an error
+        let filesystem = fs;
+        let init_res = filesystem.init(req).await;
+        if let Err(err) = init_res {
+            reply.error_code(Errno::ENOSYS).await?;
+            return Err(anyhow!("user defined init failed, the error is: {}", err,));
+        }
+        let max_write = self
+            .session_config
+            .max_write_bytes
+            .clamp(MIN_MAX_WRITE_BYTES, MAX_MAX_WRITE_BYTES);
+        let flags = arg.flags & supported_init_flags();
+        #[cfg(not(feature = "abi-7-13"))]
+        let unused = 0_u32;
+        #[cfg(feature = "abi-7-13")]
+        let congestion_threshold = CONGESTION_THRESHOLD;
+        #[cfg(feature = "abi-7-23")]
+        let time_gran = 1_u32; // TODO: set time_gran
+        #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
+        let unused = [0_u32; 9];
+        #[cfg(feature = "abi-7-28")]
+        let max_pages = compute_max_pages(max_write);
+        #[cfg(feature = "abi-7-28")]
+        let padding = 0_u16;
+        #[cfg(feature = "abi-7-28")]
+        let unused = [0_u32; 8];
+        // Reply with our desired version and settings. If the kernel supports a
+        // larger major version, it'll re-send a matching init message. If it
+        // supports only lower major versions, we replied with an error above.
+        reply
+            .init(FuseInitOut {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION, /* Do not change minor version, otherwise
+                                                   * unknown panic */
+                max_readahead: arg.max_readahead, // accept FUSE kernel module max_readahead
+                flags,                            // negotiated with kernel capabilities
+                #[cfg(not(feature = "abi-7-13"))]
+                unused,
+                #[cfg(feature = "abi-7-13")]
+                max_background: MAX_BACKGROUND,
+                #[cfg(feature = "abi-7-13")]
+                congestion_threshold,
+                max_write,
+                #[cfg(feature = "abi-7-23")]
+                time_gran,
+                #[cfg(all(feature = "abi-7-23", not(feature = "abi-7-28")))]
+                unused,
+                #[cfg(feature = "abi-7-28")]
+                max_pages,
+                #[cfg(feature = "abi-7-28")]
+                padding,
+                #[cfg(feature = "abi-7-28")]
+                unused,
+            })
+            .await?;
+        debug!(
+            "INIT response: ABI version={}.{}, flags={:#x}, max readahead={}, max write={}",
+            FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION, flags, arg.max_readahead, max_write,
+        );
+
+        // Store the kernel FUSE major and minor version
+        self.proto_version.store(ProtoVersion {
+            major: arg.major,
+            minor: arg.minor,
+        });
+
+        Ok(())
+    }
+}
+
+/// Dispatch request to the filesystem
+/// This calls the appropriate filesystem operation method for the
+/// request and sends back the returned reply to the kernel
+#[allow(clippy::too_many_lines)]
+#[instrument(name="request",skip(req, file, fs), fields(fuse_id =req.unique(),ino=req.nodeid(), op=%req.operation(), len=req.len()),ret)]
+async fn dispatch<'a>(
+    req: &'a Request<'a>,
+    file: &mut File,
+    fs: Arc<dyn FileSystem + Send + Sync + 'static>,
+) -> nix::Result<usize> {
+    let result = match *req.operation() {
+        // Filesystem initialization
+        Operation::Init { .. } => panic!("FUSE should have already initialized"),
+
+        // Filesystem destroyed
+        Operation::Destroy => {
+            fs.destroy(req).await;
+            let reply = ReplyEmpty::new(req.unique(), file);
+            reply.ok().await
+        }
+
+        Operation::Interrupt { arg } => {
+            fs.interrupt(req, arg.unique).await; // No reply
+            Ok(0)
+        }
+
+        Operation::Lookup { name } => {
+            let reply = ReplyEntry::new(req.unique(), file);
+            fs.lookup(req, req.nodeid(), name, reply).await
+        }
+        Operation::Forget { arg } => {
+            fs.forget(req, arg.nlookup).await; // No reply
+            Ok(0)
+        }
+        Operation::GetAttr => {
+            let reply = ReplyAttr::new(req.unique(), file);
+            fs.getattr(req, reply).await
+        }
+        Operation::SetAttr { arg } => {
+            #[cfg(feature = "abi-7-9")]
+            use std::time::SystemTime;
+
+            #[cfg(feature = "abi-7-9")]
+            use super::protocol::{FATTR_ATIME_NOW, FATTR_MTIME_NOW};
+
+            let mode = match arg.valid & FATTR_MODE {
+                0 => None,
+                _ => Some(arg.mode),
+            };
+            let u_id = match arg.valid & FATTR_UID {
+                0 => None,
+                _ => Some(arg.uid),
+            };
+            let g_id = match arg.valid & FATTR_GID {
+                0 => None,
+                _ => Some(arg.gid),
+            };
+            let size = match arg.valid & FATTR_SIZE {
+                0 => None,
+                _ => Some(arg.size),
+            };
+            let a_time = match arg.valid & FATTR_ATIME {
+                0 => None,
+                _ => Some(UNIX_EPOCH + Duration::new(arg.atime, arg.atimensec)),
+            };
+            let m_time = match arg.valid & FATTR_MTIME {
+                0 => None,
+                _ => Some(UNIX_EPOCH + Duration::new(arg.mtime, arg.mtimensec)),
+            };
+            let fh = match arg.valid & FATTR_FH {
+                0 => None,
+                _ => Some(arg.fh),
+            };
+
+            #[cfg(feature = "abi-7-9")]
+            let a_time = match arg.valid & FATTR_ATIME_NOW {
+                0 => a_time,
+                _ => Some(SystemTime::now()),
+            };
+            #[cfg(feature = "abi-7-9")]
+            let m_time = match arg.valid & FATTR_MTIME_NOW {
+                0 => m_time,
+                _ => Some(SystemTime::now()),
+            };
+
+            #[cfg(feature = "abi-7-9")]
+            let lock_owner = match arg.valid & FATTR_LOCKOWNER {
+                0 => None,
+                _ => Some(arg.lock_owner),
+            };
+            #[cfg(feature = "abi-7-23")]
+            let c_time = match arg.valid & FATTR_CTIME {
+                0 => None,
+                _ => Some(UNIX_EPOCH + Duration::new(arg.ctime, arg.ctimensec)),
+            };
+
+            let reply = ReplyAttr::new(req.unique(), file);
+            let param = SetAttrParam {
+                valid: arg.valid,
+                fh,
+                mode,
+                u_id,
+                g_id,
+                size,
+                #[cfg(feature = "abi-7-9")]
+                lock_owner,
+                a_time,
+                m_time,
+                #[cfg(feature = "abi-7-23")]
+                c_time,
+            };
+            fs.setattr(req, param, reply).await
+        }
+        Operation::ReadLink => {
+            let reply = ReplyData::new(req.unique(), file);
+            fs.readlink(req, reply).await
+        }
+        Operation::MkNod { arg, name } => {
+            let param = CreateParam {
+                parent: req.nodeid(),
+                name: name.to_owned(),
+                mode: arg.mode,
+                rdev: arg.rdev,
+                uid: req.uid(),
+                gid: req.gid(),
+                node_type: SFlag::S_IFREG,
+                link: None,
+            };
+            let reply = ReplyEntry::new(req.unique(), file);
+            fs.mknod(req, param, reply).await
+        }
+        Operation::MkDir { arg, name } => {
+            let reply = ReplyEntry::new(req.unique(), file);
+            fs.mkdir(req, req.nodeid(), name, arg.mode, reply).await
+        }
+        Operation::Unlink { name } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.unlink(req, req.nodeid(), name, reply).await
+        }
+        Operation::RmDir { name } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.rmdir(req, req.nodeid(), name, reply).await
+        }
+        Operation::SymLink { name, link } => {
+            let reply = ReplyEntry::new(req.unique(), file);
+            fs.symlink(req, req.nodeid(), name, Path::new(link), reply)
+                .await
+        }
+        Operation::Rename {
+            arg,
+            oldname,
+            newname,
+        } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            let param = RenameParam {
+                old_parent: req.nodeid(),
+                old_name: oldname.to_owned(),
+                new_parent: arg.newdir,
+                new_name: newname.to_owned(),
+                flags: 0,
+            };
+            fs.rename(req, param, reply).await
+        }
+        Operation::Link { arg, name } => {
+            let reply = ReplyEntry::new(req.unique(), file);
+            fs.link(req, arg.oldnodeid, name, reply).await
+        }
+        Operation::Open { arg } => {
+            let reply = ReplyOpen::new(req.unique(), file);
+            fs.open(req, arg.flags, reply).await
+        }
+        Operation::Read { arg } => {
+            let reply = ReplyData::new(req.unique(), file);
+            fs.read(req, arg.fh, arg.offset.cast(), arg.size, reply)
+                .await
+        }
+        Operation::Write { arg, data } => {
+            info!("operation:write: {:?}", arg);
+            assert_eq!(data.len(), arg.size.cast::<usize>());
+            let reply = ReplyWrite::new(req.unique(), file);
+            fs.write(req, arg.fh, arg.offset.cast(), data, arg.write_flags, reply)
+                .await
+        }
+        Operation::Flush { arg } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.flush(req, arg.fh, arg.lock_owner, reply).await
+        }
+        Operation::Release { arg } => {
+            let flush = !matches!(arg.release_flags & FUSE_RELEASE_FLUSH, 0);
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.release(req, arg.fh, arg.flags, arg.lock_owner, flush, reply)
+                .await
+        }
+        Operation::FSync { arg } => {
+            let datasync = !matches!(arg.fsync_flags & 1, 0);
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.fsync(req, arg.fh, datasync, reply).await
+        }
+        Operation::OpenDir { arg } => {
+            let reply = ReplyOpen::new(req.unique(), file);
+            fs.opendir(req, arg.flags, reply).await
+        }
+        Operation::ReadDir { arg } => {
+            let reply = ReplyDirectory::new(req.unique(), file, arg.size.cast());
+            fs.readdir(req, arg.fh, arg.offset.cast(), reply).await
+        }
+        Operation::ReleaseDir { arg } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.releasedir(req, arg.fh, arg.flags, reply).await
+        }
+        Operation::FSyncDir { arg } => {
+            let datasync = !matches!(arg.fsync_flags & 1, 0);
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.fsyncdir(req, arg.fh, datasync, reply).await
+        }
+        Operation::StatFs => {
+            let reply = ReplyStatFs::new(req.unique(), file);
+            fs.statfs(req, reply).await
+        }
+        Operation::SetXAttr { arg, name, value } => {
+            /// Set the position of an extended attribute
+            /// zero for Linux
+            #[cfg(target_os = "linux")]
+            #[inline]
+            const fn get_position(_arg: &FuseSetXAttrIn) -> u32 {
+                0
+            }
+            assert!(value.len() == arg.size.cast::<usize>());
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.setxattr(req, name, value, arg.flags, get_position(arg), reply)
+                .await
+        }
+        Operation::GetXAttr { arg, name } => {
+            let reply = ReplyXAttr::new(req.unique(), file);
+            fs.getxattr(req, name, arg.size, reply).await
+        }
+        Operation::ListXAttr { arg } => {
+            let reply = ReplyXAttr::new(req.unique(), file);
+            fs.listxattr(req, arg.size, reply).await
+        }
+        Operation::RemoveXAttr { name } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.removexattr(req, name, reply).await
+        }
+        Operation::Access { arg } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.access(req, arg.mask, reply).await
+        }
+        Operation::Create { arg, name } => {
+            let reply = ReplyCreate::new(req.unique(), file);
+            fs.create(req, req.nodeid(), name, arg.mode, arg.flags, reply)
+                .await
+        }
+        Operation::GetLk { arg } => {
+            let reply = ReplyLock::new(req.unique(), file);
+            let lock_param = FileLockParam {
+                fh: arg.fh,
+                lock_owner: arg.owner,
+                start: arg.lk.start,
+                end: arg.lk.end,
+                typ: arg.lk.typ,
+                pid: arg.lk.pid,
+            };
+            fs.getlk(req, lock_param, reply).await
+        }
+        Operation::SetLk { arg } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            let lock_param = FileLockParam {
+                fh: arg.fh,
+                lock_owner: arg.owner,
+                start: arg.lk.start,
+                end: arg.lk.end,
+                typ: arg.lk.typ,
+                pid: arg.lk.pid,
+            };
+            fs.setlk(req, lock_param, false, reply).await
+        }
+        Operation::SetLkW { arg } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            let lock_param = FileLockParam {
+                fh: arg.fh,
+                lock_owner: arg.owner,
+                start: arg.lk.start,
+                end: arg.lk.end,
+                typ: arg.lk.typ,
+                pid: arg.lk.pid,
+            };
+            fs.setlk(
+                req, lock_param, true, // sleep
+                reply,
+            )
+            .await
+        }
+        Operation::BMap { arg } => {
+            let reply = ReplyBMap::new(req.unique(), file);
+            fs.bmap(req, arg.blocksize, arg.block, reply).await
+        }
+
+        #[cfg(feature = "abi-7-11")]
+        Operation::IoCtl { arg, data } => {
+            warn!("IoCtl unsupported, arg={:?}, data={:?}", arg, data);
+            reply_errno(req, file, Errno::ENOTTY).await
+        }
+        #[cfg(feature = "abi-7-11")]
+        Operation::Poll { arg } => {
+            error!("Poll unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
+        }
+        #[cfg(feature = "abi-7-15")]
+        Operation::NotifyReply { data } => {
+            error!("NotifyReply not implemented, data={:?}", data);
+            not_implement_helper(req, file).await
+        }
+        #[cfg(feature = "abi-7-16")]
+        Operation::BatchForget { arg: _, nodes } => {
+            fs.batch_forget(req, nodes).await; // No reply
+            Ok(0)
+        }
+        #[cfg(feature = "abi-7-19")]
+        Operation::FAllocate { arg } => {
+            error!("FAllocate unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
+        }
+        #[cfg(feature = "abi-7-21")]
+        Operation::ReadDirPlus { arg } => {
+            let reply = ReplyDirectoryPlus::new(req.unique(), file, arg.size.cast());
+            fs.readdirplus(req, arg.fh, arg.offset.cast(), reply).await
+        }
+        #[cfg(feature = "abi-7-23")]
+        Operation::Rename2 {
+            arg,
+            oldname,
+            newname,
+        } => {
+            let reply = ReplyEmpty::new(req.unique(), file);
+            let param = RenameParam {
+                old_parent: req.nodeid(),
+                old_name: oldname.to_owned(),
+                new_parent: arg.newdir,
+                new_name: newname.to_owned(),
+                flags: arg.flags,
+            };
+            fs.rename(req, param, reply).await
+        }
+        // #[cfg(feature = "abi-7-24")]
+        Operation::LSeek { arg } => {
+            error!("LSeek unsupported, arg={:?}", arg);
+            reply_errno(req, file, Errno::EOPNOTSUPP).await
+        }
+        // #[cfg(feature = "abi-7-28")]
+        Operation::CopyFileRange { arg } => {
+            let offset_in = match i64::try_from(arg.off_in) {
+                Ok(v) => v,
+                Err(_) => {
+                    let reply = ReplyWrite::new(req.unique(), file);
+                    return reply.error_code(Errno::EINVAL).await;
+                }
+            };
+            let offset_out = match i64::try_from(arg.off_out) {
+                Ok(v) => v,
+                Err(_) => {
+                    let reply = ReplyWrite::new(req.unique(), file);
+                    return reply.error_code(Errno::EINVAL).await;
+                }
+            };
+            let reply = ReplyWrite::new(req.unique(), file);
+            fs.copy_file_range(
+                req,
+                arg.fh_in,
+                offset_in,
+                arg.nodeid_out,
+                arg.fh_out,
+                offset_out,
+                arg.len,
+                arg.flags,
+                reply,
+            )
+            .await
+        }
+        #[cfg(feature = "abi-7-11")]
+        Operation::CuseInit { arg } => {
+            panic!("unsupported CuseInit arg={arg:?}");
+        }
+    };
+
+    result
+}
+
+/// Replies ENOSYS
+async fn not_implement_helper(req: &Request<'_>, file: &mut File) -> nix::Result<usize> {
+    let reply = ReplyEmpty::new(req.unique(), file);
+    reply.error_code(Errno::ENOSYS).await
+}
+
+async fn reply_errno(req: &Request<'_>, file: &mut File, errno: Errno) -> nix::Result<usize> {
+    let reply = ReplyEmpty::new(req.unique(), file);
+    reply.error_code(errno).await
+}

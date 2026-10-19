@@ -1,21 +1,72 @@
 use super::*;
 use crate::fs::FsCore;
+use zeroize::Zeroize;
 
-const VAULT_HASH_DOMAIN: u8 = 0xA7;
+/// True when the `/.vault` namespace exists: a root directory entry backed by
+/// an inode. An entry whose inode is gone (a leftover of an interrupted
+/// removal) does not count, and the next create repairs it.
+pub(crate) fn vault_namespace_present(meta: &MetaStore) -> Result<bool> {
+    meta.read_txn(|txn| {
+        let Some(raw) = txn.get(dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()))? else {
+            return Ok(false);
+        };
+        let dirent: DirentRecord = decode_rkyv(&raw)?;
+        Ok(txn.get(inode_key(dirent.ino))?.is_some())
+    })
+}
 
 impl FsCore {
     pub(crate) fn vault_locked(&self) -> bool {
         !self.vault.read().unlocked()
     }
+    /// Refuses to detach the vault namespace. `/.vault` is created by the
+    /// vault code and, once its inode is gone, only the vault's original
+    /// password and key file can bring it back (`create_vault`), so a removal
+    /// has to fail loudly instead of silently bricking every vault command.
+    /// The inode flag covers the vault root inode, the name covers a root
+    /// entry whose inode was damaged. (`/.snapshots` needs no check here: its
+    /// inode is read-only, which every removal already refuses.)
+    pub(crate) fn ensure_entry_removable(
+        parent: u64,
+        name: &str,
+        inode: &InodeRecord,
+        context: &'static str,
+    ) -> Result<()> {
+        if (inode.flags & INODE_FLAG_VAULT_ROOT) != 0 {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                format!("{context}: the vault namespace is removed only with the vault"),
+            ));
+        }
+        if parent == ROOT_INODE && name == VAULT_DIR_NAME {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                format!("{context}: {name} is a filesystem-managed namespace and cannot be removed"),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn inode_is_vault(inode: &InodeRecord) -> bool {
         (inode.flags & INODE_FLAG_VAULT) != 0
     }
     pub(crate) fn hash_for_inode(inode: &InodeRecord, data: &[u8]) -> [u8; 16] {
-        if FsCore::inode_is_vault(inode) {
-            hash128_with_domain(VAULT_HASH_DOMAIN, data)
+        FsCore::chunk_content_hash(FsCore::inode_is_vault(inode), data)
+    }
+    /// Content hash of a chunk's plaintext; vault chunks hash in their own
+    /// domain so they never deduplicate against plain chunks.
+    pub(crate) fn chunk_content_hash(vault: bool, data: &[u8]) -> [u8; 16] {
+        if vault {
+            hash128_with_domain(VAULT_DOMAIN_BYTE, data)
         } else {
             hash128(data)
         }
+    }
+    /// True when a chunk record belongs to the domain its key names. The key
+    /// space separates the domains ([`ChunkId`]); a disagreement means the
+    /// record was damaged or written by a buggy version, and its copy must not
+    /// be deduplicated against or served.
+    pub(crate) fn chunk_record_matches_domain(id: &ChunkId, record: &ChunkRecord) -> bool {
+        ((record.flags & CHUNK_FLAG_ENCRYPTED) != 0) == id.vault
     }
     pub(crate) fn check_vault_parent_name_gate(&self, parent: u64, name: &str) -> Result<()> {
         if self.vault_locked() && parent == ROOT_INODE && name == VAULT_DIR_NAME {
@@ -28,7 +79,9 @@ impl FsCore {
         inode: &InodeRecord,
         context: &'static str,
     ) -> Result<()> {
-        if self.vault_locked() && FsCore::inode_is_vault(inode) {
+        // Check inode flags first (no &self needed) to avoid vault RwLock
+        // for non-vault files, which is the common case.
+        if FsCore::inode_is_vault(inode) && self.vault_locked() {
             return Err(anyhow_errno(
                 Errno::ENOENT,
                 format!("{context}: vault is locked"),
@@ -45,11 +98,20 @@ impl FsCore {
             .key()
             .ok_or_else(|| anyhow_errno(Errno::EIO, "vault key is unavailable"))
     }
+    /// Initializes the vault. `key_material` is the content of the caller's
+    /// key file; the caller writes that file itself, so it is created with the
+    /// caller's identity even when the daemon runs as another user.
+    ///
+    /// A vault record whose `/.vault` namespace is missing (removed by a
+    /// pre-B041 version) is rebuilt from that record after the caller's
+    /// password and key file are verified against it, so the vault keeps
+    /// working with its original credentials.
     pub(crate) async fn create_vault(
         &self,
         password: &str,
-        key_path: Option<&Path>,
-    ) -> Result<std::path::PathBuf> {
+        key_material: &[u8; 32],
+        owner: VaultOwner,
+    ) -> Result<()> {
         if !self.config.vault_enabled {
             return Err(anyhow_errno(
                 Errno::EOPNOTSUPP,
@@ -58,38 +120,71 @@ impl FsCore {
         }
         let _guard = self.write_lock.write().await;
 
-        if self.meta.get_sys(SYS_VAULT_WRAP)?.is_some() {
-            return Err(anyhow_errno(Errno::EEXIST, "vault is already initialized"));
+        let existing_wrap_raw = self.meta.get_sys(SYS_VAULT_WRAP)?;
+        if vault_namespace_present(&self.meta)? {
+            return Err(anyhow_errno(
+                Errno::EEXIST,
+                match existing_wrap_raw {
+                    Some(_) => "vault is already initialized",
+                    None => "vault namespace /.vault exists without a vault record",
+                },
+            ));
         }
 
-        let key_material = generate_key_file_material();
-        let folder_key = generate_folder_key();
-        let wrap = build_wrap_record(
-            password,
-            &key_material,
-            &folder_key,
-            VaultArgon2Params {
-                mem_kib: self.config.vault_argon2_mem_kib,
-                iters: self.config.vault_argon2_iters,
-                parallelism: self.config.vault_argon2_parallelism,
-            },
-        )?;
-        let out_key_path = resolve_create_key_path(key_path)?;
-        write_key_file(&out_key_path, &key_material)?;
-
+        // A vault record without its namespace is a vault whose `/.vault`
+        // directory was removed (a version that let `rmdir /.vault` succeed).
+        // The wrap record still holds the folder key, so the namespace can be
+        // rebuilt and every vault chunk stays readable — but only for a caller
+        // that can unwrap it: the rebuilt namespace keeps the original
+        // credentials, and a new password or key file would only take over a
+        // namespace it can never open.
+        let (wrap, new_wrap) = match existing_wrap_raw {
+            Some(raw) => {
+                let wrap: VaultWrapRecord = decode_rkyv(&raw)?;
+                let mut folder_key =
+                    unwrap_folder_key(password, key_material, &wrap).map_err(|err| {
+                        anyhow_errno(
+                            Errno::EPERM,
+                            format!(
+                                "vault is already initialized but its /.vault namespace is \
+                                 missing, and the supplied password and key file do not match \
+                                 the existing vault record: {err}"
+                            ),
+                        )
+                    })?;
+                folder_key.zeroize();
+                (wrap, false)
+            }
+            None => (
+                build_wrap_record(
+                    password,
+                    key_material,
+                    &generate_folder_key(),
+                    VaultArgon2Params {
+                        mem_kib: self.config.vault_argon2_mem_kib,
+                        iters: self.config.vault_argon2_iters,
+                        parallelism: self.config.vault_argon2_parallelism,
+                    },
+                )?,
+                true,
+            ),
+        };
         let now = SystemTime::now();
         let (sec, nsec) = system_time_to_parts(now);
+        let mut created_vault_ino: Option<u64> = None;
 
         self.meta
             .write_txn(|txn| {
-                if txn
-                    .get(dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()))?
-                    .is_some()
-                {
-                    return Err(anyhow_errno(
-                        Errno::EEXIST,
-                        "vault namespace already exists",
-                    ));
+                if let Some(raw) = txn.get(dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()))? {
+                    let dirent: DirentRecord = decode_rkyv(&raw)?;
+                    if txn.get(inode_key(dirent.ino))?.is_some() {
+                        return Err(anyhow_errno(
+                            Errno::EEXIST,
+                            "vault namespace already exists",
+                        ));
+                    }
+                    // Stale entry left by an interrupted create or removal.
+                    txn.delete(dirent_key(ROOT_INODE, VAULT_DIR_NAME.as_bytes()))?;
                 }
 
                 let Some(next_inode_raw) = txn.get(sys_key("next_inode"))? else {
@@ -101,6 +196,7 @@ impl FsCore {
                 let mut next_inode_bytes = [0_u8; 8];
                 next_inode_bytes.copy_from_slice(&next_inode_raw);
                 let vault_ino = u64::from_le_bytes(next_inode_bytes);
+                created_vault_ino = Some(vault_ino);
 
                 let Some(root_raw) = txn.get(inode_key(ROOT_INODE))? else {
                     return Err(anyhow_errno(Errno::EIO, "missing root inode"));
@@ -118,8 +214,8 @@ impl FsCore {
                     parent: ROOT_INODE,
                     kind: INODE_KIND_DIR,
                     perm: PERM_VAULT_DIRECTORY,
-                    uid: root_inode.uid,
-                    gid: root_inode.gid,
+                    uid: owner.uid,
+                    gid: owner.gid,
                     nlink: 2,
                     size: 0,
                     atime_sec: sec,
@@ -143,7 +239,9 @@ impl FsCore {
                     sys_key("next_inode"),
                     (vault_ino + 1).to_le_bytes().to_vec(),
                 )?;
-                txn.set(sys_key(SYS_VAULT_WRAP), encode_rkyv(&wrap)?)?;
+                if new_wrap {
+                    txn.set(sys_key(SYS_VAULT_WRAP), encode_rkyv(&wrap)?)?;
+                }
                 txn.set(sys_key(SYS_VAULT_STATE), vec![VAULT_STATE_LOCKED])?;
                 Ok(())
             })
@@ -154,12 +252,23 @@ impl FsCore {
             vault.set_initialized(true);
             vault.lock();
         }
+        if !new_wrap {
+            const REBUILT: &str = "rebuilt the missing /.vault namespace from the existing vault \
+                 record; the vault keeps its original password and key file";
+            warn!(REBUILT);
+            eprintln!("VerFSNext: {REBUILT}");
+        }
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
-        self.mark_mutation();
-        Ok(out_key_path)
+        self.mark_namespace_mutation().await;
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        self.invalidate_inode_attr_best_effort(ROOT_INODE);
+        if let Some(vault_ino) = created_vault_ino {
+            self.invalidate_inode_attr_best_effort(vault_ino);
+        }
+        Ok(())
     }
-    pub(crate) async fn unlock_vault(&self, password: &str, key_file: &Path) -> Result<()> {
+    pub(crate) async fn unlock_vault(&self, password: &str, key_material: &[u8; 32]) -> Result<()> {
         if !self.config.vault_enabled {
             return Err(anyhow_errno(
                 Errno::EOPNOTSUPP,
@@ -173,8 +282,7 @@ impl FsCore {
             .get_sys(SYS_VAULT_WRAP)?
             .ok_or_else(|| anyhow_errno(Errno::ENOENT, "vault is not initialized"))?;
         let wrap: VaultWrapRecord = decode_rkyv(&wrap_raw)?;
-        let key_material = read_key_file(key_file)?;
-        let folder_key = unwrap_folder_key(password, &key_material, &wrap)?;
+        let folder_key = unwrap_folder_key(password, key_material, &wrap)?;
         {
             let mut vault = self.vault.write();
             if vault.unlocked() {
@@ -191,6 +299,11 @@ impl FsCore {
             .await?;
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
+        self.mark_mutation();
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        if let Ok(Some(vault_dirent)) = self.load_dirent_cached(ROOT_INODE, VAULT_DIR_NAME.as_bytes()) {
+            self.invalidate_inode_attr_best_effort(vault_dirent.ino);
+        }
         Ok(())
     }
     pub(crate) async fn lock_vault(&self) -> Result<()> {
@@ -210,6 +323,11 @@ impl FsCore {
             .await?;
         self.chunk_meta_cache.invalidate_all();
         self.chunk_data_cache.invalidate_all();
+        self.mark_mutation();
+        self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
+        if let Ok(Some(vault_dirent)) = self.load_dirent_cached(ROOT_INODE, VAULT_DIR_NAME.as_bytes()) {
+            self.invalidate_inode_attr_best_effort(vault_dirent.ino);
+        }
         Ok(())
     }
 }

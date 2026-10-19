@@ -1,180 +1,112 @@
-use cdc_chunkers::{ultra, SizeParams};
+//! UltraCDC content-defined chunking (Zhou et al., IPCCC 2022).
+//!
+//! A cut point depends only on the bytes since the previous cut, never on
+//! where the data came from or how it was split into requests, so identical
+//! byte runs produce identical chunks wherever they appear in a file.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkSpan {
-    pub offset: usize,
-    pub len: usize,
+/// Bit pattern the sliding 8-byte window is compared against.
+const PATTERN: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+/// Cut mask used before the normal size is reached (fewer cut points).
+const MASK_S: u32 = 0x2F;
+/// Cut mask used after the normal size is reached (more cut points).
+const MASK_L: u32 = 0x2C;
+/// Consecutive identical 8-byte windows after which a low-entropy run is cut.
+const LOW_ENTROPY_STRING_THRESHOLD: u32 = 64;
+const WINDOW: usize = 8;
+
+/// Smallest configurable minimum chunk size: the window must fit before it.
+pub const MIN_CHUNK_SIZE_LIMIT: usize = 64;
+/// Largest configurable maximum chunk size.
+pub const MAX_CHUNK_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct UltraCdc {
+    min_size: usize,
+    normal_size: usize,
+    max_size: usize,
 }
 
-pub struct UltraStreamChunker {
-    sizes: SizeParams,
-    carry: Vec<u8>,
-    consumed_prefix: usize,
-    scanned_len: usize,
+/// Hamming distance of one byte to the pattern byte `0xAA`.
+const fn pattern_distance_table() -> [u8; 256] {
+    let mut table = [0_u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = ((byte as u8) ^ 0xAA).count_ones() as u8;
+        byte += 1;
+    }
+    table
 }
 
-impl UltraStreamChunker {
-    pub fn new(min: usize, avg: usize, max: usize) -> Self {
-        Self {
-            sizes: SizeParams::new(min, avg, max),
-            carry: Vec::new(),
-            consumed_prefix: 0,
-            scanned_len: 0,
-        }
-    }
+const PATTERN_DISTANCE: [u8; 256] = pattern_distance_table();
 
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<ChunkSpan> {
-        if bytes.is_empty() {
-            return Vec::new();
-        }
-        self.carry.extend_from_slice(bytes);
-        self.emit_ready(false)
-    }
-
-    pub fn finish(&mut self) -> Vec<ChunkSpan> {
-        self.emit_ready(true)
-    }
-
-    fn emit_ready(&mut self, finalize: bool) -> Vec<ChunkSpan> {
-        let mut out = Vec::new();
-
-        while !self.carry.is_empty() {
-            let skip_len = self.scanned_len.max(self.sizes.min);
-
-            let mut sizes = self.sizes;
-            sizes.min = skip_len;
-
-            let mut chunker = ultra::Chunker::new(&self.carry, sizes);
-            let Some(chunk) = chunker.next() else {
-                break;
-            };
-
-            if chunk.pos + chunk.len == self.carry.len() && !finalize {
-                self.scanned_len = self.carry.len().saturating_sub(8);
-                break;
-            }
-
-            out.push(ChunkSpan {
-                offset: self.consumed_prefix + chunk.pos,
-                len: chunk.len,
-            });
-
-            self.carry.drain(..chunk.len);
-            self.consumed_prefix += chunk.len;
-            self.scanned_len = 0;
-        }
-
-        if finalize {
-            self.carry.clear();
-            self.scanned_len = 0;
-        }
-
-        out
-    }
+fn read_window(data: &[u8], at: usize) -> u64 {
+    let mut bytes = [0_u8; WINDOW];
+    bytes.copy_from_slice(&data[at..at + WINDOW]);
+    u64::from_le_bytes(bytes)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::UltraStreamChunker;
-
-    #[test]
-    fn streaming_chunker_matches_single_pass_coverage() {
-        let mut streaming = UltraStreamChunker::new(2048, 4096, 16384);
-        let data = vec![42_u8; 100_000];
-        let mut spans = Vec::new();
-        for part in data.chunks(1024) {
-            spans.extend(streaming.feed(part));
-        }
-        spans.extend(streaming.finish());
-
-        let covered = spans.iter().map(|span| span.len).sum::<usize>();
-        assert_eq!(covered, data.len());
-    }
-
-    #[test]
-    fn benchmark_streaming_chunker_baseline() {
-        use std::time::Instant;
-        let mut streaming = UltraStreamChunker::new(1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024);
-
-        let chunk_size = 4096; // Feed 4KB at a time (like a slow disk or stream)
-        let total_size = 64 * 1024 * 1024; // 64 MB total
-
-        // Generate pseudo-random data to prevent extreme early match patterns
-        // but keep it fast to generate.
-        let mut data = vec![0_u8; total_size];
-        for i in 0..total_size {
-            data[i] = (i % 251) as u8;
-        }
-
-        let start = Instant::now();
-        let mut spans = Vec::new();
-        for part in data.chunks(chunk_size) {
-            spans.extend(streaming.feed(part));
-        }
-        spans.extend(streaming.finish());
-
-        let duration = start.elapsed();
-        println!(
-            "baseline_benchmark: Chunking 64MB (4KB feeds, 4MB avg chunks) took: {:?}",
-            duration
+impl UltraCdc {
+    /// Sizes must satisfy `MIN_CHUNK_SIZE_LIMIT <= min <= normal <= max <=
+    /// MAX_CHUNK_SIZE_LIMIT`, which `Config::validate` enforces.
+    pub fn new(min_size: usize, normal_size: usize, max_size: usize) -> Self {
+        assert!(
+            (MIN_CHUNK_SIZE_LIMIT..=normal_size).contains(&min_size)
+                && normal_size <= max_size
+                && max_size <= MAX_CHUNK_SIZE_LIMIT,
+            "invalid UltraCDC sizes min={min_size} normal={normal_size} max={max_size}"
         );
-        assert!(!spans.is_empty());
+        Self {
+            min_size,
+            normal_size,
+            max_size,
+        }
     }
 
-    #[test]
-    fn finish_without_data_emits_nothing() {
-        let mut streaming = UltraStreamChunker::new(2048, 4096, 16384);
-        assert!(streaming.feed(&[]).is_empty());
-        assert!(streaming.finish().is_empty());
+    pub fn max_size(&self) -> usize {
+        self.max_size
     }
 
-    #[test]
-    fn streaming_spans_are_contiguous_and_cover_all_bytes() {
-        let mut streaming = UltraStreamChunker::new(1024, 2048, 8192);
-        let total_size = 128 * 1024;
-        let mut data = vec![0_u8; total_size];
-        for (i, byte) in data.iter_mut().enumerate() {
-            *byte = (i % 251) as u8;
+    /// Length of the chunk that starts at `data[0]`.
+    ///
+    /// `data` must hold at least `max_size` bytes, or every byte left before
+    /// the end of the data run: the cut is then the same as with any longer
+    /// input, and a run shorter than a full chunk ends at its last byte.
+    pub fn cut(&self, data: &[u8]) -> usize {
+        let available = data.len();
+        let limit = available.min(self.max_size);
+        if limit > self.min_size {
+            let mut window = read_window(data, self.min_size - WINDOW);
+            let mut distance = (window ^ PATTERN).count_ones();
+            let mut mask = MASK_S;
+            let mut low_entropy_count = 0_u32;
+            let mut i = self.min_size;
+            while i + WINDOW <= limit {
+                if i >= self.normal_size {
+                    mask = MASK_L;
+                }
+                let incoming = read_window(data, i);
+                if incoming == window {
+                    // Sliding over a repeated window leaves the distance as is.
+                    low_entropy_count += 1;
+                    if low_entropy_count == LOW_ENTROPY_STRING_THRESHOLD {
+                        return i + WINDOW;
+                    }
+                    i += WINDOW;
+                    continue;
+                }
+                low_entropy_count = 0;
+                for j in 0..WINDOW {
+                    if distance & mask == 0 {
+                        return i + j;
+                    }
+                    distance = distance + u32::from(PATTERN_DISTANCE[data[i + j] as usize])
+                        - u32::from(PATTERN_DISTANCE[data[i + j - WINDOW] as usize]);
+                }
+                window = incoming;
+                i += WINDOW;
+            }
         }
-
-        let mut spans = Vec::new();
-        for part in data.chunks(333) {
-            spans.extend(streaming.feed(part));
-        }
-        spans.extend(streaming.finish());
-        assert!(!spans.is_empty());
-
-        let mut expected_offset = 0_usize;
-        for span in spans {
-            assert_eq!(span.offset, expected_offset);
-            assert!(span.len > 0);
-            expected_offset += span.len;
-        }
-        assert_eq!(expected_offset, data.len());
-    }
-
-    #[test]
-    fn chunking_is_deterministic_for_same_feed_pattern() {
-        let total_size = 64 * 1024;
-        let mut data = vec![0_u8; total_size];
-        for (i, byte) in data.iter_mut().enumerate() {
-            *byte = (i % 233) as u8;
-        }
-
-        let mut first = UltraStreamChunker::new(1024, 4096, 16384);
-        let mut first_spans = Vec::new();
-        for part in data.chunks(17) {
-            first_spans.extend(first.feed(part));
-        }
-        first_spans.extend(first.finish());
-
-        let mut second = UltraStreamChunker::new(1024, 4096, 16384);
-        let mut second_spans = Vec::new();
-        for part in data.chunks(17) {
-            second_spans.extend(second.feed(part));
-        }
-        second_spans.extend(second.finish());
-
-        assert_eq!(first_spans, second_spans);
+        limit
     }
 }
+

@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +13,22 @@ use anyhow::{bail, Context, Result};
 struct MountDaemon {
     mount_point: PathBuf,
     child: Option<Child>,
+    peak_rss_bytes: Arc<AtomicU64>,
+    _mem_monitor: Option<thread::JoinHandle<()>>,
+}
+
+fn read_pid_rss_bytes(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{}/status", pid);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    for line in contents.lines() {
+        if line.starts_with("VmRSS:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u64>().ok().map(|kb| kb * 1024);
+            }
+        }
+    }
+    None
 }
 
 impl MountDaemon {
@@ -23,16 +42,46 @@ impl MountDaemon {
             .context("failed to create daemon stderr log")?;
 
         let child = Command::new(bin)
+            .arg("mount")
             .current_dir(workdir)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
             .context("failed to start verfsnext daemon")?;
 
+        let pid = child.id();
+        let peak_rss = Arc::new(AtomicU64::new(0));
+        let peak_rss_clone = Arc::clone(&peak_rss);
+
+        let monitor = thread::spawn(move || {
+            loop {
+                if let Some(rss) = read_pid_rss_bytes(pid) {
+                    let current_peak = peak_rss_clone.load(Ordering::Relaxed);
+                    if rss > current_peak {
+                        peak_rss_clone.store(rss, Ordering::Relaxed);
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
         Ok(Self {
             mount_point,
             child: Some(child),
+            peak_rss_bytes: peak_rss,
+            _mem_monitor: Some(monitor),
         })
+    }
+
+    fn peak_rss_bytes(&self) -> u64 {
+        // Also check current RSS one more time before returning
+        if let Some(child) = &self.child {
+            if let Some(current) = read_pid_rss_bytes(child.id()) {
+                let peak = self.peak_rss_bytes.load(Ordering::Relaxed);
+                return peak.max(current);
+            }
+        }
+        self.peak_rss_bytes.load(Ordering::Relaxed)
     }
 
     fn wait_until_mounted(&self, timeout: Duration) -> Result<()> {
@@ -82,6 +131,20 @@ impl MountDaemon {
         let mount_s = self.mount_point.to_string_lossy().into_owned();
         let _ = run_cmd_raw(10, None, "fusermount", &["-uz", &mount_s]);
         bail!("daemon did not exit after SIGINT")
+    }
+}
+
+impl MountDaemon {
+    /// Kills the daemon without letting it flush or unmount, like a crash.
+    fn kill_hard(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            bail!("daemon is not running");
+        };
+        child.kill().context("failed to SIGKILL daemon")?;
+        child.wait().context("failed to reap killed daemon")?;
+        let mount_s = self.mount_point.to_string_lossy().into_owned();
+        run_cmd(10, None, "fusermount", &["-uz", &mount_s])?;
+        Ok(())
     }
 }
 
@@ -243,6 +306,286 @@ fn create_recursive_delete_fanout(mount_point: &Path, dir_count: usize) -> Resul
     Ok(target)
 }
 
+fn worker_hash(worker: usize) -> String {
+    format!("{worker:02}{worker:02}{worker:02}{worker:02}")
+}
+
+fn write_text_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent dir for {}", path.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn build_expected_cargo_like_tree(
+    root: &Path,
+    workers: usize,
+    final_iteration: usize,
+) -> Result<()> {
+    let registry_prefix = "index.crates.io-1949cf8c6b5b557f";
+
+    fs::create_dir_all(root.join("workspace"))?;
+    fs::create_dir_all(root.join("registry/src").join(registry_prefix))?;
+    fs::create_dir_all(root.join("target/debug/.fingerprint"))?;
+    fs::create_dir_all(root.join("target/debug/deps"))?;
+    fs::create_dir_all(root.join("target/debug/build"))?;
+    fs::create_dir_all(root.join("target/debug/incremental"))?;
+    fs::create_dir_all(root.join("target/tmp"))?;
+
+    for worker in 1..=workers {
+        let hash = worker_hash(worker);
+        let crate_name = format!("member_{worker}");
+
+        write_text_file(
+            &root.join("workspace").join(&crate_name).join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{crate_name}\"\nversion = \"0.{final_iteration}.0\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n"
+            ),
+        )?;
+        write_text_file(
+            &root.join("workspace").join(&crate_name).join("src/lib.rs"),
+            &format!(
+                "pub const WORKER: usize = {worker};\npub const ITERATION: usize = {final_iteration};\npub fn marker() -> &'static str {{ \"worker-{worker}-iter-{final_iteration}\" }}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("registry/src")
+                .join(registry_prefix)
+                .join(format!("{crate_name}-0.1.0"))
+                .join("src/lib.rs"),
+            &format!(
+                "pub const REGISTRY_MARKER: &str = \"registry-{worker}-{final_iteration}\";\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/deps")
+                .join(format!("lib{crate_name}.d")),
+            &format!(
+                "workspace/{crate_name}/src/lib.rs: /deps/shared-{worker}-{final_iteration}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/.fingerprint")
+                .join(format!("{crate_name}-{hash}"))
+                .join("invoked.timestamp"),
+            &format!(
+                "{{\"worker\":{worker},\"iteration\":{final_iteration},\"crate\":\"{crate_name}\"}}\n"
+            ),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/build")
+                .join(format!("{crate_name}-{hash}"))
+                .join("out/generated.rs"),
+            &format!("pub const GENERATED: &str = \"gen-{worker}-{final_iteration}\";\n"),
+        )?;
+        write_text_file(
+            &root
+                .join("target/debug/incremental")
+                .join(&crate_name)
+                .join(format!("s-{hash}"))
+                .join("work-products.txt"),
+            &format!("work-product=member_{worker} iteration={final_iteration}\n"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_tree_entries(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut dirs = BTreeSet::new();
+    let mut files = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let rel = entry_path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to strip prefix {}", root.display()))?
+                .to_string_lossy()
+                .replace('\u{5c}', "/");
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                dirs.insert(rel);
+                stack.push(entry_path);
+            } else if file_type.is_file() {
+                files.insert(rel);
+            } else {
+                bail!("unexpected non-file entry under {}", root.display());
+            }
+        }
+    }
+
+    Ok((dirs, files))
+}
+
+fn assert_trees_match(expected_root: &Path, actual_root: &Path) -> Result<()> {
+    let (expected_dirs, expected_files) = collect_tree_entries(expected_root)?;
+    let (actual_dirs, actual_files) = collect_tree_entries(actual_root)?;
+
+    if expected_dirs != actual_dirs {
+        bail!(
+            "directory layout mismatch under {}\nexpected: {:?}\nactual: {:?}",
+            actual_root.display(),
+            expected_dirs,
+            actual_dirs
+        );
+    }
+    if expected_files != actual_files {
+        bail!(
+            "file layout mismatch under {}\nexpected: {:?}\nactual: {:?}",
+            actual_root.display(),
+            expected_files,
+            actual_files
+        );
+    }
+
+    for rel in expected_files {
+        let expected = expected_root.join(&rel);
+        let actual = actual_root.join(&rel);
+        let expected_s = expected.to_string_lossy().into_owned();
+        let actual_s = actual.to_string_lossy().into_owned();
+        run_cmd(30, None, "cmp", &["-s", &expected_s, &actual_s])?;
+    }
+
+    Ok(())
+}
+
+fn verify_cargo_like_mount_state(expected_root: &Path, mount_point: &Path) -> Result<()> {
+    for subtree in ["workspace", "registry", "target"] {
+        assert_trees_match(&expected_root.join(subtree), &mount_point.join(subtree))?;
+    }
+    Ok(())
+}
+
+fn cargo_like_workload_script(
+    mount_point: &Path,
+    workers: usize,
+    iterations: usize,
+    readers: usize,
+) -> String {
+    let mut script = String::new();
+    script.push_str("set -euo pipefail\n");
+    script.push_str(&format!("mnt={:?}\n", mount_point.to_string_lossy()));
+    script.push_str(&format!("workers={}\n", workers));
+    script.push_str(&format!("iterations={}\n", iterations));
+    script.push_str(&format!("readers={}\n", readers));
+    script.push_str(
+        "registry_root=\"$mnt/registry/src/index.crates.io-1949cf8c6b5b557f\"\nworkspace_root=\"$mnt/workspace\"\nfingerprint_root=\"$mnt/target/debug/.fingerprint\"\ndeps_root=\"$mnt/target/debug/deps\"\nbuild_root=\"$mnt/target/debug/build\"\nincremental_root=\"$mnt/target/debug/incremental\"\nscratch_root=\"$mnt/target/tmp\"\nmkdir -p \"$registry_root\" \"$workspace_root\" \"$fingerprint_root\" \"$deps_root\" \"$build_root\" \"$incremental_root\" \"$scratch_root\"\n",
+    );
+    script.push_str(
+        r#"
+worker() {
+  w="$1"
+  crate="member_${w}"
+  hash=$(printf '%02d%02d%02d%02d' "$w" "$w" "$w" "$w")
+  crate_dir="$workspace_root/$crate"
+  registry_dir="$registry_root/$crate-0.1.0"
+  fp_dir="$fingerprint_root/$crate-$hash"
+  build_out="$build_root/$crate-$hash/out"
+  incr_dir="$incremental_root/$crate/s-$hash"
+
+  for i in $(seq 1 "$iterations"); do
+    if [ $((i % 4)) -eq 0 ]; then
+      rm -rf "$build_out" "$incr_dir"
+    fi
+    mkdir -p "$crate_dir/src" "$registry_dir/src" "$fp_dir" "$build_out" "$incr_dir"
+
+    cargo_tmp="$crate_dir/Cargo.toml.tmp.$i.$$"
+    lib_tmp="$crate_dir/src/lib.rs.tmp.$i.$$"
+    registry_tmp="$registry_dir/src/lib.rs.tmp.$i.$$"
+    dep_tmp="$deps_root/lib${crate}.d.tmp.$i.$$"
+    fp_tmp="$fp_dir/invoked.timestamp.tmp.$i.$$"
+    build_tmp="$build_out/generated.rs.tmp.$i.$$"
+    incr_tmp="$incr_dir/work-products.txt.tmp.$i.$$"
+
+    printf '[package]\nname = "%s"\nversion = "0.%s.0"\nedition = "2021"\n[lib]\npath = "src/lib.rs"\n' "$crate" "$i" > "$cargo_tmp"
+    printf 'pub const WORKER: usize = %s;\npub const ITERATION: usize = %s;\npub fn marker() -> &'"'"'static str { "worker-%s-iter-%s" }\n' "$w" "$i" "$w" "$i" > "$lib_tmp"
+    printf 'pub const REGISTRY_MARKER: &str = "registry-%s-%s";\n' "$w" "$i" > "$registry_tmp"
+    printf 'workspace/%s/src/lib.rs: /deps/shared-%s-%s\n' "$crate" "$w" "$i" > "$dep_tmp"
+    printf '{"worker":%s,"iteration":%s,"crate":"%s"}\n' "$w" "$i" "$crate" > "$fp_tmp"
+    printf 'pub const GENERATED: &str = "gen-%s-%s";\n' "$w" "$i" > "$build_tmp"
+    printf 'work-product=member_%s iteration=%s\n' "$w" "$i" > "$incr_tmp"
+
+    if [ $((i % 3)) -eq 0 ]; then
+      rm -f "$deps_root/lib${crate}.d" "$fp_dir/invoked.timestamp"
+    fi
+
+    mv "$cargo_tmp" "$crate_dir/Cargo.toml"
+    mv "$lib_tmp" "$crate_dir/src/lib.rs"
+    mv "$registry_tmp" "$registry_dir/src/lib.rs"
+    mv "$dep_tmp" "$deps_root/lib${crate}.d"
+    mv "$fp_tmp" "$fp_dir/invoked.timestamp"
+    mv "$build_tmp" "$build_out/generated.rs"
+    mv "$incr_tmp" "$incr_dir/work-products.txt"
+
+    cat "$crate_dir/Cargo.toml" "$crate_dir/src/lib.rs" "$registry_dir/src/lib.rs" >/dev/null
+    cat "$deps_root/lib${crate}.d" "$fp_dir/invoked.timestamp" "$build_out/generated.rs" "$incr_dir/work-products.txt" >/dev/null
+    sha256sum "$crate_dir/Cargo.toml" "$crate_dir/src/lib.rs" "$registry_dir/src/lib.rs" >/dev/null
+
+    scratch="$scratch_root/$crate-$i"
+    mkdir -p "$scratch/dir_a" "$scratch/dir_b"
+    printf 'scratch-%s-%s-a\n' "$w" "$i" > "$scratch/dir_a/a.txt"
+    printf 'scratch-%s-%s-b\n' "$w" "$i" > "$scratch/dir_b/b.txt"
+    cat "$scratch/dir_a/a.txt" "$scratch/dir_b/b.txt" >/dev/null
+    rm -rf "$scratch"
+  done
+}
+
+reader() {
+  for round in $(seq 1 $((iterations * 6))); do
+    for w in $(seq 1 "$workers"); do
+      crate="member_${w}"
+      hash=$(printf '%02d%02d%02d%02d' "$w" "$w" "$w" "$w")
+      crate_dir="$workspace_root/$crate"
+      registry_dir="$registry_root/$crate-0.1.0"
+      fp_dir="$fingerprint_root/$crate-$hash"
+      build_out="$build_root/$crate-$hash/out"
+      incr_dir="$incremental_root/$crate/s-$hash"
+
+      ls "$crate_dir" >/dev/null 2>&1 || true
+      cat "$crate_dir/Cargo.toml" >/dev/null 2>&1 || true
+      cat "$crate_dir/src/lib.rs" >/dev/null 2>&1 || true
+      cat "$registry_dir/src/lib.rs" >/dev/null 2>&1 || true
+      cat "$deps_root/lib${crate}.d" >/dev/null 2>&1 || true
+      cat "$fp_dir/invoked.timestamp" >/dev/null 2>&1 || true
+      cat "$build_out/generated.rs" >/dev/null 2>&1 || true
+      cat "$incr_dir/work-products.txt" >/dev/null 2>&1 || true
+    done
+
+    ls "$workspace_root" >/dev/null 2>&1 || true
+    ls "$deps_root" >/dev/null 2>&1 || true
+    ls "$fingerprint_root" >/dev/null 2>&1 || true
+    ls "$build_root" >/dev/null 2>&1 || true
+    ls "$incremental_root" >/dev/null 2>&1 || true
+  done
+}
+
+pids=""
+for w in $(seq 1 "$workers"); do
+  worker "$w" &
+  pids="$pids $!"
+done
+for r in $(seq 1 "$readers"); do
+  reader &
+  pids="$pids $!"
+done
+for pid in $pids; do
+  wait "$pid"
+done
+"#,
+    );
+    script
+}
+
 #[test]
 fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
     if std::env::consts::OS != "linux" {
@@ -368,9 +711,124 @@ fn rsync_copy_remount_and_delete_persistence() -> Result<()> {
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);
-
     Ok(())
 }
+
+/// Regression test for B002: git clone data corruption
+///
+/// Clones the ComfyUI-Manager repository (~155 MiB, 29851 objects) onto the
+/// FUSE mount. The clone must complete successfully without any inflate errors
+/// or corruption. This test specifically stresses the write-read coherency
+/// path under heavy concurrent write+read workload typical of git clone.
+///
+/// Requires: `git`, network access to github.com
+#[test]
+fn git_clone_comfyui_manager_regression() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "git",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_size_mb = 1024\nbatch_flush_interval_ms = 100\nfuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), &config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    // Diagnostic: write a small file and read it back
+    let diag_path = mount_point.join("diag.txt");
+    let diag_content = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n";
+    fs::write(&diag_path, diag_content).context("diagnostic write failed")?;
+    let read_back = fs::read_to_string(&diag_path).context("diagnostic read failed")?;
+    if read_back != diag_content {
+        let daemon_stderr = fs::read_to_string(root.join("daemon.stderr.log")).unwrap_or_default();
+        bail!(
+            "DIAGNOSTIC FAILED: wrote {} bytes, read back {} bytes\n\
+             wrote: {:?}\nread:   {:?}\n\
+             daemon stderr:\n{}",
+            diag_content.len(),
+            read_back.len(),
+            diag_content,
+            read_back,
+            daemon_stderr,
+        );
+    }
+    eprintln!("DIAGNOSTIC PASSED: wrote {} bytes, read back {} bytes OK", diag_content.len(), read_back.len());
+
+    // Clone the ComfyUI-Manager repo with full checkout (no --depth=1).
+    // The full repo has 29851 objects (~155 MiB) which exercises the
+    // write-read coherency path with many small+large pack file writes.
+    // Full clone triggers the race condition that shallow clones avoid.
+    let output = run_cmd_raw(
+        600,
+        Some(&mount_point),
+        "git",
+        &[
+            "-c", "protocol.version=2",
+            "clone",
+            "https://github.com/ltdrdata/ComfyUI-Manager",
+        ],
+    )?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let daemon_stderr = fs::read_to_string(root.join("daemon.stderr.log")).unwrap_or_default();
+        bail!(
+            "git clone failed — possible data corruption\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}\n\ndaemon stderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr,
+            daemon_stderr,
+        );
+    }
+
+    let cloned = mount_point.join("ComfyUI-Manager");
+    let fsck_output = run_cmd_raw(
+        120,
+        Some(&cloned),
+        "git",
+        &["fsck", "--no-dangling"],
+    )?;
+    if !fsck_output.status.success() {
+        let stdout = String::from_utf8_lossy(&fsck_output.stdout);
+        let stderr = String::from_utf8_lossy(&fsck_output.stderr);
+        bail!(
+            "git fsck detected corruption in cloned repo\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            fsck_output.status.code(),
+            stdout,
+            stderr,
+        );
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
 
 #[test]
 fn rsync_large_file_rollover_multpack_persists() -> Result<()> {
@@ -495,6 +953,1321 @@ fn rm_rf_large_fanout_directory_succeeds() -> Result<()> {
     if stat_out_post.status.success() {
         bail!("rm_fanout reappeared after remount")
     }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn cargo_like_concurrent_crud_integrity_persists() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "cat",
+        "cmp",
+        "ls",
+        "sha256sum",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let workers = 6_usize;
+    let iterations = 12_usize;
+    let readers = 3_usize;
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let expected_dir = root.join("expected");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&expected_dir).context("failed to create expected dir")?;
+    build_expected_cargo_like_tree(&expected_dir, workers, iterations)?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let workload = cargo_like_workload_script(&mount_point, workers, iterations, readers);
+    run_cmd(300, None, "bash", &["-c", &workload])?;
+
+    verify_cargo_like_mount_state(&expected_dir, &mount_point)?;
+
+    daemon.stop_graceful()?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    verify_cargo_like_mount_state(&expected_dir, &mount_point)?;
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn invalidation_sensitive_visibility_with_entry_ttl() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "mv",
+        "rm",
+        "ls",
+        "stat",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\nfuse_attr_ttl_ms = 4000\nfuse_entry_ttl_ms = 4000\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let vis_dir = mount_point.join("vis");
+    let vis_dir_s = vis_dir.to_string_lossy().into_owned();
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("mkdir -p '{}'", vis_dir_s)],
+    )?;
+
+    let created = vis_dir.join("created.txt");
+    let created_s = created.to_string_lossy().into_owned();
+    let created_stat_before = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if created_stat_before.status.success() {
+        bail!("created.txt unexpectedly existed before create")
+    }
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'create-visible' > '{}'", created_s)],
+    )?;
+
+    let created_stat_after = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if !created_stat_after.status.success() {
+        bail!("created.txt not visible immediately after create with entry TTL")
+    }
+
+    run_cmd(30, None, "rm", &["-f", &created_s])?;
+    let created_stat_deleted = run_cmd_raw(10, None, "stat", &[&created_s])?;
+    if created_stat_deleted.status.success() {
+        bail!("created.txt still visible immediately after unlink with entry TTL")
+    }
+
+    let old_name = vis_dir.join("old.txt");
+    let new_name = vis_dir.join("new.txt");
+    let old_s = old_name.to_string_lossy().into_owned();
+    let new_s = new_name.to_string_lossy().into_owned();
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'rename-source' > '{}'", old_s)],
+    )?;
+
+    let old_stat_before = run_cmd_raw(10, None, "stat", &[&old_s])?;
+    if !old_stat_before.status.success() {
+        bail!("old.txt missing before rename")
+    }
+    let new_stat_before = run_cmd_raw(10, None, "stat", &[&new_s])?;
+    if new_stat_before.status.success() {
+        bail!("new.txt unexpectedly existed before rename")
+    }
+
+    run_cmd(30, None, "mv", &[&old_s, &new_s])?;
+
+    let old_stat_after = run_cmd_raw(10, None, "stat", &[&old_s])?;
+    if old_stat_after.status.success() {
+        bail!("old.txt still visible immediately after rename with entry TTL")
+    }
+    let new_stat_after = run_cmd_raw(10, None, "stat", &[&new_s])?;
+    if !new_stat_after.status.success() {
+        bail!("new.txt not visible immediately after rename with entry TTL")
+    }
+
+    let ls_out = run_cmd(30, None, "ls", &["-1", &vis_dir_s])?;
+    let ls_text = String::from_utf8_lossy(&ls_out.stdout);
+    if ls_text.lines().any(|line| line == "old.txt") {
+        bail!("old.txt still listed after rename with entry TTL")
+    }
+    if !ls_text.lines().any(|line| line == "new.txt") {
+        bail!("new.txt missing from directory listing after rename with entry TTL")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn invalidation_sensitive_hardlink_visibility_with_entry_ttl() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "ln",
+        "rm",
+        "stat",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_max_blocks = 3000\nbatch_flush_interval_ms = 250\nfuse_attr_ttl_ms = 4000\nfuse_entry_ttl_ms = 4000\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), config).context("failed to write config.toml")?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let hardlink_dir = mount_point.join("hardlink_vis");
+    let hardlink_dir_s = hardlink_dir.to_string_lossy().into_owned();
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("mkdir -p '{}'", hardlink_dir_s)],
+    )?;
+
+    let base = hardlink_dir.join("base.txt");
+    let alias = hardlink_dir.join("alias.txt");
+    let base_s = base.to_string_lossy().into_owned();
+    let alias_s = alias.to_string_lossy().into_owned();
+
+    run_cmd(
+        30,
+        None,
+        "bash",
+        &["-c", &format!("printf 'hardlink-source' > '{}'", base_s)],
+    )?;
+
+    let alias_before = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if alias_before.status.success() {
+        bail!("alias.txt unexpectedly existed before link")
+    }
+
+    run_cmd(30, None, "ln", &[&base_s, &alias_s])?;
+
+    let alias_after = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if !alias_after.status.success() {
+        bail!("alias.txt not visible immediately after hardlink with entry TTL")
+    }
+
+    let base_stat = run_cmd(10, None, "stat", &["-c", "%i %h", &base_s])?;
+    let alias_stat = run_cmd(10, None, "stat", &["-c", "%i %h", &alias_s])?;
+    let base_sig = String::from_utf8_lossy(&base_stat.stdout).trim().to_owned();
+    let alias_sig = String::from_utf8_lossy(&alias_stat.stdout)
+        .trim()
+        .to_owned();
+    if base_sig != alias_sig {
+        bail!("hardlink inode/link-count mismatch: base={base_sig} alias={alias_sig}")
+    }
+
+    run_cmd(30, None, "rm", &["-f", &alias_s])?;
+    let alias_deleted = run_cmd_raw(10, None, "stat", &[&alias_s])?;
+    if alias_deleted.status.success() {
+        bail!("alias.txt still visible immediately after unlink with entry TTL")
+    }
+
+    let base_after = run_cmd_raw(10, None, "stat", &[&base_s])?;
+    if !base_after.status.success() {
+        bail!("base.txt missing after alias unlink")
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// Benchmark copying files with the same profile as the ComfyUI install at
+/// `/mnt/verfs/comfyui/`. That dataset has three tiers:
+///
+///   Tier       Files   Size     Profile
+///   ────────────────────────────────────────
+///   comfy-env  72K      9 GB    Python venv: many tiny files <64KB
+///   ComfyUI    14K    2+ GB     App code: mostly <16KB
+///   models    110     14 GB     Model weights: 124 MB – 3.4 GB
+///
+/// We downsample to ~500 small files (23 MB) + 2 large files (192 MB) so the
+/// benchmark finishes in ~10 s but still exercises the same I/O patterns.
+///
+/// **Durability measurement** – every file is individually `fsync`'d through
+/// Heavy ComfyUI-like profile benchmark.
+///
+/// Phases (all with UNIQUE content per file, no dedup collapsing):
+///   1. sm_write_dura  — Write 3000 small files (~274 MB unique) to a site-packages layout
+///   2. sm_read_seq    — Sequential read (hot cache)
+///   3. lg_write_dura  — Write 3 large models (768+384+192 = 1344 MB unique) — evicts small chunks
+///   4. sm_read_rnd    — Random-order read of small files (COLD — chunks evicted by phase 3)
+///   5. lg_read_seq    — Sequential large-file read (hot chunks)
+///   6. lg_read_rev    — Reverse-order large-file read (defeats sequential readahead)
+///   7. mod_write_dura — Overwrite 750 files with NEW unique content
+///   8. mod_read       — Read modified files
+///   9. sync_barrier   — system-wide sync
+///
+/// Total unique data written: ~1.7 GB (exceeds default 1 GB chunk cache).
+/// Timing is wall-clock via `date +%s%N` inside the FUSE mount.
+#[test]
+fn bench_comfyui_profile() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "dd",
+        "sync",
+        "sha256sum",
+        "shuf",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("mount dir")?;
+    fs::create_dir_all(&data_dir).context("data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\n\
+         sync_interval_ms = 1000\nbatch_max_size_mb = 1024\n\
+         batch_flush_interval_ms = 250\n\
+         fuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), &config).context("config")?;
+
+    // ── Seed content ──────────────────────────────────────────────────────
+    // 2 GB deterministic high-entropy seed so every file can use unique data.
+    let seed_file = root.join("seed.bin");
+    let mut sf = File::create(&seed_file).context("seed file")?;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut block = vec![0u8; 1024 * 1024];
+    for _ in 0..2048 {
+        for byte in &mut block {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 56) as u8;
+        }
+        sf.write_all(&block).context("seed chunk")?;
+    }
+    drop(sf);
+    let seed_s = seed_file.to_string_lossy();
+
+    // ── Launch daemon ─────────────────────────────────────────────────────
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let mnt_s = mount_point.to_string_lossy();
+
+    // ── Benchmark script ───────────────────────────────────────────────────
+    // Heavier, cache-defeating workload:
+    //   - 3000 small files with UNIQUE content (different seed offsets, no dedup)
+    //   - 3 large model files totaling ~1.3 GB of unique data
+    //   - Random-order & reverse-order reads to defeat OS page cache + FUSE cache
+    //   - Overwrite phase (750 modified files with NEW unique content)
+    //   - Total unique data written exceeds default 1 GB chunk cache
+    //   - Phase ordering guarantees small file chunks are evicted before cold read
+    let script = format!(
+        r#"set -euo pipefail
+SEED={seed_s}
+MNT={mnt_s}
+
+phase() {{
+    local name="$1" start="$2" end="$3"
+    echo "BENCH:$name:$(( end - start ))"
+}}
+
+SITE="$MNT/lib/python3.13/site-packages"
+BINDIR="$MNT/bin"
+MODELS="$MNT/models"
+mkdir -p "$SITE" "$BINDIR" "$MODELS"
+
+# ---- Phase 1: Write small files with UNIQUE content --------------------------
+# 300 packages x 10 files = 3000 files
+# Each file reads from a unique, non-overlapping seed offset so no dedup occurs.
+# Tier breakdown:
+#   tier-1  35%: 1050 files, <1 KB (config / __init__)
+#   tier-2  50%: 1500 files, 1-64 KB (source modules)
+#   tier-3  15%: 450 files, 64 KB-1 MB (compiled extensions / data)
+
+p1_start=$(date +%s%N)
+cumulative_kb=0
+
+for pkg in $(seq 1 300); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    mkdir -p "$pdir"
+    for slot in 0 1 2 3 4 5 6 7 8 9; do
+        idx=$(( (pkg - 1) * 10 + slot + 1 ))
+        if [ "$idx" -le 1050 ]; then
+            # tier-1: <1 KB → round to 1 KB
+            size_kb=1
+        elif [ "$idx" -le 2550 ]; then
+            # tier-2: 1-64 KB
+            size_bytes=$(( 1024 + (idx * 13) % 64512 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
+        else
+            # tier-3: 64 KB-1 MB
+            size_bytes=$(( 65536 + (idx * 17) % 983040 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fi
+        fname="mod_$(printf '%02d' "$slot").py"
+        [ "$slot" -eq 0 ] && fname="__init__.py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        cumulative_kb=$(( cumulative_kb + size_kb ))
+    done
+done
+
+# Bin scripts (20 small scripts with unique content)
+for i in $(seq 1 20); do
+    size_kb=$(( 1 + (i * 11) % 15 ))
+    dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+    cumulative_kb=$(( cumulative_kb + size_kb ))
+done
+
+p1_end=$(date +%s%N)
+phase "sm_write_dura" "$p1_start" "$p1_end"
+
+# ---- Phase 2: Read small files sequentially (HOT cache) ----------------------
+p2_start=$(date +%s%N)
+find "$SITE" -type f -exec sha256sum {{}} + > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p2_end=$(date +%s%N)
+phase "sm_read_seq" "$p2_start" "$p2_end"
+
+# ---- Phase 3: Large files with UNIQUE content (EVICTS small file chunks) -----
+# 768 MB checkpoint + 384 MB diffusion + 192 MB vae = 1344 MB total
+# Reads from unique seed regions well past the small-file data.
+# This write overflows the default 1 GB chunk cache, evicting small-file chunks.
+p3_start=$(date +%s%N)
+lgb_mb=400
+dd if="$SEED" bs=1M count=768 skip=$lgb_mb of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 768 ))
+dd if="$SEED" bs=1M count=384 skip=$lgb_mb of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 384 ))
+dd if="$SEED" bs=1M count=192 skip=$lgb_mb of="$MODELS/vae.bin" conv=fsync 2>/dev/null
+p3_end=$(date +%s%N)
+phase "lg_write_dura" "$p3_start" "$p3_end"
+
+# ---- Phase 4: Read small files in random order (COLD - chunks evicted) -------
+# The large file write evicted small file chunks from cache.
+# shuf randomizes access order, defeating any remaining OS page cache.
+p4_start=$(date +%s%N)
+find "$SITE" -type f -print0 | shuf -z | xargs -0 -n1 sha256sum > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p4_end=$(date +%s%N)
+phase "sm_read_rnd" "$p4_start" "$p4_end"
+
+# ---- Phase 5: Read large files sequentially (HOT chunks) ---------------------
+p5_start=$(date +%s%N)
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/vae.bin" > /dev/null
+p5_end=$(date +%s%N)
+phase "lg_read_seq" "$p5_start" "$p5_end"
+
+# ---- Phase 6: Read large files in REVERSE order (defeats seq readahead) ------
+p6_start=$(date +%s%N)
+sha256sum "$MODELS/vae.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+p6_end=$(date +%s%N)
+phase "lg_read_rev" "$p6_start" "$p6_end"
+
+# ---- Phase 7: Overwrite 50% of small files with NEW unique content ------------
+# Every other package (150 of 300), 5 files each = 750 modified files.
+# Reads from seeds at offset well past all prior regions.
+p7_start=$(date +%s%N)
+ovw_kb=$(( cumulative_kb + 4096 ))
+for pkg in $(seq 2 2 300); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    for slot in 5 6 7 8 9; do
+        idx=$(( (pkg - 1) * 10 + slot + 1 ))
+        size_bytes=$(( 2048 + (idx * 23) % 64512 ))
+        size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fname="mod_$(printf '%02d' "$slot").py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$ovw_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        ovw_kb=$(( ovw_kb + size_kb ))
+    done
+done
+p7_end=$(date +%s%N)
+phase "mod_write_dura" "$p7_start" "$p7_end"
+
+# ---- Phase 8: Read modified files --------------------------------------------
+p8_start=$(date +%s%N)
+for pkg in $(seq 2 2 300); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    sha256sum "$pdir"/* > /dev/null
+done
+p8_end=$(date +%s%N)
+phase "mod_read" "$p8_start" "$p8_end"
+
+# ---- Phase 9: Final durability barrier (system-wide sync) ---------------------
+p9_start=$(date +%s%N)
+sync
+p9_end=$(date +%s%N)
+phase "sync_barrier" "$p9_start" "$p9_end"
+
+echo "---"
+echo "BENCH:summary_total:$(( p9_end - p1_start ))"
+"#,
+    );
+
+    let out = run_cmd(900, Some(&root), "bash", &["-c", &script])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    for line in stdout.lines() {
+        if line.starts_with("BENCH:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let name = parts[1];
+                let ns: u128 = parts[2].parse().unwrap_or(0);
+                let ms = ns as f64 / 1_000_000.0;
+                println!("  {name:20}  {ms:>8.1} ms");
+            }
+        }
+    }
+
+    // Sanity checks: count all small files (pkg files under lib/python + bin scripts)
+    let sm_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "(",
+        "-path",
+        "*/lib/python*",
+        "-o",
+        "-path",
+        "*/bin/*",
+        ")",
+    ])?;
+    let sm_count = String::from_utf8_lossy(&sm_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(
+        sm_count == 3020,
+        "expected 3020 small files (3000 pkg + 20 bin), got {}",
+        sm_count
+    );
+
+    let lg_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "-path",
+        "*/models/*",
+    ])?;
+    let lg_count = String::from_utf8_lossy(&lg_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(lg_count == 3, "expected 3 large files, got {}", lg_count);
+
+    for path in &["models/checkpoint.bin", "models/diffusion.bin", "models/vae.bin"] {
+        let stat_out = run_cmd(
+            30,
+            None,
+            "stat",
+            &["-c", "%s", &format!("{}/{}", mnt_s, path)],
+        )?;
+        let size: u64 = String::from_utf8_lossy(&stat_out.stdout)
+            .trim()
+            .parse()
+            .context("stat size")?;
+        anyhow::ensure!(size > 0, "{} is empty", path);
+    }
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// Scaled-down version of bench_comfyui_profile for quick iteration.
+/// 600 small files (~50 MB) + 3 large files (128+64+32 = 224 MB) + overwrite/rnd phases.
+/// Same cache-defeating structure (unique content, random/reverse reads).
+/// Total unique data: ~300 MB.
+#[test]
+fn bench_comfyui_profile_fast() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Ok(());
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+
+    for tool in [
+        "timeout",
+        "mountpoint",
+        "fusermount",
+        "bash",
+        "dd",
+        "sync",
+        "sha256sum",
+        "shuf",
+    ] {
+        if require_tool(tool).is_err() {
+            return Ok(());
+        }
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&mount_point).context("mount dir")?;
+    fs::create_dir_all(&data_dir).context("data dir")?;
+
+    let config = format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\n\
+         sync_interval_ms = 1000\nbatch_max_size_mb = 1024\n\
+         batch_flush_interval_ms = 250\n\
+         fuse_attr_ttl_ms = 0\nfuse_entry_ttl_ms = 0\n",
+        mount_point.display(),
+        data_dir.display()
+    );
+    fs::write(root.join("config.toml"), &config).context("config")?;
+
+    // Seed content - deterministic high-entropy block
+    let seed_file = root.join("seed.bin");
+    let mut sf = File::create(&seed_file).context("seed file")?;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut block = vec![0u8; 1024 * 1024];
+    for _ in 0..384 {
+        for byte in &mut block {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 56) as u8;
+        }
+        sf.write_all(&block).context("seed chunk")?;
+    }
+    drop(sf);
+    let seed_s = seed_file.to_string_lossy();
+
+    // Launch daemon
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let mnt_s = mount_point.to_string_lossy();
+
+    // ── Benchmark script ───────────────────────────────────────────────────
+    // Scaled-down but same structure as the full benchmark.
+    // 600 small files with unique content + 3 large files (224 MB total) + overwrite/reverse.
+    let script = format!(
+        r#"set -euo pipefail
+SEED={seed_s}
+MNT={mnt_s}
+
+phase() {{
+    local name="$1" start="$2" end="$3"
+    echo "BENCH:$name:$(( end - start ))"
+}}
+
+SITE="$MNT/lib/python3.13/site-packages"
+BINDIR="$MNT/bin"
+MODELS="$MNT/models"
+mkdir -p "$SITE" "$BINDIR" "$MODELS"
+
+# ---- Phase 1: Small files with unique content ----
+p1_start=$(date +%s%N)
+cumulative_kb=0
+
+for pkg in $(seq 1 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    mkdir -p "$pdir"
+    for slot in 0 1 2 3 4 5; do
+        idx=$(( (pkg - 1) * 6 + slot + 1 ))
+        if [ "$idx" -le 210 ]; then
+            size_kb=1
+        elif [ "$idx" -le 510 ]; then
+            size_bytes=$(( 1024 + (idx * 13) % 16384 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
+        else
+            size_bytes=$(( 32768 + (idx * 17) % 229376 ))
+            size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fi
+        fname="mod_$(printf '%02d' "$slot").py"
+        [ "$slot" -eq 0 ] && fname="__init__.py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        cumulative_kb=$(( cumulative_kb + size_kb ))
+    done
+done
+
+for i in $(seq 1 10); do
+    size_kb=$(( 1 + (i * 7) % 10 ))
+    dd if="$SEED" bs=1024 count="$size_kb" skip="$cumulative_kb" of="$BINDIR/script_$(printf '%04d' "$i")" conv=fsync 2>/dev/null
+    cumulative_kb=$(( cumulative_kb + size_kb ))
+done
+
+p1_end=$(date +%s%N)
+phase "sm_write_dura" "$p1_start" "$p1_end"
+
+# ---- Phase 2: Read small files sequentially (HOT) ----
+p2_start=$(date +%s%N)
+find "$SITE" -type f -exec sha256sum {{}} + > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p2_end=$(date +%s%N)
+phase "sm_read_seq" "$p2_start" "$p2_end"
+
+# ---- Phase 3: Large files (unique content, evicts small chunks) ----
+p3_start=$(date +%s%N)
+lgb_mb=100
+dd if="$SEED" bs=1M count=128 skip=$lgb_mb of="$MODELS/checkpoint.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 128 ))
+dd if="$SEED" bs=1M count=64 skip=$lgb_mb of="$MODELS/diffusion.bin" conv=fsync 2>/dev/null
+lgb_mb=$(( lgb_mb + 64 ))
+dd if="$SEED" bs=1M count=32 skip=$lgb_mb of="$MODELS/vae.bin" conv=fsync 2>/dev/null
+p3_end=$(date +%s%N)
+phase "lg_write_dura" "$p3_start" "$p3_end"
+
+# ---- Phase 4: Read small files in random order (COLD) ----
+p4_start=$(date +%s%N)
+find "$SITE" -type f -print0 | shuf -z | xargs -0 -n1 sha256sum > /dev/null
+sha256sum "$BINDIR"/* > /dev/null
+p4_end=$(date +%s%N)
+phase "sm_read_rnd" "$p4_start" "$p4_end"
+
+# ---- Phase 5: Read large files sequentially ----
+p5_start=$(date +%s%N)
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/vae.bin" > /dev/null
+p5_end=$(date +%s%N)
+phase "lg_read_seq" "$p5_start" "$p5_end"
+
+# ---- Phase 6: Read large files in REVERSE order ----
+p6_start=$(date +%s%N)
+sha256sum "$MODELS/vae.bin" > /dev/null
+sha256sum "$MODELS/diffusion.bin" > /dev/null
+sha256sum "$MODELS/checkpoint.bin" > /dev/null
+p6_end=$(date +%s%N)
+phase "lg_read_rev" "$p6_start" "$p6_end"
+
+# ---- Phase 7: Overwrite 50% of small files ----
+p7_start=$(date +%s%N)
+ovw_kb=$(( cumulative_kb + 512 ))
+for pkg in $(seq 2 2 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    for slot in 3 4 5; do
+        size_bytes=$(( 2048 + (pkg * 17) % 16384 ))
+        size_kb=$(( (size_bytes + 1023) / 1024 ))
+        fname="mod_$(printf '%02d' "$slot").py"
+        dd if="$SEED" bs=1024 count="$size_kb" skip="$ovw_kb" of="$pdir/$fname" conv=fsync 2>/dev/null
+        ovw_kb=$(( ovw_kb + size_kb ))
+    done
+done
+p7_end=$(date +%s%N)
+phase "mod_write_dura" "$p7_start" "$p7_end"
+
+# ---- Phase 8: Read modified files ----
+p8_start=$(date +%s%N)
+for pkg in $(seq 2 2 100); do
+    pdir="$SITE/package_$(printf '%04d' "$pkg")"
+    sha256sum "$pdir"/* > /dev/null
+done
+p8_end=$(date +%s%N)
+phase "mod_read" "$p8_start" "$p8_end"
+
+# ---- Phase 9: Sync barrier ----
+p9_start=$(date +%s%N)
+sync
+p9_end=$(date +%s%N)
+phase "sync_barrier" "$p9_start" "$p9_end"
+
+echo "---"
+echo "BENCH:summary_total:$(( p9_end - p1_start ))"
+"#,
+    );
+
+    let out = run_cmd(600, Some(&root), "bash", &["-c", &script])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    for line in stdout.lines() {
+        if line.starts_with("BENCH:") {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let name = parts[1];
+                let ns: u128 = parts[2].parse().unwrap_or(0);
+                let ms = ns as f64 / 1_000_000.0;
+                println!("  {name:20}  {ms:>8.1} ms");
+            }
+        }
+    }
+
+    // Sanity checks
+    let sm_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "(",
+        "-path",
+        "*/lib/python*",
+        "-o",
+        "-path",
+        "*/bin/*",
+        ")",
+    ])?;
+    let sm_count = String::from_utf8_lossy(&sm_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(
+        sm_count == 610,
+        "expected 610 small files (600 pkg + 10 bin), got {}",
+        sm_count
+    );
+
+    let lg_lines = run_cmd(30, None, "find", &[
+        mnt_s.as_ref(),
+        "-type",
+        "f",
+        "-path",
+        "*/models/*",
+    ])?;
+    let lg_count = String::from_utf8_lossy(&lg_lines.stdout)
+        .lines()
+        .count();
+    anyhow::ensure!(lg_count == 3, "expected 3 large files, got {}", lg_count);
+
+    for path in &["models/checkpoint.bin", "models/diffusion.bin", "models/vae.bin"] {
+        let stat_out = run_cmd(
+            30,
+            None,
+            "stat",
+            &["-c", "%s", &format!("{}/{}", mnt_s, path)],
+        )?;
+        let size: u64 = String::from_utf8_lossy(&stat_out.stdout)
+            .trim()
+            .parse()
+            .context("stat size")?;
+        anyhow::ensure!(size > 0, "{} is empty", path);
+    }
+
+    // Report memory metrics
+    let peak_rss = daemon.peak_rss_bytes();
+    let peak_rss_mb = peak_rss as f64 / (1024.0 * 1024.0);
+    println!("  {:20}  {:>8.1} MB", "peak_rss", peak_rss_mb);
+    println!("METRIC peak_rss_mb={:.2}", peak_rss_mb);
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+fn verfsnext_bin() -> Result<String> {
+    Ok(std::env::var_os("CARGO_BIN_EXE_verfsnext")
+        .context("CARGO_BIN_EXE_verfsnext is not set")?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn control(root: &Path, args: &[&str]) -> Result<String> {
+    let bin = verfsnext_bin()?;
+    let config = root.join("config.toml").to_string_lossy().into_owned();
+    let mut full = vec!["--config", config.as_str()];
+    full.extend_from_slice(args);
+    let out = run_cmd(120, Some(root), &bin, &full)?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn assert_stats_healthy(root: &Path) -> Result<()> {
+    let stats = control(root, &["stats"])?;
+    let row = |name: &str| {
+        stats
+            .lines()
+            .find(|line| line.contains(name))
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("stats has no '{name}' row:\n{stats}"))
+    };
+    let consistency = row("Metadata Consistency")?;
+    if !consistency.contains("| ok") {
+        bail!("metadata consistency is not ok: {consistency}");
+    }
+    let crc_errors = row("Pack CRC32 Read Errors")?;
+    if !crc_errors.contains("| 0 ") {
+        bail!("pack checksum errors reported: {crc_errors}");
+    }
+    Ok(())
+}
+
+fn random_file(dir: &Path, name: &str, mib: u64) -> Result<PathBuf> {
+    let path = dir.join(name);
+    let of = format!("of={}", path.display());
+    let count = format!("count={mib}");
+    run_cmd(
+        300,
+        None,
+        "dd",
+        &["if=/dev/urandom", &of, "bs=1M", &count, "status=none"],
+    )?;
+    Ok(path)
+}
+
+fn copy_into(src: &Path, dst: &Path) -> Result<()> {
+    let src_s = src.to_string_lossy().into_owned();
+    let dst_s = dst.to_string_lossy().into_owned();
+    run_cmd(300, None, "cp", &[&src_s, &dst_s])?;
+    Ok(())
+}
+
+/// Copies `src` to `dst` and fsyncs it before returning, so the data has
+/// reached the pack and its metadata is committed.
+fn copy_into_fsync(src: &Path, dst: &Path) -> Result<()> {
+    let iff = format!("if={}", src.display());
+    let of = format!("of={}", dst.display());
+    run_cmd(
+        300,
+        None,
+        "dd",
+        &[&iff, &of, "bs=1M", "conv=fsync", "status=none"],
+    )?;
+    Ok(())
+}
+
+fn remove(path: &Path) -> Result<()> {
+    let path_s = path.to_string_lossy().into_owned();
+    run_cmd(120, None, "rm", &[&path_s])?;
+    Ok(())
+}
+
+fn run_sync() -> Result<()> {
+    run_cmd(120, None, "sync", &[])?;
+    Ok(())
+}
+
+/// Pack data files (`pack-*.vpk`) by name with their sizes.
+fn pack_files(packs_dir: &Path) -> Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(packs_dir).context("failed to read packs dir")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.starts_with("pack-") && name.ends_with(".vpk") {
+                out.push((name, file.metadata()?.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// True while a pack rewrite has its temporary pack file on disk.
+fn rewrite_in_progress(packs_dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(packs_dir).context("failed to read packs dir")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            if file?.file_name().to_string_lossy().ends_with(".vpk.rewrite") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn wait_for(
+    what: &str,
+    timeout: Duration,
+    poll: Duration,
+    mut done: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done()? {
+            return Ok(());
+        }
+        thread::sleep(poll);
+    }
+    bail!("timed out waiting for {what}")
+}
+
+fn assert_same_content(expected: &Path, actual: &Path) -> Result<()> {
+    if sha256(expected)? != sha256(actual)? {
+        bail!(
+            "content of {} does not match {}",
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+fn compaction_test_config(mount_point: &Path, data_dir: &Path) -> String {
+    format!(
+        "mount_point = \"{}\"\ndata_dir = \"{}\"\nsync_interval_ms = 1000\nbatch_flush_interval_ms = 50\ngc_idle_min_ms = 2000\nvault_argon2_mem_kib = 8192\nvault_argon2_iters = 1\n",
+        mount_point.display(),
+        data_dir.display()
+    )
+}
+
+fn compaction_tests_enabled() -> Result<bool> {
+    if std::env::consts::OS != "linux" {
+        return Ok(false);
+    }
+    if std::env::var("VERFSNEXT_RUN_MOUNT_TESTS").ok().as_deref() != Some("1") {
+        return Ok(false);
+    }
+    for tool in [
+        "timeout",
+        "dd",
+        "cp",
+        "sync",
+        "sha256sum",
+        "mountpoint",
+        "fusermount",
+    ] {
+        require_tool(tool)?;
+    }
+    Ok(true)
+}
+
+/// The active pack is compacted in place while files are written, overwritten,
+/// re-created with the content of deleted files (plain and vault) and read.
+/// Data appended while the copy runs must be carried over, the pack must keep
+/// its id and keep growing, and every file must match before and after a
+/// remount.
+#[test]
+fn gc_compacts_active_pack_in_place_under_concurrent_io() -> Result<()> {
+    if !compaction_tests_enabled()? {
+        return Ok(());
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let src_dir = root.join("src");
+    let key_dir = root.join("keys");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&src_dir).context("failed to create source dir")?;
+    fs::write(
+        root.join("config.toml"),
+        compaction_test_config(&mount_point, &data_dir),
+    )
+    .context("failed to write config.toml")?;
+    let packs_dir = data_dir.join("packs");
+
+    let keep = random_file(&src_dir, "keep.bin", 512)?;
+    let dead_big = random_file(&src_dir, "dead_big.bin", 192)?;
+    let dead_small = random_file(&src_dir, "dead_small.bin", 16)?;
+    let cow_v1 = random_file(&src_dir, "cow_v1.bin", 16)?;
+    let cow_v2 = random_file(&src_dir, "cow_v2.bin", 16)?;
+    let vault_keep = random_file(&src_dir, "vault_keep.bin", 24)?;
+    let vault_dead = random_file(&src_dir, "vault_dead.bin", 64)?;
+    let during = (0..4)
+        .map(|i| random_file(&src_dir, &format!("during{i}.bin"), 8))
+        .collect::<Result<Vec<_>>>()?;
+    let after = random_file(&src_dir, "after.bin", 16)?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+
+    let password = "compaction-test-password";
+    let key_dir_s = key_dir.to_string_lossy().into_owned();
+    let key_file = control(&root, &["crypt", "-c", "-p", password, "-path", &key_dir_s])?
+        .lines()
+        .last()
+        .context("crypt -c printed no key file")?
+        .trim()
+        .to_owned();
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    let vault = mount_point.join(".vault");
+
+    copy_into(&keep, &mount_point.join("keep.bin"))?;
+    copy_into(&dead_big, &mount_point.join("dead_big.bin"))?;
+    copy_into(&dead_small, &mount_point.join("dead_small.bin"))?;
+    copy_into(&cow_v1, &mount_point.join("cow.bin"))?;
+    copy_into(&vault_keep, &vault.join("keep.bin"))?;
+    copy_into(&vault_dead, &vault.join("dead.bin"))?;
+    // Overwriting leaves the first version as garbage in the active pack.
+    copy_into(&cow_v2, &mount_point.join("cow.bin"))?;
+    run_sync()?;
+
+    let packs_before = pack_files(&packs_dir)?;
+    if packs_before.len() != 1 {
+        bail!("expected a single active pack before cleanup, found {packs_before:?}");
+    }
+    let pack_size_before = packs_before[0].1;
+
+    remove(&mount_point.join("dead_big.bin"))?;
+    remove(&mount_point.join("dead_small.bin"))?;
+    remove(&vault.join("dead.bin"))?;
+    run_sync()?;
+
+    wait_for(
+        "active pack compaction to start",
+        Duration::from_secs(180),
+        Duration::from_millis(10),
+        || rewrite_in_progress(&packs_dir),
+    )?;
+
+    let stop_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop_reader = Arc::clone(&stop_reader);
+        let expected = sha256(&keep)?;
+        let target = mount_point.join("keep.bin");
+        thread::spawn(move || -> Result<u64> {
+            let mut reads = 0_u64;
+            while !stop_reader.load(Ordering::Relaxed) {
+                if sha256(&target)? != expected {
+                    bail!("keep.bin changed while its pack was compacted");
+                }
+                reads += 1;
+            }
+            Ok(reads)
+        })
+    };
+
+    // Appends while the copy runs: new data, and the content of deleted files
+    // whose dead copies sit in the part of the pack being filtered.
+    copy_into_fsync(&during[0], &mount_point.join("during0.bin"))?;
+    let carried_tail = rewrite_in_progress(&packs_dir)?;
+    copy_into_fsync(&dead_small, &mount_point.join("resurrected.bin"))?;
+    copy_into_fsync(&vault_dead, &vault.join("resurrected.bin"))?;
+    for (i, src) in during.iter().enumerate().skip(1) {
+        copy_into_fsync(src, &mount_point.join(format!("during{i}.bin")))?;
+    }
+    if !carried_tail {
+        bail!(
+            "compaction finished before the concurrent append; grow keep.bin so this test covers appends during the copy"
+        );
+    }
+
+    wait_for(
+        "active pack compaction to finish",
+        Duration::from_secs(300),
+        Duration::from_millis(100),
+        || Ok(!rewrite_in_progress(&packs_dir)?),
+    )?;
+    stop_reader.store(true, Ordering::Relaxed);
+    let reads = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+    if reads == 0 {
+        bail!("no read of keep.bin completed during compaction");
+    }
+
+    let verify_all = |vault_unlocked: bool| -> Result<()> {
+        assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+        assert_same_content(&cow_v2, &mount_point.join("cow.bin"))?;
+        assert_same_content(&dead_small, &mount_point.join("resurrected.bin"))?;
+        for (i, src) in during.iter().enumerate() {
+            assert_same_content(src, &mount_point.join(format!("during{i}.bin")))?;
+        }
+        for gone in ["dead_big.bin", "dead_small.bin"] {
+            if mount_point.join(gone).exists() {
+                bail!("{gone} reappeared after compaction");
+            }
+        }
+        if vault_unlocked {
+            assert_same_content(&vault_keep, &vault.join("keep.bin"))?;
+            assert_same_content(&vault_dead, &vault.join("resurrected.bin"))?;
+            if vault.join("dead.bin").exists() {
+                bail!("deleted vault file reappeared after compaction");
+            }
+        }
+        Ok(())
+    };
+    verify_all(true)?;
+
+    let packs_compacted = pack_files(&packs_dir)?;
+    if packs_compacted.len() != 1 || packs_compacted[0].0 != packs_before[0].0 {
+        bail!("compaction must keep the active pack id: before {packs_before:?}, after {packs_compacted:?}");
+    }
+    if packs_compacted[0].1 >= pack_size_before {
+        bail!("active pack did not shrink: before {packs_before:?}, after {packs_compacted:?}");
+    }
+
+    // The compacted pack stays active and keeps growing.
+    copy_into(&after, &mount_point.join("after.bin"))?;
+    run_sync()?;
+    let packs_grown = pack_files(&packs_dir)?;
+    if packs_grown.len() != 1
+        || packs_grown[0].0 != packs_before[0].0
+        || packs_grown[0].1 <= packs_compacted[0].1
+    {
+        bail!("new data must be appended to the compacted pack: compacted {packs_compacted:?}, now {packs_grown:?}");
+    }
+    assert_same_content(&after, &mount_point.join("after.bin"))?;
+    assert_stats_healthy(&root)?;
+
+    control(&root, &["crypt", "-l"])?;
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    verify_all(true)?;
+
+    daemon.stop_graceful()?;
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    verify_all(false)?;
+    assert_same_content(&after, &mount_point.join("after.bin"))?;
+    control(&root, &["crypt", "-u", "-p", password, "-k", &key_file])?;
+    verify_all(true)?;
+    assert_stats_healthy(&root)?;
+
+    daemon.stop_graceful()?;
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// The daemon is killed while the active pack is being compacted, right after
+/// an fsynced append. Everything acknowledged must survive the restart, the
+/// interrupted compaction must complete afterwards, and no temporary pack may
+/// be left behind.
+#[test]
+fn gc_active_pack_compaction_survives_crash() -> Result<()> {
+    if !compaction_tests_enabled()? {
+        return Ok(());
+    }
+
+    let root = unique_test_root();
+    let mount_point = root.join("mnt");
+    let data_dir = root.join("data");
+    let src_dir = root.join("src");
+    fs::create_dir_all(&mount_point).context("failed to create mount dir")?;
+    fs::create_dir_all(&data_dir).context("failed to create data dir")?;
+    fs::create_dir_all(&src_dir).context("failed to create source dir")?;
+    fs::write(
+        root.join("config.toml"),
+        compaction_test_config(&mount_point, &data_dir),
+    )
+    .context("failed to write config.toml")?;
+    let packs_dir = data_dir.join("packs");
+
+    let keep = random_file(&src_dir, "keep.bin", 384)?;
+    let dead = random_file(&src_dir, "dead.bin", 192)?;
+    let during = random_file(&src_dir, "during.bin", 8)?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    copy_into(&keep, &mount_point.join("keep.bin"))?;
+    copy_into(&dead, &mount_point.join("dead.bin"))?;
+    run_sync()?;
+    let packs_before = pack_files(&packs_dir)?;
+    if packs_before.len() != 1 {
+        bail!("expected a single active pack, found {packs_before:?}");
+    }
+
+    remove(&mount_point.join("dead.bin"))?;
+    run_sync()?;
+    wait_for(
+        "active pack compaction to start",
+        Duration::from_secs(180),
+        Duration::from_millis(10),
+        || rewrite_in_progress(&packs_dir),
+    )?;
+    copy_into_fsync(&during, &mount_point.join("during.bin"))?;
+    daemon.kill_hard()?;
+
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    if mount_point.join("dead.bin").exists() {
+        bail!("deleted file reappeared after crash");
+    }
+
+    let dead_len = fs::metadata(&dead)?.len();
+    wait_for(
+        "compaction to finish after restart",
+        Duration::from_secs(300),
+        Duration::from_millis(200),
+        || {
+            let packs = pack_files(&packs_dir)?;
+            Ok(!rewrite_in_progress(&packs_dir)?
+                && packs.len() == 1
+                && packs[0].1 + dead_len / 2 < packs_before[0].1)
+        },
+    )?;
+    let packs_after = pack_files(&packs_dir)?;
+    if packs_after[0].0 != packs_before[0].0 {
+        bail!("compaction must keep the active pack id: before {packs_before:?}, after {packs_after:?}");
+    }
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    assert_stats_healthy(&root)?;
+
+    daemon.stop_graceful()?;
+    let mut daemon = MountDaemon::start(&root, mount_point.clone())?;
+    daemon.wait_until_mounted(Duration::from_secs(30))?;
+    assert_same_content(&keep, &mount_point.join("keep.bin"))?;
+    assert_same_content(&during, &mount_point.join("during.bin"))?;
+    assert_stats_healthy(&root)?;
 
     daemon.stop_graceful()?;
     let _ = fs::remove_dir_all(&root);

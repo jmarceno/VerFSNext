@@ -1,0 +1,248 @@
+//! The implementation of FUSE mount and un-mount
+
+use std::fs;
+use std::os::unix::io::RawFd;
+use std::path::Path;
+
+use anyhow::Context;
+use nix::fcntl::{self, OFlag};
+use nix::sys::stat::{self, Mode};
+use tracing::{debug, info};
+
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    pub direct_io: bool,
+    pub fs_name: String,
+    pub subtype: String,
+    /// Let users other than the mounting user access the filesystem. When it
+    /// is off, the kernel restricts the mount to the mounting user. A
+    /// non-root mount with it on requires `user_allow_other` in
+    /// /etc/fuse.conf.
+    pub allow_other: bool,
+}
+
+impl Default for MountConfig {
+    fn default() -> Self {
+        Self {
+            direct_io: false,
+            fs_name: "verfsnext".to_owned(),
+            subtype: "verfsnext".to_owned(),
+            allow_other: false,
+        }
+    }
+}
+
+/// Access-control options shared by both mount paths. The kernel always
+/// enforces permission bits (`default_permissions`); the filesystem does not
+/// check them itself.
+fn access_options(config: &MountConfig) -> Vec<&'static str> {
+    let mut options = vec!["default_permissions"];
+    if config.allow_other {
+        options.push("allow_other");
+    }
+    options
+}
+
+fn build_fusermount_options(config: &MountConfig) -> String {
+    let mut options = vec!["nosuid".to_owned(), "nodev".to_owned()];
+    options.extend(access_options(config).into_iter().map(str::to_owned));
+    options.push(format!("fsname={}", config.fs_name));
+    options.push(format!("subtype={}", config.subtype));
+    options.join(",")
+}
+
+fn direct_mount_fstype(config: &MountConfig) -> String {
+    format!("fuse.{}", config.subtype)
+}
+
+// Linux mount flags, check the following link for details
+// <https://github.com/torvalds/linux/blob/master/include/uapi/linux/mount.h#L11>
+
+/// Linux un-mount
+#[cfg(target_os = "linux")]
+pub async fn umount(short_path: &Path) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    use nix::unistd;
+
+    let mount_path = short_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mntpnt = mount_path.as_os_str();
+
+        if unistd::geteuid().is_root() {
+            nix::mount::umount2(&mount_path, nix::mount::MntFlags::MNT_DETACH)
+                .context(format!("failed to un-mount FUSE, path={mount_path:?}",))
+        } else {
+            // Use fusermount to un-mount
+            let umount_handle = Command::new("fusermount")
+                .arg("-uz") // lazy un-mount
+                .arg(mntpnt)
+                .output()
+                .context("fusermount command failed to start")?;
+            if umount_handle.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&umount_handle.stderr);
+                debug!("fusermount failed to umount, the error is: {}", &stderr);
+                Err(anyhow::anyhow!(
+                    "fusermount failed to umount fuse device, the error is: {}",
+                    stderr,
+                ))
+            }
+        }
+    })
+    .await?
+}
+
+/// Linux mount
+#[cfg(target_os = "linux")]
+pub async fn mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
+    use nix::unistd;
+
+    if unistd::geteuid().is_root() {
+        // Direct mount
+        direct_mount(mount_point, config).await
+    } else {
+        // Use fusermount to mount
+        fuser_mount(mount_point, config).await
+    }
+}
+
+/// Linux fusermount
+#[cfg(target_os = "linux")]
+async fn fuser_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
+    use std::io::IoSliceMut;
+    use std::os::fd::AsRawFd;
+    use std::process::Command;
+
+    use nix::cmsg_space;
+    use nix::sys::socket::{
+        self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+    };
+
+    let mount_path = mount_point.to_path_buf();
+    let mount_opts = build_fusermount_options(config);
+
+    let (local, remote) = tokio::task::spawn_blocking(|| {
+        socket::socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+    })
+    .await?
+    .context("failed to create socket pair")?;
+
+    let mount_handle = tokio::task::spawn_blocking(move || {
+        Command::new("fusermount")
+            .arg("-o")
+            // `allow_other` requires `user_allow_other` in /etc/fuse.conf.
+            .arg(mount_opts)
+            .arg(mount_path.as_os_str())
+            .env("_FUSE_COMMFD", remote.as_raw_fd().to_string())
+            .output()
+    })
+    .await?
+    .context("fusermount command failed to start")?;
+
+    if !mount_handle.status.success() {
+        let stderr = String::from_utf8_lossy(&mount_handle.stderr);
+        let hint = if config.allow_other && stderr.contains("user_allow_other") {
+            " (fuse_allow_other is enabled: add `user_allow_other` to /etc/fuse.conf, or set fuse_allow_other = false to restrict the mount to the mounting user)"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "fusermount failed to mount {mount_point:?}: {}{hint}",
+            stderr.trim()
+        );
+    }
+    info!(
+        "fusermount path={:?} to FUSE device successfully!",
+        mount_point,
+    );
+    eprintln!(
+        "fusermount path={:?} to FUSE device successfully!",
+        mount_point
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0_u8; 5];
+        let mut iov = [IoSliceMut::new(&mut buf[..])];
+
+        #[allow(clippy::arithmetic_side_effects)]
+        let mut cmsgspace = cmsg_space!([RawFd; 1]);
+        let msg: socket::RecvMsg<'_, '_, ()> = socket::recvmsg(
+            local.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsgspace),
+            MsgFlags::empty(),
+        )
+        .context("failed to receive from fusermount")?;
+
+        let mount_fd = if let Some(cmsg) = msg.cmsgs().next() {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg {
+                debug_assert_eq!(fds.len(), 1);
+                *fds.first()
+                    .unwrap_or_else(|| panic!("failed to get the only fd"))
+            } else {
+                panic!("unexpected cmsg")
+            }
+        } else {
+            panic!("failed to get cmsgs")
+        };
+
+        Ok(mount_fd)
+    })
+    .await?
+}
+
+/// Linux directly mount
+#[cfg(target_os = "linux")]
+async fn direct_mount(mount_point: &Path, config: &MountConfig) -> anyhow::Result<RawFd> {
+    use nix::mount::MsFlags;
+    use nix::sys::stat::SFlag;
+    use nix::unistd;
+
+    let devpath = Path::new("/dev/fuse");
+
+    let dev_fd =
+        tokio::task::spawn_blocking(move || fcntl::open(devpath, OFlag::O_RDWR, Mode::empty()))
+            .await?
+            .context("failed to open fuse device")?;
+    let mount_path = mount_point.to_path_buf();
+    let full_path = tokio::task::spawn_blocking(move || fs::canonicalize(mount_path)).await??;
+    let target_path = full_path.clone();
+    let fstype = direct_mount_fstype(config);
+    let fsname = config.fs_name.clone();
+
+    let mnt_sb = tokio::task::spawn_blocking(move || stat::stat(&full_path))
+        .await?
+        .context(format!(
+            "failed to get the file stat of mount point={mount_point:?}",
+        ))?;
+    let opts = format!(
+        "fd={},rootmode={:o},user_id={},group_id={},{}",
+        dev_fd,
+        mnt_sb.st_mode & SFlag::S_IFMT.bits(),
+        unistd::getuid().as_raw(),
+        unistd::getgid().as_raw(),
+        access_options(config).join(","),
+    );
+
+    debug!("direct mount opts={:?}", &opts);
+    tokio::task::spawn_blocking(move || {
+        nix::mount::mount(
+            Some(fsname.as_str()),
+            &target_path,
+            Some(fstype.as_str()),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some(opts.as_str()),
+        )
+    })
+    .await?
+    .context(format!("failed to direct mount {mount_point:?}"))?;
+
+    Ok(dev_fd)
+}

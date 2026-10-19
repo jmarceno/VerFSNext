@@ -1,0 +1,11 @@
+[Unit]
+Description=Concurrent copy, atomic writer, and readers for VerFSNext resilience test
+After=verfsnext-soak.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/verfsnext-resilience-release.env
+ExecStart=/usr/bin/python3 ${RESILIENCE_GUEST} worker
+TimeoutStopSec=10
+KillMode=control-group
+Restart=no
