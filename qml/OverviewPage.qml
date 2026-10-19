@@ -34,6 +34,10 @@ ScrollView {
     readonly property real shownWriteBps: moving ? status.write_throughput_bps : keptWriteBps
 
     readonly property real logicalAll: stats ? stats.all_logical_size_bytes : 0
+    readonly property real logicalCurrent: stats ? stats.current_logical_size_bytes : 0
+    readonly property real snapshotDisk: stats ? stats.snapshot_only_compressed_bytes : 0
+    /// Disk used by current files: everything except payload only snapshots hold.
+    readonly property real onDiskCurrent: onDisk - snapshotDisk
     readonly property real onDisk: stats ? stats.data_dir_size_bytes : 0
     readonly property real saved: stats ? stats.net_saved_bytes : 0
     readonly property real compressionSaving: stats ? stats.compression_savings_ratio : 0
@@ -57,13 +61,14 @@ ScrollView {
             ["Hidden in locked vault", b(stats.hidden_vault_logical_size_bytes)],
             ["Everything reachable", b(stats.all_logical_size_bytes)],
             ["Referenced data (excluding holes)", b(stats.referenced_data_bytes)],
-            ["Dedup savings (all namespaces)", b(stats.dedup_saved_bytes) + " (" + theme.percent(stats.dedup_savings_ratio) + ")"],
+            ["Snapshot history on disk", b(stats.snapshot_only_compressed_bytes)],
+            ["Dedup savings (files and vault)", b(stats.dedup_saved_bytes) + " (" + theme.percent(stats.dedup_savings_ratio) + ")"],
             ["Unique data before compression", b(stats.stored_unique_uncompressed_bytes)],
             ["Unique data after compression", b(stats.stored_unique_compressed_bytes)],
             ["Compression savings", b(stats.compression_saved_bytes) + " (" + theme.percent(stats.compression_savings_ratio) + ")"],
             ["Unreachable indexed payload (partial garbage)", b(stats.unreachable_chunk_compressed_bytes)],
             ["Obsolete data awaiting cleanup", b(stats.obsolete_awaiting_cleanup_bytes)],
-            ["Net savings (all namespaces)", b(stats.net_saved_bytes) + " (" + theme.percent(stats.net_savings_ratio) + ")"],
+            ["Net savings (files and vault)", b(stats.net_saved_bytes) + " (" + theme.percent(stats.net_savings_ratio) + ")"],
             ["Metadata on disk", b(stats.metadata_size_bytes)],
             ["Data folder on disk", b(stats.data_dir_size_bytes)],
             ["Vault", stats.vault_locked ? "Locked" : "Unlocked or not created"],
@@ -242,7 +247,7 @@ ScrollView {
                         text: !root.stats ? (root.controller.stats_error.length > 0 ? root.controller.stats_error
                                              : "This looks through all your files and can take a moment on large folders.")
                               : (root.logicalAll === 0 ? "Copy files into your folder and VerFSNext will start removing duplicates and compressing them."
-                                 : (root.saved > 0 ? theme.percent(root.stats.net_savings_ratio) + " less space than storing your files and snapshots as they are."
+                                 : (root.saved > 0 ? theme.percent(root.stats.net_savings_ratio) + " less space than storing your files as they are. Snapshots are not counted as savings."
                                     : (root.stats.obsolete_awaiting_cleanup_bytes > 0
                                        ? "Records use " + theme.bytes(root.stats.metadata_size_bytes) + ". Deleted data still on disk uses " + theme.bytes(root.stats.obsolete_awaiting_cleanup_bytes) + " and is reclaimed when the folder is idle."
                                        : "Records use " + theme.bytes(root.stats.metadata_size_bytes) + ". The remaining difference is indexes and pack framing.")))
@@ -295,7 +300,7 @@ ScrollView {
                     radius: 6
                     color: theme.sliderTrack
                     Rectangle {
-                        width: parent.width * Math.min(1, root.logicalAll > 0 ? root.onDisk / root.logicalAll : 0)
+                        width: parent.width * Math.min(1, root.logicalCurrent > 0 ? root.onDiskCurrent / root.logicalCurrent : 0)
                         height: parent.height
                         radius: 6
                         color: theme.accent
@@ -304,14 +309,14 @@ ScrollView {
                 RowLayout {
                     width: parent.width
                     Label {
-                        text: "On disk: " + theme.bytes(root.onDisk)
+                        text: "Your files on disk: " + theme.bytes(root.onDiskCurrent)
                         color: theme.accentStrong
                         font.pixelSize: 12
                         font.bold: true
                     }
                     Item { Layout.fillWidth: true }
                     Label {
-                        text: "Files, snapshots and vault: " + theme.bytes(root.logicalAll)
+                        text: "Files and vault: " + theme.bytes(root.logicalCurrent)
                         color: theme.textMuted
                         font.pixelSize: 12
                     }
@@ -338,9 +343,9 @@ ScrollView {
             StatTile {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                label: "Kept by snapshots"
-                value: root.stats ? theme.bytes(root.stats.snapshots_logical_size_bytes) : "—"
-                caption: "Shared with your files when unchanged"
+                label: "Snapshots use"
+                value: root.stats ? theme.bytes(root.stats.snapshot_only_compressed_bytes) : "—"
+                caption: root.stats ? "Extra disk for history; " + theme.bytes(root.stats.snapshots_logical_size_bytes) + " in snapshots" : ""
             }
             StatTile {
                 Layout.fillWidth: true
@@ -360,7 +365,7 @@ ScrollView {
                 label: "Duplicates removed"
                 value: theme.percent(root.dedupSaving)
                 valueColor: theme.accentStrong
-                caption: root.stats ? theme.bytes(root.stats.dedup_saved_bytes) + " saved across files, snapshots and vault" : ""
+                caption: root.stats ? theme.bytes(root.stats.dedup_saved_bytes) + " saved across your files and vault" : ""
             }
             StatTile {
                 Layout.fillWidth: true
@@ -368,7 +373,7 @@ ScrollView {
                 label: "Compression"
                 value: theme.percent(root.compressionSaving)
                 valueColor: theme.accentStrong
-                caption: root.stats ? theme.bytes(root.stats.compression_saved_bytes) + " saved on reachable unique data" : ""
+                caption: root.stats ? theme.bytes(root.stats.compression_saved_bytes) + " saved on your unique data" : ""
             }
             StatTile {
                 Layout.fillWidth: true

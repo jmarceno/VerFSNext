@@ -160,7 +160,18 @@ pub struct VerFsStats {
     pub snapshots_logical_size_bytes: u64,
     pub hidden_vault_logical_size_bytes: u64,
     pub all_logical_size_bytes: u64,
+    /// Live folder plus vault: the data the user would store without snapshots.
+    pub current_logical_size_bytes: u64,
     pub referenced_data_bytes: u64,
+    /// Extent bytes referenced by the live folder and vault only.
+    pub current_referenced_data_bytes: u64,
+    /// Unique chunks reachable from the live folder or vault.
+    pub current_unique_uncompressed_bytes: u64,
+    pub current_unique_compressed_bytes: u64,
+    /// Compressed payload referenced only by snapshots: the disk cost of keeping history.
+    pub snapshot_only_compressed_bytes: u64,
+    /// Dedup and compression savings below cover current data only, so
+    /// snapshot sharing is never reported as saved space.
     pub dedup_saved_bytes: u64,
     pub dedup_savings_ratio: f64,
     pub stored_unique_uncompressed_bytes: u64,
@@ -1200,8 +1211,12 @@ impl FsCore {
             hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
             referenced_data_bytes,
+            current_referenced_data_bytes,
             stored_unique_uncompressed_bytes,
             stored_unique_compressed_bytes,
+            current_unique_uncompressed_bytes,
+            current_unique_compressed_bytes,
+            snapshot_only_compressed_bytes,
             unreachable_chunk_compressed_bytes,
             chunk_refcount_mismatch_count,
             missing_chunk_records_for_extents,
@@ -1258,13 +1273,18 @@ impl FsCore {
                 .saturating_add(snapshots_logical_size_bytes)
                 .saturating_add(hidden_vault_logical_size_bytes);
 
-            let reachable_inodes: HashSet<u64> = live_seen_inodes
+            let current_inodes: HashSet<u64> = live_seen_inodes
+                .union(&hidden_vault_seen_inodes)
+                .copied()
+                .collect();
+            let reachable_inodes: HashSet<u64> = current_inodes
                 .union(&snapshots_seen_inodes)
                 .copied()
-                .chain(hidden_vault_seen_inodes.iter().copied())
                 .collect();
             let mut reachable_chunks = HashSet::<ChunkId>::new();
+            let mut current_chunks = HashSet::<ChunkId>::new();
             let mut referenced_data_bytes = 0_u64;
+            let mut current_referenced_data_bytes = 0_u64;
             let mut all_extent_refcounts = HashMap::<ChunkId, u64>::new();
             let mut inode_domain_cache = HashMap::<u64, Option<bool>>::new();
             let mut orphan_extent_records = 0_u64;
@@ -1304,12 +1324,19 @@ impl FsCore {
                     referenced_data_bytes += u64::from(extent.len);
                     reachable_chunks.insert(id);
                 }
+                if current_inodes.contains(&owner_ino) {
+                    current_referenced_data_bytes += u64::from(extent.len);
+                    current_chunks.insert(id);
+                }
                 let counter = all_extent_refcounts.entry(id).or_insert(0);
                 *counter = counter.saturating_add(1);
             }
 
             let mut stored_unique_uncompressed_bytes = 0_u64;
             let mut stored_unique_compressed_bytes = 0_u64;
+            let mut current_unique_uncompressed_bytes = 0_u64;
+            let mut current_unique_compressed_bytes = 0_u64;
+            let mut snapshot_only_compressed_bytes = 0_u64;
             let mut unreachable_chunk_compressed_bytes = 0_u64;
             let mut chunk_refcount_mismatch_count = 0_u64;
             let mut seen_chunk_records = HashSet::<ChunkId>::new();
@@ -1327,6 +1354,12 @@ impl FsCore {
                 if reachable_chunks.contains(&id) {
                     stored_unique_uncompressed_bytes += chunk_uncompressed;
                     stored_unique_compressed_bytes += chunk_compressed;
+                    if current_chunks.contains(&id) {
+                        current_unique_uncompressed_bytes += chunk_uncompressed;
+                        current_unique_compressed_bytes += chunk_compressed;
+                    } else {
+                        snapshot_only_compressed_bytes += chunk_compressed;
+                    }
                 } else {
                     unreachable_chunk_compressed_bytes += chunk_compressed;
                 }
@@ -1348,8 +1381,12 @@ impl FsCore {
                 hidden_vault_logical_size_bytes,
                 all_logical_size_bytes,
                 referenced_data_bytes,
+                current_referenced_data_bytes,
                 stored_unique_uncompressed_bytes,
                 stored_unique_compressed_bytes,
+                current_unique_uncompressed_bytes,
+                current_unique_compressed_bytes,
+                snapshot_only_compressed_bytes,
                 unreachable_chunk_compressed_bytes,
                 chunk_refcount_mismatch_count,
                 missing_chunk_records_for_extents,
@@ -1357,31 +1394,36 @@ impl FsCore {
             ))
         })?;
 
-        let dedup_saved_bytes = referenced_data_bytes
-            .checked_sub(stored_unique_uncompressed_bytes)
-            .ok_or_else(|| anyhow!("invalid dedup accounting: reachable unique bytes exceed referenced data bytes"))?;
-        let dedup_savings_ratio = if referenced_data_bytes == 0 {
+        let dedup_saved_bytes = current_referenced_data_bytes
+            .checked_sub(current_unique_uncompressed_bytes)
+            .ok_or_else(|| anyhow!("invalid dedup accounting: current unique bytes exceed current referenced data bytes"))?;
+        let dedup_savings_ratio = if current_referenced_data_bytes == 0 {
             0.0
         } else {
-            dedup_saved_bytes as f64 / referenced_data_bytes as f64
+            dedup_saved_bytes as f64 / current_referenced_data_bytes as f64
         };
 
         let metadata_size_bytes = dir_size_recursive(&self.config.metadata_dir())?;
         let data_dir_size_bytes = dir_size_recursive(&self.config.data_dir)?;
         let obsolete_awaiting_cleanup_bytes = self.obsolete_awaiting_cleanup_bytes()?;
 
-        let compression_saved_bytes = stored_unique_uncompressed_bytes as i128
-            - stored_unique_compressed_bytes as i128;
-        let compression_savings_ratio = if stored_unique_uncompressed_bytes == 0 {
+        let compression_saved_bytes = current_unique_uncompressed_bytes as i128
+            - current_unique_compressed_bytes as i128;
+        let compression_savings_ratio = if current_unique_uncompressed_bytes == 0 {
             0.0
         } else {
-            compression_saved_bytes as f64 / stored_unique_uncompressed_bytes as f64
+            compression_saved_bytes as f64 / current_unique_uncompressed_bytes as f64
         };
-        let net_saved_bytes = all_logical_size_bytes as i128 - data_dir_size_bytes as i128;
-        let net_savings_ratio = if all_logical_size_bytes == 0 {
+        // Snapshot history is a cost, not a saving: its exclusive payload is
+        // taken off the disk side and its logical size never enters the baseline.
+        let current_logical_size_bytes =
+            live_logical_size_bytes.saturating_add(hidden_vault_logical_size_bytes);
+        let net_saved_bytes = current_logical_size_bytes as i128
+            - (data_dir_size_bytes as i128 - snapshot_only_compressed_bytes as i128);
+        let net_savings_ratio = if current_logical_size_bytes == 0 {
             0.0
         } else {
-            net_saved_bytes as f64 / all_logical_size_bytes as f64
+            net_saved_bytes as f64 / current_logical_size_bytes as f64
         };
 
         let cache = self.cache_totals();
@@ -1401,7 +1443,12 @@ impl FsCore {
             snapshots_logical_size_bytes,
             hidden_vault_logical_size_bytes,
             all_logical_size_bytes,
+            current_logical_size_bytes,
             referenced_data_bytes,
+            current_referenced_data_bytes,
+            current_unique_uncompressed_bytes,
+            current_unique_compressed_bytes,
+            snapshot_only_compressed_bytes,
             dedup_saved_bytes,
             dedup_savings_ratio,
             stored_unique_uncompressed_bytes,

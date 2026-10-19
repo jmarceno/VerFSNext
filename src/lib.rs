@@ -946,26 +946,26 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
         (
-            "Dedup Savings (All Reachable Namespaces)".to_owned(),
+            "Dedup Savings (Live + Vault)".to_owned(),
             format!(
                 "{} ({:.2}%)",
                 human_bytes(stats.dedup_saved_bytes),
                 stats.dedup_savings_ratio * 100.0
             ),
             format!(
-                "{} bytes; repeated extent data stored once",
+                "{} bytes; repeated data in current files stored once; snapshot sharing excluded",
                 stats.dedup_saved_bytes
             ),
         ),
         (
-            "Compression (Stored Unique Chunks)".to_owned(),
+            "Compression (Live + Vault Unique Chunks)".to_owned(),
             format!(
                 "{} ({:.2}%)",
                 human_bytes_signed(stats.compression_saved_bytes),
                 stats.compression_savings_ratio * 100.0
             ),
             format!(
-                "{} bytes saved; reachable unique data, no padding",
+                "{} bytes saved; current unique data, no padding",
                 stats.compression_saved_bytes
             ),
         ),
@@ -992,13 +992,18 @@ fn format_stats_report(stats: &VerFsStats) -> String {
                 .to_owned(),
         ),
         (
-            "Net Savings (All Reachable Namespaces)".to_owned(),
+            "Snapshot History on Disk".to_owned(),
+            human_bytes(stats.snapshot_only_compressed_bytes),
+            "compressed payload referenced only by snapshots".to_owned(),
+        ),
+        (
+            "Net Savings (Live + Vault)".to_owned(),
             format!(
                 "{} ({:.2}%)",
                 human_bytes_signed(stats.net_saved_bytes),
                 stats.net_savings_ratio * 100.0
             ),
-            "logical minus allocated disk bytes; includes metadata, indexes and garbage".to_owned(),
+            "current logical minus disk bytes not held by snapshots; includes metadata, indexes and garbage".to_owned(),
         ),
         (
             "Metadata Consistency".to_owned(),
@@ -1283,7 +1288,12 @@ mod tests {
             snapshots_logical_size_bytes: 2_000,
             hidden_vault_logical_size_bytes: 0,
             all_logical_size_bytes: 12_000,
+            current_logical_size_bytes: 10_000,
             referenced_data_bytes: 12_000,
+            current_referenced_data_bytes: 10_000,
+            current_unique_uncompressed_bytes: 9_000,
+            current_unique_compressed_bytes: 4_000,
+            snapshot_only_compressed_bytes: 1_000,
             dedup_saved_bytes: 1_000,
             dedup_savings_ratio: 1.0 / 12.0,
             stored_unique_uncompressed_bytes: 11_000,
@@ -1324,7 +1334,7 @@ mod tests {
         assert!(report.contains("VerFSNext Stats"));
         assert!(report.contains("Metric"));
         assert!(report.contains("Live Logical Size (/.snapshots excluded)"));
-        assert!(report.contains("Compression (Stored Unique Chunks)"));
+        assert!(report.contains("Compression (Live + Vault Unique Chunks)"));
         assert!(report.contains("Metadata Consistency"));
         assert!(report.contains("Pack CRC32 Read Errors"));
         assert!(report.contains("Recent Throughput"));
