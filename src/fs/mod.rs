@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Context, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use verfsnext_async_fusex::session::SessionNotifier;
 use verfsnext_async_fusex::fs_util::{
@@ -571,27 +571,29 @@ impl VerFs {
         self.throughput_worker.abort();
         // The batcher reports per-write failures to their own waiters, so a
         // shutdown error here only means its worker is gone; it must not skip
-        // the stages below. Skipping the final full sync or the metadata close
-        // would leave acknowledged writes only in the page cache after a clean
-        // stop, so every stage runs and every failure is reported.
+        // the final full sync. Skipping it would leave acknowledged writes
+        // only in the page cache after a clean stop.
         if let Err(err) = self.batcher.shutdown().await {
             warn!(error = %format!("{err:#}"), "write batcher shutdown reported an error");
         }
-        let mut failures = Vec::new();
-        for (stage, result) in [
-            (
-                "final full sync",
-                self.sync_service.shutdown_with_full_sync().await,
-            ),
-            ("metadata close", self.core.meta.close().await),
-        ] {
-            if let Err(err) = result {
-                failures.push(format!("{stage}: {err:#}"));
-            }
+        // The metadata close flushes every memtable into fsynced SSTables. It
+        // must not run when the pack sync failed: it would make durable the
+        // extents and chunk records that point at pack bytes that may never
+        // reach the disk, while the WAL hand-off deliberately holds them back
+        // until their pack data is durable. Leaving the store unclosed keeps
+        // the on-disk state consistent; the next open recovers it like a crash.
+        if let Err(err) = self.sync_service.shutdown_with_full_sync().await {
+            error!(
+                error = %format!("{err:#}"),
+                "final full sync failed; metadata close skipped so no metadata that references unsynced pack data becomes durable"
+            );
+            return Err(err.context("final full sync failed; metadata close skipped"));
         }
-        if !failures.is_empty() {
-            bail!("{}", failures.join("; "));
-        }
+        self.core
+            .meta
+            .close()
+            .await
+            .context("metadata close failed")?;
         Ok(())
     }
 

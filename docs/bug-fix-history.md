@@ -1577,9 +1577,9 @@ without the induced failure exited 0 with an SST and an empty WAL.
   waiter, which the FUSE write handler logs with inode, offset, length and
   flags, so nothing can latch. Shutdown still reports a dead apply worker, but
   no earlier write error can fail a later shutdown.
-- `graceful_shutdown` always runs the final full sync and the metadata close and
-  reports every stage that failed; a batcher shutdown error is logged as a
-  warning. No stop can skip the stages that make acknowledged metadata durable.
+- `graceful_shutdown` always runs the final full sync; a batcher shutdown error
+  is logged as a warning. The metadata close runs only after that sync
+  succeeded (review follow-up, below).
 
 ### Validation
 
@@ -1596,6 +1596,22 @@ the injected error again.
   `batcher.shutdown()` ("final filesystem sync: failed to open next pack file
   ..."), a 26 KB WAL segment that was never handed off and an empty
   `sstables/` directory, the reproduction described in the report.
+
+### Review Follow-Up - Oct 19 2026
+
+The first version of the fix ran the metadata close even when the final full
+sync failed. `MetaStore` opens SurrealKV with `flush_on_close(true)`, so the
+close flushes every memtable into fsynced SSTables. The WAL hand-off
+(`write_durable_wal_prefix`) only releases records whose pack data is already
+durable; flushing the memtable after a failed pack fsync would publish durable
+extents and chunk records that name pack bytes that may never reach the disk
+(a failed fsync can drop the dirty pages), turning a failed sync into missing
+or CRC-failing chunks after the next power loss instead of a consistent
+rollback. `graceful_shutdown` now returns the full-sync error and skips the
+close; the next open recovers the store as after a crash, from metadata whose
+pack data is durable. Validated with remote `clippy --all-targets` (clean) and
+the library suite (43 passed); the failing-fsync path itself was not exercised
+at runtime (it needs a fault-injecting block device).
 
 ### Affected Files
 

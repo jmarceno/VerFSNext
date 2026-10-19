@@ -42,7 +42,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
   - Protocol types and the client live in `src/control.rs`, shared by the CLI and the desktop app.
   - `stats` responses carry both the rendered table (`message`) and the structured `VerFsStats` (`stats`, serde-optional so old clients/daemons interoperate). `Stats { allow_cached }` returns the last completed scan right away and lets the daemon refresh it in the background, reporting `stats_scanned_at_ms`, `stats_refreshing` and `stats_refresh_error`; without it the request waits for a scan taken after it arrived, which is what the CLI uses.
   - `status` is a cheap request for frequent polling (`DaemonStatus`: vault enabled/initialized/locked, GC running, uptime, I/O totals, RSS, cache hit rate and approximate cache memory, plus the last activity). It never scans metadata, unlike `stats`.
-- The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final full sync, metadata close, unmount) on SIGINT and on SIGTERM. Every stage runs even when an earlier one fails, and each failure is reported (B042).
+- The daemon shuts down gracefully (kernel writeback flush, FUSE request drain, final full sync, metadata close, unmount) on SIGINT and on SIGTERM. A batcher error never skips the final full sync (B042); the metadata close (which flushes memtables to SSTables) runs only after that sync succeeded, so no metadata that names unsynced pack data becomes durable.
 - Auto config discovery order when `--config/-c` is not provided:
   - `./config.toml`
   - `~/.config/verfsnext/config.toml`
