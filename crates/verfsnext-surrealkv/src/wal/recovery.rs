@@ -496,24 +496,42 @@ pub(crate) fn repair_corrupted_wal_segment(
 }
 
 /// Cuts everything after `valid_end` from a segment: bytes that are not
-/// records (a torn or zeroed tail). The writer appends at the end of the
-/// file, so a record written after such a tail would be unreadable.
+/// records (a torn or zeroed tail). The writer writes after the end of the
+/// file it opens, so a record written after such a tail would be unreadable.
+///
+/// The active segment always runs into the zeros the writer extends it with
+/// ahead of its records (see `PREALLOCATE_BYTES`), so after a crash a tail
+/// of zeros is expected and only reported at info level; a tail holding
+/// anything else is a torn write and is reported as a warning.
 pub(crate) fn truncate_wal_segment_tail(wal_dir: &Path, segment_id: u64, valid_end: u64) -> Result<()> {
     let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
-    let file = std::fs::OpenOptions::new().write(true).open(&segment_path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&segment_path)?;
     let len = file.metadata()?.len();
     if len <= valid_end {
         return Ok(());
     }
-    log::warn!(
-        "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end}) \
+    let mut tail = vec![0_u8; (len - valid_end) as usize];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut tail, valid_end)?;
+    if tail.iter().all(|&byte| byte == 0) {
+        log::info!(
+            "WAL segment {segment_id:020}.wal: cutting the {} preallocated zero bytes after the last \
+record (offset {valid_end})",
+            len - valid_end
+        );
+    } else {
+        log::warn!(
+            "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end}) \
 so new records do not land behind a torn tail",
-        len - valid_end
-    );
-    eprintln!(
-        "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end})",
-        len - valid_end
-    );
+            len - valid_end
+        );
+        eprintln!(
+            "WAL segment {segment_id:020}.wal: cutting {} bytes after the last record (offset {valid_end})",
+            len - valid_end
+        );
+    }
     file.set_len(valid_end)?;
     file.sync_all()?;
     Ok(())

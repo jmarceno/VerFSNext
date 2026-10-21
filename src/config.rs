@@ -26,6 +26,10 @@ fn default_chunk_cache_capacity_mb() -> u64 {
     640
 }
 
+fn default_metadata_block_cache_mb() -> u64 {
+    64
+}
+
 fn default_pack_index_cache_capacity_entries() -> u64 {
     524_288
 }
@@ -126,6 +130,10 @@ pub struct Config {
     pub metadata_cache_capacity_entries: u64,
     #[serde(default = "default_chunk_cache_capacity_mb")]
     pub chunk_cache_capacity_mb: u64,
+    /// Memory for decoded metadata store blocks (SSTable data and index
+    /// blocks), shared by every metadata lookup.
+    #[serde(default = "default_metadata_block_cache_mb")]
+    pub metadata_block_cache_mb: u64,
     #[serde(default = "default_pack_index_cache_capacity_entries")]
     pub pack_index_cache_capacity_entries: u64,
     #[serde(default = "default_pack_max_size_mb")]
@@ -216,6 +224,9 @@ impl Config {
         }
         if self.chunk_cache_capacity_mb == 0 {
             bail!("chunk_cache_capacity_mb must be > 0");
+        }
+        if self.metadata_block_cache_mb == 0 {
+            bail!("metadata_block_cache_mb must be > 0");
         }
         if self.pack_index_cache_capacity_entries == 0 {
             bail!("pack_index_cache_capacity_entries must be > 0");
@@ -315,6 +326,7 @@ mod tests {
             batch_flush_interval_ms: 1,
             metadata_cache_capacity_entries: 1,
             chunk_cache_capacity_mb: 1,
+            metadata_block_cache_mb: 1,
             pack_index_cache_capacity_entries: 1,
             pack_max_size_mb: 1,
             zstd_compression_level: 3,

@@ -1,5 +1,4 @@
 use std::io;
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -7,6 +6,7 @@ use anyhow::{Context, Result};
 use nix::unistd::{getgid, getuid};
 use verfsnext_surrealkv::{DurabilityBarrier, Mode, Tree, TreeBuilder};
 
+use crate::config::Config;
 use crate::data::pack::PackStore;
 
 use crate::types::{
@@ -60,8 +60,8 @@ impl DurabilityBarrier for PackBarrier {
 }
 
 impl MetaStore {
-    pub async fn open(path: &Path) -> Result<Self> {
-        Self::open_with_builder(path, TreeBuilder::new()).await
+    pub async fn open(config: &Config) -> Result<Self> {
+        Self::open_with_builder(config, TreeBuilder::new()).await
     }
 
     /// Opens the store so that no WAL record reaches the OS before the pack
@@ -74,11 +74,11 @@ impl MetaStore {
     /// open. Until then this process cannot have appended to any pack and the
     /// barrier has nothing to sync.
     pub async fn open_with_pack_barrier(
-        path: &Path,
+        config: &Config,
         packs: Arc<OnceLock<Arc<PackStore>>>,
     ) -> Result<Self> {
         Self::open_with_builder(
-            path,
+            config,
             TreeBuilder::new().with_durability_barrier(Arc::new(PackBarrier(packs))),
         )
         .await
@@ -92,10 +92,13 @@ impl MetaStore {
             .context("failed to hand off durable WAL records")
     }
 
-    async fn open_with_builder(path: &Path, builder: TreeBuilder) -> Result<Self> {
+    async fn open_with_builder(config: &Config, builder: TreeBuilder) -> Result<Self> {
         let tree = builder
-            .with_path(path.to_path_buf())
+            .with_path(config.metadata_dir())
             .with_max_memtable_size(128 * 1024 * 1024)
+            .with_block_cache_capacity(
+                config.metadata_block_cache_mb.saturating_mul(1024 * 1024),
+            )
             .with_flush_on_close(true)
             .build()
             .context("failed to open SurrealKV tree")?;

@@ -830,6 +830,27 @@ impl VirtualFs for VerFs {
         self.core
             .read_bytes_total
             .fetch_add(read_len as u64, Ordering::Relaxed);
+        // Vault files are not read ahead: locking the vault clears the chunk
+        // cache, and a load finishing after that would put plaintext back.
+        if !FsCore::inode_is_vault(&inode) {
+            if let Some((from, to)) =
+                self.core
+                    .claim_readahead(fh, offset, read_end, inode.size)
+            {
+                let core = Arc::clone(&self.core);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = core.read_ahead(&inode, from, to) {
+                        warn!(
+                            ino = inode.ino,
+                            from,
+                            to,
+                            error = %format!("{err:#}"),
+                            "readahead failed; the read of that range reports the error"
+                        );
+                    }
+                });
+            }
+        }
         Ok(read_len)
     }
 
@@ -915,7 +936,7 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(_ino, "fsync")
             .map_err(map_anyhow_to_fuse)?;
         self.core
-            .sync_durably(datasync)
+            .sync_durably()
             .await
             .map_err(|err| {
                 error!(error = %format!("{err:#}"), datasync, "explicit fsync failed");
@@ -1018,7 +1039,7 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(_ino, "fsyncdir")
             .map_err(map_anyhow_to_fuse)?;
         self.core
-            .sync_durably(datasync)
+            .sync_durably()
             .await
             .map_err(|err| {
                 error!(error = %format!("{err:#}"), datasync, "explicit fsync failed");

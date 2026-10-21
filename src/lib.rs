@@ -1188,7 +1188,7 @@ fn human_bytes_signed(bytes: i128) -> String {
 }
 
 async fn run_snapshot_via_metadata(config: &Config, cmd: &SnapshotCommand) -> Result<()> {
-    let meta = MetaStore::open(&config.metadata_dir()).await?;
+    let meta = MetaStore::open(config).await?;
     ensure_vault_chunk_keys_migrated(&meta).await?;
     let snapshots = SnapshotManager::new(&meta);
 

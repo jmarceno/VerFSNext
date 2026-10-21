@@ -1789,3 +1789,93 @@ dropped, a second flush, then one explicit L0 -> bottom compaction.
 
 `crates/verfsnext-surrealkv/src/snapshot.rs`,
 `crates/verfsnext-surrealkv/Cargo.toml`
+
+## B046 - Reads and Writes Burned Several CPU-Seconds per GiB and Fsyncs Paid Avoidable Journal Commits - Oct 21 2026
+
+### Symptom
+
+Reading 1 GiB through the mount took 1.6 s but used about 10.5 CPU-seconds;
+writing 1 GiB used about 6 CPU-seconds while chunking, hashing and zstd need
+well under one. Cold reads after a restart spent most of their time in
+metadata lookups. On the 5900 rpm data disk every small-file fsync cost about
+137 ms, more than ext4 itself needs for the same file (about 104 ms).
+
+### Root Cause
+
+- Every FUSE read handed its 4-5 missing chunks, and every write batch its
+  new chunks, to the global rayon pool. Each woken worker spins (yielding)
+  for a while before it sleeps again, so 16 workers burned CPU for every
+  128 KiB request.
+- The SurrealKV block cache was its built-in 1 MiB default. Blocks are
+  64 KiB and Snappy-compressed, so nearly every chunk-record lookup after a
+  restart read and decoded a whole block (about 44 us per lookup).
+- The kernel keeps about one 128 KiB read in flight on the FUSE mount, so a
+  sequential reader waited for the pack reads of every request in turn.
+- Each write appended its chunks to the pack with one `write` per chunk
+  after copying header and payload into a new buffer, and copied
+  incompressible payloads once more.
+- Every explicit fsync synced the active pack and its index (one after the
+  other) even when nothing had been appended, and the periodic sync cycle
+  did the same on an idle mount. The WAL was appended and synced with
+  `fsync`, so every WAL sync needed an ext4 journal commit for the size
+  change (about 100 ms on the HDD, versus about 20 ms for `fdatasync` of
+  space the file already has).
+
+### Fix
+
+- `map_chunks` runs chunk sets of up to 8 chunks on the calling thread and
+  gives larger sets to the pool in jobs of at least 8.
+- New config key `metadata_block_cache_mb` (default 64) sizes the SurrealKV
+  block cache; older configs get the default.
+- Readahead: a sequential reader's chunks are loaded up to 4 MiB ahead into
+  the chunk cache by a blocking task, verified exactly like a read; vault
+  files are excluded (locking clears the cache).
+- `PackStore::append_chunks` writes all records of a batch with one
+  `writev`; compression and vault encryption run in one pass
+  (`StoredPayload`); a payload that does not compress shares the chunk's
+  buffer; header and payload of a pack record are read with one `pread`;
+  raw payloads are decoded without a copy.
+- `sync_durably` and the periodic cycle sync the packs only when records
+  were appended since the last pack sync, with `sync_data`; the pack and its
+  index are synced concurrently.
+- The SurrealKV WAL keeps its active segment extended with zeros up to
+  4 MiB past its records, writes at its own position and syncs with
+  `fdatasync`. Recovery already cut a zeroed tail from the highest segment;
+  closing or rotating a segment now cuts it back to its records, and the
+  recovery log reports an all-zero tail at info level. No storage format
+  change and no migration: an existing segment is reopened at its end.
+
+### Validation
+
+NVMe, heavily loaded machine (load average 10-30), 1 GiB random data:
+cold sequential read 4.5-4.9 s -> 1.8-2.3 s and 10.5 -> 3.5 CPU-seconds;
+write about 6 -> 3.5 CPU-seconds. HDD (5900 rpm, ext4): 300 small files with
+`dd conv=fsync` 39.7 s -> 21.7 s; 1 GiB write 14.0 s -> 11.6 s; read of the
+just-written file 1.76 s -> 0.75 s (11.1 -> 2.3 CPU-seconds).
+
+- Workspace unit tests passed (lib 42, fusex 20, SurrealKV 930).
+- Mount suite without benchmarks (9 tests, including both active-pack GC
+  compaction tests): passed.
+- Scratch-mount integrity run against an ext4 mirror (sha256 of every file):
+  150 small fsynced files, 200 MB random and 46 MB compressible files with
+  in-place overwrites, appends and truncates, dedup copies, 2000 random-range
+  reads, graceful restart (cold reads with readahead), SIGKILL after fsync,
+  idle GC promotion of inline tails followed by restart, and vault
+  create/unlock/write/lock/unlock/restart: all identical; `verfsnext check`
+  consistent.
+- WAL tail: after SIGKILL the active segment was 4 MiB holding 4018 bytes of
+  records; recovery cut it to the last record and the fsynced file read back
+  intact.
+
+### Affected Files
+
+`src/data/pack.rs`, `src/data/compress.rs`, `src/fs/chunk.rs`,
+`src/fs/fuse.rs`, `src/fs/gc.rs`, `src/fs/mod.rs`, `src/meta/mod.rs`,
+`src/config.rs`, `src/gui/settings.rs`, `src/lib.rs`,
+`src/migration/pack_size.rs`, `config.toml.example`,
+`crates/verfsnext-surrealkv/src/wal/mod.rs`,
+`crates/verfsnext-surrealkv/src/wal/manager.rs`,
+`crates/verfsnext-surrealkv/src/wal/recovery.rs`,
+`crates/verfsnext-surrealkv/src/wal/reader.rs`,
+`crates/verfsnext-surrealkv/src/wal/writer.rs`,
+`crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`

@@ -155,6 +155,15 @@ const FIELDS: &[FieldMeta] = &[
     .unit("entries", 1.0)
     .advanced(),
     field(
+        "metadata_block_cache_mb",
+        PERF,
+        "File information memory",
+        "More memory makes looking up files and their pieces faster, above all after a restart.",
+        Kind::Unsigned,
+    )
+    .unit("MB", 1.0)
+    .advanced(),
+    field(
         "pack_index_cache_capacity_entries",
         PERF,
         "Storage index cache",

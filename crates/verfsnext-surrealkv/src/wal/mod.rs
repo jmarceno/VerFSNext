@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::{self, read_dir, File};
-use std::io::{self, Write};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
@@ -554,9 +555,25 @@ pub trait WritableFile: Send {
     fn close(&mut self) -> Result<()>;
 }
 
+/// How far the file of the active segment is extended with zeros ahead of
+/// its records. Records then overwrite space the file already has, so a sync
+/// (`fdatasync`) makes them durable without the journal commit a size change
+/// needs: on a rotational disk about 20 ms instead of about 100 ms per sync.
+/// Recovery reads the zeros as the end of the records and cuts them off the
+/// highest segment before the writer reopens it, and a segment that is
+/// closed or rotated away is cut back to its records.
+pub(crate) const PREALLOCATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Zeros written per call while extending a segment.
+static ZERO_FILL: [u8; 64 * 1024] = [0_u8; 64 * 1024];
+
 /// Buffered WAL file writer. With a durability barrier, buffered bytes reach
 /// the file only once the external data their records may reference is
 /// durable.
+///
+/// Bytes are written at `position` (the end of the records written so far),
+/// not appended at the end of the file: the file runs up to
+/// [`PREALLOCATE_BYTES`] of zeros past it.
 pub struct BufferedFileWriter {
     file: File,
     buffer: Vec<u8>,
@@ -566,23 +583,52 @@ pub struct BufferedFileWriter {
     /// that record may reference. Both are non-decreasing.
     record_ends: Vec<(usize, u64)>,
     pending_sync: bool,
+    /// File offset of the next byte handed to the OS.
+    position: u64,
+    /// Length of the file: `position` plus the zeros written past it.
+    allocated: u64,
 }
 
 impl BufferedFileWriter {
-    /// Creates a new BufferedFileWriter with the specified buffer size.
+    /// Creates a new BufferedFileWriter with the specified buffer size that
+    /// writes after the current end of `file`. A reopened segment must hold
+    /// only records: recovery cuts any zeroed tail before the writer opens it.
     pub fn new(
         file: File,
         buffer_size: usize,
         barrier: Option<std::sync::Arc<dyn DurabilityBarrier>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let len = file.metadata()?.len();
+        Ok(Self {
             file,
             buffer: Vec::with_capacity(buffer_size),
             buffer_size,
             barrier,
             record_ends: Vec::new(),
             pending_sync: false,
+            position: len,
+            allocated: len,
+        })
+    }
+
+    /// Writes the first `end` buffered bytes at `position` and extends the
+    /// file with zeros past them when they reach its end. `position` moves
+    /// only once both succeeded, so a failed write is retried in place.
+    fn write_buffered(&mut self, end: usize) -> Result<()> {
+        let data_end = self.position + end as u64;
+        self.file.write_all_at(&self.buffer[..end], self.position)?;
+        if data_end > self.allocated {
+            let target = (data_end / PREALLOCATE_BYTES + 1) * PREALLOCATE_BYTES;
+            let mut offset = data_end;
+            while offset < target {
+                let len = (target - offset).min(ZERO_FILL.len() as u64) as usize;
+                self.file.write_all_at(&ZERO_FILL[..len], offset)?;
+                offset += len as u64;
+            }
+            self.allocated = target;
         }
+        self.position = data_end;
+        Ok(())
     }
 
     /// Marks the end of a logical record and tags it with the current
@@ -610,7 +656,7 @@ impl BufferedFileWriter {
             return Ok(());
         }
         let end = self.record_ends[ready - 1].0;
-        self.file.write_all(&self.buffer[..end])?;
+        self.write_buffered(end)?;
         self.buffer.drain(..end);
         self.record_ends.drain(..ready);
         for (record_end, _) in &mut self.record_ends {
@@ -645,24 +691,34 @@ impl WritableFile for BufferedFileWriter {
                 barrier.make_durable(required)?;
             }
         }
-        self.file.write_all(&self.buffer)?;
+        self.write_buffered(self.buffer.len())?;
         self.buffer.clear();
         self.record_ends.clear();
         Ok(())
     }
 
+    /// `fdatasync` covers the records and, after an extension, the new file
+    /// length; the timestamps a full `fsync` would add play no part in
+    /// reading the records back.
     fn sync(&mut self) -> Result<()> {
         if !self.pending_sync {
             return Ok(());
         }
         self.flush()?;
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         self.pending_sync = false;
         Ok(())
     }
 
+    /// Syncs the records and cuts the zeros past them, so a segment that is
+    /// no longer written ends at its last record.
     fn close(&mut self) -> Result<()> {
         self.sync()?;
+        if self.allocated > self.position {
+            self.file.set_len(self.position)?;
+            self.file.sync_data()?;
+            self.allocated = self.position;
+        }
         Ok(())
     }
 }

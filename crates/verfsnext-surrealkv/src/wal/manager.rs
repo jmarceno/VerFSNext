@@ -123,7 +123,7 @@ impl Wal {
         let file_name = segment_name(log_number, extension);
         let file_path = dir.join(&file_name);
 
-        // Open or create the file (append mode ensures writes go to end)
+        // Open or create the file; the writer writes after its current end.
         let file = Self::open_wal_file(&file_path, opts)?;
 
         // Get file size from the opened file handle
@@ -138,7 +138,7 @@ impl Wal {
             // Calculate block_offset from file size
             let block_offset = (existing_size as usize) % BLOCK_SIZE;
 
-            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts);
+            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts)?;
 
             Ok(Writer::new(
                 buffered_writer,
@@ -150,7 +150,7 @@ impl Wal {
             // New file - use compression type from options
             let compression_type = opts.compression_type;
 
-            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts);
+            let (buffered_writer, manual_flush) = Self::buffered_writer(file, opts)?;
 
             let mut writer = Writer::new(buffered_writer, manual_flush, compression_type, 0);
             if compression_type != CompressionType::None {
@@ -163,14 +163,14 @@ impl Wal {
     /// Without a durability barrier every record is handed to the OS as it is
     /// added. With one, records stay buffered until an explicit flush or sync
     /// (or a full buffer), which is when the barrier runs.
-    fn buffered_writer(file: File, opts: &Options) -> (BufferedFileWriter, bool) {
-        match &opts.durability_barrier {
+    fn buffered_writer(file: File, opts: &Options) -> Result<(BufferedFileWriter, bool)> {
+        Ok(match &opts.durability_barrier {
             Some(barrier) => (
-                BufferedFileWriter::new(file, BARRIER_BUFFER_SIZE, Some(barrier.clone())),
+                BufferedFileWriter::new(file, BARRIER_BUFFER_SIZE, Some(barrier.clone()))?,
                 true,
             ),
-            None => (BufferedFileWriter::new(file, BLOCK_SIZE, None), false),
-        }
+            None => (BufferedFileWriter::new(file, BLOCK_SIZE, None)?, false),
+        })
     }
 
     /// Detects the compression type used in an existing WAL file.
@@ -212,11 +212,9 @@ impl Wal {
 
     fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
         let mut open_options = OpenOptions::new();
-        open_options
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true);
+        // Not in append mode: the writer writes at its own position, ahead of
+        // which the file is extended with zeros.
+        open_options.read(true).write(true).create(true);
 
         let file = open_options.open(file_path)?;
         #[cfg(unix)]
@@ -428,7 +426,9 @@ impl Wal {
     pub(crate) fn rotate(&mut self) -> Result<u64> {
         let old_log_number = self.active_log_number;
 
-        self.active_writer.sync()?;
+        // Syncs the records and cuts the zeros past them before a higher
+        // segment exists, so only the highest segment can end in zeros.
+        self.active_writer.close()?;
 
         // Update the log number
         self.active_log_number += 1;

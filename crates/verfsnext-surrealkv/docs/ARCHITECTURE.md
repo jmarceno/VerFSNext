@@ -373,6 +373,15 @@ With a barrier set:
 - A full flush (`flush_wal`, `sync`, rotation, close, full buffer) calls `make_durable` for the newest buffered tag (or the current watermark for a trailing partial record) before writing. It does so under the WAL lock.
 - Memtable rotation syncs the WAL first, so SSTables never contain entries that bypassed the barrier.
 
+**Preallocated segment tail and `fdatasync`**
+
+`BufferedFileWriter` writes at its own position (the end of the records written so far), not in append mode, and keeps the active segment's file extended with zeros up to the next multiple of `PREALLOCATE_BYTES` (4 MiB) past it. A sync is `fdatasync`: records overwrite space the file already has, so most syncs need no journal commit for a size change (measured on a 5900 rpm disk with ext4: about 20 ms per sync instead of about 100 ms). A sync right after an extension still commits the new length, which `fdatasync` covers. The writer moves its position only after the bytes and any extension were written, so a failed write is retried in place.
+
+- Readers see the zeros as the end of the records: an `Empty` header, which the writer never emits, is a zeroed region (see "Why Damage Appears Mid-Segment").
+- `close` (shutdown, `reopen_wal_after_recovery`) and `rotate` sync the records and then cut the zeros (`set_len` plus `fdatasync`), and rotation does so before the next segment is created. Only the highest segment can therefore end in zeros.
+- After a crash, recovery cuts that zero tail from the highest segment before the writer reopens it (`truncate_wal_segment_tail`, which reports an all-zero tail at info level and anything else as a torn tail warning). `BufferedFileWriter::new` starts writing at the file's length, so every open of an existing segment for writing must follow that cut, which all paths do (startup and restore reopen after replay).
+- Segments are never recycled: the zeros are always fresh, so a crash cannot expose stale records past the written ones. A page of unsynced records that reached the disk while an earlier page did not is a zeroed region followed by records, which the tolerant replay only accepts when it continues the replayed sequence.
+
 Without a barrier, behavior is unchanged: every record is handed to the OS as it is added. Committed records in the buffer are lost if the process dies before they are handed off; the caller bounds that window by calling `write_durable_wal_prefix` periodically.
 
 **Sequence Numbers**
@@ -1325,8 +1334,8 @@ SurrealKV supports two recovery modes that control behavior when WAL corruption 
 
 ### Why Damage Appears Mid-Segment: Appending Behind a Torn Tail
 
-The writer appends to the highest segment when the database opens
-(`Wal::create_writer`, block offset = file size % block size). A crash can
+The writer writes after the end of the highest segment when the database
+opens (`Wal::create_writer`, block offset = file size % block size). A crash can
 leave a torn tail: a zeroed region (an `Empty` header, which the writer never
 emits — block padding is always shorter than a header) or a partial record.
 Replay accepts both as a clean end of segment. Before B033 the writer then

@@ -15,6 +15,74 @@ pub(crate) struct NewChunk {
     pub(crate) inline_payload: Option<Vec<u8>>,
 }
 
+/// Chunks per job handed to the thread pool. Every pool worker that wakes
+/// spins for a while before it sleeps again, so spreading the few chunks of
+/// one FUSE request over all cores burns far more CPU than the chunks need
+/// (it used to cost about ten CPU-seconds per GiB read). Smaller sets run on
+/// the calling thread.
+const CHUNKS_PER_PARALLEL_JOB: usize = 8;
+
+/// Maps `f` over `items` in order, in parallel only when there is more than
+/// one job's worth of chunks.
+fn map_chunks<T, R>(
+    items: &[T],
+    f: impl Fn(&T) -> Result<R> + Sync + Send,
+) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+{
+    if items.len() <= CHUNKS_PER_PARALLEL_JOB {
+        return items.iter().map(f).collect();
+    }
+    items
+        .par_iter()
+        .with_min_len(CHUNKS_PER_PARALLEL_JOB)
+        .map(f)
+        .collect()
+}
+
+/// The bytes of one chunk as they go into a pack record.
+pub(crate) struct StoredPayload {
+    pub(crate) codec: u8,
+    /// Compressed payload, the chunk itself when compression would not
+    /// shrink it (shared, not copied), or the vault ciphertext.
+    pub(crate) bytes: Arc<Vec<u8>>,
+    nonce: [u8; 24],
+    uncompressed_len: u32,
+    pub(crate) crc32: u32,
+}
+
+impl StoredPayload {
+    /// Compresses `data` and, with a vault `key`, encrypts the result.
+    pub(crate) fn new(
+        data: &Arc<Vec<u8>>,
+        key: Option<&[u8; 32]>,
+        zstd_level: i32,
+    ) -> Result<Self> {
+        let uncompressed_len = u32::try_from(data.len())
+            .map_err(|_| anyhow!("chunk too large for u32 length: {}", data.len()))?;
+        let (codec, bytes) = match compress_payload(data, zstd_level)? {
+            Some(compressed) => (CODEC_ZSTD, Arc::new(compressed)),
+            None => (CODEC_RAW, Arc::clone(data)),
+        };
+        let (bytes, nonce) = match key {
+            Some(key) => {
+                let (ciphertext, nonce) = encrypt_chunk_payload(key, &bytes)?;
+                (Arc::new(ciphertext), nonce)
+            }
+            None => (bytes, [0_u8; 24]),
+        };
+        Ok(Self {
+            codec,
+            crc32: crc32c::crc32c(&bytes),
+            bytes,
+            nonce,
+            uncompressed_len,
+        })
+    }
+}
+
 impl FsCore {
     /// Fails with EIO when a stored payload does not match the CRC32 its
     /// pack index recorded for it, so a damaged copy is never decoded.
@@ -88,8 +156,9 @@ impl FsCore {
     }
 
     /// Returns the plaintext of every chunk in `ids`. Chunks missing from
-    /// the cache are read and decompressed in parallel, so a read that spans
-    /// many small chunks does not pay for them one after another.
+    /// the cache are read and decompressed in parallel when there are
+    /// enough of them, so a read that spans many small chunks does not pay
+    /// for them one after another.
     pub(crate) fn load_chunk_payloads(
         &self,
         ids: &[ChunkId],
@@ -114,19 +183,42 @@ impl FsCore {
         self.chunk_data_cache_misses
             .fetch_add(missing.len() as u64, Ordering::Relaxed);
         let loaded = tokio::task::block_in_place(|| {
-            missing
-                .par_iter()
-                .map(|id| {
-                    self.read_chunk_from_pack(*id)
-                        .map(|payload| (*id, Arc::new(payload)))
-                })
-                .collect::<Result<Vec<_>>>()
+            map_chunks(&missing, |id| {
+                self.read_chunk_from_pack(*id)
+                    .map(|payload| (*id, Arc::new(payload)))
+            })
         })?;
         for (id, payload) in loaded {
             self.chunk_data_cache.insert(id, Arc::clone(&payload));
             out.insert(id, payload);
         }
         Ok(out)
+    }
+
+    /// Loads the chunks of `inode` that hold `[from, to)` into the chunk
+    /// cache, one after another, ahead of a sequential reader. Blocks on the
+    /// disk. Copies are verified exactly as for a read; a failure is
+    /// returned for the caller to log, and the reader then gets the same
+    /// error from its own read.
+    pub(crate) fn read_ahead(&self, inode: &InodeRecord, from: u64, to: u64) -> Result<()> {
+        let extents = self
+            .meta
+            .read_txn(|txn| self.load_extents_in_txn(txn, inode.ino, from, to))?;
+        let vault = FsCore::inode_is_vault(inode);
+        for extent in extents {
+            let id = ChunkId {
+                vault,
+                hash: extent.record.chunk_hash,
+            };
+            if self.chunk_data_cache.contains_key(&id) {
+                continue;
+            }
+            self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
+            let payload = Arc::new(self.read_chunk_from_pack(id)?);
+            FsCore::check_extent_payload_len(&extent, &payload)?;
+            self.chunk_data_cache.insert(id, payload);
+        }
+        Ok(())
     }
 
     /// Reads, authenticates, decompresses and verifies chunk `id` from its
@@ -174,7 +266,7 @@ impl FsCore {
             })?;
             chunk = current;
             if let Some(stored) = inline_payload {
-                return self.decode_inline_chunk(id, &chunk, &stored);
+                return self.decode_inline_chunk(id, &chunk, stored);
             }
         }
         let folder_key = if id.vault {
@@ -194,17 +286,17 @@ impl FsCore {
                     chunk.pack_id,
                     id.hash,
                     index.payload_crc32,
-                    stored,
+                    &stored,
                 ) {
                     damaged = true;
                     return Err(err);
                 }
                 let plaintext = match &folder_key {
                     Some(key) => {
-                        let compressed = decrypt_chunk_payload(key, &chunk.nonce, stored)?;
+                        let compressed = decrypt_chunk_payload(key, &chunk.nonce, &stored)?;
                         crate::data::compress::decompress_chunk(
                             chunk.codec,
-                            &compressed,
+                            compressed,
                             chunk.uncompressed_len,
                         )?
                     }
@@ -254,16 +346,16 @@ impl FsCore {
         &self,
         id: ChunkId,
         chunk: &ChunkRecord,
-        stored: &[u8],
+        stored: Vec<u8>,
     ) -> Result<Vec<u8>> {
         let plaintext = if id.vault {
             let key = self.current_vault_key()?;
-            decrypt_chunk_payload(&key, &chunk.nonce, stored)?
+            decrypt_chunk_payload(&key, &chunk.nonce, &stored)?
         } else {
-            stored.to_vec()
+            stored
         };
         let plaintext =
-            crate::data::compress::decompress_chunk(chunk.codec, &plaintext, chunk.uncompressed_len)?;
+            crate::data::compress::decompress_chunk(chunk.codec, plaintext, chunk.uncompressed_len)?;
         if FsCore::chunk_content_hash(id.vault, &plaintext) != id.hash {
             self.corrupt_chunks.lock().insert(id);
             tracing::error!(
@@ -468,11 +560,11 @@ impl FsCore {
         pending_chunks.insert(id, StagedChunk { data, inline });
         Ok(true)
     }
-    /// Stores the staged chunks: pack chunks are compressed in parallel and
-    /// appended to the active pack; inline chunks keep their bytes (vault:
-    /// encrypted) for the commit to write into metadata. The domain of each
-    /// chunk comes from its [`ChunkId`], so a staged vault chunk is always
-    /// encrypted.
+    /// Stores the staged chunks: pack chunks are compressed (vault: then
+    /// encrypted) in parallel and appended to the active pack with one
+    /// vectored write; inline chunks keep their bytes (vault: encrypted) for
+    /// the commit to write into metadata. The domain of each chunk comes from
+    /// its [`ChunkId`], so a staged vault chunk is always encrypted.
     pub(crate) async fn materialize_pending_chunks(
         &self,
         pending_chunks: HashMap<ChunkId, StagedChunk>,
@@ -480,23 +572,28 @@ impl FsCore {
         if pending_chunks.is_empty() {
             return Ok(HashMap::new());
         }
+        let folder_key = if pending_chunks.keys().any(|id| id.vault) {
+            Some(self.current_vault_key()?)
+        } else {
+            None
+        };
+        let vault_key = || {
+            folder_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("vault chunk staged without a vault key"))
+        };
 
         let mut out = HashMap::with_capacity(pending_chunks.len());
-        let mut pending = Vec::with_capacity(pending_chunks.len());
+        let mut packed = Vec::with_capacity(pending_chunks.len());
         for (id, staged) in pending_chunks {
             if !staged.inline {
-                pending.push(PendingChunk {
-                    hash: id.hash,
-                    vault: id.vault,
-                    data: staged.data,
-                });
+                packed.push((id, staged.data));
                 continue;
             }
             let uncompressed_len = u32::try_from(staged.data.len())
                 .map_err(|_| anyhow!("chunk too large for u32 length: {}", staged.data.len()))?;
             let (payload, nonce, flags) = if id.vault {
-                let folder_key = self.current_vault_key()?;
-                let (ciphertext, nonce) = encrypt_chunk_payload(&folder_key, &staged.data)?;
+                let (ciphertext, nonce) = encrypt_chunk_payload(vault_key()?, &staged.data)?;
                 (ciphertext, nonce, CHUNK_FLAG_INLINE | CHUNK_FLAG_ENCRYPTED)
             } else {
                 (staged.data.as_ref().clone(), [0_u8; 24], CHUNK_FLAG_INLINE)
@@ -517,62 +614,46 @@ impl FsCore {
                 },
             );
         }
-        if pending.is_empty() {
+        if packed.is_empty() {
             return Ok(out);
         }
 
+        // Compression, encryption and the pack write block, so they run off
+        // the async workers.
         let zstd_level = self.config.zstd_compression_level;
-        let ready = tokio::task::spawn_blocking(move || compress_parallel(pending, zstd_level))
-            .await
-            .map_err(|e| anyhow!("compression task failed: {}", e))??;
-        for ready_chunk in ready {
-            let chunk = if ready_chunk.vault {
-                let folder_key = self.current_vault_key()?;
-                let (ciphertext, nonce) =
-                    encrypt_chunk_payload(&folder_key, &ready_chunk.chunk.compressed)?;
-                let disk_compressed_len = ciphertext.len() as u32;
-                let payload_crc32 = crc32c::crc32c(&ciphertext);
-                let pack_id = self.packs.append_chunk_with_crc32(
-                    ready_chunk.hash,
-                    ready_chunk.chunk.codec,
-                    ready_chunk.chunk.uncompressed_len,
-                    &ciphertext,
-                    payload_crc32,
-                )?;
-                ChunkRecord {
-                    refcount: 0,
-                    pack_id,
-                    codec: ready_chunk.chunk.codec,
-                    flags: CHUNK_FLAG_ENCRYPTED,
-                    nonce,
-                    uncompressed_len: ready_chunk.chunk.uncompressed_len,
-                    compressed_len: disk_compressed_len,
-                }
-            } else {
-                let pack_id = self.packs.append_chunk_with_crc32(
-                    ready_chunk.hash,
-                    ready_chunk.chunk.codec,
-                    ready_chunk.chunk.uncompressed_len,
-                    &ready_chunk.chunk.compressed,
-                    ready_chunk.chunk.payload_crc32,
-                )?;
-                ChunkRecord {
-                    refcount: 0,
-                    pack_id,
-                    codec: ready_chunk.chunk.codec,
-                    flags: 0,
-                    nonce: [0_u8; 24],
-                    uncompressed_len: ready_chunk.chunk.uncompressed_len,
-                    compressed_len: ready_chunk.chunk.compressed_len,
-                }
-            };
+        let (stored, pack_ids) = tokio::task::block_in_place(|| -> Result<_> {
+            let stored = map_chunks(&packed, |(id, data)| {
+                let key = if id.vault { Some(vault_key()?) } else { None };
+                StoredPayload::new(data, key, zstd_level)
+            })?;
+            let appends = packed
+                .iter()
+                .zip(&stored)
+                .map(|((id, _), payload)| ChunkAppend {
+                    hash: id.hash,
+                    codec: payload.codec,
+                    uncompressed_len: payload.uncompressed_len,
+                    payload: &payload.bytes,
+                    payload_crc32: payload.crc32,
+                })
+                .collect::<Vec<_>>();
+            let pack_ids = self.packs.append_chunks(&appends)?;
+            Ok((stored, pack_ids))
+        })?;
+
+        for (((id, _), payload), pack_id) in packed.into_iter().zip(stored).zip(pack_ids) {
             out.insert(
-                ChunkId {
-                    vault: ready_chunk.vault,
-                    hash: ready_chunk.hash,
-                },
+                id,
                 NewChunk {
-                    record: chunk,
+                    record: ChunkRecord {
+                        refcount: 0,
+                        pack_id,
+                        codec: payload.codec,
+                        flags: if id.vault { CHUNK_FLAG_ENCRYPTED } else { 0 },
+                        nonce: payload.nonce,
+                        uncompressed_len: payload.uncompressed_len,
+                        compressed_len: payload.bytes.len() as u32,
+                    },
                     inline_payload: None,
                 },
             );

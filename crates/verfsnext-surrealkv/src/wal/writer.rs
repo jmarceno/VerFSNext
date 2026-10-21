@@ -251,7 +251,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None).unwrap();
 
         let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
@@ -270,7 +270,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None).unwrap();
 
         let mut writer = Writer::new(buffered_writer, true, CompressionType::None, 0);
 
@@ -288,7 +288,7 @@ mod tests {
         let temp_dir = TempDir::new("test").unwrap();
         let file_path = temp_dir.path().join("test.wal");
         let file = File::create(&file_path).unwrap();
-        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None);
+        let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE, None).unwrap();
 
         let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 

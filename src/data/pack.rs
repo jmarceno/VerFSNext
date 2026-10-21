@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, IoSlice, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -72,6 +72,40 @@ pub struct PackIndexEntry {
     pub uncompressed_len: u32,
     pub compressed_len: u32,
     pub payload_crc32: u32,
+}
+
+/// One record to append: a chunk's stored payload and how it decodes.
+pub struct ChunkAppend<'a> {
+    pub hash: [u8; 16],
+    pub codec: u8,
+    pub uncompressed_len: u32,
+    pub payload: &'a [u8],
+    pub payload_crc32: u32,
+}
+
+/// Most iovecs one `writev` accepts (`IOV_MAX` on Linux).
+const MAX_IOVECS: usize = 1024;
+
+/// Writes every byte of `slices`, retrying short writes and interrupts.
+fn write_all_vectored(
+    file: &mut File,
+    mut slices: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    while !slices.is_empty() {
+        let window = slices.len().min(MAX_IOVECS);
+        match file.write_vectored(&slices[..window]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole pack records",
+                ));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 struct ActivePack {
@@ -284,19 +318,49 @@ impl PackStore {
         compressed_data: &[u8],
         payload_crc32: u32,
     ) -> Result<u64> {
-        let mut active = self.active.lock();
-        self.ensure_no_swap_failure()?;
-        self.make_room(&mut active, Self::record_len(compressed_data.len()))?;
-        Self::append_record_locked(
-            &mut active,
-            chunk_hash,
+        let pack_ids = self.append_chunks(&[ChunkAppend {
+            hash: chunk_hash,
             codec,
             uncompressed_len,
-            compressed_data,
+            payload: compressed_data,
             payload_crc32,
-        )?;
-        self.append_watermark.fetch_add(1, Ordering::Release);
-        Ok(active.pack_id)
+        }])?;
+        Ok(pack_ids[0])
+    }
+
+    /// Appends one record per chunk, in order, and returns the pack each one
+    /// landed in. Records that fit in the active pack together are written
+    /// with one vectored write; the pack is rotated between records when the
+    /// next one would push it past the size target.
+    pub fn append_chunks(&self, chunks: &[ChunkAppend<'_>]) -> Result<Vec<u64>> {
+        let mut pack_ids = Vec::with_capacity(chunks.len());
+        let mut active = self.active.lock();
+        self.ensure_no_swap_failure()?;
+        let mut run_start = 0;
+        let mut run_len = 0_u64;
+        for (position, chunk) in chunks.iter().enumerate() {
+            let record_len = Self::record_len(chunk.payload.len());
+            let fits = active
+                .size_bytes
+                .checked_add(run_len)
+                .and_then(|size| size.checked_add(record_len))
+                .is_some_and(|size| size <= self.max_pack_size_bytes);
+            if !fits && run_start < position {
+                self.append_run_locked(&mut active, &chunks[run_start..position])?;
+                pack_ids.resize(position, active.pack_id);
+                run_start = position;
+                run_len = 0;
+            }
+            if run_start == position {
+                self.make_room(&mut active, record_len)?;
+            }
+            run_len += record_len;
+        }
+        if run_start < chunks.len() {
+            self.append_run_locked(&mut active, &chunks[run_start..])?;
+            pack_ids.resize(chunks.len(), active.pack_id);
+        }
+        Ok(pack_ids)
     }
 
     /// Appends several stored copies of one chunk, in order, to a single pack
@@ -312,88 +376,101 @@ impl PackStore {
             .iter()
             .map(|(_, payload)| Self::record_len(payload.len()))
             .sum::<u64>();
+        let records = copies
+            .iter()
+            .map(|(entry, payload)| ChunkAppend {
+                hash: chunk_hash,
+                codec: entry.codec,
+                uncompressed_len: entry.uncompressed_len,
+                payload,
+                payload_crc32: entry.payload_crc32,
+            })
+            .collect::<Vec<_>>();
         let mut active = self.active.lock();
         self.ensure_no_swap_failure()?;
         self.make_room(&mut active, group_len)?;
-        for (entry, payload) in copies {
-            Self::append_record_locked(
-                &mut active,
-                chunk_hash,
-                entry.codec,
-                entry.uncompressed_len,
-                payload,
-                entry.payload_crc32,
-            )?;
-            self.append_watermark.fetch_add(1, Ordering::Release);
-        }
+        self.append_run_locked(&mut active, &records)?;
         Ok(active.pack_id)
     }
 
-    fn append_record_locked(
+    /// Writes `records` at the end of the active pack with one vectored
+    /// write (split only by the iovec limit) and indexes them. On a failed
+    /// or short write the pack is cut back to where the run started, so no
+    /// partial record is left behind.
+    fn append_run_locked(
+        &self,
         active: &mut ActivePack,
-        chunk_hash: [u8; 16],
-        codec: u8,
-        uncompressed_len: u32,
-        compressed_data: &[u8],
-        payload_crc32: u32,
+        records: &[ChunkAppend<'_>],
     ) -> Result<()> {
-        if compressed_data.len() > u32::MAX as usize {
-            bail!("compressed chunk too large: {}", compressed_data.len());
+        let run_offset = active.size_bytes;
+        let mut headers = Vec::with_capacity(records.len());
+        let mut entries = Vec::with_capacity(records.len());
+        let mut next_offset = run_offset;
+        for record in records {
+            if record.payload.len() > u32::MAX as usize {
+                bail!("compressed chunk too large: {}", record.payload.len());
+            }
+            let compressed_len = record.payload.len() as u32;
+            headers.push(Self::encode_pack_header(&PackRecordHeader {
+                magic: RECORD_MAGIC,
+                hash: record.hash,
+                codec: record.codec,
+                reserved: RECORD_RESERVED,
+                uncompressed_len: record.uncompressed_len,
+                compressed_len,
+            })?);
+            entries.push((
+                record.hash,
+                PackIndexEntry {
+                    offset: next_offset,
+                    codec: record.codec,
+                    uncompressed_len: record.uncompressed_len,
+                    compressed_len,
+                    payload_crc32: record.payload_crc32,
+                },
+            ));
+            next_offset = next_offset
+                .checked_add(Self::record_len(record.payload.len()))
+                .context("active pack size overflow")?;
         }
-        let record_len = Self::record_len(compressed_data.len());
-        let next_size = active
-            .size_bytes
-            .checked_add(record_len)
-            .context("active pack size overflow")?;
-        let record_offset = active.size_bytes;
-        let compressed_len = compressed_data.len() as u32;
-        let header = PackRecordHeader {
-            magic: RECORD_MAGIC,
-            hash: chunk_hash,
-            codec,
-            reserved: RECORD_RESERVED,
-            uncompressed_len,
-            compressed_len,
-        };
-        let header_bytes = Self::encode_pack_header(&header)?;
+        let mut slices = Vec::with_capacity(records.len() * 2);
+        for (header, record) in headers.iter().zip(records) {
+            slices.push(IoSlice::new(header));
+            slices.push(IoSlice::new(record.payload));
+        }
 
-        // One write per record: content-defined chunks are small, so the
-        // syscall count matters more than the copy of the payload.
-        let mut record = Vec::with_capacity(record_len as usize);
-        record.extend_from_slice(&header_bytes);
-        record.extend_from_slice(compressed_data);
-        let file = &mut active.file;
-        if let Err(err) = file.write_all(&record) {
+        if let Err(err) = write_all_vectored(&mut active.file, &mut slices) {
             // A partial record (e.g. ENOSPC) would shift every later record
             // away from the offset recorded in its index entry, so cut the
             // pack back to the last complete record before reporting.
-            if let Err(rollback_err) = file.set_len(record_offset) {
+            let file = &active.file;
+            if let Err(rollback_err) = file.set_len(run_offset) {
                 active.size_bytes = file
                     .metadata()
                     .context("failed to stat active pack after failed rollback")?
                     .len();
                 bail!(
-                    "failed to append pack record ({err}) and failed to truncate the partial record ({rollback_err}); pack {} now has a torn record at offset {}",
+                    "failed to append pack records ({err}) and failed to truncate the partial records ({rollback_err}); pack {} now has a torn record at offset {}",
                     active.pack_id,
-                    record_offset
+                    run_offset
                 );
             }
-            return Err(err).context("failed to append pack record");
+            return Err(err).context("failed to append pack records");
         }
 
-        let index = PackIndexEntry {
-            offset: record_offset,
-            codec,
-            uncompressed_len,
-            compressed_len,
-            payload_crc32,
-        };
-        // Buffer the index entry instead of writing it immediately.
-        // Index entries are flushed to disk in a single write during sync().
-        // The lookup map is updated immediately so reads are still correct.
-        active.pending_index.push((chunk_hash, index));
-        active.index_map.write().insert(chunk_hash, index);
-        active.size_bytes = next_size;
+        // Index entries are buffered and flushed to disk in a single write
+        // during sync(). The lookup map is updated right away so reads find
+        // the records.
+        {
+            let mut map = active.index_map.write();
+            for (hash, entry) in &entries {
+                map.insert(*hash, *entry);
+            }
+        }
+        active.pending_index.extend(entries);
+        active.size_bytes = next_offset;
+        self.append_watermark
+            .fetch_add(records.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -416,7 +493,7 @@ impl PackStore {
         expected_codec: u8,
         expected_uncompressed_len: u32,
         expected_compressed_len: u32,
-        mut accept: impl FnMut(&[u8], &PackIndexEntry) -> Result<T>,
+        mut accept: impl FnMut(Vec<u8>, &PackIndexEntry) -> Result<T>,
     ) -> Result<T> {
         let swap_lock = self.swap_lock(pack_id);
         let _swap_guard = swap_lock.read();
@@ -440,7 +517,7 @@ impl PackStore {
                     expected_uncompressed_len,
                     expected_compressed_len,
                 )
-                .and_then(|payload| accept(&payload, entry));
+                .and_then(|payload| accept(payload, entry));
             match result {
                 Ok(value) => {
                     if let Some(rejected) = primary_err {
@@ -638,11 +715,18 @@ impl PackStore {
         let path = self.pack_path(pack_id);
         let file = self.open_pack_file(pack_id)?;
 
+        // Header and payload are read together: the index entry already
+        // gives the record's length, and the header is checked against it
+        // before the payload is used.
+        let record_len = usize::try_from(Self::record_len(index.compressed_len as usize))
+            .context("pack record too large to read")?;
+        let mut payload = vec![0_u8; record_len];
+        file.read_exact_at(&mut payload, index.offset)
+            .with_context(|| format!("failed to read pack record from {}", path.display()))?;
         let mut raw_header = AlignedBytes::<RECORD_HEADER_LEN>::zeroed();
-        file.read_exact_at(raw_header.as_mut_slice(), index.offset)
-            .with_context(|| {
-                format!("failed to read pack record header from {}", path.display())
-            })?;
+        raw_header
+            .as_mut_slice()
+            .copy_from_slice(&payload[..RECORD_HEADER_LEN]);
         let header = Self::decode_pack_header(raw_header.as_slice())?;
 
         if header.magic != RECORD_MAGIC {
@@ -680,14 +764,7 @@ impl PackStore {
             );
         }
 
-        let payload_offset = index
-            .offset
-            .checked_add(RECORD_HEADER_LEN_U64)
-            .context("pack record offset overflow while reading payload")?;
-        let mut payload = vec![0_u8; header.compressed_len as usize];
-        file.read_exact_at(&mut payload, payload_offset)
-            .with_context(|| format!("failed to read pack payload from {}", path.display()))?;
-
+        payload.drain(..RECORD_HEADER_LEN);
         Ok(payload)
     }
 
@@ -715,7 +792,10 @@ impl PackStore {
     /// Only the index flush runs under the active-pack lock. The fsync goes
     /// through duplicated handles so appends and reads continue while the disk
     /// works; data appended before this call is covered either way, and a
-    /// rotation syncs the pack it retires itself.
+    /// rotation syncs the pack it retires itself. The pack and its index are
+    /// synced concurrently: both must be durable before the caller goes on,
+    /// but not in any order relative to each other, so the filesystem can
+    /// cover both with one journal commit.
     pub fn sync(&self, full: bool) -> Result<()> {
         let (watermark, file, index_file) = {
             let mut active = self.active.lock();
@@ -733,17 +813,33 @@ impl PackStore {
                     .context("failed to duplicate active pack index handle for sync")?,
             )
         };
-        if full {
-            file.sync_all().context("failed to sync_all active pack")?;
-            index_file
-                .sync_all()
-                .context("failed to sync_all active pack index")?;
-        } else {
-            file.sync_data().context("failed to sync_data active pack")?;
-            index_file
-                .sync_data()
-                .context("failed to sync_data active pack index")?;
-        }
+        let sync_file = |file: &File, what: &str| {
+            if full {
+                file.sync_all()
+                    .with_context(|| format!("failed to sync_all active pack {what}"))
+            } else {
+                file.sync_data()
+                    .with_context(|| format!("failed to sync_data active pack {what}"))
+            }
+        };
+        std::thread::scope(|scope| -> Result<()> {
+            let index_sync = std::thread::Builder::new()
+                .name("pack-index-sync".to_owned())
+                .spawn_scoped(scope, || sync_file(&index_file, "index"))
+                .context("failed to start the active pack index sync thread")?;
+            let pack_result = sync_file(&file, "data");
+            let index_result = index_sync
+                .join()
+                .map_err(|_| anyhow::anyhow!("active pack index sync thread panicked"))
+                .and_then(|result| result);
+            match (pack_result, index_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+                (Err(pack_err), Err(index_err)) => Err(pack_err.context(format!(
+                    "the active pack index sync failed as well: {index_err:#}"
+                ))),
+            }
+        })?;
         self.durable_watermark.fetch_max(watermark, Ordering::AcqRel);
         Ok(())
     }
@@ -1962,7 +2058,7 @@ mod tests {
                 CODEC_RAW,
                 payload.len() as u32,
                 payload.len() as u32,
-                |stored, _| Ok(stored.to_vec()),
+                |stored, _| Ok(stored),
             )
             .expect("chunk read should succeed");
         assert_eq!(read_back, payload);

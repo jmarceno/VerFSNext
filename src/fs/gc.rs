@@ -1,5 +1,6 @@
 use super::*;
 use crate::fs::FsCore;
+use crate::fs::chunk::StoredPayload;
 
 enum RewriteStep {
     Rewritten(u64),
@@ -683,13 +684,17 @@ impl FsCore {
                 for (id, inline, payload) in batch {
                     // Vault payloads are already encrypted and are moved as
                     // they are; plain payloads are compressed on the way.
-                    let (codec, stored) = if id.vault {
-                        (inline.codec, payload)
+                    let (codec, stored, payload_crc32) = if id.vault {
+                        let payload_crc32 = crc32c::crc32c(&payload);
+                        (inline.codec, Arc::new(payload), payload_crc32)
                     } else {
-                        let compressed = compress_chunk(&payload, self.config.zstd_compression_level)?;
-                        (compressed.codec, compressed.compressed)
+                        let compressed = StoredPayload::new(
+                            &Arc::new(payload),
+                            None,
+                            self.config.zstd_compression_level,
+                        )?;
+                        (compressed.codec, compressed.bytes, compressed.crc32)
                     };
-                    let payload_crc32 = crc32c::crc32c(&stored);
                     let pack_id = tokio::task::block_in_place(|| {
                         self.packs.append_chunk_with_crc32(
                             id.hash,

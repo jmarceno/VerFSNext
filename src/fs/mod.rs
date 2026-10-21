@@ -31,9 +31,9 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use fill_cache::FillCache;
 use crate::data::chunker::UltraCdc;
-use crate::data::compress::{compress_chunk, compress_parallel, PendingChunk, CODEC_RAW};
+use crate::data::compress::{compress_payload, CODEC_RAW, CODEC_ZSTD};
 use crate::data::hash::{hash128, hash128_with_domain};
-use crate::data::pack::PackStore;
+use crate::data::pack::{ChunkAppend, PackStore};
 use crate::gc::{append_records, ensure_file, read_records, rewrite_records, DiscardRecord};
 use crate::meta::{is_retryable_commit_error, MetaStore, MAX_COMMIT_ATTEMPTS};
 use crate::migration::pack_index_crc32::{
@@ -145,7 +145,16 @@ struct SmallFileReadPlan {
 struct FileHandleState {
     ino: u64,
     inode_data_version: u64,
+    /// Where the next read starts if the handle reads sequentially.
+    next_read_offset: u64,
+    /// End of the range readahead has been started for.
+    readahead_end: u64,
 }
+
+/// How far ahead of a sequential reader its chunks are loaded into the chunk
+/// cache. The kernel sends FUSE reads of at most 128 KiB with about one in
+/// flight, so without readahead every request waits for its own pack reads.
+const READAHEAD_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
@@ -399,7 +408,7 @@ impl VerFs {
 
         let pack_barrier = Arc::new(std::sync::OnceLock::new());
         let meta =
-            MetaStore::open_with_pack_barrier(&config.metadata_dir(), Arc::clone(&pack_barrier))
+            MetaStore::open_with_pack_barrier(&config, Arc::clone(&pack_barrier))
                 .await?;
         ensure_pack_index_crc32_compat(&config, &meta).await?;
         if let Err(err) = ensure_pack_size_metadata_compat(&meta, config.pack_max_size_mb).await {
@@ -961,6 +970,8 @@ impl FsCore {
             FileHandleState {
                 ino,
                 inode_data_version,
+                next_read_offset: 0,
+                readahead_end: 0,
             },
         );
         self.file_read_plan_cache.invalidate(&fh);
@@ -1057,6 +1068,34 @@ impl FsCore {
             self.file_read_plan_cache.invalidate(&fh);
         }
         Ok(())
+    }
+
+    /// Records the read `[offset, read_end)` on `fh` and returns the range
+    /// whose chunks should be loaded ahead of the reader: none unless the
+    /// handle reads sequentially and less than half the window is left
+    /// ahead of it.
+    fn claim_readahead(
+        &self,
+        fh: u64,
+        offset: u64,
+        read_end: u64,
+        file_size: u64,
+    ) -> Option<(u64, u64)> {
+        let mut handles = self.file_handles.lock();
+        let state = handles.get_mut(&fh)?;
+        let sequential = offset == state.next_read_offset;
+        state.next_read_offset = read_end;
+        if !sequential {
+            state.readahead_end = read_end;
+            return None;
+        }
+        let target = read_end.saturating_add(READAHEAD_WINDOW_BYTES).min(file_size);
+        let from = state.readahead_end.max(read_end);
+        if from >= target || from >= read_end.saturating_add(READAHEAD_WINDOW_BYTES / 2) {
+            return None;
+        }
+        state.readahead_end = target;
+        Some((from, target))
     }
 
     fn unregister_file_handle(&self, fh: u64) {
@@ -1634,12 +1673,16 @@ impl FsCore {
     /// Makes every write acknowledged so far durable for an explicit
     /// fsync/fdatasync/fsyncdir: the packs first, then the metadata WAL
     /// records that reference them, both synced to disk before returning.
-    /// `data_only` (fdatasync) only relaxes the pack sync to `sync_data`;
-    /// the WAL is always synced, because the inode size, extents and chunk
-    /// records are needed to read the data back.
-    pub(crate) async fn sync_durably(&self, data_only: bool) -> Result<()> {
+    /// The packs are synced only when records were appended since the last
+    /// pack sync (most small files live inline in metadata and append
+    /// nothing), and with `sync_data`, which covers their size: the pack
+    /// files' timestamps play no part in reading data back. The WAL is
+    /// always synced, because the inode size, extents and chunk records are
+    /// needed to read the data back; it skips the disk itself when nothing
+    /// was committed since its last sync.
+    pub(crate) async fn sync_durably(&self) -> Result<()> {
         tokio::task::block_in_place(|| {
-            self.packs.sync(!data_only)?;
+            self.packs.sync_to(self.packs.append_watermark())?;
             self.meta.flush_wal(true)
         })
     }
@@ -1651,16 +1694,18 @@ impl SyncTarget for FsCore {
         self.persist_active_pack_id_if_needed().await?;
         self.persist_pack_crc32_read_error_count_if_needed().await?;
         self.persist_corrupt_chunk_marks().await?;
-        // Both block on the disk. The periodic cycle only hands off WAL
-        // records whose pack data the sync just made durable: flushing the
-        // whole buffer would sync packs again under the WAL lock and pause
-        // every commit while writes are streaming in. A full cycle (fsync,
-        // shutdown) makes everything durable.
+        // Both block on the disk. The periodic cycle syncs the packs only
+        // when something was appended since the last pack sync, and hands
+        // off only WAL records whose pack data is durable: flushing the whole
+        // buffer would sync packs again under the WAL lock and pause every
+        // commit while writes are streaming in. A full cycle (shutdown)
+        // makes everything durable.
         tokio::task::block_in_place(|| {
-            self.packs.sync(full)?;
             if full {
+                self.packs.sync(true)?;
                 self.meta.flush_wal(true)
             } else {
+                self.packs.sync_to(self.packs.append_watermark())?;
                 self.meta.write_durable_wal_prefix()
             }
         })?;
@@ -1718,6 +1763,7 @@ mod tests {
             batch_flush_interval_ms: 100,
             metadata_cache_capacity_entries: 10000,
             chunk_cache_capacity_mb: 100,
+            metadata_block_cache_mb: 16,
             pack_index_cache_capacity_entries: 10000,
             pack_max_size_mb: 10,
             zstd_compression_level: 1,

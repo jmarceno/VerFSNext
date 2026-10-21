@@ -78,7 +78,7 @@ pub async fn ensure_pack_size_metadata_compat(meta: &MetaStore, configured_mb: u
 pub async fn run_pack_size_migration(config: &Config) -> Result<()> {
     ensure_daemon_offline(config).await?;
 
-    let meta = MetaStore::open(&config.metadata_dir()).await?;
+    let meta = MetaStore::open(config).await?;
     let action_result = run_pack_size_migration_inner(config, &meta).await;
     let close_result = meta.close().await;
     action_result?;
