@@ -394,7 +394,11 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
    - encrypted payload is read from pack
    - payload is decrypted using in-memory folder key and the record's nonce; if the most recent copy of the chunk in its pack fails authentication, the other indexed copies are tried (see `src/data/pack.rs`)
    - decrypted compressed bytes are decompressed and returned
-6. `verfsnext crypt -l` clears in-memory key material and invalidates vault-related caches.
+6. `verfsnext crypt -l` (mounted daemon, `VerFs::lock_vault`):
+   - first runs `syncfs` on the mount, without the mutation gate, so data the kernel still holds dirty for vault files is written back while the vault can still encrypt it (afterwards those writes would be refused)
+   - then, under the write side of the mutation gate, clears the in-memory key, persists the locked state and empties the chunk metadata and chunk data caches. The chunk data cache is emptied under the write side of the vault cache epoch gate, which also bumps the epoch: reads cache vault plaintext only under the read side and only when the epoch they read before decoding is still current, so a read that was in flight during the lock still returns its data but cannot put plaintext back into the cache. Writes stage chunks under the read side of the mutation gate, which the lock holds exclusively
+   - finally, off the async workers and without the mutation gate, sends `FUSE_NOTIFY_INVAL_INODE` (whole range) for every vault file the kernel holds (looked up or open), so pages it cached while the vault was unlocked are dropped and a descriptor opened before the lock reads `EIO` instead of cached plaintext. A missing notifier or a failed invalidation is reported as an error that says the vault itself is locked
+   - offline (no daemon mounted, `lock_vault_offline`) only the metadata state changes: no kernel holds pages
 
 ## `.DISCARD` Flow
 

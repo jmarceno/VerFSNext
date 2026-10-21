@@ -146,12 +146,13 @@ impl FsCore {
             return Ok(cached);
         }
         self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
+        let epoch = self.vault_cache_epoch();
         // The pack read and decompression block, so they run off the async
         // workers.
         let payload = Arc::new(tokio::task::block_in_place(|| {
             self.read_chunk_from_pack(id)
         })?);
-        self.chunk_data_cache.insert(id, Arc::clone(&payload));
+        self.cache_chunk_payload(id, Arc::clone(&payload), epoch);
         Ok(payload)
     }
 
@@ -182,6 +183,7 @@ impl FsCore {
         }
         self.chunk_data_cache_misses
             .fetch_add(missing.len() as u64, Ordering::Relaxed);
+        let epoch = self.vault_cache_epoch();
         let loaded = tokio::task::block_in_place(|| {
             map_chunks(&missing, |id| {
                 self.read_chunk_from_pack(*id)
@@ -189,7 +191,7 @@ impl FsCore {
             })
         })?;
         for (id, payload) in loaded {
-            self.chunk_data_cache.insert(id, Arc::clone(&payload));
+            self.cache_chunk_payload(id, Arc::clone(&payload), epoch);
             out.insert(id, payload);
         }
         Ok(out)
@@ -214,9 +216,10 @@ impl FsCore {
                 continue;
             }
             self.chunk_data_cache_misses.fetch_add(1, Ordering::Relaxed);
+            let epoch = self.vault_cache_epoch();
             let payload = Arc::new(self.read_chunk_from_pack(id)?);
             FsCore::check_extent_payload_len(&extent, &payload)?;
-            self.chunk_data_cache.insert(id, payload);
+            self.cache_chunk_payload(id, payload, epoch);
         }
         Ok(())
     }
@@ -541,6 +544,9 @@ impl FsCore {
             return Ok(false);
         }
 
+        // Writes and truncates stage chunks under the read side of the
+        // mutation gate, which a vault lock takes exclusively, so this needs
+        // no vault cache epoch check.
         self.chunk_data_cache.insert(id, Arc::clone(&data));
         if let Some(raw) = txn.get(chunk_key(&id))? {
             let existing: ChunkRecord = decode_rkyv(&raw)?;

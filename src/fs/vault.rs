@@ -322,11 +322,105 @@ impl FsCore {
             })
             .await?;
         self.chunk_meta_cache.invalidate_all();
-        self.chunk_data_cache.invalidate_all();
+        self.forget_vault_plaintext();
         self.mark_mutation();
         self.invalidate_entry_best_effort(ROOT_INODE, VAULT_DIR_NAME);
         if let Ok(Some(vault_dirent)) = self.load_dirent_cached(ROOT_INODE, VAULT_DIR_NAME.as_bytes()) {
             self.invalidate_inode_attr_best_effort(vault_dirent.ino);
+        }
+        Ok(())
+    }
+
+    /// Empties the chunk cache and starts a new vault cache epoch, both under
+    /// the write side of the epoch gate: plaintext decoded before this call
+    /// can no longer be cached by a read still in flight.
+    fn forget_vault_plaintext(&self) {
+        let mut epoch = self.vault_cache_epoch.write();
+        *epoch += 1;
+        self.chunk_data_cache.invalidate_all();
+        self.chunk_data_cache.run_pending_tasks();
+    }
+
+    /// The current vault cache epoch. Read it before decoding a chunk and
+    /// pass it to [`FsCore::cache_chunk_payload`].
+    pub(crate) fn vault_cache_epoch(&self) -> u64 {
+        *self.vault_cache_epoch.read()
+    }
+
+    /// Caches the plaintext of chunk `id`. A vault chunk is cached only when
+    /// the vault has not locked since `epoch` was read; its plaintext is then
+    /// still returned to the reader that decoded it, but not kept.
+    pub(crate) fn cache_chunk_payload(&self, id: ChunkId, payload: Arc<Vec<u8>>, epoch: u64) {
+        if !id.vault {
+            self.chunk_data_cache.insert(id, payload);
+            return;
+        }
+        let current = self.vault_cache_epoch.read();
+        if *current == epoch {
+            self.chunk_data_cache.insert(id, payload);
+        }
+    }
+
+    /// Writes back everything the kernel holds dirty for the mount, through
+    /// this filesystem, so writes made before a vault lock are stored while
+    /// the vault can still encrypt them. Runs without the mutation gate,
+    /// which the write-back's own writes need.
+    pub(crate) async fn write_back_mount(&self) -> Result<()> {
+        let mount_point = self.config.mount_point.clone();
+        tokio::task::spawn_blocking(move || {
+            let root = std::fs::File::open(&mount_point).with_context(|| {
+                format!(
+                    "failed to open {} to write back before the vault lock",
+                    mount_point.display()
+                )
+            })?;
+            nix::unistd::syncfs(std::os::fd::AsRawFd::as_raw_fd(&root)).with_context(|| {
+                format!("syncfs of {} before the vault lock failed", mount_point.display())
+            })
+        })
+        .await
+        .context("vault lock write-back task failed")?
+    }
+
+    /// Drops the kernel's cached pages and attributes of every vault file the
+    /// kernel holds (looked up or open), so plaintext it cached while the
+    /// vault was unlocked is neither kept in memory nor readable through a
+    /// descriptor opened before the lock: the next read of such a page comes
+    /// back to this filesystem, which refuses it. Blocks on the FUSE device
+    /// (dropping a page that was dirtied after the write-back writes it back
+    /// first), so it runs off the async workers and after the lock released
+    /// the mutation gate.
+    pub(crate) fn drop_vault_pages_from_kernel(&self) -> Result<()> {
+        let Some(notifier) = self.notifier.read().clone() else {
+            return Err(anyhow_errno(
+                Errno::EIO,
+                "the vault is locked, but the mount has no kernel notifier: pages of vault files \
+                 the kernel cached stay in memory until it evicts them",
+            ));
+        };
+        let mut inos = self.kernel_lookups.lock().keys().copied().collect::<Vec<_>>();
+        inos.extend(self.file_handles.lock().values().map(|state| state.ino));
+        inos.sort_unstable();
+        inos.dedup();
+        for ino in inos {
+            let Some(inode) = self.load_inode_cached(ino)? else {
+                continue;
+            };
+            if !FsCore::inode_is_vault(&inode) || inode.kind != INODE_KIND_FILE {
+                continue;
+            }
+            match notifier.invalidate_inode(ino, 0, 0) {
+                Ok(_) | Err(Errno::ENOENT) => {}
+                Err(err) => {
+                    return Err(anyhow_errno(
+                        err,
+                        format!(
+                            "the vault is locked, but the kernel could not drop the cached pages of \
+                             vault inode {ino}: {err}"
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }

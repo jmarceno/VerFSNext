@@ -1879,3 +1879,56 @@ just-written file 1.76 s -> 0.75 s (11.1 -> 2.3 CPU-seconds).
 `crates/verfsnext-surrealkv/src/wal/reader.rs`,
 `crates/verfsnext-surrealkv/src/wal/writer.rs`,
 `crates/verfsnext-surrealkv/docs/ARCHITECTURE.md`
+
+## B047 - Vault Plaintext Stayed Readable and Cached After a Lock - Oct 21 2026
+
+### Symptom
+
+After `crypt -l`, a process that had opened (and read) a vault file before
+the lock could still read its plaintext through that descriptor, served from
+the kernel page cache. The decrypted pages also stayed in kernel memory until
+evicted. Inside the daemon, a read that was decoding a vault chunk while the
+lock ran could put its plaintext back into the chunk cache right after the
+lock emptied it. Data the kernel still held dirty for a vault file at lock
+time was written back only after the lock, where the write is refused.
+
+### Root Cause
+
+- `lock_vault` emptied the chunk caches but reads do not take the mutation
+  gate, so a read that obtained the key before the lock inserted its
+  plaintext after `invalidate_all`.
+- Nothing told the kernel to drop the cached pages of vault files; only the
+  `/.vault` entry and the vault root's attributes were invalidated.
+- Nothing wrote back dirty kernel pages before the vault locked. In practice
+  the FUSE bdi writes back within milliseconds, so the window is small.
+
+### Fix
+
+- Vault cache epoch (`FsCore::vault_cache_epoch`, a `parking_lot::RwLock`):
+  the lock bumps it and empties the chunk data cache under the write side
+  (then runs moka's pending tasks so the entries are dropped, not just
+  hidden); `cache_chunk_payload` inserts a vault chunk only under the read
+  side and only if the epoch read before decoding is still current. Reads,
+  batched reads and readahead go through it; write staging runs under the
+  mutation gate the lock holds exclusively.
+- `VerFs::lock_vault` (mounted daemon) runs `syncfs` on the mount before
+  locking and, after the lock released the mutation gate, sends
+  `FUSE_NOTIFY_INVAL_INODE` for every vault file the kernel looked up or has
+  open (off the async workers, since dropping a dirty page writes it back
+  through this filesystem). The offline path is `lock_vault_offline`.
+
+### Validation
+
+- Scratch mount, vault file opened and read, then `crypt -l`: reading the
+  same descriptor returned the plaintext before the fix and `EIO` after it.
+- 64 KiB and 3 MiB writes left open at lock time, daemon SIGKILLed while
+  locked, restart, unlock: data intact (old and new builds; the kernel had
+  already written the pages back before the lock in these runs, so the
+  `syncfs` ordering is not exercised by this test).
+- Workspace unit tests, mount suite without benchmarks (9 tests) and the
+  scratch-mount integrity run (vault create/unlock/write/lock/unlock/restart
+  included) passed.
+
+### Affected Files
+
+`src/fs/vault.rs`, `src/fs/chunk.rs`, `src/fs/mod.rs`, `src/control.rs`

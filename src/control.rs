@@ -264,7 +264,7 @@ pub async fn lock_vault(config: &Config) -> Result<()> {
         return Ok(());
     }
     let fs = VerFs::new(config.clone()).await?;
-    let result = fs.lock_vault().await;
+    let result = fs.lock_vault_offline().await;
     fs.graceful_shutdown().await?;
     result
 }

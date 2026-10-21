@@ -399,6 +399,11 @@ struct FsCore {
     /// Lookup references the kernel holds per inode (entry replies minus FORGET).
     kernel_lookups: ParkingMutex<HashMap<u64, u64>>,
     vault: ParkingRwLock<VaultRuntime>,
+    /// Bumped under the write side each time the vault locks. Vault chunk
+    /// plaintext enters the chunk cache only under the read side and only
+    /// while the epoch it was decoded under is still current, so a read that
+    /// finishes after a lock cannot put plaintext back into the cache.
+    vault_cache_epoch: ParkingRwLock<u64>,
 }
 
 impl VerFs {
@@ -522,6 +527,7 @@ impl VerFs {
             open_file_counts: ParkingMutex::new(HashMap::new()),
             kernel_lookups: ParkingMutex::new(HashMap::new()),
             vault: ParkingRwLock::new(VaultRuntime::new(vault_initialized)),
+            vault_cache_epoch: ParkingRwLock::new(0),
         });
         core.load_stats_snapshot();
 
@@ -669,7 +675,21 @@ impl VerFs {
         self.core.unlock_vault(password, key_material).await
     }
 
+    /// Locks the vault of this mounted daemon. Data the kernel still holds
+    /// dirty is written back first, while the vault can still store it, and
+    /// the kernel's cached pages of vault files are dropped afterwards.
     pub async fn lock_vault(&self) -> Result<()> {
+        self.core.write_back_mount().await?;
+        self.core.lock_vault().await?;
+        let core = Arc::clone(&self.core);
+        tokio::task::spawn_blocking(move || core.drop_vault_pages_from_kernel())
+            .await
+            .context("vault page invalidation task failed")?
+    }
+
+    /// Locks the vault in the metadata store when no daemon is mounted: no
+    /// kernel holds pages of it.
+    pub async fn lock_vault_offline(&self) -> Result<()> {
         self.core.lock_vault().await
     }
 
