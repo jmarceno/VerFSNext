@@ -149,6 +149,7 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - stats include cumulative pack payload CRC32 read mismatch count
   - live scope is traversed from root while excluding `/.snapshots`, and excludes `/.vault` when vault is locked
   - snapshot logical and hidden-vault logical totals are computed separately, with an all-reachable-namespaces total
+  - per-snapshot reclaimable payload is computed in the same scan: every inode reachable from a snapshot root is attributed to that snapshot, and a chunk counts for it only when no live data, no other snapshot and no orphan inode references it, so the number is the compressed payload only that snapshot holds, which its deletion makes reclaimable (see "Kept statistics scan")
   - metadata consistency checks are computed in stats output:
     chunk refcount mismatches, extents referencing missing chunk records, and orphan extent records
   - stats output includes full `data_dir` size and disk delta `data_dir_size - live_logical_size`
@@ -336,7 +337,7 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 - `src/gui/tray.rs` — status line, open folder, take snapshot, start/stop, control center, quit. Quit leaves a user service running; in app mode it stops the daemon (final sync) before exiting.
 - `src/gui/desktop.rs` — app-menu and login-autostart entries (bare executable), icon install, desktop notifications for results that arrive while no window is open.
 - First run (no config): welcome → background service or app-only → recommended settings (customizable) → mount point and data folder (in-app folder picker with New Folder) → summary → start. The window closes once the folder is mounted; the app stays in the tray.
-- Control center pages: Overview (state, space saved, dedup/compression, health, activity, memory, every `stats` field; the page shows the daemon's last completed scan immediately — including after a reboot — and asks for a newer one at most every 30 s, re-reading every 2 s while the daemon measures it), Snapshots, Vault (create with key file / unlock / lock), Folders & Startup (move folders, service mode, login autostart, stale-mount repair), Settings (all config options, restart prompt when running).
+- Control center pages: Overview (state, space saved, dedup/compression, health, activity, memory, every `stats` field; the page shows the daemon's last completed scan immediately — including after a reboot — and asks for a newer one at most every 30 s, re-reading every 2 s while the daemon measures it), Snapshots (each row shows the compressed payload only that snapshot holds, which deleting it makes reclaimable, read from the kept statistics scan; the page keeps the scan fresh while open and forces a new one after a snapshot is created or deleted), Vault (create with key file / unlock / lock), Folders & Startup (move folders, service mode, login autostart, stale-mount repair), Settings (all config options, restart prompt when running).
 
 ## Metadata and Snapshot/GC Additions
 
@@ -572,6 +573,22 @@ last completed scan and answers from it:
   numbers of the last session's scan, labelled with their time, and the daemon
   replaces them when the background scan finishes. A daemon restart loads the
   file at startup.
+- `VerFsStats.snapshot_usage` carries one entry per snapshot: the compressed
+  chunk payload referenced only by that snapshot, i.e. the bytes its deletion
+  makes reclaimable. A chunk shared with live data, with another snapshot, or
+  with an orphan inode counts for no snapshot, so the per-snapshot sum can be
+  below `snapshot_only_compressed_bytes` (which counts payload shared between
+  snapshots until the last of them goes). A chunk whose refcount does not
+  match the extents found in the scan is a metadata mismatch and is left out
+  instead of being reported. Deleting a snapshot only drops its references;
+  the payload is reclaimed by GC, which may keep a pack that falls below its
+  rewrite thresholds. A file kept alive by an open snapshot handle is also
+  excluded from what the change makes reclaimable, so the number is an upper
+  bound while the snapshot is open. The Snapshots page reads the list from
+  the kept scan; after a snapshot is created or deleted the app asks with
+  `allow_cached: false` while a page that shows the numbers is open, so the
+  row is never measured before the change without costing a scan while the
+  window is hidden.
 
 The scan is a read-only metadata transaction and runs on the blocking pool, so
 it never blocks FUSE reads; a 128 MiB read and a 22k-entry `find` during a

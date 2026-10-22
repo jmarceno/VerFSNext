@@ -1094,6 +1094,16 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             ),
         ),
     ];
+    for usage in &stats.snapshot_usage {
+        rows.push((
+            format!("Snapshot \"{}\" Reclaimable on Delete", usage.name),
+            human_bytes(usage.reclaimable_bytes),
+            format!(
+                "{} compressed bytes referenced only by this snapshot; reclaimed by GC after deletion",
+                usage.reclaimable_bytes
+            ),
+        ));
+    }
     if stats.vault_locked {
         rows.insert(
             1,
@@ -1280,6 +1290,7 @@ mod tests {
         render_stats_table, resolve_config_path, ConfigSource, GcCommand,
     };
     use crate::fs::VerFsStats;
+    use crate::snapshot::SnapshotUsage;
     use std::path::Path;
 
     fn sample_stats() -> VerFsStats {
@@ -1294,6 +1305,10 @@ mod tests {
             current_unique_uncompressed_bytes: 9_000,
             current_unique_compressed_bytes: 4_000,
             snapshot_only_compressed_bytes: 1_000,
+            snapshot_usage: vec![SnapshotUsage {
+                name: "2026-10-19_10-25-34".to_owned(),
+                reclaimable_bytes: 1_000,
+            }],
             dedup_saved_bytes: 1_000,
             dedup_savings_ratio: 1.0 / 12.0,
             stored_unique_uncompressed_bytes: 11_000,

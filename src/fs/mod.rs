@@ -42,7 +42,7 @@ use crate::migration::pack_index_crc32::{
 use crate::migration::pack_size::ensure_pack_size_metadata_compat;
 use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::normalize_data_tree;
-use crate::snapshot::SnapshotManager;
+use crate::snapshot::{records_in_txn, SnapshotManager, SnapshotUsage};
 use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
     chunk_key, decode_chunk_key, decode_dirent_name, decode_inline_chunk_key, decode_rkyv,
@@ -163,6 +163,21 @@ struct ZeroRefCandidate {
     block_size_bytes: u32,
 }
 
+/// Who references a chunk, as seen by the statistics scan.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkHolders {
+    /// Extents that reference it, from this same scan.
+    extent_refs: u64,
+    /// The live folder or the vault references it.
+    current: bool,
+    /// The only snapshot that references it, while no other snapshot does.
+    snapshot: Option<usize>,
+    /// More than one snapshot references it.
+    shared_by_snapshots: bool,
+    /// An inode outside the live tree and the snapshot trees references it.
+    referenced_elsewhere: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerFsStats {
     pub live_logical_size_bytes: u64,
@@ -179,6 +194,11 @@ pub struct VerFsStats {
     pub current_unique_compressed_bytes: u64,
     /// Compressed payload referenced only by snapshots: the disk cost of keeping history.
     pub snapshot_only_compressed_bytes: u64,
+    /// Per-snapshot share of that payload: the compressed bytes deleting each
+    /// snapshot on its own makes reclaimable. Payload another snapshot still
+    /// references is not counted there.
+    #[serde(default)]
+    pub snapshot_usage: Vec<SnapshotUsage>,
     /// Dedup and compression savings below cover current data only, so
     /// snapshot sharing is never reported as saved space.
     pub dedup_saved_bytes: u64,
@@ -1212,10 +1232,13 @@ impl FsCore {
             .collect()
     }
 
-    fn accumulate_namespace_logical_size(
+    /// Walks the namespace under 'start_ino' once, adding each file's logical
+    /// size and reporting every inode it reaches.
+    fn walk_namespace_logical_size(
         txn: &verfsnext_surrealkv::Transaction,
         start_ino: u64,
         seen_inodes: &mut HashSet<u64>,
+        mut visit: impl FnMut(&InodeRecord),
     ) -> Result<u64> {
         let mut logical_size_bytes = 0_u64;
         let mut stack = vec![start_ino];
@@ -1229,6 +1252,7 @@ impl FsCore {
                 continue;
             };
             let inode: InodeRecord = decode_rkyv(&raw)?;
+            visit(&inode);
 
             match inode.kind {
                 INODE_KIND_FILE => {
@@ -1276,11 +1300,17 @@ impl FsCore {
             current_unique_uncompressed_bytes,
             current_unique_compressed_bytes,
             snapshot_only_compressed_bytes,
+            snapshot_usage,
             unreachable_chunk_compressed_bytes,
             chunk_refcount_mismatch_count,
             missing_chunk_records_for_extents,
             orphan_extent_records,
         ) = self.meta.read_txn(|txn| {
+            let snapshot_records = records_in_txn(txn)?;
+            let mut snapshot_reclaimable_bytes = vec![0_u64; snapshot_records.len()];
+            // Inode -> index into snapshot_records, from each snapshot root.
+            let mut snapshot_inodes = HashMap::<u64, usize>::new();
+
             let mut live_logical_size_bytes = 0_u64;
             let mut snapshots_logical_size_bytes = 0_u64;
             let mut hidden_vault_logical_size_bytes = 0_u64;
@@ -1288,6 +1318,23 @@ impl FsCore {
             let mut live_seen_inodes = HashSet::<u64>::new();
             let mut snapshots_seen_inodes = HashSet::<u64>::new();
             let mut hidden_vault_seen_inodes = HashSet::<u64>::new();
+
+            // Snapshot usage follows the S: records, the same source the
+            // snapshot list uses. Only files can own extents.
+            for (index, (_, record)) in snapshot_records.iter().enumerate() {
+                snapshots_logical_size_bytes = snapshots_logical_size_bytes.saturating_add(
+                    FsCore::walk_namespace_logical_size(
+                        txn,
+                        record.root_ino,
+                        &mut snapshots_seen_inodes,
+                        |inode| {
+                            if inode.kind == INODE_KIND_FILE {
+                                snapshot_inodes.insert(inode.ino, index);
+                            }
+                        },
+                    )?,
+                );
+            }
 
             let root_prefix = dirent_prefix(ROOT_INODE);
             let root_end = prefix_end(&root_prefix);
@@ -1299,31 +1346,26 @@ impl FsCore {
                 let dirent: DirentRecord = decode_rkyv(&value)?;
 
                 if name == SNAPSHOTS_DIR_NAME.as_bytes() {
-                    snapshots_logical_size_bytes = snapshots_logical_size_bytes.saturating_add(
-                        FsCore::accumulate_namespace_logical_size(
-                            txn,
-                            dirent.ino,
-                            &mut snapshots_seen_inodes,
-                        )?,
-                    );
                     continue;
                 }
 
                 if vault_locked && name == VAULT_DIR_NAME.as_bytes() {
                     hidden_vault_logical_size_bytes = hidden_vault_logical_size_bytes
-                        .saturating_add(FsCore::accumulate_namespace_logical_size(
+                        .saturating_add(FsCore::walk_namespace_logical_size(
                             txn,
                             dirent.ino,
                             &mut hidden_vault_seen_inodes,
+                            |_| {},
                         )?);
                     continue;
                 }
 
                 live_logical_size_bytes = live_logical_size_bytes.saturating_add(
-                    FsCore::accumulate_namespace_logical_size(
+                    FsCore::walk_namespace_logical_size(
                         txn,
                         dirent.ino,
                         &mut live_seen_inodes,
+                        |_| {},
                     )?,
                 );
             }
@@ -1336,15 +1378,9 @@ impl FsCore {
                 .union(&hidden_vault_seen_inodes)
                 .copied()
                 .collect();
-            let reachable_inodes: HashSet<u64> = current_inodes
-                .union(&snapshots_seen_inodes)
-                .copied()
-                .collect();
-            let mut reachable_chunks = HashSet::<ChunkId>::new();
-            let mut current_chunks = HashSet::<ChunkId>::new();
+            let mut chunk_holders = HashMap::<ChunkId, ChunkHolders>::new();
             let mut referenced_data_bytes = 0_u64;
             let mut current_referenced_data_bytes = 0_u64;
-            let mut all_extent_refcounts = HashMap::<ChunkId, u64>::new();
             let mut inode_domain_cache = HashMap::<u64, Option<bool>>::new();
             let mut orphan_extent_records = 0_u64;
             let extent_prefix_all = vec![crate::types::KEY_PREFIX_EXTENT];
@@ -1379,16 +1415,30 @@ impl FsCore {
                     vault,
                     hash: extent.chunk_hash,
                 };
-                if reachable_inodes.contains(&owner_ino) {
+                let in_current = current_inodes.contains(&owner_ino);
+                let in_snapshot = snapshot_inodes.get(&owner_ino).copied();
+                if in_current || in_snapshot.is_some() {
                     referenced_data_bytes += u64::from(extent.len);
-                    reachable_chunks.insert(id);
                 }
-                if current_inodes.contains(&owner_ino) {
+                if in_current {
                     current_referenced_data_bytes += u64::from(extent.len);
-                    current_chunks.insert(id);
                 }
-                let counter = all_extent_refcounts.entry(id).or_insert(0);
-                *counter = counter.saturating_add(1);
+
+                let holders = chunk_holders.entry(id).or_default();
+                holders.extent_refs = holders.extent_refs.saturating_add(1);
+                if in_current {
+                    holders.current = true;
+                }
+                if let Some(index) = in_snapshot {
+                    match holders.snapshot {
+                        None => holders.snapshot = Some(index),
+                        Some(existing) if existing == index => {}
+                        Some(_) => holders.shared_by_snapshots = true,
+                    }
+                }
+                if !in_current && in_snapshot.is_none() {
+                    holders.referenced_elsewhere = true;
+                }
             }
 
             let mut stored_unique_uncompressed_bytes = 0_u64;
@@ -1410,29 +1460,52 @@ impl FsCore {
 
                 let chunk_uncompressed = chunk.uncompressed_len as u64;
                 let chunk_compressed = chunk.compressed_len as u64;
-                if reachable_chunks.contains(&id) {
-                    stored_unique_uncompressed_bytes += chunk_uncompressed;
-                    stored_unique_compressed_bytes += chunk_compressed;
-                    if current_chunks.contains(&id) {
-                        current_unique_uncompressed_bytes += chunk_uncompressed;
-                        current_unique_compressed_bytes += chunk_compressed;
-                    } else {
-                        snapshot_only_compressed_bytes += chunk_compressed;
+                let holders = chunk_holders.get(&id).copied();
+                let expected_refcount = holders.map_or(0, |holders| holders.extent_refs);
+                let refcount_consistent = chunk.refcount == expected_refcount;
+                match holders {
+                    Some(holders)
+                        if holders.current
+                            || holders.snapshot.is_some()
+                            || holders.shared_by_snapshots =>
+                    {
+                        stored_unique_uncompressed_bytes += chunk_uncompressed;
+                        stored_unique_compressed_bytes += chunk_compressed;
+                        if holders.current {
+                            current_unique_uncompressed_bytes += chunk_uncompressed;
+                            current_unique_compressed_bytes += chunk_compressed;
+                        } else {
+                            snapshot_only_compressed_bytes += chunk_compressed;
+                            let exclusive = !holders.shared_by_snapshots
+                                && !holders.referenced_elsewhere
+                                && refcount_consistent;
+                            if let Some(index) = holders.snapshot.filter(|_| exclusive) {
+                                let total = &mut snapshot_reclaimable_bytes[index];
+                                *total = total.saturating_add(chunk_compressed);
+                            }
+                        }
                     }
-                } else {
-                    unreachable_chunk_compressed_bytes += chunk_compressed;
+                    _ => unreachable_chunk_compressed_bytes += chunk_compressed,
                 }
-                let expected_refcount = all_extent_refcounts.get(&id).copied().unwrap_or(0);
-                if chunk.refcount != expected_refcount {
+                if !refcount_consistent {
                     chunk_refcount_mismatch_count = chunk_refcount_mismatch_count.saturating_add(1);
                 }
                 seen_chunk_records.insert(id);
             }
 
-            let missing_chunk_records_for_extents = all_extent_refcounts
+            let missing_chunk_records_for_extents = chunk_holders
                 .keys()
                 .filter(|id| !seen_chunk_records.contains(*id))
                 .count() as u64;
+
+            let snapshot_usage = snapshot_records
+                .into_iter()
+                .zip(snapshot_reclaimable_bytes)
+                .map(|((name, _), reclaimable_bytes)| SnapshotUsage {
+                    name,
+                    reclaimable_bytes,
+                })
+                .collect();
 
             Ok((
                 live_logical_size_bytes,
@@ -1446,6 +1519,7 @@ impl FsCore {
                 current_unique_uncompressed_bytes,
                 current_unique_compressed_bytes,
                 snapshot_only_compressed_bytes,
+                snapshot_usage,
                 unreachable_chunk_compressed_bytes,
                 chunk_refcount_mismatch_count,
                 missing_chunk_records_for_extents,
@@ -1508,6 +1582,7 @@ impl FsCore {
             current_unique_uncompressed_bytes,
             current_unique_compressed_bytes,
             snapshot_only_compressed_bytes,
+            snapshot_usage,
             dedup_saved_bytes,
             dedup_savings_ratio,
             stored_unique_uncompressed_bytes,

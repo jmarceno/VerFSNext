@@ -3,6 +3,7 @@ use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use nix::errno::Errno;
+use serde::{Deserialize, Serialize};
 use verfsnext_surrealkv::LSMIterator;
 
 use crate::meta::MetaStore;
@@ -15,6 +16,36 @@ use crate::types::{
     SNAPSHOTS_DIR_NAME,
 };
 
+/// Disk space a snapshot holds on its own: the compressed chunk payload its
+/// deletion makes reclaimable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotUsage {
+    pub name: String,
+    /// Compressed chunk payload referenced only by this snapshot. Payload the
+    /// folder, the vault or another snapshot still references is excluded
+    /// because deleting this snapshot alone does not make it reclaimable.
+    pub reclaimable_bytes: u64,
+}
+
+/// Snapshot names and records, ordered by name.
+pub(crate) fn records_in_txn(
+    txn: &verfsnext_surrealkv::Transaction,
+) -> Result<Vec<(String, SnapshotRecord)>> {
+    let prefix = snapshot_prefix();
+    let end = prefix_end(&prefix);
+    let mut records = Vec::new();
+    for pair in scan_range_pairs(txn, prefix, end)? {
+        let (key, value) = pair?;
+        let Some(raw_name) = decode_snapshot_name(&key) else {
+            continue;
+        };
+        let record: SnapshotRecord = decode_rkyv(&value)?;
+        records.push((String::from_utf8_lossy(raw_name).to_string(), record));
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(records)
+}
+
 pub struct SnapshotManager<'a> {
     meta: &'a MetaStore,
 }
@@ -26,18 +57,10 @@ impl<'a> SnapshotManager<'a> {
 
     pub fn list(&self) -> Result<Vec<String>> {
         self.meta.read_txn(|txn| {
-            let prefix = snapshot_prefix();
-            let end = prefix_end(&prefix);
-            let mut names = Vec::new();
-            for pair in scan_range_pairs(txn, prefix, end)? {
-                let (key, _) = pair?;
-                let Some(raw_name) = decode_snapshot_name(&key) else {
-                    continue;
-                };
-                names.push(String::from_utf8_lossy(raw_name).to_string());
-            }
-            names.sort_unstable();
-            Ok(names)
+            Ok(records_in_txn(txn)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect())
         })
     }
 

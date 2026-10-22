@@ -252,6 +252,8 @@ enum Effect {
     RefreshSnapshots,
     /// Re-reads the expensive reports (statistics and records check).
     RefreshReports,
+    /// Measures the statistics again instead of showing the kept scan first.
+    RefreshStatsNow,
     RememberKeyFile(PathBuf),
     Quit,
 }
@@ -311,6 +313,8 @@ struct Runtime {
     probe_in_flight: bool,
     last_probe: Option<Instant>,
     last_stats: Option<Instant>,
+    /// A forced statistics scan was asked for while another one was running.
+    stats_refresh_pending: bool,
     /// Shown instead of the probed state while a start/stop runs.
     pending_state: Option<&'static str>,
 }
@@ -637,6 +641,7 @@ impl qobject::AppController {
             probe_in_flight: false,
             last_probe: None,
             last_stats: None,
+            stats_refresh_pending: false,
             pending_state: None,
         });
 
@@ -792,6 +797,10 @@ impl qobject::AppController {
             Event::Stats(result) => {
                 self.as_mut().set_stats_loading(false);
                 self.as_mut().rt_mut().last_stats = Some(Instant::now());
+                let pending = std::mem::take(&mut self.as_mut().rt_mut().stats_refresh_pending);
+                if pending {
+                    self.as_mut().refresh_stats_now();
+                }
                 match result {
                     Ok(report) => {
                         let mut value = json!(report.stats);
@@ -865,6 +874,15 @@ impl qobject::AppController {
                 self.as_mut().refresh_stats();
                 self.as_mut().refresh_records_check();
             }
+            Effect::RefreshStatsNow => {
+                // Measuring costs a full metadata scan. Only pay it when a page
+                // that shows the numbers is on screen; otherwise the next
+                // refresh while such a page is open picks the change up.
+                let tab = *self.control_tab();
+                if *self.control_visible() && (tab == 0 || tab == 1) {
+                    self.as_mut().refresh_stats_now();
+                }
+            }
             Effect::RememberKeyFile(path) => {
                 self.as_mut()
                     .set_vault_key_file(qs(path.to_string_lossy()));
@@ -935,8 +953,9 @@ impl qobject::AppController {
     }
 
     fn maybe_refresh_stats(mut self: Pin<&mut Self>) {
+        let tab = *self.control_tab();
         if !*self.control_visible()
-            || *self.control_tab() != 0
+            || (tab != 0 && tab != 1)
             || *self.stats_loading()
             || self.daemon_state().to_string() != "running"
         {
@@ -1176,7 +1195,20 @@ impl qobject::AppController {
     }
 
     fn refresh_stats(mut self: Pin<&mut Self>) {
+        self.as_mut().request_stats(true);
+    }
+
+    /// Measures the statistics again instead of showing the kept scan first.
+    /// Snapshot changes use it so their sizes appear right away.
+    fn refresh_stats_now(mut self: Pin<&mut Self>) {
+        self.as_mut().request_stats(false);
+    }
+
+    fn request_stats(mut self: Pin<&mut Self>, allow_cached: bool) {
         if *self.stats_loading() {
+            if !allow_cached {
+                self.as_mut().rt_mut().stats_refresh_pending = true;
+            }
             return;
         }
         let rt = self.as_mut().rt_mut();
@@ -1187,12 +1219,7 @@ impl qobject::AppController {
         let tx = rt.events_tx.clone();
         let spawned = spawn_worker("stats", tx, move || {
             let result = handle
-                .block_on(require_daemon(
-                    &config,
-                    &ControlRequest::Stats {
-                        allow_cached: true,
-                    },
-                ))
+                .block_on(require_daemon(&config, &ControlRequest::Stats { allow_cached }))
                 .and_then(|resp| {
                     let stats = resp
                         .stats
@@ -1374,7 +1401,8 @@ impl qobject::AppController {
             .run_op("Taking a snapshot…", None, move |ctx| {
                 ctx.request(ControlRequest::SnapshotCreate { name: name.clone() })?;
                 Ok(Outcome::message(format!("Snapshot \"{name}\" saved."))
-                    .with(Effect::RefreshSnapshots))
+                    .with(Effect::RefreshSnapshots)
+                    .with(Effect::RefreshStatsNow))
             });
     }
 
@@ -1386,7 +1414,8 @@ impl qobject::AppController {
                 Ok(Outcome::message(format!(
                     "Snapshot \"{name}\" deleted. Its space is reclaimed during the next cleanup."
                 ))
-                .with(Effect::RefreshSnapshots))
+                .with(Effect::RefreshSnapshots)
+                .with(Effect::RefreshStatsNow))
             });
     }
 

@@ -13,6 +13,23 @@ ColumnLayout {
         return list.slice().sort().reverse()
     }
 
+    // Space each snapshot holds on its own, from the last statistics scan.
+    readonly property var snapshotUsage: {
+        if (controller.stats_json.length === 0)
+            return ({})
+        const stats = JSON.parse(controller.stats_json)
+        const list = stats.snapshot_usage !== undefined ? stats.snapshot_usage : []
+        const result = ({})
+        for (let i = 0; i < list.length; ++i)
+            result[list[i].name] = list[i].reclaimable_bytes
+        return result
+    }
+
+    function snapshotSpace(name) {
+        const bytes = snapshotUsage[name]
+        return bytes === undefined ? "—" : theme.bytes(bytes)
+    }
+
     function defaultName() {
         return Qt.formatDateTime(new Date(), "yyyy-MM-dd_hh-mm-ss")
     }
@@ -62,6 +79,7 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
         title: root.names.length > 0 ? (root.names.length === 1 ? "1 snapshot" : root.names.length + " snapshots") : "Your snapshots"
+        subtitle: root.names.length > 0 ? "Space only this snapshot holds; deleting it makes that space reclaimable." : ""
 
         Label {
             visible: !root.running || root.names.length === 0
@@ -105,6 +123,15 @@ ColumnLayout {
                         font.pixelSize: 14
                         elide: Text.ElideMiddle
                         Layout.fillWidth: true
+                    }
+                    Label {
+                        Layout.preferredWidth: 88
+                        horizontalAlignment: Text.AlignRight
+                        text: root.snapshotSpace(modelData)
+                        color: theme.textMuted
+                        font.pixelSize: 13
+                        ToolTip.visible: rowMouse.containsMouse
+                        ToolTip.text: "Compressed data only this snapshot holds. Deleting it makes the space reclaimable; data your folder or another snapshot still uses is not counted."
                     }
                     TealButton {
                         text: "Open"
