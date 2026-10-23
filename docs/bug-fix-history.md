@@ -1932,3 +1932,35 @@ time was written back only after the lock, where the write is refused.
 ### Affected Files
 
 `src/fs/vault.rs`, `src/fs/chunk.rs`, `src/fs/mod.rs`, `src/control.rs`
+
+## B048 - An Overlapping Older Statistics Scan Could Replace the Kept Scan - Oct 23 2026
+
+### Problem
+
+The per-snapshot space column (commit 167c1d2) forces a fresh statistics
+scan after a snapshot is created or deleted. A background refresh started
+before the change could still be running; it finished after the forced scan
+and replaced the kept scan with numbers read before the change. Its
+`scanned_at_ms` is the finish time, so the stale scan looked fresh for 30 s
+and the Snapshots page showed "—" for a new snapshot (or a size for a deleted
+one) until the next refresh. Both scans also wrote the same temporary file
+for `stats-snapshot.json` concurrently.
+
+### Fix
+
+`FsCore::collect_stats` takes a start order from `stats_scan_seq` before it
+opens its read transaction. `record_stats_snapshot` keeps and persists a scan
+only when no scan that started later is already kept, and does both under the
+`stats_snapshot` lock, so persisting is serialized as well. The caller still
+gets its own scan.
+
+### Validation
+
+Library unit tests passed. Review of the per-snapshot attribution itself
+(snapshots clone every inode, so no inode is shared between snapshot trees;
+chunks shared with live data, another snapshot, an orphan or with a refcount
+mismatch are excluded) found no other defect.
+
+### Affected Files
+
+`src/fs/mod.rs`, `docs/technical_deep_dive.md`

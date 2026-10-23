@@ -569,6 +569,11 @@ last completed scan and answers from it:
   after setup — the request waits for the first scan.
 - `stats { allow_cached: false }` (the CLI `stats`) always waits for a scan
   taken after the request arrived, so the printed table is never stale.
+- Scans can overlap (a forced scan while a background refresh runs). Each scan
+  takes a start order (`stats_scan_seq`) before it opens its read transaction;
+  a scan that finishes after one that started later is returned to its caller
+  but not kept or persisted, so an older view of the metadata never replaces a
+  newer kept scan.
 - The file survives reboots, so the first window opened after a boot shows the
   numbers of the last session's scan, labelled with their time, and the daemon
   replaces them when the background scan finishes. A daemon restart loads the

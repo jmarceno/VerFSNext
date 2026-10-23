@@ -387,6 +387,10 @@ struct FsCore {
     /// Last completed statistics scan, persisted so a fresh daemon (and a
     /// fresh boot) can answer before its first scan finishes.
     stats_snapshot: ParkingMutex<Option<StatsSnapshot>>,
+    /// Hands each statistics scan its start order.
+    stats_scan_seq: AtomicU64,
+    /// Start order of the kept scan; written only under 'stats_snapshot'.
+    stats_kept_scan_seq: AtomicU64,
     stats_scan_in_progress: AtomicBool,
     stats_refresh_error: ParkingMutex<String>,
     read_bytes_total: AtomicU64,
@@ -520,6 +524,8 @@ impl VerFs {
             throughput: ParkingMutex::new(ThroughputSample::default()),
             last_activity: ParkingMutex::new(None),
             stats_snapshot: ParkingMutex::new(None),
+            stats_scan_seq: AtomicU64::new(0),
+            stats_kept_scan_seq: AtomicU64::new(0),
             stats_scan_in_progress: AtomicBool::new(false),
             stats_refresh_error: ParkingMutex::new(String::new()),
             read_bytes_total: AtomicU64::new(0),
@@ -1284,6 +1290,7 @@ impl FsCore {
     }
 
     fn collect_stats(&self) -> Result<StatsSnapshot> {
+        let scan_seq = self.stats_scan_seq.fetch_add(1, Ordering::Relaxed) + 1;
         self.chunk_meta_cache.run_pending_tasks();
         self.chunk_data_cache.run_pending_tasks();
         let vault_locked = self.vault_locked();
@@ -1615,17 +1622,24 @@ impl FsCore {
             chunk_cache_entries: cache.chunk_entries,
             approx_cache_memory_bytes: cache.memory_bytes,
         };
-        Ok(self.record_stats_snapshot(stats))
+        Ok(self.record_stats_snapshot(scan_seq, stats))
     }
 
     /// Records a completed scan as the kept snapshot and writes it to disk, so
     /// a later daemon — or the same one after a reboot — answers instantly.
-    fn record_stats_snapshot(&self, stats: VerFsStats) -> StatsSnapshot {
+    /// Scans can overlap (a forced scan during a background refresh); one that
+    /// started before the kept scan read older metadata and is not kept.
+    fn record_stats_snapshot(&self, scan_seq: u64, stats: VerFsStats) -> StatsSnapshot {
         let snapshot = StatsSnapshot {
             scanned_at_ms: now_millis(),
             stats,
         };
-        *self.stats_snapshot.lock() = Some(snapshot.clone());
+        let mut kept = self.stats_snapshot.lock();
+        if self.stats_kept_scan_seq.load(Ordering::Relaxed) > scan_seq {
+            return snapshot;
+        }
+        self.stats_kept_scan_seq.store(scan_seq, Ordering::Relaxed);
+        *kept = Some(snapshot.clone());
         self.persist_stats_snapshot(&snapshot);
         snapshot
     }
