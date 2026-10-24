@@ -1148,7 +1148,7 @@ impl qobject::AppController {
                         tracing::info!("user service now points at {}", exe.display());
                     }
                 }
-                daemon::start(&ctx.config, &ctx.config_path, &ctx.child)?;
+                daemon::start_with_retry(&ctx.config, &ctx.config_path, &ctx.child)?;
                 Ok(Outcome::message(""))
             });
     }

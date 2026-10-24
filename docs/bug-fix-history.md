@@ -1964,3 +1964,31 @@ mismatch are excluded) found no other defect.
 ### Affected Files
 
 `src/fs/mod.rs`, `docs/technical_deep_dive.md`
+
+## B049 - App Gave Up Mounting After One Attempt When Its Folders Were Slow to Appear - Oct 24 2026
+
+### Problem
+
+The desktop app started the filesystem once at launch and reported an error
+as soon as that attempt failed. Data or mount folders on a network or
+removable drive routinely appear seconds to minutes after login, so the user
+got an error for a condition that resolves itself. Worse, a missing folder
+was created on the local disk, so a not-yet-mounted drive could get an empty
+filesystem placed under its mount path.
+
+### Fix
+
+`daemon::start_with_retry` (used by the app's Start action, including the
+launch-time start) refuses to start while the data folder or the VerFSNext
+folder does not exist (a stale FUSE mount still counts as present so it can
+be repaired), and retries a failed start every 3 s. The error is shown only
+after it keeps failing for 5 minutes; each failed attempt is logged as a
+warning. A start that is progressing slowly (migrations) is not cut short.
+
+### Validation
+
+Release build passed.
+
+### Affected Files
+
+`src/gui/daemon.rs`, `src/gui/controller.rs`

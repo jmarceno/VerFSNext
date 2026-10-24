@@ -31,6 +31,11 @@ pub const UNIT_NAME: &str = "verfsnext.service";
 const START_TIMEOUT: Duration = Duration::from_secs(600);
 /// Matches the user unit's TimeoutStopSec: a final sync during GC can be long.
 const STOP_TIMEOUT: Duration = Duration::from_secs(3000);
+/// Folders on network or removable drives can take minutes to appear after
+/// login, so a failed start is retried this often...
+const START_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+/// ...and only reported once it keeps failing for this long.
+const START_RETRY_WINDOW: Duration = Duration::from_secs(300);
 
 pub type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -233,6 +238,52 @@ pub fn repair_mount(mount_point: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Fails while a configured folder does not exist yet (e.g. its network
+/// drive is still mounting), so it is never recreated empty on the local disk.
+fn require_locations(config: &Config) -> Result<()> {
+    if !config.data_dir.is_dir() {
+        bail!("the data folder {} is not available", config.data_dir.display());
+    }
+    if !config.mount_point.is_dir() && !mount_is_stale(&config.mount_point) {
+        bail!("the VerFSNext folder {} is not available", config.mount_point.display());
+    }
+    Ok(())
+}
+
+/// Starts the filesystem like [`start`], retrying every
+/// [`START_RETRY_INTERVAL`] while it fails, and returns the error only once
+/// it has kept failing for [`START_RETRY_WINDOW`].
+pub fn start_with_retry(config: &Config, config_path: &Path, child: &SharedChild) -> Result<()> {
+    let deadline = Instant::now() + START_RETRY_WINDOW;
+    let mut attempt: u32 = 1;
+    loop {
+        match require_locations(config).and_then(|()| start(config, config_path, child)) {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "VerFSNext started after retrying");
+                }
+                return Ok(());
+            }
+            Err(err) if Instant::now() < deadline => {
+                tracing::warn!(
+                    attempt,
+                    error = %format!("{err:#}"),
+                    "VerFSNext could not start yet; retrying in {} s",
+                    START_RETRY_INTERVAL.as_secs()
+                );
+            }
+            Err(err) => {
+                return Err(err.context(format!(
+                    "VerFSNext kept failing to start for {} minutes",
+                    START_RETRY_WINDOW.as_secs() / 60
+                )));
+            }
+        }
+        std::thread::sleep(START_RETRY_INTERVAL);
+        attempt += 1;
+    }
 }
 
 /// Starts the filesystem in the current mode and waits until it serves the
