@@ -52,6 +52,7 @@ The repository now includes a Phase 5 implementation on top of the existing full
 - Crypt CLI first tries socket RPC; create/lock can fall back to metadata-only mode if no daemon is mounted.
 - Stats CLI uses socket RPC and requires a mounted daemon.
 - Control socket file mode is forced to `0660` at bind time so `verfs` group members can run control commands. The systemd installer no longer widens it (it used to `chmod 666` the socket, letting every local user run control commands).
+- Startup first waits for `data_dir` and `mount_point` to exist (checked every 3 s, up to 5 minutes, then the daemon exits with an error) and never creates them, so a network or removable drive that is still mounting never gets an empty filesystem under its mount path. The wait lives in the daemon, so the desktop app, the systemd unit and a shell start behave the same; the desktop app also retries any failed start every 3 s and reports only after 5 minutes of failures.
 - Startup now normalizes `<data_dir>` tree permissions to group-writable POSIX modes:
   - directories: `0770`
   - regular runtime files (packs/indices/metadata/discard): `0660`

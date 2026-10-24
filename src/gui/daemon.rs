@@ -240,18 +240,6 @@ pub fn repair_mount(mount_point: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fails while a configured folder does not exist yet (e.g. its network
-/// drive is still mounting), so it is never recreated empty on the local disk.
-fn require_locations(config: &Config) -> Result<()> {
-    if !config.data_dir.is_dir() {
-        bail!("the data folder {} is not available", config.data_dir.display());
-    }
-    if !config.mount_point.is_dir() && !mount_is_stale(&config.mount_point) {
-        bail!("the VerFSNext folder {} is not available", config.mount_point.display());
-    }
-    Ok(())
-}
-
 /// Starts the filesystem like [`start`], retrying every
 /// [`START_RETRY_INTERVAL`] while it fails, and returns the error only once
 /// it has kept failing for [`START_RETRY_WINDOW`].
@@ -259,7 +247,7 @@ pub fn start_with_retry(config: &Config, config_path: &Path, child: &SharedChild
     let deadline = Instant::now() + START_RETRY_WINDOW;
     let mut attempt: u32 = 1;
     loop {
-        match require_locations(config).and_then(|()| start(config, config_path, child)) {
+        match start(config, config_path, child) {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "VerFSNext started after retrying");
@@ -297,9 +285,6 @@ pub fn start(config: &Config, config_path: &Path, child: &SharedChild) -> Result
         tracing::warn!(mount_point = %config.mount_point.display(), "repairing stale mount left by a previous run");
         repair_mount(&config.mount_point)?;
     }
-    std::fs::create_dir_all(&config.mount_point)
-        .with_context(|| format!("failed to create {}", config.mount_point.display()))?;
-
     let service = service_installed()?;
     if service {
         systemctl(&["start", UNIT_NAME])?;

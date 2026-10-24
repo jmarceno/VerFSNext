@@ -92,10 +92,63 @@ async fn cli_main(log_handle: LogHandle, args: Vec<String>) -> Result<()> {
     }
 }
 
+/// Folders on network or removable drives can take minutes to appear after
+/// boot or login; check this often...
+const LOCATION_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+/// ...and give up after this long.
+const LOCATION_WAIT_WINDOW: Duration = Duration::from_secs(300);
+
+/// A folder exists, or is a FUSE mount whose daemon died (repairable).
+fn location_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_dir(),
+        Err(err) => err.raw_os_error() == Some(nix::libc::ENOTCONN),
+    }
+}
+
+/// Waits until the data and mount folders exist instead of creating them, so
+/// a drive that is still mounting never gets an empty filesystem placed
+/// under its mount path. The same wait applies however the daemon is started
+/// (desktop app, systemd unit or a shell).
+async fn wait_for_locations(config: &Config) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + LOCATION_WAIT_WINDOW;
+    let mut announced = false;
+    loop {
+        let missing: Vec<String> = [
+            ("data folder", &config.data_dir),
+            ("mount folder", &config.mount_point),
+        ]
+        .into_iter()
+        .filter(|(_, path)| !location_present(path))
+        .map(|(label, path)| format!("{label} {}", path.display()))
+        .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let missing = missing.join(", ");
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "{missing} did not become available within {} minutes",
+                LOCATION_WAIT_WINDOW.as_secs() / 60
+            );
+        }
+        if !announced {
+            eprintln!(
+                "waiting up to {} minutes for {missing} to become available (checking every {} s)",
+                LOCATION_WAIT_WINDOW.as_secs() / 60,
+                LOCATION_RETRY_INTERVAL.as_secs()
+            );
+            announced = true;
+        }
+        tokio::time::sleep(LOCATION_RETRY_INTERVAL).await;
+    }
+}
+
 async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
     let config = Config::load_from_file(&config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
 
+    wait_for_locations(&config).await?;
     let fs = Arc::new(VerFs::new(config.clone()).await?);
     let startup_crc32 = fs.pack_crc32_read_error_counters();
     let crc32_session_start_total = startup_crc32.current_total;
