@@ -17,6 +17,14 @@ RowLayout {
 
     spacing: 24
 
+    ToolTip.visible: root.locked && rowHover.hovered
+    ToolTip.delay: 300
+    ToolTip.text: "This setting can only be changed when the drive is first set up."
+
+    HoverHandler {
+        id: rowHover
+    }
+
     function levelName(v) {
         if (v < 0) return "Fastest"
         if (v <= 3) return "Fast"
@@ -121,7 +129,7 @@ RowLayout {
                 TextInput {
                     id: input
                     Layout.fillWidth: true
-                    readOnly: root.locked
+                    enabled: !root.locked
                     text: String(root.value)
                     color: theme.textPrimary
                     selectionColor: theme.accentMuted
@@ -155,6 +163,8 @@ RowLayout {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
+            enabled: !root.locked
+            opacity: root.locked ? 0.6 : 1.0
 
             Label {
                 Layout.alignment: Qt.AlignRight
