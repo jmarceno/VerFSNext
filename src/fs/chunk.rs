@@ -497,6 +497,45 @@ impl FsCore {
         Ok(out)
     }
 
+    /// Resolves SEEK_DATA (`data`) or SEEK_HOLE for `offset < size`. Extents
+    /// are scanned forward from the one covering `offset` and the scan stops
+    /// at the first answer. `None` means no data at or after `offset`.
+    pub(crate) fn seek_extents_in_txn(
+        &self,
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+        offset: u64,
+        size: u64,
+        data: bool,
+    ) -> Result<Option<u64>> {
+        let scan_from = offset.saturating_sub(self.max_extent_len.saturating_sub(1));
+        let mut iter = txn.range(extent_key(ino, scan_from), extent_key(ino, size))?;
+        let mut cursor = offset;
+        let mut valid = iter.seek_first()?;
+        while valid {
+            let key = iter.key().user_key();
+            let start = FsCore::extent_start_from_key(key).ok_or_else(|| {
+                anyhow_errno(Errno::EIO, format!("malformed extent key {:x?}", key))
+            })?;
+            let record: ExtentRecord = decode_rkyv(&iter.value()?)?;
+            let end = FileExtent { start, record }.end().min(size);
+            if end > cursor {
+                if data {
+                    return Ok(Some(start.max(offset)));
+                }
+                if start > cursor {
+                    return Ok(Some(cursor));
+                }
+                cursor = end;
+                if cursor >= size {
+                    return Ok(Some(size));
+                }
+            }
+            valid = iter.next()?;
+        }
+        Ok((!data).then_some(cursor))
+    }
+
     /// Every extent of `ino`, sorted by offset.
     pub(crate) fn load_all_extents_in_txn(
         txn: &verfsnext_surrealkv::Transaction,

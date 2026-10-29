@@ -2381,3 +2381,56 @@ On scratch mounts:
 `crates/verfsnext-async-fusex/src/virtual_fs.rs`,
 `docs/bug-fix-history.md`, `docs/migration-guide.md`,
 `docs/technical_deep_dive.md`
+
+## B058 - Fallocate Materialized Zeros and Seek/Punch Read Whole Ranges - Oct 29 2026
+
+### Symptom
+
+Found in review of B051-B057. `posix_fallocate` and `FALLOC_FL_KEEP_SIZE`
+hashed and staged one zero chunk per maximum-size chunk across the whole
+range in a single transaction under the inode lock: a 100 GiB preallocation
+(download managers, torrent clients, VM images) meant hashing 100 GiB of zeros
+and committing hundreds of thousands of extents, and every later write over
+the range had to re-chunk against those zero extents. `PUNCH_HOLE` and
+`ZERO_RANGE` loaded and decompressed the payload of every extent in the range,
+so discarding a large range read all of it. `SEEK_DATA`/`SEEK_HOLE` loaded the
+file's entire extent list on every call.
+
+### Root Cause
+
+B057 implemented allocation by materializing zero extents, although
+deduplication folds every zero chunk into one record, so they reserve no
+space. `remove_extent_range_in_txn` loaded the payload before checking whether
+the extent was fully covered. The B054 seek used `load_all_extents_in_txn`.
+
+### Fix
+
+- Allocation stores nothing: mode 0 only grows the size past EOF (the range
+  stays a hole that reads as zeros) and KEEP_SIZE allocation is a no-op. The
+  same approach as OpenZFS on a deduplicating store.
+- Punch/zero-range read payloads only for the two boundary extents that keep
+  bytes; fully covered extents are deleted and their refcounts decremented
+  without reading them.
+- `FsCore::seek_extents_in_txn` scans forward from the extent covering the
+  offset and stops at the first answer.
+
+Write planning still loads extents for size-zero files, so zero extents
+already left past EOF by B057 builds stay handled.
+
+### Validation
+
+Clippy over all targets passed. On a scratch mount: `posix_fallocate` of
+1 GiB returned immediately with the leading bytes intact and the tail reading
+zero; KEEP_SIZE left the size at 0 and a following write was correct; a
+65543-byte punch in a 4 MiB random file matched the expected bytes exactly
+and `SEEK_HOLE`/`SEEK_DATA` reported its boundaries; ZERO_RANGE with and
+without KEEP_SIZE zeroed exactly its range; `cp --sparse=always` round-tripped;
+the punched and extended file hashed identically after a remount. FIFO
+creation, `ENAMETOOLONG` for a 256-byte name, and default-ACL inheritance with
+chmod mask sync were rechecked.
+
+### Affected Files
+
+`src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`,
+`docs/bug-fix-history.md`, `docs/migration-guide.md`,
+`docs/technical_deep_dive.md`

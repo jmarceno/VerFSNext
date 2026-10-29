@@ -82,7 +82,7 @@ File data is stored as variable-length, content-defined chunks. Chunk boundaries
 ### Extent layout (storage format 2)
 
 - Extent key: `E` + inode (u64 BE) + first byte offset (u64 BE). Value: `ExtentRecord { chunk_hash, len }`; an extent always maps a whole chunk and `len` equals the chunk's `uncompressed_len` (a mismatch is an `EIO`, logged with both lengths).
-- Extents of a file never overlap and normally lie inside `[0, size)`. Gaps between extents, and the space between the last extent and `size`, are holes that read as zeros; writes beyond end of file and `truncate` up never store zeros. A successful `FALLOC_FL_KEEP_SIZE` may materialize zero extents past the current EOF: they are invisible to reads and `SEEK_DATA`/`SEEK_HOLE` until the file grows, are counted and removed like any other extent, and write planning loads extents around a write even when the current inode size is zero so writes can replace a preallocated range.
+- Extents of a file never overlap and lie inside `[0, size)`. Gaps between extents, and the space between the last extent and `size`, are holes that read as zeros; writes beyond end of file, `truncate` up and fallocate never store zeros. Builds between B057 and B058 could leave zero extents past EOF through `FALLOC_FL_KEEP_SIZE`; they are invisible to reads and `SEEK_DATA`/`SEEK_HOLE`, are removed like any other extent, and write planning therefore loads extents around a write even when the inode size is zero.
 - `SYS:max_extent_len` is the largest maximum chunk size any mount of the data directory has used. At startup it is raised to the configured `ultracdc_max_size_bytes` if lower and is then fixed for the session (every extent written is at most the configured maximum). The extent covering an offset is found with a forward range scan that starts `max_extent_len - 1` bytes before it, so lookups need no reverse iteration.
 - Snapshots copy extent records verbatim; GC, pack format and chunk records are unchanged, since the pack store was already chunk-size agnostic (one record per chunk hash).
 
@@ -149,30 +149,32 @@ the daemon does not duplicate those checks in each operation.
 ### Fallocate
 
 `FUSE_FALLOCATE` is implemented by `FsCore::fallocate_file_locked` and uses the
-same extent, chunk-staging and refcount machinery as writes and truncates.
+same extent, chunk-staging and refcount machinery as truncates.
 
-- Mode 0 allocates zero chunks in every hole over `[offset, offset+length)` and
-  extends the file size unless KEEP_SIZE is set. Existing data is left
-  untouched.
-- `FALLOC_FL_KEEP_SIZE` allocates the same zero extents without changing
-  `InodeRecord.size`. The range may extend past EOF; the extents stay
-  addressable only by later size-growing operations.
+- Mode 0 stores nothing: it grows the size to `offset+length` when that is
+  past EOF and leaves the range a hole. Deduplication folds every zero chunk
+  into one record, so materialized zeros would reserve no space while costing
+  hashing, one extent per maximum-size chunk in a single transaction, and
+  re-chunking on the next write.
+- `FALLOC_FL_KEEP_SIZE` allocation succeeds without any change.
 - `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` removes extents fully covered by
-  the range and trims the first and last partially covered extents by loading
-  and verifying their payloads before staging replacement chunks at the exact
-  byte boundaries. The file size does not change.
+  the range without reading them, and trims the first and last partially
+  covered extents by loading and verifying their payloads before staging
+  replacement chunks at the exact byte boundaries. The file size does not
+  change.
 - `FALLOC_FL_ZERO_RANGE` removes/trims extents the same way so the range reads
   as a hole of zeroes. Without KEEP_SIZE it grows the file to the end of the
   requested range.
-- Zero chunk lengths use the configured maximum chunk size, so a large
-  allocation creates a bounded number of extents and one shared zero chunk per
-  distinct length. Mode combinations outside the four POSIX cases are rejected
-  with `EOPNOTSUPP`.
+- Mode combinations outside the four POSIX cases are rejected with
+  `EOPNOTSUPP`.
 
 All extent deletes, replacement extents, inode size/time changes and chunk
 reference deltas are staged in one transaction. New chunks are materialized
 before the commit, and retryable commit conflicts rerun the complete plan from
 the new transaction snapshot.
+
+`SEEK_DATA`/`SEEK_HOLE` scan extents forward from the one covering the offset
+and stop at the first answer, so a seek never loads a file's whole extent list.
 
 ### Inline end-of-file chunks
 

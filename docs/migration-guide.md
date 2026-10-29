@@ -121,9 +121,10 @@ which is the intended fix for directories that already contain them.
 ## No migration for fallocate
 
 Fallocate uses the existing extent, chunk-refcount and inode records. Mode 0
-and KEEP_SIZE materialize ordinary zero chunks through the same staging and
-transaction path as writes; punch-hole and zero-range split existing extents
-and adjust refcounts transactionally. KEEP_SIZE may leave allocated zero
-extents beyond the current file size, but they use the existing `E` extent
-keys and become visible through the normal size-growing paths. No metadata key
-or record layout changed, so no startup migration is required.
+only grows the inode size and KEEP_SIZE allocation changes nothing;
+punch-hole and zero-range split existing extents and adjust refcounts
+transactionally. Builds from B057 until B058 could store zero extents past
+EOF through KEEP_SIZE. Those use the ordinary `E` keys, read as the zeros they
+hold, are removed by truncate, unlink and GC like any extent, and write
+planning still loads extents for files of size zero, so no startup migration
+is required.

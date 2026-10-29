@@ -918,51 +918,29 @@ impl VirtualFs for VerFs {
             );
         }
 
-        let extents = self
-            .core
-            .meta
-            .read_txn(|txn| FsCore::load_all_extents_in_txn(txn, ino))
-            .map_err(map_anyhow_to_fuse)?;
-        match whence {
-            value if value == libc::SEEK_DATA as u32 => {
-                for extent in &extents {
-                    if extent.start >= inode.size {
-                        break;
-                    }
-                    let extent_end = extent.end().min(inode.size);
-                    if extent_end <= offset {
-                        continue;
-                    }
-                    return Ok(extent.start.max(offset));
-                }
-                build_error_result_from_errno(
-                    Errno::ENXIO,
-                    format!("no data at or after offset {}", offset),
+        let data = match whence {
+            value if value == libc::SEEK_DATA as u32 => true,
+            value if value == libc::SEEK_HOLE as u32 => false,
+            _ => {
+                return build_error_result_from_errno(
+                    Errno::EINVAL,
+                    format!("unsupported lseek whence {}", whence),
                 )
             }
-            value if value == libc::SEEK_HOLE as u32 => {
-                let mut cursor = offset;
-                for extent in &extents {
-                    if extent.start >= inode.size {
-                        break;
-                    }
-                    let extent_end = extent.end().min(inode.size);
-                    if extent_end <= cursor {
-                        continue;
-                    }
-                    if extent.start > cursor {
-                        return Ok(cursor);
-                    }
-                    cursor = extent_end;
-                    if cursor >= inode.size {
-                        return Ok(inode.size);
-                    }
-                }
-                Ok(cursor)
-            }
-            _ => build_error_result_from_errno(
-                Errno::EINVAL,
-                format!("unsupported lseek whence {}", whence),
+        };
+        let resolved = self
+            .core
+            .meta
+            .read_txn(|txn| {
+                self.core
+                    .seek_extents_in_txn(txn, ino, offset, inode.size, data)
+            })
+            .map_err(map_anyhow_to_fuse)?;
+        match resolved {
+            Some(position) => Ok(position),
+            None => build_error_result_from_errno(
+                Errno::ENXIO,
+                format!("no data at or after offset {}", offset),
             ),
         }
     }

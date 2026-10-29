@@ -577,9 +577,12 @@ impl FsCore {
         let mut attempt = 1;
         loop {
             let mut txn = self.meta.begin_write()?;
-            let (inode, new_chunks) = self
+            let (inode, staged) = self
                 .stage_fallocate_in_txn(ino, offset, length, flags, &mut txn)
                 .await?;
+            let Some(new_chunks) = staged else {
+                return Ok(inode);
+            };
             match self.meta.commit_write_txn(&mut txn).await {
                 Ok(()) => {
                     self.publish_committed_chunk_records(&new_chunks);
@@ -611,7 +614,7 @@ impl FsCore {
         length: u64,
         flags: FallocateFlags,
         txn: &mut verfsnext_surrealkv::Transaction,
-    ) -> Result<(InodeRecord, HashMap<ChunkId, NewChunk>)> {
+    ) -> Result<(InodeRecord, Option<HashMap<ChunkId, NewChunk>>)> {
         let mut inode = FsCore::load_inode_in_txn(txn, ino, "fallocate")?;
         self.ensure_inode_vault_access(&inode, "fallocate")?;
         if inode.kind != INODE_KIND_FILE {
@@ -656,49 +659,15 @@ impl FsCore {
                 new_size = old_size.max(end);
             }
         } else {
-            let alloc_end = end;
-            if !flags.keep_size {
-                new_size = old_size.max(end);
+            // Allocation stores nothing: deduplication folds every zero
+            // chunk into one record, so materializing zeros reserves no
+            // space and only costs hashing and extents the next write has to
+            // re-chunk. The range stays a hole that reads as zeros; mode 0
+            // only grows the size, and KEEP_SIZE changes nothing.
+            if flags.keep_size || end <= old_size {
+                return Ok((inode, None));
             }
-            if offset < alloc_end {
-                let extents = self.load_extents_in_txn(txn, ino, offset, alloc_end)?;
-                let mut cursor = offset;
-                for extent in extents {
-                    if extent.start >= alloc_end {
-                        break;
-                    }
-                    if extent.start > cursor {
-                        self.allocate_zero_extents_in_txn(
-                            txn,
-                            &inode,
-                            vault,
-                            cursor,
-                            extent.start.min(alloc_end),
-                            &mut extent_updates,
-                            &mut ref_deltas,
-                            &mut checked_ids,
-                            &mut pending_chunks,
-                        )?;
-                    }
-                    cursor = cursor.max(extent.end()).min(alloc_end);
-                    if cursor >= alloc_end {
-                        break;
-                    }
-                }
-                if cursor < alloc_end {
-                    self.allocate_zero_extents_in_txn(
-                        txn,
-                        &inode,
-                        vault,
-                        cursor,
-                        alloc_end,
-                        &mut extent_updates,
-                        &mut ref_deltas,
-                        &mut checked_ids,
-                        &mut pending_chunks,
-                    )?;
-                }
-            }
+            new_size = end;
         }
 
         let new_chunks = self.materialize_pending_chunks(pending_chunks).await?;
@@ -718,7 +687,7 @@ impl FsCore {
         }
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunks)?;
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-        Ok((inode, new_chunks))
+        Ok((inode, Some(new_chunks)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -746,6 +715,10 @@ impl FsCore {
             };
             *ref_deltas.entry(old_id).or_insert(0) -= 1;
             extent_deletes.push(extent.start);
+            if extent.start >= range_start && extent.end() <= range_end {
+                continue;
+            }
+            // Only the two boundary extents keep bytes, so only they are read.
             let payload = self.load_extent_payload(&extent, vault)?;
 
             if extent.start < range_start {
@@ -816,47 +789,6 @@ impl FsCore {
             checked_ids,
             pending_chunks,
         )?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn allocate_zero_extents_in_txn(
-        &self,
-        txn: &verfsnext_surrealkv::Transaction,
-        inode: &InodeRecord,
-        vault: bool,
-        mut start: u64,
-        end: u64,
-        extent_updates: &mut Vec<FileExtent>,
-        ref_deltas: &mut HashMap<ChunkId, i64>,
-        checked_ids: &mut HashSet<ChunkId>,
-        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
-    ) -> Result<()> {
-        let max_chunk = self.chunker.max_size() as u64;
-        if max_chunk == 0 {
-            return Err(anyhow_errno(
-                Errno::EIO,
-                "fallocate cannot allocate with a zero-size chunker maximum",
-            ));
-        }
-        while start < end {
-            let len = (end - start).min(max_chunk);
-            let data = Arc::new(vec![0_u8; len as usize]);
-            self.stage_replacement_extent(
-                txn,
-                inode,
-                vault,
-                start,
-                data,
-                extent_updates,
-                ref_deltas,
-                checked_ids,
-                pending_chunks,
-            )?;
-            start = start
-                .checked_add(len)
-                .ok_or_else(|| anyhow_errno(Errno::EFBIG, "fallocate allocation overflows"))?;
-        }
         Ok(())
     }
 
