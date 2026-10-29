@@ -87,6 +87,8 @@ pub struct CreateParam {
     pub name: String,
     /// File mode
     pub mode: u32,
+    /// File creation mode mask supplied by the kernel
+    pub umask: u32,
     /// File flags
     pub rdev: u32,
     /// User ID

@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs::acl::{inherit_child_acls, ACL_XATTR_ACCESS, ACL_XATTR_DEFAULT};
 use crate::fs::FsCore;
 use crate::types::{
     orphan_key, KEY_PREFIX_ORPHAN, MODE_PERM_MASK, PERM_BIT_EXEC, PERM_BIT_GROUP_EXEC, PERM_BIT_OTHER_EXEC, PERM_BIT_READ,
@@ -138,12 +139,14 @@ impl FsCore {
         FsCore::ensure_inode_writable(&parent_inode, context)?;
         Ok(parent_inode)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_inode_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
         parent: INum,
         name: &str,
         kind: u8,
         mode: u32,
+        umask: u32,
         uid: u32,
         gid: u32,
     ) -> Result<InodeRecord> {
@@ -211,9 +214,27 @@ impl FsCore {
         } else {
             gid
         };
-        let mut child_perm = (mode & MODE_PERM_MASK) as u16;
+        let parent_default_acl = if kind == INODE_KIND_SYMLINK {
+            None
+        } else {
+            txn.get(xattr_key(parent, ACL_XATTR_DEFAULT.as_bytes()))?
+        };
+        let requested_perm = (mode & MODE_PERM_MASK) as u16;
+        let mut child_perm = if kind == INODE_KIND_SYMLINK || parent_default_acl.is_some() {
+            requested_perm
+        } else {
+            requested_perm & !((umask & MODE_PERM_MASK) as u16)
+        };
         if parent_setgid && kind == INODE_KIND_DIR {
             child_perm |= libc::S_ISGID as u16;
+        }
+        let mut inherited_access_acl = None;
+        let mut inherited_default_acl = None;
+        if let Some(parent_default_acl) = parent_default_acl {
+            let inherited = inherit_child_acls(&parent_default_acl, child_perm, kind)?;
+            child_perm = inherited.mode;
+            inherited_access_acl = inherited.access;
+            inherited_default_acl = inherited.default;
         }
         let inode = InodeRecord {
             ino,
@@ -237,6 +258,12 @@ impl FsCore {
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
         txn.set(dirent_key_bytes, encode_rkyv(&DirentRecord { ino, kind })?)?;
         txn.set(next_inode_key, (ino + 1).to_le_bytes().to_vec())?;
+        if let Some(access_acl) = inherited_access_acl {
+            txn.set(xattr_key(ino, ACL_XATTR_ACCESS.as_bytes()), access_acl)?;
+        }
+        if let Some(default_acl) = inherited_default_acl {
+            txn.set(xattr_key(ino, ACL_XATTR_DEFAULT.as_bytes()), default_acl)?;
+        }
 
         if kind == INODE_KIND_DIR {
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);

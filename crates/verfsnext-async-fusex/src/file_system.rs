@@ -15,6 +15,7 @@ use super::protocol::FuseForgetOne;
 use crate::fs_util::{CreateParam, FileLockParam, INum, RenameParam, SetAttrParam};
 
 /// FUSE filesystem trait
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait FileSystem {
     /// Initialize filesystem
@@ -71,6 +72,7 @@ pub trait FileSystem {
         parent: INum,
         name: &str,
         mode: u32,
+        umask: u32,
         reply: ReplyEntry<'_>,
     ) -> nix::Result<usize>;
 
@@ -282,6 +284,7 @@ pub trait FileSystem {
         _parent: u64,
         _name: &str,
         _mode: u32,
+        _umask: u32,
         _flags: u32,
         reply: ReplyCreate<'_>,
     ) -> nix::Result<usize>;

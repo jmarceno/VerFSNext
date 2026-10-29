@@ -74,6 +74,7 @@ const STATS_REFRESH_MIN_AGE_MS: u64 = 30_000;
 /// daemon restarts.
 const STATS_SNAPSHOT_FILE: &str = "stats-snapshot.json";
 
+mod acl;
 pub mod chunk;
 mod fill_cache;
 pub mod fuse;
@@ -1901,7 +1902,16 @@ mod tests {
         let fs = VerFs::new(config).await?;
 
         let (_entry_ttl, _attr_ttl, attr, _gen, _fh, _) = fs
-            .create(1000, 1000, ROOT_INODE, ROOT_INODE, "bench_file", 0o644, 0)
+            .create(
+                1000,
+                1000,
+                ROOT_INODE,
+                ROOT_INODE,
+                "bench_file",
+                0o644,
+                0,
+                0,
+            )
             .await
             .map_err(|e| anyhow!("create failed: {:?}", e))?;
         let ino = attr.ino;

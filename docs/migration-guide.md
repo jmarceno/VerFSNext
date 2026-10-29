@@ -107,3 +107,13 @@ carry no record of the FIFO or socket type the caller requested.
 Once a FIFO or socket exists, downgrading is not supported because older
 binaries map unknown kinds as regular files. Keep the previous binary only for
 data directories that contain no FIFO or socket entries.
+
+## No migration for POSIX ACL enforcement
+
+Access and default ACLs were already persisted as
+`system.posix_acl_access` and `system.posix_acl_default` xattrs. The new ACL
+parser reads those same version-2 payloads, and chmod/setxattr may rewrite an
+existing payload canonically in the same transaction that updates the inode.
+No key or record layout changes, so startup performs no migration. The change
+does reinterpret existing ACLs (from opaque bytes to enforced permissions),
+which is the intended fix for directories that already contain them.

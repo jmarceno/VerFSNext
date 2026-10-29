@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs::acl::{PosixAcl, ACL_XATTR_ACCESS, ACL_XATTR_DEFAULT};
 use async_trait::async_trait;
 use tracing::{error, info, warn};
 #[async_trait]
@@ -104,6 +105,13 @@ impl VirtualFs for VerFs {
                 let mut current = FsCore::load_inode_in_txn(txn, ino, "setattr")?;
                 if let Some(mode) = param.mode {
                     current.perm = (mode & MODE_PERM_MASK) as u16;
+                    let access_acl_key = xattr_key(ino, ACL_XATTR_ACCESS.as_bytes());
+                    if let Some(access_acl_raw) = txn.get(access_acl_key.clone())? {
+                        let mut access_acl =
+                            PosixAcl::parse(&access_acl_raw, ACL_XATTR_ACCESS)?;
+                        access_acl.sync_mode(current.perm)?;
+                        txn.set(access_acl_key, access_acl.to_xattr())?;
+                    }
                 }
                 if let Some(uid) = param.u_id {
                     current.uid = uid;
@@ -205,6 +213,7 @@ impl VirtualFs for VerFs {
                     &param.name,
                     create_kind,
                     param.mode,
+                    param.umask,
                     param.uid,
                     param.gid,
                 )?;
@@ -253,6 +262,7 @@ impl VirtualFs for VerFs {
                     &param.name,
                     INODE_KIND_DIR,
                     param.mode,
+                    param.umask,
                     param.uid,
                     param.gid,
                 )?;
@@ -434,6 +444,7 @@ impl VirtualFs for VerFs {
                     name,
                     INODE_KIND_SYMLINK,
                     PERM_SYMLINK_DEFAULT as u32,
+                    0,
                     uid,
                     gid,
                 )?;
@@ -1174,6 +1185,7 @@ impl VirtualFs for VerFs {
         parent: u64,
         name: &str,
         mode: u32,
+        umask: u32,
         _flags: u32,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
         FsCore::validate_name_length(name, "create").map_err(map_anyhow_to_fuse)?;
@@ -1195,6 +1207,7 @@ impl VirtualFs for VerFs {
                     name,
                     INODE_KIND_FILE,
                     mode,
+                    umask,
                     uid,
                     gid,
                 )?;
@@ -1341,7 +1354,7 @@ impl VirtualFs for VerFs {
         flags: u32,
         position: u32,
     ) -> AsyncFusexResult<()> {
-        let _inode = self
+        let inode = self
             .core
             .load_inode_with_vault_access(ino, "setxattr")
             .map_err(map_anyhow_to_fuse)?;
@@ -1362,6 +1375,26 @@ impl VirtualFs for VerFs {
         if create && replace {
             return build_error_result_from_errno(Errno::EINVAL, "invalid xattr flags".to_owned());
         }
+
+        let is_access_acl = name == ACL_XATTR_ACCESS;
+        let is_default_acl = name == ACL_XATTR_DEFAULT;
+        if is_default_acl && inode.kind != INODE_KIND_DIR {
+            return build_error_result_from_errno(
+                Errno::ENOTDIR,
+                "default POSIX ACLs are only valid on directories".to_owned(),
+            );
+        }
+        if is_access_acl && inode.kind == INODE_KIND_SYMLINK {
+            return build_error_result_from_errno(
+                Errno::EOPNOTSUPP,
+                "symbolic links do not support POSIX ACLs".to_owned(),
+            );
+        }
+        let parsed_acl = if is_access_acl || is_default_acl {
+            Some(PosixAcl::parse(value, name).map_err(map_anyhow_to_fuse)?)
+        } else {
+            None
+        };
 
         let _guard = self.core.write_lock.write().await;
         self.core
@@ -1389,7 +1422,15 @@ impl VirtualFs for VerFs {
                         format!("xattr {} not found", name),
                     ));
                 }
-                txn.set(key, value.to_vec())?;
+                let stored_value = if let Some(access_acl) = parsed_acl.as_ref() {
+                    if is_access_acl {
+                        inode.perm = access_acl.mode_bits(inode.perm & 0o7000)?;
+                    }
+                    access_acl.to_xattr()
+                } else {
+                    value.to_vec()
+                };
+                txn.set(key, stored_value)?;
 
                 let now = SystemTime::now();
                 let (sec, nsec) = system_time_to_parts(now);

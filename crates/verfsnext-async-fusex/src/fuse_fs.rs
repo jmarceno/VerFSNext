@@ -256,11 +256,12 @@ impl FileSystem for FuseFs {
         parent: INum,
         name: &str,
         mode: u32,
+        umask: u32,
         reply: ReplyEntry<'_>,
     ) -> nix::Result<usize> {
         debug!(
-            "mkdir(parent={}, name={:?}, mode={}, req={:?})",
-            parent, name, mode, req,
+            "mkdir(parent={}, name={:?}, mode={}, umask={:o}, req={:?})",
+            parent, name, mode, umask, req,
         );
 
         // TODO: this mkdir param is different from mknod one, need to unify them
@@ -268,6 +269,7 @@ impl FileSystem for FuseFs {
             parent,
             name: name.to_owned(),
             mode,
+            umask,
             rdev: 0,
             uid: req.uid(),
             gid: req.gid(),
@@ -1382,18 +1384,28 @@ impl FileSystem for FuseFs {
         parent: u64,
         name: &str,
         mode: u32,
+        umask: u32,
         flags: u32,
         reply: ReplyCreate<'_>,
     ) -> nix::Result<usize> {
         let ino = req.nodeid();
         debug!(
-            "create(ino={}, parent={}, name={:?}, mode={}, flags={}, req={:?})",
-            ino, parent, name, mode, flags, req,
+            "create(ino={}, parent={}, name={:?}, mode={}, umask={:o}, flags={}, req={:?})",
+            ino, parent, name, mode, umask, flags, req,
         );
 
         let create_res = self
             .virtual_fs
-            .create(req.uid(), req.gid(), ino, parent, name, mode, flags)
+            .create(
+                req.uid(),
+                req.gid(),
+                ino,
+                parent,
+                name,
+                mode,
+                umask,
+                flags,
+            )
             .await;
 
         match create_res {

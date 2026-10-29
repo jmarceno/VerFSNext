@@ -2228,3 +2228,81 @@ inherited both again.
 ### Affected Files
 
 `src/fs/inode.rs`, `docs/bug-fix-history.md`
+
+## B056 - POSIX ACLs Were Stored but Never Enforced - Oct 29 2026
+
+### Symptom
+
+`setfacl` completed successfully, but the ACL had no effect on access. An ACL
+that removed all owner permissions still allowed the owner to read the file.
+ACL masks were not reflected in the group mode bits after chmod or setxattr,
+and files created under a directory with a default ACL did not inherit it.
+Users could believe access was restricted when every process still passed the
+kernel's mode-bit check.
+
+### Root Cause
+
+ACLs were treated as opaque `system.posix_acl_access` and
+`system.posix_acl_default` extended attributes. The mount negotiated only
+`default_permissions`, never `FUSE_POSIX_ACL`, so the kernel never consulted
+the ACL xattrs. The mode/ACL synchronization and default-ACL creation rules
+lived neither in the kernel path nor in VerFS. Creation also let the kernel
+apply umask before the request arrived, which makes default ACLs produce the
+wrong mask because POSIX says a default ACL replaces umask for that create.
+
+### Fix
+
+The mount now negotiates `FUSE_POSIX_ACL` when the kernel offers it, so the
+kernel performs permission checks against the ACL returned by getxattr. It
+also negotiates `FUSE_DONT_MASK`; create, mkdir and mknod now receive the
+kernel's separate umask field and apply it themselves. When the parent has a
+default ACL, that ACL is used for POSIX inheritance and umask is ignored, as
+required. Without a default ACL, the same umask filtering as before is applied.
+
+`src/fs/acl.rs` validates and canonically serializes version-2 POSIX ACLs. It
+implements the access-ACL mode mapping and the default-ACL inheritance
+transformation:
+
+- owner, mask and other permissions are narrowed by the requested mode;
+- named user/group permissions are retained and limited through the inherited
+  mask;
+- files, FIFOs and sockets receive the generated access ACL, while symbolic
+  links receive none;
+- a new directory also receives the parent's default ACL;
+- only extended ACLs are stored as access xattrs, while basic inherited ACLs
+  remain representable by mode bits alone.
+
+`setxattr` now validates ACL payloads, rejects default ACLs on non-directories,
+synchronizes `InodeRecord.perm` from an access ACL, and stores ACL payloads in
+canonical order. `setattr` chmod updates an existing access ACL in the same
+metadata transaction: `USER_OBJ`, `MASK` (or `GROUP_OBJ` for a basic ACL) and
+`OTHER` follow the new owner, group and other mode bits. Existing ACL xattrs
+are interpreted in place, so no on-disk migration is required.
+
+### Validation
+
+Release build passed. On a scratch mount:
+
+- `setfacl -m u:1001:rwx` produced an extended ACL and changed the mode from
+  `640` to `670`; `chmod g-r` changed the ACL mask and the mode coherently to
+  `630`.
+- A directory default ACL containing a named user was inherited by regular
+  files, FIFOs and subdirectories. Files/FIFOs became mode `660` and the
+  subdirectory became mode `2770` with the same default ACL, matching the ext4
+  result for the same ACL. Symlinks stayed `777` without an access ACL.
+- With no default ACL, umask `027` still produced file/FIFO modes `640` and a
+  directory mode `750`.
+- An ACL with `u::---,g::---,m::---,o::---` made an owner read fail with
+  `EACCES`; restoring mode permissions made it readable again.
+- ACL xattrs and inherited modes survived a full unmount/remount unchanged.
+
+### Affected Files
+
+`src/fs/acl.rs`, `src/fs/inode.rs`, `src/fs/fuse.rs`, `src/fs/mod.rs`,
+`crates/verfsnext-async-fusex/src/fs_util.rs`,
+`crates/verfsnext-async-fusex/src/file_system.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`,
+`crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`,
+`docs/bug-fix-history.md`, `docs/migration-guide.md`,
+`docs/technical_deep_dive.md`

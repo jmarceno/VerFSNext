@@ -115,6 +115,37 @@ Old extents a region can reach are loaded through the batch transaction once per
 
 Cost: each FUSE write that extends a file re-reads (usually from the chunk cache) and re-stores the file's tail chunk. A random write re-chunks the extent before it, the extents it overwrites and normally one or two more until resynchronization.
 
+### POSIX ACLs and creation modes
+
+The mount always passes `default_permissions` and additionally negotiates
+`FUSE_POSIX_ACL` and `FUSE_DONT_MASK`. The kernel therefore resolves access
+against `system.posix_acl_access`, while the daemon receives the unmasked
+creation mode and the separate umask in FUSE create/mkdir/mknod requests.
+
+`src/fs/acl.rs` owns the version-2 ACL wire format and its rules:
+
+- ACL xattrs are validated, normalized in canonical tag/id order, and kept in
+  the existing xattr key space, so snapshot cloning and persistence need no
+  special case.
+- An access ACL determines the owner mode bits from `USER_OBJ`, the group mode
+  bits from `MASK` (or `GROUP_OBJ` on a basic ACL), and the other bits from
+  `OTHER`. Setting the xattr updates the inode mode in the same transaction.
+- chmod updates `USER_OBJ`, `MASK` or `GROUP_OBJ`, and `OTHER` in the stored
+  access ACL in the same transaction as the mode change.
+- When a parent has a default ACL, it is copied unchanged to a new
+  subdirectory and used to generate the child's access ACL. Owner, mask and
+  other permissions are narrowed by the requested mode; named entries keep
+  their permissions and are made effective through the inherited mask.
+- A create under a default ACL ignores umask, matching POSIX and ext4. Without
+  a default ACL the daemon applies the request umask itself because
+  `FUSE_DONT_MASK` disabled the kernel's automatic masking.
+- Symbolic links never receive ACL xattrs; regular files, FIFOs and sockets
+  do. Basic inherited ACLs need no access xattr because their result is fully
+  represented by mode bits.
+
+Because the kernel owns ACL permission checks under `default_permissions`,
+the daemon does not duplicate those checks in each operation.
+
 ### Inline end-of-file chunks
 
 The chunk that ends a region at the end of the file is not a content-defined cut: the next append re-chunks it. Such a chunk, when new, is stored inline in metadata instead of a pack (`CHUNK_FLAG_INLINE`, `pack_id = INLINE_PACK_ID`, payload under `T` + hash; raw bytes, vault payloads encrypted with the record's nonce). Truncating down stores the kept prefix of the last extent the same way.
@@ -303,7 +334,7 @@ Crash behavior:
 - `chunk_cache_capacity_mb`
 - `metadata_block_cache_mb` (default 64): SurrealKV block cache for decoded SSTable data and index blocks. Blocks are 64 KiB and Snappy-compressed, so a lookup that misses reads and decodes a whole block; with the former built-in 1 MiB cache nearly every chunk-record lookup after a restart did, at about 44 us per lookup. Older configs without the key get the default
 - `pack_index_cache_capacity_entries`
-- `fuse_allow_other` (default `false`): adds the `allow_other` mount option so users other than the daemon's user can access the mount. Both mount paths (`fusermount` for non-root, direct `mount(2)` for root) always pass `default_permissions`, so the kernel enforces permission bits; the filesystem does not check them in its operations. A non-root mount with `allow_other` needs `user_allow_other` in `/etc/fuse.conf`, and a failed `fusermount` returns an error (it used to panic). Before this option existed the `fusermount` path always used `allow_other` and the direct root path passed neither `allow_other` nor `default_permissions`
+- `fuse_allow_other` (default `false`): adds the `allow_other` mount option so users other than the daemon's user can access the mount. Both mount paths (`fusermount` for non-root, direct `mount(2)` for root) always pass `default_permissions`, so the kernel enforces mode bits and, after `FUSE_POSIX_ACL` negotiation, POSIX ACLs; the filesystem does not duplicate those checks in its operations. `FUSE_DONT_MASK` makes the kernel send the original creation mode plus umask separately so VerFS can apply umask only when no default ACL exists. A non-root mount with `allow_other` needs `user_allow_other` in `/etc/fuse.conf`, and a failed `fusermount` returns an error (it used to panic). Before this option existed the `fusermount` path always used `allow_other` and the direct root path passed neither `allow_other` nor `default_permissions`
 - `fuse_attr_ttl_ms` and `fuse_entry_ttl_ms` are loaded from `config.toml` at mount (current defaults: 150ms each); effective runtime TTLs are zeroed automatically if kernel invalidation notifier is unavailable
 - `pack_max_size_mb`
 - `zstd_compression_level`

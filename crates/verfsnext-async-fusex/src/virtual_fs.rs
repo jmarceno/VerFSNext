@@ -358,6 +358,7 @@ pub trait VirtualFs: Sync + Send {
         parent: u64,
         name: &str,
         mode: u32,
+        umask: u32,
         flags: u32,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
         Err(AsyncFusexError::Unimplemented {

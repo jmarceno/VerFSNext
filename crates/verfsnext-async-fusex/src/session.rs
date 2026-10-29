@@ -38,10 +38,14 @@ use super::protocol::FATTR_CTIME;
 use super::protocol::FATTR_LOCKOWNER; // {FATTR_ATIME_NOW, FATTR_MTIME_NOW};
 #[cfg(feature = "abi-7-9")]
 use super::protocol::FUSE_BIG_WRITES;
+#[cfg(feature = "abi-7-12")]
+use super::protocol::FUSE_DONT_MASK;
 #[cfg(feature = "abi-7-28")]
 use super::protocol::FUSE_MAX_PAGES;
 #[cfg(feature = "abi-7-23")]
 use super::protocol::FUSE_WRITEBACK_CACHE;
+#[cfg(feature = "abi-7-26")]
+use super::protocol::FUSE_POSIX_ACL;
 use super::protocol::{
     FuseInitIn, FuseInitOut, FuseOutHeader, FuseSetXAttrIn, FATTR_ATIME, FATTR_FH, FATTR_GID,
     FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ASYNC_READ, FUSE_KERNEL_MINOR_VERSION,
@@ -100,9 +104,17 @@ fn supported_init_flags() -> u32 {
     {
         flags |= FUSE_BIG_WRITES;
     }
+    #[cfg(feature = "abi-7-12")]
+    {
+        flags |= FUSE_DONT_MASK;
+    }
     #[cfg(feature = "abi-7-23")]
     {
         flags |= FUSE_WRITEBACK_CACHE;
+    }
+    #[cfg(feature = "abi-7-26")]
+    {
+        flags |= FUSE_POSIX_ACL;
     }
     #[cfg(feature = "abi-7-28")]
     {
@@ -848,6 +860,7 @@ async fn dispatch<'a>(
                 parent: req.nodeid(),
                 name: name.to_owned(),
                 mode: arg.mode,
+                umask: arg.umask,
                 rdev: arg.rdev,
                 uid: req.uid(),
                 gid: req.gid(),
@@ -859,7 +872,8 @@ async fn dispatch<'a>(
         }
         Operation::MkDir { arg, name } => {
             let reply = ReplyEntry::new(req.unique(), file);
-            fs.mkdir(req, req.nodeid(), name, arg.mode, reply).await
+            fs.mkdir(req, req.nodeid(), name, arg.mode, arg.umask, reply)
+                .await
         }
         Operation::Unlink { name } => {
             let reply = ReplyEmpty::new(req.unique(), file);
@@ -976,8 +990,16 @@ async fn dispatch<'a>(
         }
         Operation::Create { arg, name } => {
             let reply = ReplyCreate::new(req.unique(), file);
-            fs.create(req, req.nodeid(), name, arg.mode, arg.flags, reply)
-                .await
+            fs.create(
+                req,
+                req.nodeid(),
+                name,
+                arg.mode,
+                arg.umask,
+                arg.flags,
+                reply,
+            )
+            .await
         }
         Operation::GetLk { arg } => {
             let reply = ReplyLock::new(req.unique(), file);
