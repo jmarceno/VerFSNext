@@ -3207,3 +3207,110 @@ matching FORGET arrives, as before.
 `crates/verfsnext-async-fusex/src/fuse_reply.rs`,
 `crates/verfsnext-async-fusex/src/fuse_fs.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B069 - Review Fixes for the Oct 29 FUSE Feature Batch (st_blocks, relatime, copy_file_range, append-only) - Oct 29 2026
+
+### Symptom
+
+A review of B060-B068 (relatime, st_blocks, statx/schema v2, O_TMPFILE,
+copy_file_range cloning, device nodes, file attribute ioctls,
+collapse/insert range, READDIRPLUS) found these defects:
+
+1. **stat could never return on a file under continuous writes.**
+   `allocated_blocks` rescanned every extent in a loop until the inode data
+   version stayed the same across the scan. On a large file that is written
+   faster than one scan takes, getattr/lookup/readdirplus spin forever.
+2. **Unbounded memory growth from stat.** `inode_data_version` inserted a map
+   entry for every inode it was asked about. `allocated_blocks` calls it on
+   every getattr/lookup/readdirplus of a regular file, so a `find`/`ls -l`
+   over N files grew `inode_data_versions` by N entries. That map is never
+   pruned.
+3. **An explicit `touch -a` could be reverted.** A read recorded a relatime
+   access in `pending_atimes`. A `touch -a -d 2020-01-01` before the next sync
+   cycle set an old atime and a new ctime, which made relatime "due" again, so
+   the flush overwrote the explicit time with the read time.
+4. **atime commits forced write batches to re-chunk.** The atime flush
+   committed inode keys while write batches were staging the same inodes. The
+   batch then failed its commit on the inode key and re-planned all of its
+   data: CPU and pack garbage on every read+write workload.
+5. **copy_file_range could commit and then report EOVERFLOW.** A request
+   longer than `u32::MAX` copied everything in one transaction and then
+   answered `EOVERFLOW`, because the reply length is a `u32`. A completed
+   copy reported as a failure.
+6. **Append-only (`chattr +a`) did not match Linux.** An append-only
+   *directory* still allowed unlink, rmdir and rename of its entries.
+   Append-only files still allowed chmod/chown, setxattr/removexattr and
+   growing truncates. Plain `fallocate` allocation (allowed by Linux) was
+   refused.
+7. **Unsupported ioctls logged at WARN.** Python calls `isatty` (TCGETS)
+   on every `open()`, which logged one WARN line per file opened on the
+   mount.
+
+### Root Cause
+
+1/2: the retry loop treated a version change as "scan again" instead of "do
+not cache", and the version getter used `entry().or_insert(0)`.
+3: nothing dropped the pending entry when the access time was set explicitly.
+4: the flush took no part in the mutation gate that every data and attribute
+mutation holds from staging to commit.
+5: no length cap before staging. Older kernels do not clamp the request.
+6: only the inode's own append-only bit was checked, never the parent
+directory's, and setattr/xattr/truncate/fallocate followed shrink-only rules.
+7: unknown ioctl commands were logged at warn level.
+
+### Fix
+
+- `allocated_blocks` (`src/fs/inode.rs`) scans once. Its read transaction is
+  a consistent snapshot, so the sum is always correct. It is cached only when
+  the data version did not move across the scan, and returned uncached
+  otherwise.
+- `inode_data_version` (`src/fs/mod.rs`) reads the map without inserting
+  (missing = 0, the same value as before).
+- `setattr` drops the inode's `pending_atimes` entry when it sets the atime.
+- `flush_pending_atimes` takes the write side of the mutation gate before
+  taking entries, like a namespace mutation. No write batch is staging during
+  the atime commit.
+- `VerFs::copy_file_range` caps `len` at `COPY_FILE_RANGE_MAX_LEN`
+  (`u32::MAX & !0xfff`, the kernel's own clamp) before staging. A longer
+  request is a short copy.
+- Append-only enforcement now matches Linux:
+  - The parent directory is checked in unlink, rmdir and rename: on the
+    source parent, and on the destination parent when an entry is replaced.
+  - setattr refuses mode/uid/gid changes, and setxattr/removexattr are
+    refused.
+  - Every truncate is refused (Linux `do_truncate`).
+  - Only punch/zero/collapse/insert fallocate is refused (Linux
+    `vfs_fallocate`).
+- The unsupported-ioctl log is now debug level.
+
+### Data integrity
+
+No on-disk format change and no migration. The st_blocks sum is the same
+value read from a consistent snapshot. The atime flush still writes only
+atime fields. The gate only orders it against other mutations. The append-only
+changes only refuse more operations. The copy cap makes a request copy less
+and report exactly what it copied.
+
+### Validation
+
+- `cargo remote -h -- clippy --all-targets` emits no warnings.
+  `cargo remote -h -- test` passes.
+- Scratch mount of the headless build (sync interval 3 s):
+  - Read a file, then `touch -a -d 2020-01-01` before the flush. The 2020
+    atime survived two sync cycles and a remount. A read of a file with a
+    2-day-old atime still updated it.
+  - 992 `stat` calls ran while a 600 MB file was being written, and each
+    returned promptly. Final `st_blocks` = 1228800.
+  - A copy_file_range loop of the 600 MB file produced an identical sha256,
+    also after a remount.
+  - `chattr +d` and `lsattr` work on files and directories.
+  - `isatty` on a mount file works.
+  - Daemon log is clean apart from the known one-per-mount opcode 53 line.
+- The append-only paths need `CAP_LINUX_IMMUTABLE` to set `+a` and were not
+  exercised on this unprivileged host. The change is limited to extra EPERM
+  checks.
+
+### Affected Files
+
+`src/fs/inode.rs`, `src/fs/mod.rs`, `src/fs/fuse.rs`, `src/fs/write.rs`,
+`docs/bug-fix-history.md`, `docs/technical_deep_dive.md`

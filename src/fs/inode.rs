@@ -53,33 +53,35 @@ impl FsCore {
     /// The value is computed on demand from the extent records and cached per
     /// (ino, inode data version). Every extent-mutating path commits and then
     /// bumps that version, so a scan whose extents belong to a different
-    /// version than the one it started with is retried instead of cached, and
+    /// version than the one it started with is returned but not cached, and
     /// a cached value is never served for another version. Nothing is
     /// denormalized into the inode record, so there is no counter to drift.
     fn allocated_blocks(&self, inode: &InodeRecord) -> Result<u64> {
         if inode.kind != INODE_KIND_FILE {
             return Ok(0);
         }
-        loop {
-            let version = self.inode_data_version(inode.ino);
-            if let Some(blocks) = self.allocated_blocks_cache.get(&(inode.ino, version)) {
-                return Ok(blocks);
-            }
-            let allocated_bytes = self.meta.read_txn(|txn| {
-                let mut allocated_bytes = 0_u64;
-                for extent in FsCore::load_all_extents_in_txn(txn, inode.ino)? {
-                    allocated_bytes += u64::from(extent.record.len);
-                }
-                Ok(allocated_bytes)
-            })?;
-            if self.inode_data_version(inode.ino) != version {
-                continue;
-            }
-            let blocks = allocated_bytes.div_ceil(512);
-            self.allocated_blocks_cache
-                .insert((inode.ino, version), blocks);
+        let version = self.inode_data_version(inode.ino);
+        if let Some(blocks) = self.allocated_blocks_cache.get(&(inode.ino, version)) {
             return Ok(blocks);
         }
+        // The read transaction is one consistent snapshot of the extents, so
+        // the sum is always a correct answer. It is cached only when no
+        // extent mutation bumped the version during the scan; it is never
+        // rescanned in a loop, which a file under continuous writes would
+        // turn into a stat that never returns.
+        let allocated_bytes = self.meta.read_txn(|txn| {
+            let mut allocated_bytes = 0_u64;
+            for extent in FsCore::load_all_extents_in_txn(txn, inode.ino)? {
+                allocated_bytes += u64::from(extent.record.len);
+            }
+            Ok(allocated_bytes)
+        })?;
+        let blocks = allocated_bytes.div_ceil(512);
+        if self.inode_data_version(inode.ino) == version {
+            self.allocated_blocks_cache
+                .insert((inode.ino, version), blocks);
+        }
+        Ok(blocks)
     }
 
     /// Records an access time for the next sync cycle when POSIX relatime

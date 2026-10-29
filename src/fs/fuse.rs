@@ -3,6 +3,10 @@ use crate::fs::acl::{PosixAcl, ACL_XATTR_ACCESS, ACL_XATTR_DEFAULT};
 use async_trait::async_trait;
 use tracing::{error, info, warn};
 use verfsnext_async_fusex::protocol::FOPEN_DIRECT_IO;
+
+/// Longest copy one FUSE_COPY_FILE_RANGE request performs: the largest
+/// page-aligned length the u32 reply field can report.
+const COPY_FILE_RANGE_MAX_LEN: u64 = (u32::MAX as u64) & !0xfff;
 #[async_trait]
 impl VirtualFs for VerFs {
     async fn init(&self) -> AsyncFusexResult<()> {
@@ -146,6 +150,17 @@ impl VirtualFs for VerFs {
                 .map_err(map_anyhow_to_fuse)?
         };
         FsCore::ensure_inode_writable(&inode, "setattr").map_err(map_anyhow_to_fuse)?;
+        // Like Linux notify_change: an append-only inode keeps its mode and
+        // ownership.
+        if param.mode.is_some() || param.u_id.is_some() || param.g_id.is_some() {
+            FsCore::ensure_inode_not_append_only(&inode, "setattr")
+                .map_err(map_anyhow_to_fuse)?;
+        }
+        if param.a_time.is_some() {
+            // An explicitly set access time replaces any access a read
+            // recorded earlier; the sync cycle must not overwrite it.
+            self.core.pending_atimes.lock().remove(&ino);
+        }
 
         // The attribute update is applied to the inode as read inside the
         // transaction: writing back a copy loaded earlier would revert any
@@ -372,8 +387,9 @@ impl VirtualFs for VerFs {
         self.core
             .meta
             .write_txn(|txn| {
-                let _parent_inode =
+                let parent_inode =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "unlink")?;
+                FsCore::ensure_inode_not_append_only(&parent_inode, "unlink")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, name, "unlink")?;
                 removed_ino = Some(dirent.ino);
                 let Some(inode_raw) = txn.get(inode_key(dirent.ino))? else {
@@ -434,8 +450,9 @@ impl VirtualFs for VerFs {
         self.core
             .meta
             .write_txn(|txn| {
-                let _parent_inode =
+                let parent_inode =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, parent, "rmdir")?;
+                FsCore::ensure_inode_not_append_only(&parent_inode, "rmdir")?;
                 let dirent = FsCore::ensure_dirent_target(txn, parent, dir_name, "rmdir")?;
                 removed_ino = Some(dirent.ino);
                 let Some(raw) = txn.get(inode_key(dirent.ino))? else {
@@ -614,9 +631,10 @@ impl VirtualFs for VerFs {
                     "rename source",
                 )?;
                 moved_ino = Some(source.ino);
-                let _old_parent =
+                let old_parent =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, param.old_parent, "rename")?;
-                let _new_parent =
+                FsCore::ensure_inode_not_append_only(&old_parent, "rename")?;
+                let new_parent =
                     FsCore::ensure_parent_dir_writable_in_txn(txn, param.new_parent, "rename")?;
                 let Some(source_inode_raw) = txn.get(inode_key(source.ino))? else {
                     return Err(anyhow_errno(Errno::ENOENT, "rename source inode not found"));
@@ -663,6 +681,7 @@ impl VirtualFs for VerFs {
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
                     FsCore::ensure_inode_not_append_only(&target_inode, "rename")?;
+                    FsCore::ensure_inode_not_append_only(&new_parent, "rename")?;
                     FsCore::ensure_entry_removable(
                         param.new_parent,
                         &param.new_name,
@@ -739,6 +758,7 @@ impl VirtualFs for VerFs {
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
                     FsCore::ensure_inode_not_append_only(&target_inode, "rename")?;
+                    FsCore::ensure_inode_not_append_only(&new_parent, "rename")?;
                     FsCore::ensure_entry_removable(
                         param.new_parent,
                         &param.new_name,
@@ -1169,6 +1189,11 @@ impl VirtualFs for VerFs {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // The reply carries the copied length in a u32, so a longer request
+        // is shortened before anything is staged (as the kernel does since
+        // it clamps to UINT_MAX & PAGE_MASK); a copy that committed and then
+        // failed with EOVERFLOW would report an error for a completed copy.
+        let len = len.min(COPY_FILE_RANGE_MAX_LEN);
         self.core
             .copy_file_range_locked(ino_in, ino_out, offset_in, offset_out, len)
             .await
@@ -1645,6 +1670,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "setxattr")?;
+                FsCore::ensure_inode_not_append_only(&inode, "setxattr")?;
                 let key = xattr_key(ino, name.as_bytes());
                 let exists = txn.get(key.clone())?.is_some();
                 if create && exists {
@@ -1786,6 +1812,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "removexattr")?;
+                FsCore::ensure_inode_not_append_only(&inode, "removexattr")?;
                 let key = xattr_key(ino, name.as_bytes());
                 if txn.get(key.clone())?.is_none() {
                     return Err(anyhow_errno(
@@ -2015,7 +2042,10 @@ impl VirtualFs for VerFs {
                 Ok((0, out))
             }
             unsupported => {
-                warn!(
+                // Programs probe files with ioctls such as TCGETS (isatty on
+                // every Python open), so ENOTTY is the expected answer here,
+                // not a failure.
+                debug!(
                     ino,
                     cmd = format!("{unsupported:#x}"),
                     in_data_len = in_data.len(),

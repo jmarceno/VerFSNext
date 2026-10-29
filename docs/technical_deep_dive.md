@@ -86,7 +86,7 @@ File data is stored as variable-length, content-defined chunks. Chunk boundaries
 - Extents of a file never overlap and lie inside `[0, size)`. Gaps between extents, and the space between the last extent and `size`, are holes that read as zeros; writes beyond end of file, `truncate` up and fallocate never store zeros. Builds between B057 and B058 could leave zero extents past EOF through `FALLOC_FL_KEEP_SIZE`; they are invisible to reads and `SEEK_DATA`/`SEEK_HOLE`, are removed like any other extent, and write planning therefore loads extents around a write even when the inode size is zero.
 - `SYS:max_extent_len` is the largest maximum chunk size any mount of the data directory has used. At startup it is raised to the configured `ultracdc_max_size_bytes` if lower and is then fixed for the session (every extent written is at most the configured maximum). The extent covering an offset is found with a forward range scan that starts `max_extent_len - 1` bytes before it, so lookups need no reverse iteration.
 - Snapshots copy extent records verbatim; GC, pack format and chunk records are unchanged, since the pack store was already chunk-size agnostic (one record per chunk hash).
-- `st_blocks` reports allocated data, never the logical size: `file_attr_from_inode` (`src/fs/inode.rs`) sums the lengths of the inode's extent records, divides by 512 rounding up, and inode kinds without extent data (directory, symlink, FIFO, socket) report zero. A 64 MiB sparse file with one byte written reports 8 blocks instead of 131072 — the writeback cache hands the write path the byte's whole 4 KiB page, so that page is the exact allocated chunk — and `cp --sparse=always`/`rsync --sparse` see and reproduce the holes. The sum is computed on demand from metadata — nothing is denormalized into the inode record, so no counter can drift — and cached in a bounded `moka` cache keyed by (ino, inode data version) with `metadata_cache_capacity_entries` capacity. Every extent-mutating path (write batch, truncate, fallocate) commits and then bumps that version, so a sum is cached only when the version did not move across the scan, and a cached value is never served for another version (B060).
+- `st_blocks` reports allocated data, never the logical size: `file_attr_from_inode` (`src/fs/inode.rs`) sums the lengths of the inode's extent records, divides by 512 rounding up, and inode kinds without extent data (directory, symlink, FIFO, socket) report zero. A 64 MiB sparse file with one byte written reports 8 blocks instead of 131072 — the writeback cache hands the write path the byte's whole 4 KiB page, so that page is the exact allocated chunk — and `cp --sparse=always`/`rsync --sparse` see and reproduce the holes. The sum is computed on demand from metadata — nothing is denormalized into the inode record, so no counter can drift — and cached in a bounded `moka` cache keyed by (ino, inode data version) with `metadata_cache_capacity_entries` capacity. Every extent-mutating path (write batch, truncate, fallocate) commits and then bumps that version, so a sum is cached only when the version did not move across the scan, and a cached value is never served for another version (B060). The scan runs once per request: its read transaction is a consistent snapshot, so a sum taken across a version bump is returned uncached instead of rescanned, which on a file under continuous writes would never return. Reading the data version adds no entry to `inode_data_versions`, so stat-only paths do not grow that map (B069).
 
 ### Chunk identity and domains
 
@@ -128,7 +128,9 @@ under one short mutex. Reads therefore take no metadata transaction and no
 inode lock, which keeps a read-heavy workload from turning every read into a
 metadata write.
 
-`FsCore::sync_cycle` drains the map: it takes at most
+`FsCore::sync_cycle` drains the map under the write side of the mutation
+gate (so the atime commit never lands inside a write batch, which would make
+the batch fail on the inode key and re-chunk its data): it takes at most
 `ATIME_FLUSH_MAX_INODES` (4096) entries, loads each inode inside one metadata
 transaction, re-checks the relatime rule against the inode as committed (so a
 file written after the read keeps its new mtime/ctime and still gets the
@@ -136,7 +138,9 @@ recorded access time), writes only `atime_sec`/`atime_nsec`, and invalidates
 the inode cache after the commit so the next relatime check sees the new
 value. Inodes that vanished since the read are skipped (logged at debug
 level); a failed commit puts the entries back for the next cycle and is
-logged at error level. A full sync (shutdown) loops until the map is empty, so
+logged at error level. A `setattr` that sets the access time drops the
+inode's pending entry, so an explicit `touch -a -d <date>` after a read is
+never overwritten by the recorded read time. A full sync (shutdown) loops until the map is empty, so
 a clean stop persists every recorded access time. Read-only inodes (the
 snapshot trees) never record one, like a read-only mount. No kernel attribute
 invalidation is sent per read: the configured attr TTL bounds attribute
@@ -257,7 +261,10 @@ by `VerFs` with `FsCore::copy_file_range_locked`.
 - `stage_copy_file_range_in_txn` loads both inodes through the transaction: both
   must be regular files with vault access, the destination must be writable,
   the vault/plain domains must match (`EXDEV`), and same-inode overlapping
-  ranges are `EINVAL`. The copied length is `min(len, source_size - offset_in)`.
+  ranges are `EINVAL`. The copied length is `min(len, source_size - offset_in)`,
+  with `len` first capped at `COPY_FILE_RANGE_MAX_LEN` (`u32::MAX & !0xfff`,
+  the kernel's own clamp) because the reply reports the length in a `u32`; a
+  longer request is a short copy, never a committed copy answered `EOVERFLOW`.
 - The destination range is trimmed/removed first with
   `remove_extent_range_in_txn`, so overwritten destination chunks lose exactly
   one reference and destination boundary extents are split.
@@ -906,7 +913,9 @@ bytes for data-returning commands. In/out data sizes follow both kernel paths:
 the 64-bit command decodes as an 8-byte `long`, while the kernel's fileattr
 path (`fuse_fileattr_get/set` → `fuse_priv_ioctl`) sends a 4-byte `int`.
 `FS_IOC_FSGETXATTR` uses the 28-byte `struct fsxattr`. Unknown commands still
-return `ENOTTY` explicitly.
+return `ENOTTY` explicitly, logged at debug level only: programs probe regular
+files with ioctls such as `TCGETS` (Python's `isatty` on every `open`), so
+`ENOTTY` is an expected answer, not a failure.
 
 The flags live in the existing `InodeRecord::flags` word (bits 3, 4 and 5;
 no layout or migration change) and map to the Linux flag values as follows:
@@ -931,9 +940,12 @@ to the parent so an immutable directory cannot gain entries. Append-only
 regular files additionally require each staged write to extend the file
 contiguously from its current end (checked in the same transaction snapshot
 that the write commits against), reject `O_TRUNC` and write opens without
-`O_APPEND`, reject shrinking truncate/setattr-size and fallocate, and refuse
-unlink/rename/link with `EPERM`. Growing `ftruncate` through an `O_APPEND`
-descriptor is allowed.
+`O_APPEND`, reject every truncate/setattr-size (like Linux `do_truncate`),
+punch/zero/collapse/insert fallocate (plain allocation is allowed, like
+`vfs_fallocate`), chmod/chown and xattr changes, and refuse
+unlink/rename/link with `EPERM`. An append-only directory accepts new entries
+but refuses unlink, rmdir and rename out of it, and rename over one of its
+entries (Linux `may_delete`).
 
 Append-only inodes are opened with `FOPEN_DIRECT_IO`. This is required for
 correctness, not performance: with the writeback cache the kernel flushes dirty

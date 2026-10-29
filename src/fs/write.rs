@@ -542,11 +542,13 @@ impl FsCore {
             ));
         }
         FsCore::ensure_inode_writable(&inode, "truncate")?;
-        if (inode.flags & INODE_FLAG_APPEND) != 0 && new_size < inode.size {
+        // Like Linux do_truncate: an append-only file cannot be truncated in
+        // either direction.
+        if (inode.flags & INODE_FLAG_APPEND) != 0 {
             return Err(anyhow_errno(
                 Errno::EPERM,
                 format!(
-                    "truncate: append-only inode {} cannot shrink from {} to {}",
+                    "truncate: append-only inode {} cannot change size from {} to {}",
                     inode.ino, inode.size, new_size
                 ),
             ));
@@ -693,7 +695,11 @@ impl FsCore {
             ));
         }
         FsCore::ensure_inode_writable(&inode, "fallocate")?;
-        FsCore::ensure_inode_not_append_only(&inode, "fallocate")?;
+        // Like Linux vfs_fallocate: an append-only file only accepts plain
+        // allocation, which never rewrites existing bytes.
+        if flags.punch_hole || flags.zero_range || flags.collapse_range || flags.insert_range {
+            FsCore::ensure_inode_not_append_only(&inode, "fallocate")?;
+        }
 
         let end = offset
             .checked_add(length)

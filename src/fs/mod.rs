@@ -970,9 +970,15 @@ impl FsCore {
         lock
     }
 
+    /// Data version of `ino`; inodes never bumped are at version 0. Reading
+    /// it adds no entry, so stat-only paths (getattr, lookup, readdirplus)
+    /// do not grow the map for every inode they touch.
     fn inode_data_version(&self, ino: u64) -> u64 {
-        let mut versions = self.inode_data_versions.lock();
-        *versions.entry(ino).or_insert(0)
+        self.inode_data_versions
+            .lock()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn bump_inode_data_version(&self, ino: u64) {
@@ -1849,6 +1855,15 @@ impl FsCore {
     /// failure for the next cycle, and the error is returned so the caller
     /// logs it instead of dropping the update silently.
     async fn flush_pending_atimes(&self, max_inodes: usize) -> Result<()> {
+        if self.pending_atimes.lock().is_empty() {
+            return Ok(());
+        }
+        // Every data and attribute mutation stages its inode under the read
+        // side of the mutation gate and commits it before releasing it. An
+        // atime commit in the middle of a write batch would make the batch
+        // fail its commit on the inode key and re-chunk all of its data, so
+        // the flush runs between them, like a namespace mutation.
+        let _mutation_guard = self.write_lock.write().await;
         let pending = self.take_pending_atimes(max_inodes);
         if pending.is_empty() {
             return Ok(());
