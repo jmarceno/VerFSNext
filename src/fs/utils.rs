@@ -11,6 +11,8 @@ pub(crate) fn sflag_for_kind(kind: u8) -> SFlag {
     match kind {
         INODE_KIND_DIR => SFlag::S_IFDIR,
         INODE_KIND_FILE => SFlag::S_IFREG,
+        INODE_KIND_FIFO => SFlag::S_IFIFO,
+        INODE_KIND_SOCKET => SFlag::S_IFSOCK,
         INODE_KIND_SYMLINK => SFlag::S_IFLNK,
         _ => SFlag::S_IFREG,
     }

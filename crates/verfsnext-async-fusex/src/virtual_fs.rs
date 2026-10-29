@@ -28,6 +28,10 @@ pub enum FileType {
     File,
     /// A symbolic link.
     Symlink,
+    /// A named pipe (FIFO).
+    Fifo,
+    /// A UNIX-domain socket.
+    Socket,
 }
 
 impl TryFrom<SFlag> for FileType {
@@ -47,8 +51,10 @@ impl TryFrom<SFlag> for FileType {
     fn try_from(value: SFlag) -> Result<Self, Self::Error> {
         match value {
             SFlag::S_IFDIR => Ok(Self::Dir),
+            SFlag::S_IFIFO => Ok(Self::Fifo),
             SFlag::S_IFREG => Ok(Self::File),
             SFlag::S_IFLNK => Ok(Self::Symlink),
+            SFlag::S_IFSOCK => Ok(Self::Socket),
             _ => {
                 error!("Try convert {:?} to FileType failed.", value);
                 Err(AsyncFusexError::ArgumentInvalid { context: vec![] })
@@ -70,7 +76,9 @@ impl From<FileType> for SFlag {
     fn from(value: FileType) -> Self {
         match value {
             FileType::Dir => SFlag::S_IFDIR,
+            FileType::Fifo => SFlag::S_IFIFO,
             FileType::File => SFlag::S_IFREG,
+            FileType::Socket => SFlag::S_IFSOCK,
             FileType::Symlink => SFlag::S_IFLNK,
         }
     }

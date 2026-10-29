@@ -493,6 +493,8 @@ impl FsCore {
         match kind {
             INODE_KIND_DIR => FileType::Dir,
             INODE_KIND_FILE => FileType::File,
+            INODE_KIND_FIFO => FileType::Fifo,
+            INODE_KIND_SOCKET => FileType::Socket,
             INODE_KIND_SYMLINK => FileType::Symlink,
             _ => FileType::File,
         }

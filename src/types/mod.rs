@@ -17,6 +17,8 @@ pub const SYS_MAX_EXTENT_LEN: &str = "max_extent_len";
 pub const INODE_KIND_FILE: u8 = 1;
 pub const INODE_KIND_DIR: u8 = 2;
 pub const INODE_KIND_SYMLINK: u8 = 3;
+pub const INODE_KIND_FIFO: u8 = 4;
+pub const INODE_KIND_SOCKET: u8 = 5;
 
 pub const KEY_PREFIX_INODE: u8 = b'I';
 pub const KEY_PREFIX_DIRENT: u8 = b'D';

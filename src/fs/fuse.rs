@@ -173,12 +173,25 @@ impl VirtualFs for VerFs {
         self.core
             .check_vault_parent_name_gate(param.parent, &param.name)
             .map_err(map_anyhow_to_fuse)?;
-        let _guard = self.core.write_lock.write().await;
-        let create_kind = if param.node_type == SFlag::S_IFDIR {
-            INODE_KIND_DIR
-        } else {
-            INODE_KIND_FILE
+        let create_kind = match param.node_type {
+            SFlag::S_IFREG => INODE_KIND_FILE,
+            SFlag::S_IFIFO => INODE_KIND_FIFO,
+            SFlag::S_IFSOCK => INODE_KIND_SOCKET,
+            SFlag::S_IFDIR => INODE_KIND_DIR,
+            SFlag::S_IFCHR | SFlag::S_IFBLK | SFlag::S_IFLNK => {
+                return build_error_result_from_errno(
+                    Errno::EOPNOTSUPP,
+                    format!("mknod does not support node type {:?}", param.node_type),
+                );
+            }
+            _ => {
+                return build_error_result_from_errno(
+                    Errno::EINVAL,
+                    format!("mknod received invalid node type {:?}", param.node_type),
+                );
+            }
         };
+        let _guard = self.core.write_lock.write().await;
 
         let mut created: Option<InodeRecord> = None;
         self.core

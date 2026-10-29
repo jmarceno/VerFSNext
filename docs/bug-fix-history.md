@@ -2028,3 +2028,46 @@ Headless build on a scratch mount: three `poll(POLLIN)` calls on a file returned
 ### Affected Files
 
 `crates/verfsnext-async-fusex/src/session.rs`
+
+## B051 - mknod Dropped FIFO and Socket Types and Created Regular Files - Oct 29 2026
+
+### Symptom
+
+`mkfifo` and `bind()` on an `AF_UNIX` socket returned `EIO` on a fresh
+VerFS mount and left a zero-length regular file at the requested path.
+`rsync -a` therefore failed whenever `--specials` encountered either kind.
+
+### Root Cause
+
+The FUSE session hard-coded every `FUSE_MKNOD` request as `S_IFREG`, and
+`VerFs::mknod` mapped every non-directory node type to the regular-file inode
+kind. The requested `S_IFMT` bits never reached metadata, so the kernel
+received a regular-file entry for a FIFO or socket request and rejected it.
+
+### Fix
+
+`FUSE_MKNOD` now preserves the requested node type. Metadata has explicit
+FIFO and socket inode kinds (`4` and `5`), and lookup, stat, readdir and
+snapshot bookkeeping map them back to `S_IFIFO`/`S_IFSOCK` and the matching
+directory-entry type. Character and block devices are rejected explicitly
+with `EOPNOTSUPP`; they need stored `rdev` data that this change does not
+invent.
+
+No on-disk migration is needed: `InodeRecord` and `DirentRecord` already carry
+a `u8` kind, and old data only contains values `1` through `3`. The new
+values do not change the archive schema. A downgrade after FIFO or socket
+entries exist is unsupported because older binaries do not know those kinds;
+the migration guide records that no forward data rewrite is required.
+
+### Validation
+
+Release build passed. On a scratch mount, `mkfifo`, an `AF_UNIX` `bind()`, and
+`rsync -a --specials` all succeeded; `stat` reported a FIFO (`11b4`) and a
+socket (`c1fd`).
+
+### Affected Files
+
+`src/types/mod.rs`, `src/fs/mod.rs`, `src/fs/utils.rs`, `src/fs/inode.rs`,
+`src/fs/fuse.rs`, `crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`,
+`docs/bug-fix-history.md`, `docs/migration-guide.md`

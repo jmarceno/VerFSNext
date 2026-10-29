@@ -851,7 +851,7 @@ async fn dispatch<'a>(
                 rdev: arg.rdev,
                 uid: req.uid(),
                 gid: req.gid(),
-                node_type: SFlag::S_IFREG,
+                node_type: SFlag::from_bits_truncate(arg.mode),
                 link: None,
             };
             let reply = ReplyEntry::new(req.unique(), file);

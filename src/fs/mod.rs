@@ -50,7 +50,8 @@ use crate::types::{
     inode_key, inline_chunk_key, parts_to_system_time, prefix_end, symlink_target_key, sys_key,
     system_time_to_parts, xattr_key, xattr_prefix, ChunkId, ChunkRecord, DirentRecord,
     ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT, INODE_FLAG_VAULT_ROOT,
-    INODE_KIND_DIR, INODE_KIND_FILE, INODE_KIND_SYMLINK, INLINE_PACK_ID, KEY_PREFIX_CHUNK,
+    INODE_KIND_DIR, INODE_KIND_FIFO, INODE_KIND_FILE, INODE_KIND_SOCKET, INODE_KIND_SYMLINK,
+    INLINE_PACK_ID, KEY_PREFIX_CHUNK,
     KEY_PREFIX_INLINE_CHUNK, MODE_PERM_MASK, PERM_SYMLINK_DEFAULT, PERM_VAULT_DIRECTORY,
     ROOT_INODE, SNAPSHOTS_DIR_NAME, SYS_MAX_EXTENT_LEN, VAULT_DIR_NAME, VAULT_DOMAIN_BYTE,
 };

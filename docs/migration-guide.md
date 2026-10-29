@@ -94,3 +94,16 @@ A downgrade after the marker is written is not supported: the old binary looks
 up the untagged key for vault chunks, so vault files would fail with `EIO`, and
 its GC does not recognize the tagged keys. To roll back, restore the data
 directory (or snapshot) taken before the upgrade, not just the binary.
+
+## No migration for FIFO and socket inode kinds
+
+The FIFO and UNIX-socket inode kinds are new `u8` values in the existing
+`InodeRecord.kind` and `DirentRecord.kind` fields. The archived record layout
+does not change, so an existing data directory needs no rewrite before the new
+binary reads or writes it. There is also no reliable transformation for files
+created by the old defect: they were stored as ordinary regular files and
+carry no record of the FIFO or socket type the caller requested.
+
+Once a FIFO or socket exists, downgrading is not supported because older
+binaries map unknown kinds as regular files. Keep the previous binary only for
+data directories that contain no FIFO or socket entries.
