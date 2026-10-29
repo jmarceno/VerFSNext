@@ -2108,3 +2108,39 @@ both the parent's mtime and ctime.
 ### Affected Files
 
 `src/fs/inode.rs`, `src/fs/fuse.rs`, `docs/bug-fix-history.md`
+
+## B053 - Names Longer Than NAME_MAX Were Accepted - Oct 29 2026
+
+### Symptom
+
+VerFS accepted a 300-byte path component even though statfs reported
+`f_namemax = 255`. The entry could not be copied to ext4 or any other local
+filesystem, and normal path lookup became dependent on a filesystem-local
+extension instead of the POSIX limit.
+
+### Root Cause
+
+The FUSE entry-creation and lookup paths passed names directly to the
+metadata key builders. There was no component-length check, and statfs
+reported the backing directory's `NAME_MAX` while the filesystem itself
+accepted longer names.
+
+### Fix
+
+A single `NAME_MAX = 255` check now rejects longer components with
+`ENAMETOOLONG` in lookup, create, mknod, mkdir, symlink, link and both names of
+rename before any metadata transaction starts. statfs reports the same fixed
+value, so the advertised limit and the enforced limit agree even when the data
+directory sits on a filesystem with a different limit.
+
+### Validation
+
+Release build passed. On a scratch mount, `statvfs().f_namemax` was 255; a
+300-byte component was rejected with `ENAMETOOLONG` by lookup, create, mknod
+(FIFO), mkdir, symlink, link and rename. A 255-byte component was accepted,
+and the failed operations left no entries behind.
+
+### Affected Files
+
+`src/types/mod.rs`, `src/fs/mod.rs`, `src/fs/inode.rs`, `src/fs/fuse.rs`,
+`docs/bug-fix-history.md`

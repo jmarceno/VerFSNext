@@ -5,6 +5,9 @@ use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const ROOT_INODE: u64 = 1;
+/// POSIX byte limit for one path component, matching the value reported by
+/// statfs and the limit every other local filesystem enforces.
+pub const NAME_MAX: usize = 255;
 
 /// Layout of file data in metadata. Version 2: extents are keyed by their
 /// byte offset and each one maps a variable-length content-defined chunk.

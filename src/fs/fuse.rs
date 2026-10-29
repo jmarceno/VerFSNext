@@ -34,6 +34,7 @@ impl VirtualFs for VerFs {
         parent: INum,
         name: &str,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
+        FsCore::validate_name_length(name, "lookup").map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(parent, name)
             .map_err(map_anyhow_to_fuse)?;
@@ -166,6 +167,7 @@ impl VirtualFs for VerFs {
         &self,
         param: CreateParam,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
+        FsCore::validate_name_length(&param.name, "mknod").map_err(map_anyhow_to_fuse)?;
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(param.parent, "mknod")
@@ -232,6 +234,7 @@ impl VirtualFs for VerFs {
         &self,
         param: CreateParam,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
+        FsCore::validate_name_length(&param.name, "mkdir").map_err(map_anyhow_to_fuse)?;
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(param.parent, "mkdir")
@@ -410,6 +413,7 @@ impl VirtualFs for VerFs {
         name: &str,
         target_path: &Path,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
+        FsCore::validate_name_length(name, "symlink").map_err(map_anyhow_to_fuse)?;
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(parent, "symlink")
@@ -459,6 +463,10 @@ impl VirtualFs for VerFs {
     }
 
     async fn rename(&self, _uid: u32, _gid: u32, param: RenameParam) -> AsyncFusexResult<()> {
+        FsCore::validate_name_length(&param.old_name, "rename source")
+            .map_err(map_anyhow_to_fuse)?;
+        FsCore::validate_name_length(&param.new_name, "rename target")
+            .map_err(map_anyhow_to_fuse)?;
         if (param.old_parent == ROOT_INODE
             && param.old_name == VAULT_DIR_NAME
             && !(param.new_parent == ROOT_INODE && param.new_name == VAULT_DIR_NAME))
@@ -1073,7 +1081,7 @@ impl VirtualFs for VerFs {
             files: vfs.files(),
             f_free: vfs.files_free(),
             bsize: vfs.block_size() as u32,
-            namelen: vfs.name_max() as u32,
+            namelen: NAME_MAX as u32,
             frsize: vfs.fragment_size() as u32,
         })
     }
@@ -1088,6 +1096,7 @@ impl VirtualFs for VerFs {
         mode: u32,
         _flags: u32,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
+        FsCore::validate_name_length(name, "create").map_err(map_anyhow_to_fuse)?;
         let _parent_inode = self
             .core
             .load_inode_with_vault_access(parent, "create")
@@ -1144,6 +1153,7 @@ impl VirtualFs for VerFs {
         newparent: u64,
         newname: &str,
     ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)> {
+        FsCore::validate_name_length(newname, "link").map_err(map_anyhow_to_fuse)?;
         self.core
             .check_vault_parent_name_gate(newparent, newname)
             .map_err(map_anyhow_to_fuse)?;

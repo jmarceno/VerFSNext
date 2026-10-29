@@ -6,6 +6,19 @@ use crate::types::{
 };
 
 impl FsCore {
+    pub(crate) fn validate_name_length(name: &str, context: &'static str) -> Result<()> {
+        if name.len() > NAME_MAX {
+            return Err(anyhow_errno(
+                Errno::ENAMETOOLONG,
+                format!(
+                    "{context}: name is {} bytes, NAME_MAX is {NAME_MAX}",
+                    name.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn file_attr_from_inode(&self, inode: &InodeRecord) -> FileAttr {
         FileAttr {
             ino: inode.ino,
