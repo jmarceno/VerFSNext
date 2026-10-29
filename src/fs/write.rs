@@ -114,23 +114,55 @@ fn skip_segments_before(segments: &[WriteOp], next: &mut usize, offset: u64) {
 
 const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
 
 #[derive(Clone, Copy)]
 struct FallocateFlags {
     keep_size: bool,
     punch_hole: bool,
     zero_range: bool,
+    collapse_range: bool,
+    insert_range: bool,
 }
 
 impl FallocateFlags {
     fn parse(mode: u32) -> Result<Self> {
-        let known = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+        let known = FALLOC_FL_KEEP_SIZE
+            | FALLOC_FL_PUNCH_HOLE
+            | FALLOC_FL_COLLAPSE_RANGE
+            | FALLOC_FL_ZERO_RANGE
+            | FALLOC_FL_INSERT_RANGE;
         if mode & !known != 0 {
             return Err(anyhow_errno(
                 Errno::EOPNOTSUPP,
                 format!("unsupported fallocate mode {mode:#x}"),
             ));
+        }
+        let collapse_range = mode & FALLOC_FL_COLLAPSE_RANGE != 0;
+        let insert_range = mode & FALLOC_FL_INSERT_RANGE != 0;
+        if collapse_range || insert_range {
+            // Neither mode can be combined with any other flag, including
+            // FALLOC_FL_KEEP_SIZE and each other.
+            let operation = if collapse_range {
+                FALLOC_FL_COLLAPSE_RANGE
+            } else {
+                FALLOC_FL_INSERT_RANGE
+            };
+            if mode != operation {
+                return Err(anyhow_errno(
+                    Errno::EINVAL,
+                    "FALLOC_FL_COLLAPSE_RANGE and FALLOC_FL_INSERT_RANGE cannot be combined with other flags",
+                ));
+            }
+            return Ok(Self {
+                keep_size: false,
+                punch_hole: false,
+                zero_range: false,
+                collapse_range,
+                insert_range,
+            });
         }
         let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
         let punch_hole = mode & FALLOC_FL_PUNCH_HOLE != 0;
@@ -151,6 +183,8 @@ impl FallocateFlags {
             keep_size,
             punch_hole,
             zero_range,
+            collapse_range,
+            insert_range,
         })
     }
 }
@@ -673,7 +707,77 @@ impl FsCore {
         let mut pending_chunks = HashMap::<ChunkId, StagedChunk>::new();
         let mut checked_ids = HashSet::<ChunkId>::new();
 
-        if flags.punch_hole || flags.zero_range {
+        if flags.collapse_range || flags.insert_range {
+            // Native filesystems limit these modes to filesystem block
+            // boundaries; this filesystem has no blocks, so the POSIX block
+            // alignment unit (4096 bytes) is enforced for parity.
+            const RANGE_ALIGNMENT: u64 = 4096;
+            if !offset.is_multiple_of(RANGE_ALIGNMENT) || !length.is_multiple_of(RANGE_ALIGNMENT) {
+                return Err(anyhow_errno(
+                    Errno::EINVAL,
+                    format!(
+                        "FALLOC_FL_COLLAPSE_RANGE and FALLOC_FL_INSERT_RANGE require offset and length to be multiples of {RANGE_ALIGNMENT} (got offset {offset}, length {length})"
+                    ),
+                ));
+            }
+        }
+        if flags.collapse_range {
+            if end >= old_size {
+                return Err(anyhow_errno(
+                    Errno::EINVAL,
+                    format!(
+                        "FALLOC_FL_COLLAPSE_RANGE range [{offset}, {end}) reaches or passes the end of file {old_size}"
+                    ),
+                ));
+            }
+            new_size = old_size - length;
+            self.shift_extent_range_in_txn(
+                txn,
+                ino,
+                &inode,
+                vault,
+                offset,
+                end,
+                -i64::try_from(length).map_err(|_| {
+                    anyhow_errno(Errno::EFBIG, "fallocate length exceeds file offsets")
+                })?,
+                new_size,
+                &mut extent_updates,
+                &mut extent_deletes,
+                &mut ref_deltas,
+                &mut checked_ids,
+                &mut pending_chunks,
+            )?;
+        } else if flags.insert_range {
+            if offset >= old_size {
+                return Err(anyhow_errno(
+                    Errno::EINVAL,
+                    format!(
+                        "FALLOC_FL_INSERT_RANGE offset {offset} reaches or passes the end of file {old_size}"
+                    ),
+                ));
+            }
+            new_size = old_size.checked_add(length).ok_or_else(|| {
+                anyhow_errno(Errno::EFBIG, "fallocate range overflows file offsets")
+            })?;
+            self.shift_extent_range_in_txn(
+                txn,
+                ino,
+                &inode,
+                vault,
+                offset,
+                offset,
+                i64::try_from(length).map_err(|_| {
+                    anyhow_errno(Errno::EFBIG, "fallocate length exceeds file offsets")
+                })?,
+                new_size,
+                &mut extent_updates,
+                &mut extent_deletes,
+                &mut ref_deltas,
+                &mut checked_ids,
+                &mut pending_chunks,
+            )?;
+        } else if flags.punch_hole || flags.zero_range {
             let rewrite_start = offset.min(old_size);
             let rewrite_end = end.min(old_size);
             if rewrite_start < rewrite_end {
@@ -895,6 +999,7 @@ impl FsCore {
                 vault,
                 mapped_start,
                 data,
+                false,
                 &mut extent_updates,
                 &mut ref_deltas,
                 &mut checked_ids,
@@ -923,6 +1028,99 @@ impl FsCore {
         FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunks)?;
         txn.set(inode_key(dest_ino), encode_rkyv(&dest)?)?;
         Ok((copied, Some(new_chunks)))
+    }
+
+    /// Shifts the extents of `ino` for a collapse (`shift < 0`) or an insert
+    /// (`shift > 0`) of `[range_start, range_end)`.
+    ///
+    /// Extents entirely before the range stay in place and extents that start
+    /// at or after `range_end` move by `shift` with their chunk references
+    /// unchanged. The at most two extents that intersect the range lose their
+    /// old reference and are re-encoded from their verified payload: the
+    /// surviving prefix stays at its offset and the surviving suffix moves to
+    /// `range_end + shift`. A replacement piece that ends at the new end of
+    /// file is stored as the provisional end-of-file chunk, like a truncate.
+    #[allow(clippy::too_many_arguments)]
+    fn shift_extent_range_in_txn(
+        &self,
+        txn: &verfsnext_surrealkv::Transaction,
+        ino: u64,
+        inode: &InodeRecord,
+        vault: bool,
+        range_start: u64,
+        range_end: u64,
+        shift: i64,
+        new_size: u64,
+        extent_updates: &mut Vec<FileExtent>,
+        extent_deletes: &mut Vec<u64>,
+        ref_deltas: &mut HashMap<ChunkId, i64>,
+        checked_ids: &mut HashSet<ChunkId>,
+        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
+    ) -> Result<()> {
+        for extent in FsCore::load_all_extents_in_txn(txn, ino)? {
+            if extent.start >= range_end {
+                let start = extent.start.checked_add_signed(shift).ok_or_else(|| {
+                    anyhow_errno(
+                        Errno::EOVERFLOW,
+                        "fallocate extent shift overflows file offsets",
+                    )
+                })?;
+                extent_deletes.push(extent.start);
+                extent_updates.push(FileExtent {
+                    start,
+                    record: extent.record,
+                });
+                continue;
+            }
+            if extent.end() <= range_start {
+                continue;
+            }
+            let old_id = ChunkId {
+                vault,
+                hash: extent.record.chunk_hash,
+            };
+            *ref_deltas.entry(old_id).or_insert(0) -= 1;
+            extent_deletes.push(extent.start);
+            let payload = self.load_extent_payload(&extent, vault)?;
+            if extent.start < range_start {
+                let data = Arc::new(payload[..(range_start - extent.start) as usize].to_vec());
+                self.stage_replacement_extent(
+                    txn,
+                    inode,
+                    vault,
+                    extent.start,
+                    data,
+                    range_start == new_size,
+                    extent_updates,
+                    ref_deltas,
+                    checked_ids,
+                    pending_chunks,
+                )?;
+            }
+            if extent.end() > range_end {
+                let data = Arc::new(payload[(range_end - extent.start) as usize..].to_vec());
+                let start = range_end.checked_add_signed(shift).ok_or_else(|| {
+                    anyhow_errno(
+                        Errno::EOVERFLOW,
+                        "fallocate extent shift overflows file offsets",
+                    )
+                })?;
+                let ends_at_eof = extent.end().checked_add_signed(shift) == Some(new_size);
+                self.stage_replacement_extent(
+                    txn,
+                    inode,
+                    vault,
+                    start,
+                    data,
+                    ends_at_eof,
+                    extent_updates,
+                    ref_deltas,
+                    checked_ids,
+                    pending_chunks,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -964,6 +1162,7 @@ impl FsCore {
                     vault,
                     extent.start,
                     Arc::new(payload[..len].to_vec()),
+                    false,
                     extent_updates,
                     ref_deltas,
                     checked_ids,
@@ -978,6 +1177,7 @@ impl FsCore {
                     vault,
                     range_end,
                     Arc::new(payload[from..].to_vec()),
+                    false,
                     extent_updates,
                     ref_deltas,
                     checked_ids,
@@ -996,6 +1196,7 @@ impl FsCore {
         vault: bool,
         start: u64,
         data: Arc<Vec<u8>>,
+        inline: bool,
         extent_updates: &mut Vec<FileExtent>,
         ref_deltas: &mut HashMap<ChunkId, i64>,
         checked_ids: &mut HashSet<ChunkId>,
@@ -1016,14 +1217,7 @@ impl FsCore {
                 len,
             },
         });
-        self.stage_chunk_if_missing(
-            txn,
-            id,
-            data,
-            false,
-            checked_ids,
-            pending_chunks,
-        )?;
+        self.stage_chunk_if_missing(txn, id, data, inline, checked_ids, pending_chunks)?;
         Ok(())
     }
 

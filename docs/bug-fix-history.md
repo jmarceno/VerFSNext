@@ -3008,3 +3008,100 @@ overwrite of bytes below EOF.
 `crates/verfsnext-async-fusex/src/fuse_fs.rs`, `src/fs/fuse.rs`,
 `src/fs/inode.rs`, `src/fs/write.rs`, `src/fs/mod.rs`, `src/types/mod.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B067 - Fallocate COLLAPSE_RANGE and INSERT_RANGE Were Unsupported - Oct 29 2026
+
+### Symptom
+
+`fallocate(2)` with `FALLOC_FL_COLLAPSE_RANGE` or `FALLOC_FL_INSERT_RANGE`
+failed with `EOPNOTSUPP` on a VerFSNext mount. Video editors, databases and
+copy tools that remove or insert a byte range without rewriting the rest of the
+file had to fall back to copy-and-truncate sequences.
+
+### Root Cause
+
+`FallocateFlags::parse` recognized only `FALLOC_FL_KEEP_SIZE`,
+`FALLOC_FL_PUNCH_HOLE` and `FALLOC_FL_ZERO_RANGE`, and
+`stage_fallocate_in_txn` only had the allocation, punch and zero paths. There
+was no way to shift the extent map when the file content moves.
+
+### Fix
+
+Both modes are implemented server-side in `src/fs/write.rs`:
+
+- `FALLOC_FL_COLLAPSE_RANGE` (0x08) rewrites the file as
+  `old[0..offset] ++ old[offset+len..]` and shrinks it by `len`.
+- `FALLOC_FL_INSERT_RANGE` (0x20; 0x10 is `FALLOC_FL_ZERO_RANGE`, which was
+  already implemented) rewrites it as `old[0..offset] ++ hole(len) ++
+  old[offset..]`, grows it by `len` and stores nothing for the hole.
+
+`shift_extent_range_in_txn` walks every extent of the inode:
+
+- Extents entirely before the range stay in place.
+- Extents that start at or after `offset+len` (collapse) or `offset` (insert)
+  get new keys at `start + shift` (delete the old key, set the new key) with
+  their chunk references unchanged.
+- Extents that intersect the range lose their old reference and are
+  re-encoded from their verified payload: the surviving prefix keeps its
+  offset, the surviving suffix moves to `range_end + shift`, both are new
+  chunks with one reference each. Bytes of extents fully covered by the
+  removed range are dropped with a single reference decrement.
+- A replacement piece that ends at the new end of file is materialized as the
+  provisional inline end-of-file chunk, mirroring `stage_truncate_in_txn`, so
+  a following append re-chunks it exactly like any other tail.
+
+Both modes follow the native filesystem rules: `len > 0`, `offset` and `len`
+must both be multiples of 4096 (the POSIX block-alignment unit; this filesystem
+has no smaller block), `FALLOC_FL_COLLAPSE_RANGE` requires `offset+len < size`
+and `FALLOC_FL_INSERT_RANGE` requires `offset < size` (both strictly inside the
+file, `EINVAL` otherwise, as ext4/xfs do), and neither mode may be combined
+with any other fallocate flag (`EINVAL`).
+
+Extent deletes, shifted extents, replacement chunks, refcount deltas, the new
+size and mtime/ctime are staged in one transaction with the usual commit-retry
+loop; caches and the inode data version are updated only after the commit.
+Vault inodes use the same `hash_for_inode` path.
+
+### Kernel limitation
+
+The host kernel (`7.2.6`) never forwards these two modes: its FUSE client's
+`fuse_file_fallocate` rejects every mode outside
+`KEEP_SIZE|PUNCH_HOLE|ZERO_RANGE` with `EOPNOTSUPP` before sending a request.
+The server-side implementation is therefore unreachable through
+`fallocate(2)` on this host and only becomes reachable on a kernel that
+forwards the modes.
+
+### Validation
+
+Release build, `cargo remote -h -- test` and clippy passed. The staging logic
+was driven through the public `VerFs` API by a temporary internal harness
+(deleted before the commit, since the project does not keep new tests):
+
+- 19 degenerate cases were rejected with the expected errno: zero length,
+  unaligned offset, unaligned length, collapse whole file, collapse reaching
+  or passing EOF, insert at or past EOF, collapse/insert combined with
+  `KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE` or each other, and an unsupported
+  mode bit.
+- 5 explicit aligned cases (offset 0, middle, crossing chunk boundaries)
+  produced byte-exact content against a mirror.
+- 80 random aligned collapse/insert operations on a file with 1 KiB-4 KiB
+  chunks matched a byte-array mirror byte for byte, kept size and mtime/ctime
+  correct, satisfied the extent invariants (sorted, non-overlapping, inside
+  the file) and left `check_records` clean after every step.
+- Appending after a collapse/insert whose tail chunk was re-encoded produced
+  exact content.
+- After a sync and daemon shutdown the same data directory was reopened and the
+  152456-byte file read back identically with a clean records check.
+
+The kernel-blocked state was proven on a scratch mount: direct
+`fallocate(2)` syscalls with modes 0x08 and 0x20 returned `EOPNOTSUPP`
+(errno 95), `fallocate -c`/`-i` failed the same way, and a temporary probe
+(removed before the commit) showed the daemon receives `FUSE_FALLOCATE` only
+for the punch, zero and allocate modes. `verfsnext check` after those
+operations reported no missing data, no refcount mismatches, no orphan extents
+and no CRC32 errors.
+
+### Affected Files
+
+`src/fs/write.rs`, `docs/bug-fix-history.md`,
+`docs/technical_deep_dive.md`

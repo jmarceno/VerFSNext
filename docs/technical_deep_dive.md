@@ -192,8 +192,46 @@ same extent, chunk-staging and refcount machinery as truncates.
 - `FALLOC_FL_ZERO_RANGE` removes/trims extents the same way so the range reads
   as a hole of zeroes. Without KEEP_SIZE it grows the file to the end of the
   requested range.
-- Mode combinations outside the four POSIX cases are rejected with
-  `EOPNOTSUPP`.
+- `FALLOC_FL_COLLAPSE_RANGE` (0x08) rewrites the file as
+  `old[0..offset] ++ old[offset+len..]` and shrinks it by `len`.
+- `FALLOC_FL_INSERT_RANGE` (0x20) rewrites it as
+  `old[0..offset] ++ hole(len) ++ old[offset..]` and grows it by `len`; the
+  inserted range is a hole and stores nothing.
+
+Both range-shifting modes go through `shift_extent_range_in_txn`, which walks
+every extent of the inode:
+
+- Extents entirely before the range keep their keys.
+- Extents that start at or after `offset+len` (collapse) or `offset` (insert)
+  get new keys at `start + shift` (delete the old key, set the new one) and
+  keep their chunk references unchanged.
+- Extents that intersect the range lose their old reference and are re-encoded
+  from their verified payload: the surviving prefix stays at its offset and the
+  surviving suffix moves to `range_end + shift`, each a new chunk with one
+  reference. Extents fully covered by the removed range are dropped with a
+  single reference decrement.
+- A replacement piece that ends at the new end of file is materialized as the
+  provisional inline end-of-file chunk (see "Inline end-of-file chunks"), so
+  the next append re-chunks it like any other tail.
+
+Both modes follow the native filesystem rules, so a future kernel that
+forwards them sees POSIX behavior: `len > 0`, `offset` and `len` must both be
+multiples of 4096 (the POSIX block-alignment unit; this filesystem has no
+smaller block), collapse requires `offset+len < size`, insert requires
+`offset < size` (both strictly inside the file), and neither mode can be
+combined with any other fallocate flag. Violations are `EINVAL`. Collapsing to
+EOF and inserting at EOF are rejected like ext4/xfs/btrfs do; `truncate` and
+allocation cover those cases.
+
+The host kernel's FUSE client does not forward these two modes:
+`fuse_file_fallocate` accepts only `KEEP_SIZE|PUNCH_HOLE|ZERO_RANGE` and
+returns `EOPNOTSUPP` for everything else before a request is sent. The
+server-side implementation is therefore unreachable through `fallocate(2)`
+until a kernel forwards the modes.
+
+Mode combinations outside the supported POSIX cases are rejected: combinations
+involving the two range-shifting modes are `EINVAL`, and the pre-existing
+unsupported combinations are `EOPNOTSUPP`.
 
 All extent deletes, replacement extents, inode size/time changes and chunk
 reference deltas are staged in one transaction. New chunks are materialized
