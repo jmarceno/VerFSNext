@@ -608,6 +608,38 @@ impl FileSystem for FuseFs {
         reply.written(copied.cast()).await
     }
 
+    /// Allocate, deallocate or zero a byte range in an open file.
+    async fn fallocate(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize> {
+        let ino = req.nodeid();
+        debug!(
+            "fallocate(ino={}, fh={}, offset={}, length={}, mode={:#x}, req={:?})",
+            ino, fh, offset, length, mode, req,
+        );
+
+        match self
+            .virtual_fs
+            .fallocate(ino, fh, offset, length, mode)
+            .await
+        {
+            Ok(()) => reply.ok().await,
+            Err(e) => {
+                debug!(
+                    "fusefilesystem call fallocate() failed for ino={} fh={} offset={} length={} mode={:#x}, the error is: {:?}",
+                    ino, fh, offset, length, mode, e,
+                );
+                reply.error(e).await
+            }
+        }
+    }
+
     /// Flush method.
     /// This is called on each close() of the opened file. Since file
     /// descriptors can be duplicated (dup, dup2, fork), for one open call

@@ -1007,6 +1007,29 @@ impl VirtualFs for VerFs {
         Ok(())
     }
 
+    async fn fallocate(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> AsyncFusexResult<()> {
+        self.core.mark_activity();
+        self.core
+            .validate_file_handle(fh, ino)
+            .map_err(map_anyhow_to_fuse)?;
+        let _mutation_guard = self.core.write_lock.read().await;
+        let inode_lock = self.core.inode_write_lock(ino);
+        let _inode_guard = inode_lock.lock().await;
+        let _inode = self
+            .core
+            .fallocate_file_locked(ino, offset, length, mode)
+            .await
+            .map_err(map_anyhow_to_fuse)?;
+        Ok(())
+    }
+
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
         self.core.mark_activity();
         if let Ok(inode) = self.core.load_inode_or_errno(_ino, "flush") {

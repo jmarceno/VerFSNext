@@ -112,6 +112,49 @@ fn skip_segments_before(segments: &[WriteOp], next: &mut usize, offset: u64) {
     }
 }
 
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+
+#[derive(Clone, Copy)]
+struct FallocateFlags {
+    keep_size: bool,
+    punch_hole: bool,
+    zero_range: bool,
+}
+
+impl FallocateFlags {
+    fn parse(mode: u32) -> Result<Self> {
+        let known = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+        if mode & !known != 0 {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                format!("unsupported fallocate mode {mode:#x}"),
+            ));
+        }
+        let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
+        let punch_hole = mode & FALLOC_FL_PUNCH_HOLE != 0;
+        let zero_range = mode & FALLOC_FL_ZERO_RANGE != 0;
+        if punch_hole && zero_range {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                "FALLOC_FL_PUNCH_HOLE cannot be combined with FALLOC_FL_ZERO_RANGE",
+            ));
+        }
+        if punch_hole && !keep_size {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                "FALLOC_FL_PUNCH_HOLE requires FALLOC_FL_KEEP_SIZE",
+            ));
+        }
+        Ok(Self {
+            keep_size,
+            punch_hole,
+            zero_range,
+        })
+    }
+}
+
 impl FsCore {
     fn ensure_write_target_inode(&self, ino: u64, inode: &InodeRecord) -> Result<()> {
         self.ensure_inode_vault_access(inode, "write")?;
@@ -154,13 +197,11 @@ impl FsCore {
         let reach = (RESYNC_MAX_CHUNKS + 2) * max_chunk + 2 * self.max_extent_len;
         let file_end = inode.size.max(write_end);
         let mut old_extents = BTreeMap::<u64, FileExtent>::new();
-        if inode.size != 0 {
-            for segment in &group.segments {
-                let from = segment.offset.saturating_sub(1);
-                let to = segment_end(segment).saturating_add(reach);
-                for extent in self.load_extents_in_txn(txn, group.ino, from, to)? {
-                    old_extents.insert(extent.start, extent);
-                }
+        for segment in &group.segments {
+            let from = segment.offset.saturating_sub(1);
+            let to = segment_end(segment).saturating_add(reach);
+            for extent in self.load_extents_in_txn(txn, group.ino, from, to)? {
+                old_extents.insert(extent.start, extent);
             }
         }
 
@@ -513,6 +554,312 @@ impl FsCore {
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
         Ok((inode, Some(new_chunks)))
     }
+    /// Applies FUSE_FALLOCATE to one regular file. The caller holds the
+    /// global mutation gate read side and the inode write lock.
+    pub(crate) async fn fallocate_file_locked(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> Result<InodeRecord> {
+        let flags = FallocateFlags::parse(mode)?;
+        if length == 0 {
+            return Err(anyhow_errno(
+                Errno::EINVAL,
+                "fallocate length must be greater than zero",
+            ));
+        }
+        offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow_errno(Errno::EFBIG, "fallocate range overflows file offsets"))?;
+
+        let mut attempt = 1;
+        loop {
+            let mut txn = self.meta.begin_write()?;
+            let (inode, new_chunks) = self
+                .stage_fallocate_in_txn(ino, offset, length, flags, &mut txn)
+                .await?;
+            match self.meta.commit_write_txn(&mut txn).await {
+                Ok(()) => {
+                    self.publish_committed_chunk_records(&new_chunks);
+                    self.invalidate_inode_cache(ino);
+                    self.mark_mutation();
+                    self.bump_inode_data_version(ino);
+                    self.invalidate_inode_attr_best_effort(ino);
+                    return Ok(inode);
+                }
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(
+                        ino,
+                        attempt,
+                        error = %format!("{err:#}"),
+                        "retrying fallocate after metadata conflict"
+                    );
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn stage_fallocate_in_txn(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        flags: FallocateFlags,
+        txn: &mut verfsnext_surrealkv::Transaction,
+    ) -> Result<(InodeRecord, HashMap<ChunkId, NewChunk>)> {
+        let mut inode = FsCore::load_inode_in_txn(txn, ino, "fallocate")?;
+        self.ensure_inode_vault_access(&inode, "fallocate")?;
+        if inode.kind != INODE_KIND_FILE {
+            return Err(anyhow_errno(
+                Errno::EISDIR,
+                format!("fallocate inode {} is not a regular file", ino),
+            ));
+        }
+        FsCore::ensure_inode_writable(&inode, "fallocate")?;
+
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow_errno(Errno::EFBIG, "fallocate range overflows file offsets"))?;
+        let old_size = inode.size;
+        let mut new_size = old_size;
+        let vault = FsCore::inode_is_vault(&inode);
+        let mut extent_updates = Vec::<FileExtent>::new();
+        let mut extent_deletes = Vec::<u64>::new();
+        let mut ref_deltas = HashMap::<ChunkId, i64>::new();
+        let mut pending_chunks = HashMap::<ChunkId, StagedChunk>::new();
+        let mut checked_ids = HashSet::<ChunkId>::new();
+
+        if flags.punch_hole || flags.zero_range {
+            let rewrite_start = offset.min(old_size);
+            let rewrite_end = end.min(old_size);
+            if rewrite_start < rewrite_end {
+                self.remove_extent_range_in_txn(
+                    txn,
+                    ino,
+                    &inode,
+                    vault,
+                    rewrite_start,
+                    rewrite_end,
+                    &mut extent_updates,
+                    &mut extent_deletes,
+                    &mut ref_deltas,
+                    &mut checked_ids,
+                    &mut pending_chunks,
+                )?;
+            }
+            if flags.zero_range && !flags.keep_size {
+                new_size = old_size.max(end);
+            }
+        } else {
+            let alloc_end = end;
+            if !flags.keep_size {
+                new_size = old_size.max(end);
+            }
+            if offset < alloc_end {
+                let extents = self.load_extents_in_txn(txn, ino, offset, alloc_end)?;
+                let mut cursor = offset;
+                for extent in extents {
+                    if extent.start >= alloc_end {
+                        break;
+                    }
+                    if extent.start > cursor {
+                        self.allocate_zero_extents_in_txn(
+                            txn,
+                            &inode,
+                            vault,
+                            cursor,
+                            extent.start.min(alloc_end),
+                            &mut extent_updates,
+                            &mut ref_deltas,
+                            &mut checked_ids,
+                            &mut pending_chunks,
+                        )?;
+                    }
+                    cursor = cursor.max(extent.end()).min(alloc_end);
+                    if cursor >= alloc_end {
+                        break;
+                    }
+                }
+                if cursor < alloc_end {
+                    self.allocate_zero_extents_in_txn(
+                        txn,
+                        &inode,
+                        vault,
+                        cursor,
+                        alloc_end,
+                        &mut extent_updates,
+                        &mut ref_deltas,
+                        &mut checked_ids,
+                        &mut pending_chunks,
+                    )?;
+                }
+            }
+        }
+
+        let new_chunks = self.materialize_pending_chunks(pending_chunks).await?;
+        let now = SystemTime::now();
+        let (sec, nsec) = system_time_to_parts(now);
+        inode.size = new_size;
+        inode.mtime_sec = sec;
+        inode.mtime_nsec = nsec;
+        inode.ctime_sec = sec;
+        inode.ctime_nsec = nsec;
+
+        for start in extent_deletes {
+            txn.delete(extent_key(ino, start))?;
+        }
+        for extent in extent_updates {
+            txn.set(extent_key(ino, extent.start), encode_rkyv(&extent.record)?)?;
+        }
+        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunks)?;
+        txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
+        Ok((inode, new_chunks))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remove_extent_range_in_txn(
+        &self,
+        txn: &mut verfsnext_surrealkv::Transaction,
+        ino: u64,
+        inode: &InodeRecord,
+        vault: bool,
+        range_start: u64,
+        range_end: u64,
+        extent_updates: &mut Vec<FileExtent>,
+        extent_deletes: &mut Vec<u64>,
+        ref_deltas: &mut HashMap<ChunkId, i64>,
+        checked_ids: &mut HashSet<ChunkId>,
+        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
+    ) -> Result<()> {
+        for extent in self.load_extents_in_txn(txn, ino, range_start, range_end)? {
+            if extent.end() <= range_start || extent.start >= range_end {
+                continue;
+            }
+            let old_id = ChunkId {
+                vault,
+                hash: extent.record.chunk_hash,
+            };
+            *ref_deltas.entry(old_id).or_insert(0) -= 1;
+            extent_deletes.push(extent.start);
+            let payload = self.load_extent_payload(&extent, vault)?;
+
+            if extent.start < range_start {
+                let len = (range_start - extent.start) as usize;
+                self.stage_replacement_extent(
+                    txn,
+                    inode,
+                    vault,
+                    extent.start,
+                    Arc::new(payload[..len].to_vec()),
+                    extent_updates,
+                    ref_deltas,
+                    checked_ids,
+                    pending_chunks,
+                )?;
+            }
+            if extent.end() > range_end {
+                let from = (range_end - extent.start) as usize;
+                self.stage_replacement_extent(
+                    txn,
+                    inode,
+                    vault,
+                    range_end,
+                    Arc::new(payload[from..].to_vec()),
+                    extent_updates,
+                    ref_deltas,
+                    checked_ids,
+                    pending_chunks,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_replacement_extent(
+        &self,
+        txn: &verfsnext_surrealkv::Transaction,
+        inode: &InodeRecord,
+        vault: bool,
+        start: u64,
+        data: Arc<Vec<u8>>,
+        extent_updates: &mut Vec<FileExtent>,
+        ref_deltas: &mut HashMap<ChunkId, i64>,
+        checked_ids: &mut HashSet<ChunkId>,
+        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
+    ) -> Result<()> {
+        let len = u32::try_from(data.len())
+            .map_err(|_| anyhow_errno(Errno::EIO, "fallocate extent exceeds u32 length"))?;
+        let chunk_hash = FsCore::hash_for_inode(inode, &data);
+        let id = ChunkId {
+            vault,
+            hash: chunk_hash,
+        };
+        *ref_deltas.entry(id).or_insert(0) += 1;
+        extent_updates.push(FileExtent {
+            start,
+            record: ExtentRecord {
+                chunk_hash,
+                len,
+            },
+        });
+        self.stage_chunk_if_missing(
+            txn,
+            id,
+            data,
+            false,
+            checked_ids,
+            pending_chunks,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_zero_extents_in_txn(
+        &self,
+        txn: &verfsnext_surrealkv::Transaction,
+        inode: &InodeRecord,
+        vault: bool,
+        mut start: u64,
+        end: u64,
+        extent_updates: &mut Vec<FileExtent>,
+        ref_deltas: &mut HashMap<ChunkId, i64>,
+        checked_ids: &mut HashSet<ChunkId>,
+        pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
+    ) -> Result<()> {
+        let max_chunk = self.chunker.max_size() as u64;
+        if max_chunk == 0 {
+            return Err(anyhow_errno(
+                Errno::EIO,
+                "fallocate cannot allocate with a zero-size chunker maximum",
+            ));
+        }
+        while start < end {
+            let len = (end - start).min(max_chunk);
+            let data = Arc::new(vec![0_u8; len as usize]);
+            self.stage_replacement_extent(
+                txn,
+                inode,
+                vault,
+                start,
+                data,
+                extent_updates,
+                ref_deltas,
+                checked_ids,
+                pending_chunks,
+            )?;
+            start = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow_errno(Errno::EFBIG, "fallocate allocation overflows"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn lock_type_valid(typ: u32) -> bool {
         typ == libc::F_RDLCK as u32 || typ == libc::F_WRLCK as u32 || typ == libc::F_UNLCK as u32
     }

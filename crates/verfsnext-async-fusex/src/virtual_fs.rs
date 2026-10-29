@@ -245,6 +245,16 @@ pub trait VirtualFs: Sync + Send {
     /// Write data
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()>;
 
+    /// Allocate, deallocate or zero a byte range in an open file.
+    async fn fallocate(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> AsyncFusexResult<()>;
+
     /// Flush method
     async fn flush(&self, ino: u64, lock_owner: u64) -> AsyncFusexResult<()>;
 

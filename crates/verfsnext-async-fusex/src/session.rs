@@ -1071,8 +1071,16 @@ async fn dispatch<'a>(
         }
         #[cfg(feature = "abi-7-19")]
         Operation::FAllocate { arg } => {
-            error!("FAllocate unsupported, arg={:?}", arg);
-            reply_errno(req, file, Errno::EOPNOTSUPP).await
+            let reply = ReplyEmpty::new(req.unique(), file);
+            fs.fallocate(
+                req,
+                arg.fh,
+                arg.offset,
+                arg.length,
+                arg.mode,
+                reply,
+            )
+            .await
         }
         #[cfg(feature = "abi-7-21")]
         Operation::ReadDirPlus { arg } => {

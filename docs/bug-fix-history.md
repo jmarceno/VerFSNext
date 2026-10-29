@@ -2306,3 +2306,78 @@ Release build passed. On a scratch mount:
 `crates/verfsnext-async-fusex/src/virtual_fs.rs`,
 `docs/bug-fix-history.md`, `docs/migration-guide.md`,
 `docs/technical_deep_dive.md`
+
+## B057 - FUSE_FALLOCATE Rejected Every Supported Mode - Oct 29 2026
+
+### Symptom
+
+`fallocate(2)` and `posix_fallocate(3)` failed with `EOPNOTSUPP` for every
+mode. Applications that reserve file space, discard VM ranges, punch holes or
+zero ranges could not use the filesystem. Userspace fallbacks such as glibc's
+write-zero loop were the only way to extend a file.
+
+### Root Cause
+
+`FUSE_FALLOCATE` was dispatched to an error helper and no fallocate operation
+existed in the `FileSystem`, `VirtualFs` or VerFS layers. There was no code to
+allocate zero extents, split extents around a discarded range, or apply the
+size rules of the four standard modes.
+
+### Fix
+
+`FUSE_FALLOCATE` now reaches `FsCore::fallocate_file_locked` through the
+regular FUSE reply path. The implementation validates the file handle, regular
+file type, non-zero length and offset overflow, and accepts these modes:
+
+- `mode = 0`: materialize zero chunks in holes over the requested range and
+  extend the file to `offset + length` when required.
+- `FALLOC_FL_KEEP_SIZE`: materialize zero extents over the range without
+  changing the visible size. This includes ranges beyond EOF; those extents
+  stay invisible until a later truncate/write makes them addressable. Write
+  planning now sees preallocated extents even when the inode size is zero.
+- `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: remove or split extents at
+  the exact requested boundaries, leaving a logical hole and preserving the
+  bytes on both sides and the file size.
+- `FALLOC_FL_ZERO_RANGE` (with or without `FALLOC_FL_KEEP_SIZE`): remove or
+  split extents in the range so reads return zeroes, and extend the size to
+  the range end unless KEEP_SIZE is set.
+
+Unsupported mode bits, `PUNCH_HOLE` without `KEEP_SIZE`, and combining
+`PUNCH_HOLE` with `ZERO_RANGE` return `EOPNOTSUPP`. Partial extents are
+re-chunked from their verified payload, all old/new chunk reference changes
+and extent updates are committed in one metadata transaction, and retryable
+conflicts rebuild the plan from the transaction snapshot. No data or metadata
+is modified when validation or payload verification fails.
+
+### Validation
+
+Release build, Clippy over all targets, and the workspace test suite passed.
+On scratch mounts:
+
+- `posix_fallocate` extended a file to 1 MiB while preserving its leading
+  bytes; the rest read as zeroes.
+- KEEP_SIZE preallocation on an empty file left the size at zero; after
+  growing the file, `SEEK_HOLE(0)` returned EOF, proving the range had been
+  materialized rather than left sparse, and reads/writes over the preallocated
+  range were correct.
+- Punching a 64 KiB range from a 1 MiB deterministic file preserved both
+  sides exactly, made only the punched bytes zero, and updated `SEEK_HOLE`.
+- ZERO_RANGE zeroed exactly its range with KEEP_SIZE, and without KEEP_SIZE
+  extended a 1 MiB file to its requested end with the new range reading zero.
+- All resulting sparse files round-tripped through `cp --sparse=always` with
+  matching SHA-256 hashes, and content plus split extents survived a full
+  unmount/remount.
+- Reads through an already-populated kernel page cache observed punched and
+  zeroed data immediately.
+- Collapse range, insert range and punch-without-keep returned `ENOTSUP`
+  without changing file contents.
+
+### Affected Files
+
+`src/fs/write.rs`, `src/fs/fuse.rs`,
+`crates/verfsnext-async-fusex/src/file_system.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`,
+`crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`,
+`docs/bug-fix-history.md`, `docs/migration-guide.md`,
+`docs/technical_deep_dive.md`

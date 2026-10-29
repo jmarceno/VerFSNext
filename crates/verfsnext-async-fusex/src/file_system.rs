@@ -156,6 +156,17 @@ pub trait FileSystem {
         reply: ReplyWrite<'_>,
     ) -> nix::Result<usize>;
 
+    /// Allocate, deallocate or zero a byte range in an open file.
+    async fn fallocate(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+        reply: ReplyEmpty<'_>,
+    ) -> nix::Result<usize>;
+
     /// Flush method
     async fn flush(
         &self,

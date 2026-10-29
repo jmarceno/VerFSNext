@@ -117,3 +117,13 @@ existing payload canonically in the same transaction that updates the inode.
 No key or record layout changes, so startup performs no migration. The change
 does reinterpret existing ACLs (from opaque bytes to enforced permissions),
 which is the intended fix for directories that already contain them.
+
+## No migration for fallocate
+
+Fallocate uses the existing extent, chunk-refcount and inode records. Mode 0
+and KEEP_SIZE materialize ordinary zero chunks through the same staging and
+transaction path as writes; punch-hole and zero-range split existing extents
+and adjust refcounts transactionally. KEEP_SIZE may leave allocated zero
+extents beyond the current file size, but they use the existing `E` extent
+keys and become visible through the normal size-growing paths. No metadata key
+or record layout changed, so no startup migration is required.
