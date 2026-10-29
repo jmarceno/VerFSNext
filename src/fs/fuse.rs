@@ -44,7 +44,10 @@ impl VirtualFs for VerFs {
             .lookup_inode_with_vault_access(parent, name)
             .map_err(map_anyhow_to_fuse)?;
 
-        let attr = self.core.file_attr_from_inode(&inode);
+        let attr = self
+            .core
+            .file_attr_from_inode(&inode)
+            .map_err(map_anyhow_to_fuse)?;
         self.core.add_kernel_lookup(inode.ino);
         Ok((self.core.entry_ttl(), self.core.attr_ttl(), attr, inode.generation))
     }
@@ -66,7 +69,12 @@ impl VirtualFs for VerFs {
             .load_inode_with_vault_access(ino, "getattr")
             .map_err(map_anyhow_to_fuse)?;
 
-        Ok((self.core.attr_ttl(), self.core.file_attr_from_inode(&inode)))
+        Ok((
+            self.core.attr_ttl(),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
+        ))
     }
 
     async fn statx(
@@ -78,7 +86,10 @@ impl VirtualFs for VerFs {
             .core
             .load_inode_with_vault_access(ino, "statx")
             .map_err(map_anyhow_to_fuse)?;
-        let attr = self.core.file_attr_from_inode(&inode);
+        let attr = self
+            .core
+            .file_attr_from_inode(&inode)
+            .map_err(map_anyhow_to_fuse)?;
         let (rdev_major, rdev_minor) = split_dev(inode.rdev);
         Ok((
             self.core.attr_ttl(),
@@ -181,7 +192,12 @@ impl VirtualFs for VerFs {
         self.core.mark_mutation();
         self.core.invalidate_inode_attr_best_effort(ino);
 
-        Ok((self.core.attr_ttl(), self.core.file_attr_from_inode(&inode)))
+        Ok((
+            self.core.attr_ttl(),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
+        ))
     }
 
     async fn readlink(&self, ino: u64) -> AsyncFusexResult<Vec<u8>> {
@@ -273,7 +289,9 @@ impl VirtualFs for VerFs {
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
-            self.core.file_attr_from_inode(&inode),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
             inode.generation,
         ))
     }
@@ -322,7 +340,9 @@ impl VirtualFs for VerFs {
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
-            self.core.file_attr_from_inode(&inode),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
             inode.generation,
         ))
     }
@@ -507,7 +527,9 @@ impl VirtualFs for VerFs {
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
-            self.core.file_attr_from_inode(&inode),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
             inode.generation,
         ))
     }
@@ -1273,7 +1295,9 @@ impl VirtualFs for VerFs {
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
-            self.core.file_attr_from_inode(&inode),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
             inode.generation,
             fh,
             0,
@@ -1381,7 +1405,9 @@ impl VirtualFs for VerFs {
         Ok((
             self.core.entry_ttl(),
             self.core.attr_ttl(),
-            self.core.file_attr_from_inode(&inode),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
             inode.generation,
         ))
     }

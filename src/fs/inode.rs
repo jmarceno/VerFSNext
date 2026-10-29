@@ -20,11 +20,13 @@ impl FsCore {
         Ok(())
     }
 
-    pub(crate) fn file_attr_from_inode(&self, inode: &InodeRecord) -> FileAttr {
-        FileAttr {
+    /// Builds the attribute reply for `inode`. `st_size` is the logical size;
+    /// `st_blocks` is the allocated data only (see `allocated_blocks`).
+    pub(crate) fn file_attr_from_inode(&self, inode: &InodeRecord) -> Result<FileAttr> {
+        Ok(FileAttr {
             ino: inode.ino,
             size: inode.size,
-            blocks: inode.size.div_ceil(512),
+            blocks: self.allocated_blocks(inode)?,
             atime: parts_to_system_time(inode.atime_sec, inode.atime_nsec),
             mtime: parts_to_system_time(inode.mtime_sec, inode.mtime_nsec),
             ctime: parts_to_system_time(inode.ctime_sec, inode.ctime_nsec),
@@ -35,6 +37,45 @@ impl FsCore {
             gid: inode.gid,
             rdev: inode.rdev,
             version: inode.generation,
+        })
+    }
+
+    /// `st_blocks` of `inode`: the bytes its extent records allocate, in
+    /// 512-byte units. Holes store nothing and are not counted, so a 64 MiB
+    /// file with one byte written reports one block instead of 131072, and
+    /// `cp --sparse=always`/`rsync --sparse` see the sparse layout. Inode
+    /// kinds without extent data (directory, symlink, FIFO, socket) have no
+    /// allocated data blocks and report zero.
+    ///
+    /// The value is computed on demand from the extent records and cached per
+    /// (ino, inode data version). Every extent-mutating path commits and then
+    /// bumps that version, so a scan whose extents belong to a different
+    /// version than the one it started with is retried instead of cached, and
+    /// a cached value is never served for another version. Nothing is
+    /// denormalized into the inode record, so there is no counter to drift.
+    fn allocated_blocks(&self, inode: &InodeRecord) -> Result<u64> {
+        if inode.kind != INODE_KIND_FILE {
+            return Ok(0);
+        }
+        loop {
+            let version = self.inode_data_version(inode.ino);
+            if let Some(blocks) = self.allocated_blocks_cache.get(&(inode.ino, version)) {
+                return Ok(blocks);
+            }
+            let allocated_bytes = self.meta.read_txn(|txn| {
+                let mut allocated_bytes = 0_u64;
+                for extent in FsCore::load_all_extents_in_txn(txn, inode.ino)? {
+                    allocated_bytes += u64::from(extent.record.len);
+                }
+                Ok(allocated_bytes)
+            })?;
+            if self.inode_data_version(inode.ino) != version {
+                continue;
+            }
+            let blocks = allocated_bytes.div_ceil(512);
+            self.allocated_blocks_cache
+                .insert((inode.ino, version), blocks);
+            return Ok(blocks);
         }
     }
     pub(crate) fn load_inode_or_errno(

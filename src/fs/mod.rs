@@ -423,6 +423,9 @@ struct FsCore {
     /// Persistent read-plan cache keyed by (ino, data_version).
     /// Survives across file close/reopen, unlike the fh-keyed cache.
     file_read_plan_inode_cache: Cache<(u64, u64), Arc<SmallFileReadPlan>>,
+    /// Allocated data blocks (512-byte units) per (ino, data version),
+    /// computed on demand from the extent records for `st_blocks`.
+    allocated_blocks_cache: Cache<(u64, u64), u64>,
     notifier: ParkingRwLock<Option<Arc<SessionNotifier>>>,
     open_file_counts: ParkingMutex<HashMap<u64, u64>>,
     /// Lookup references the kernel holds per inode (entry replies minus FORGET).
@@ -553,6 +556,9 @@ impl VerFs {
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
             file_read_plan_inode_cache: Cache::builder()
+                .max_capacity(config.metadata_cache_capacity_entries)
+                .build(),
+            allocated_blocks_cache: Cache::builder()
                 .max_capacity(config.metadata_cache_capacity_entries)
                 .build(),
             notifier: ParkingRwLock::new(None),
