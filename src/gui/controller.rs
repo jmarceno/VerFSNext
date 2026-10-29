@@ -934,6 +934,7 @@ impl qobject::AppController {
         let tx = rt.events_tx.clone();
         let spawned = spawn_worker("probe", tx, move || {
             let result = (|| -> Result<_> {
+                daemon::cap_daemon_log()?;
                 let probe = daemon::probe(&config, &child)?;
                 let status = if probe.state == "running" {
                     handle

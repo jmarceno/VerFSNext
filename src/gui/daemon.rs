@@ -36,6 +36,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3000);
 const START_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// ...and only reported once it keeps failing for this long.
 const START_RETRY_WINDOW: Duration = Duration::from_secs(300);
+/// Size past which `daemon.log` moves to `daemon.log.1`, replacing the
+/// previous one, and starts over empty.
+const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 pub type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -173,11 +176,39 @@ pub fn file_log_tail(path: &Path) -> Result<String> {
     Ok(lines[lines.len().saturating_sub(30)..].join("\n"))
 }
 
+/// Keeps `daemon.log` under [`DAEMON_LOG_MAX_BYTES`]. The daemon writes it
+/// through an O_APPEND descriptor, so after the truncation its next line
+/// lands at the start of the emptied file. Lines written between the copy and
+/// the truncation are lost.
+pub fn cap_daemon_log() -> Result<()> {
+    let log_path = paths::daemon_log_path()?;
+    let len = match std::fs::metadata(&log_path) {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", log_path.display()))
+        }
+    };
+    if len <= DAEMON_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let rotated = log_path.with_extension("log.1");
+    std::fs::copy(&log_path, &rotated).with_context(|| {
+        format!("failed to copy {} to {}", log_path.display(), rotated.display())
+    })?;
+    OpenOptions::new()
+        .write(true)
+        .open(&log_path)
+        .and_then(|file| file.set_len(0))
+        .with_context(|| format!("failed to truncate {}", log_path.display()))
+}
+
 fn spawn_child(exe: &Path, config_path: &Path) -> Result<Child> {
     let log_path = paths::daemon_log_path()?;
     let parent = log_path.parent().context("log path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
+    cap_daemon_log()?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)

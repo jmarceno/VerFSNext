@@ -3314,3 +3314,101 @@ and report exactly what it copied.
 
 `src/fs/inode.rs`, `src/fs/mod.rs`, `src/fs/fuse.rs`, `src/fs/write.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B070 - Daemon Memory Grew to 3x the Cache Budget (glibc Arena Fragmentation) - Oct 29 2026
+
+### Symptom
+
+The live desktop daemon used 1.89 GB RSS plus 0.30 GB swap with
+`chunk_cache_capacity_mb = 640`. The `stats` table reported about 260-640 MB
+of cache memory, and RSS never came back down when the folder went idle. The
+daemon's `daemon.log` had also reached 790 MB, because nothing capped it.
+
+### Reproduction
+
+Scratch mount on the HDD with the live config (640 MB chunk cache, 512 MB
+batch, 131072 metadata entries, 524288 pack index entries): 4 GiB of
+incompressible files (85 % 64 KiB-4 MiB, the rest 32-256 MiB), then four
+O_DIRECT readers, two 1 GiB writers and a 1 GiB delete at the same time.
+With the old build:
+
+| | RSS |
+|---|---|
+| after the 4 GiB write | 1011 MB |
+| after one stress cycle | 1607 MB |
+| idle 60 s later | 1688 MB |
+| after four stress cycles, idle | 2271 MB |
+
+The chunk cache held about 600 MB throughout.
+
+### Root Cause
+
+glibc malloc. Each thread that allocates gets its own arena, up to eight per
+CPU, built from 64 MiB heaps, and glibc only returns memory from the top of a
+heap. The daemon allocates chunk buffers, decompressed payloads, write batches
+and metadata from dozens of tokio, FUSE, rayon and SurrealKV threads. Freed
+buffers left half-empty arenas resident. The scratch daemon ended with 13
+fully resident 64 MiB arena heaps (about 830 MB) next to a 600 MB cache, and
+every further cycle grew the RSS.
+
+A jemalloc heap profile of the same run gave the live heap: the chunk cache
+(its pack-read and decompression buffers, ~630 MB), the SurrealKV memtable
+arena (128 MB), the SurrealKV block cache (64 MB) and the FUSE request buffer
+pool (48 x ~1.25 MiB = 60 MB). Nothing else was over a few MB. So the live data
+honours the configured budgets. The excess was allocator fragmentation.
+
+### Fix
+
+- `src/alloc.rs`: `alloc::configure()` runs first in `run()`, before any
+  thread starts. It sets `mallopt(M_ARENA_MAX, 2)`, so all threads share two
+  arenas.
+- The throughput worker calls `malloc_trim(0)` (in `spawn_blocking`) once
+  the folder has had no reads or writes for 10 s, then again every 60 s while
+  it stays quiet. That covers memory freed by the batch flush, the sync cycle,
+  GC and statistics scans. `malloc_trim` returns the free pages inside every
+  heap, not only the top.
+- `stats` gains a "Heap Memory" row (`heap_allocated_bytes`,
+  `heap_free_bytes` from `mallinfo2`).
+- `daemon.log` (written by app-spawned daemons) is capped at 16 MiB: past
+  that it is copied to `daemon.log.1` (replacing the previous one) and
+  truncated. The check runs before each spawn and on every 2 s probe of the
+  app. The daemon's descriptor is O_APPEND, so its next line lands at the
+  start of the emptied file.
+
+jemalloc was evaluated and rejected: under the same workload it peaked at
+1198/1211 MB (glibc with 2 arenas: 990/997 MB) and used 16 % more daemon CPU
+(50.4/50.6 s vs 43.4/43.8 s). An earlier project attempt with jemalloc had
+also caused trouble.
+
+### Data integrity
+
+No on-disk change and no migration. Only allocator parameters, when free
+memory is returned and the log file handling change.
+
+### Validation
+
+Scratch mount, same workload, two interleaved rounds per build (write time,
+stress time, daemon CPU):
+
+| build | peak RSS | idle RSS | write s | stress s | CPU s |
+|---|---|---|---|---|---|
+| glibc default | 1607 / 1572 MB | 1688 / 1659 MB | 50.2 / 50.8 | 29.4 / 28.4 | 43.4 / 43.3 |
+| 2 arenas + trim | 990 / 997 MB | 1020 / 1024 MB | 52.0 / 50.2 | 27.7 / 29.1 | 43.4 / 43.8 |
+| jemalloc | 1198 / 1211 MB | 973 / 1018 MB | 49.8 / 50.6 | 30.2 / 29.8 | 50.4 / 50.6 |
+
+Soak, four stress cycles on one mount, idle RSS after each:
+old build 1631 → 2056 → 2104 → 2205 → 2271 MB, fixed build
+977 → 1146 → 1073 → 1023 → 1032 MB. RSS dropped by 30-120 MB at each trim.
+`cargo remote -h -- clippy --all-targets` emits no warnings and
+`cargo remote -h -- test` passes.
+
+The remaining resident set above `chunk_cache_capacity_mb` is by design: the
+memtable (128 MB, twice that while one is being flushed), the block cache
+(`metadata_block_cache_mb`), the FUSE buffer pool (60 MB at 1 MiB max write)
+and, while writing, the write batch (`batch_max_size_mb`).
+
+### Affected Files
+
+`src/alloc.rs`, `src/lib.rs`, `src/fs/mod.rs`, `src/gui/daemon.rs`,
+`src/gui/controller.rs`, `docs/bug-fix-history.md`,
+`docs/technical_deep_dive.md`

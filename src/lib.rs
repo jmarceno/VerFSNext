@@ -1,5 +1,6 @@
 #![allow(clippy::double_must_use)] // async_trait expands a must_use onto every boxed-future method
 
+mod alloc;
 mod config;
 mod control;
 mod data;
@@ -56,6 +57,7 @@ type LogHandle =
 /// so the Qt bridge symbols reach every linked target (cxx-qt links its C++
 /// objects into all of them, the integration tests included).
 pub fn run() -> Result<()> {
+    alloc::configure()?;
     let log_handle = init_logging();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
@@ -1115,6 +1117,14 @@ fn format_stats_report(stats: &VerFsStats) -> String {
             format!("{} bytes", stats.process_rss_bytes),
         ),
         (
+            "Heap Memory".to_owned(),
+            human_bytes(stats.heap_allocated_bytes),
+            format!(
+                "{} bytes in use, {} bytes free inside the heaps",
+                stats.heap_allocated_bytes, stats.heap_free_bytes
+            ),
+        ),
+        (
             "Approx Cache Memory".to_owned(),
             human_bytes(stats.approx_cache_memory_bytes),
             format!("{} bytes", stats.approx_cache_memory_bytes),
@@ -1390,6 +1400,8 @@ mod tests {
             cache_hit_rate: 0.9,
             process_private_memory_bytes: 2_048,
             process_rss_bytes: 4_096,
+            heap_allocated_bytes: 3_072,
+            heap_free_bytes: 512,
             read_bytes_total: 100_000,
             write_bytes_total: 50_000,
             uptime_secs: 10.0,

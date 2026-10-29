@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use crate::alloc::{heap_stats, trim as trim_heap};
 use crate::config::Config;
 use fill_cache::FillCache;
 use crate::data::chunker::UltraCdc;
@@ -170,6 +171,12 @@ struct FileHandleState {
 /// flight, so without readahead every request waits for its own pack reads.
 const READAHEAD_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Seconds without reads or writes after which free heap memory is handed
+/// back to the kernel. Twice the default sync interval.
+const HEAP_TRIM_QUIET_SECS: u64 = 10;
+/// How often free heap memory is handed back while the folder stays quiet.
+const HEAP_TRIM_INTERVAL_SECS: u64 = 60;
+
 #[derive(Debug, Clone, Copy)]
 struct ZeroRefCandidate {
     id: ChunkId,
@@ -238,6 +245,10 @@ pub struct VerFsStats {
     pub cache_hit_rate: f64,
     pub process_private_memory_bytes: u64,
     pub process_rss_bytes: u64,
+    /// Bytes in live heap allocations.
+    pub heap_allocated_bytes: u64,
+    /// Free bytes inside the heaps, partly already returned to the kernel.
+    pub heap_free_bytes: u64,
     pub read_bytes_total: u64,
     pub write_bytes_total: u64,
     pub uptime_secs: f64,
@@ -587,6 +598,7 @@ impl VerFs {
             let mut sampled_at = Instant::now();
             let mut previous_read = 0_u64;
             let mut previous_write = 0_u64;
+            let mut quiet_secs = 0_u64;
             loop {
                 sleep(Duration::from_secs(1)).await;
                 let Some(core) = throughput_core.upgrade() else {
@@ -604,6 +616,7 @@ impl VerFs {
                     write_bps,
                 };
                 if read_bps > 0.0 || write_bps > 0.0 {
+                    quiet_secs = 0;
                     let cache = core.cache_totals();
                     *core.last_activity.lock() = Some(ActivitySnapshot {
                         read_bps,
@@ -613,6 +626,15 @@ impl VerFs {
                         process_rss_bytes: read_process_rss_bytes().unwrap_or(0),
                         at_ms: now_millis(),
                     });
+                } else {
+                    quiet_secs += 1;
+                    // By then the batch flush and the sync cycle that follow
+                    // the last transfer have freed their buffers. Later trims
+                    // cover what GC and statistics scans free while the
+                    // folder stays quiet.
+                    if quiet_secs % HEAP_TRIM_INTERVAL_SECS == HEAP_TRIM_QUIET_SECS {
+                        tokio::task::spawn_blocking(trim_heap);
+                    }
                 }
                 sampled_at = now;
                 previous_read = read;
@@ -1602,6 +1624,7 @@ impl FsCore {
         let process_rss_bytes = read_process_rss_bytes().unwrap_or(0);
         let process_private_memory_bytes =
             read_process_private_memory_bytes().unwrap_or(process_rss_bytes);
+        let heap = heap_stats();
         let read_bytes_total = self.read_bytes_total.load(Ordering::Relaxed);
         let write_bytes_total = self.write_bytes_total.load(Ordering::Relaxed);
         let pack_crc32_read_error_count = self.pack_crc32_read_error_count.load(Ordering::Relaxed);
@@ -1643,6 +1666,8 @@ impl FsCore {
             cache_hit_rate: cache.hit_rate,
             process_private_memory_bytes,
             process_rss_bytes,
+            heap_allocated_bytes: heap.allocated,
+            heap_free_bytes: heap.free,
             read_bytes_total,
             write_bytes_total,
             uptime_secs,
