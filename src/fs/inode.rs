@@ -205,13 +205,23 @@ impl FsCore {
         } else {
             0
         };
+        let parent_setgid = (parent_inode.perm & libc::S_ISGID as u16) != 0;
+        let inherited_gid = if parent_setgid {
+            parent_inode.gid
+        } else {
+            gid
+        };
+        let mut child_perm = (mode & MODE_PERM_MASK) as u16;
+        if parent_setgid && kind == INODE_KIND_DIR {
+            child_perm |= libc::S_ISGID as u16;
+        }
         let inode = InodeRecord {
             ino,
             parent,
             kind,
-            perm: (mode & MODE_PERM_MASK) as u16,
+            perm: child_perm,
             uid,
-            gid,
+            gid: inherited_gid,
             nlink: if kind == INODE_KIND_DIR { 2 } else { 1 },
             size: 0,
             atime_sec: sec,

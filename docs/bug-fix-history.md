@@ -2193,3 +2193,38 @@ contents.
 `crates/verfsnext-async-fusex/src/session.rs`,
 `crates/verfsnext-async-fusex/src/virtual_fs.rs`, `src/fs/fuse.rs`,
 `docs/bug-fix-history.md`
+
+## B055 - Setgid Directories Did Not Propagate Group or S_ISGID - Oct 29 2026
+
+### Symptom
+
+Inside a mode `2775` directory, newly created files and directories kept the
+requesting process's primary group instead of the directory's group.
+Subdirectories also lost `S_ISGID`, so nested entries stopped inheriting the
+shared group after one level. Shared group trees therefore gained
+wrong-group entries.
+
+### Root Cause
+
+`create_inode_in_txn` copied the request `gid` and masked mode bits directly.
+It never examined the parent's setgid bit, so the parent `gid` and the
+subdirectory setgid bit were not inherited.
+
+### Fix
+
+When the parent has `S_ISGID`, every new inode now receives the parent
+directory's gid. A newly created subdirectory also receives `S_ISGID`, which
+propagates group ownership through arbitrarily deep directory trees. Other
+mode bits, file type bits and non-setgid inheritance are unchanged.
+
+### Validation
+
+Release build passed. On a scratch mount, a `2775` directory was changed to a
+supplementary group different from the process egid. New files, a FIFO and a
+symlink inherited the group without a setgid bit; a new subdirectory inherited
+both the group and mode `2775`; and a directory created beneath that subdir
+inherited both again.
+
+### Affected Files
+
+`src/fs/inode.rs`, `docs/bug-fix-history.md`
