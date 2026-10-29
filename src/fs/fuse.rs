@@ -884,6 +884,11 @@ impl VirtualFs for VerFs {
             );
         }
 
+        // POSIX relatime: a read records the access in memory when the rule
+        // says it is due; the sync cycle turns it into one bounded metadata
+        // transaction, so reads never commit metadata themselves.
+        self.core.note_atime(&inode);
+
         if size == 0 || offset >= inode.size {
             return Ok(0);
         }

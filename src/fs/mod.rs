@@ -77,6 +77,10 @@ const STATS_REFRESH_MIN_AGE_MS: u64 = 30_000;
 /// File in the data directory that keeps the last completed scan across
 /// daemon restarts.
 const STATS_SNAPSHOT_FILE: &str = "stats-snapshot.json";
+/// Pending access times committed by one periodic sync cycle. A large read
+/// scan can queue more; the rest waits for the following cycles, and a full
+/// sync (shutdown) drains every entry in bounded chunks.
+const ATIME_FLUSH_MAX_INODES: usize = 4096;
 
 mod acl;
 pub mod chunk;
@@ -417,6 +421,9 @@ struct FsCore {
     write_lock: AsyncRwLock<()>,
     inode_write_locks: ParkingMutex<HashMap<u64, Weak<Mutex<()>>>>,
     inode_data_versions: ParkingMutex<HashMap<u64, u64>>,
+    /// Access times recorded by reads that POSIX relatime says are due,
+    /// committed by the sync cycle instead of one metadata commit per read.
+    pending_atimes: ParkingMutex<HashMap<u64, (i64, u32)>>,
     gc_lock: Mutex<()>,
     file_locks: ParkingMutex<HashMap<u64, Vec<FileLockState>>>,
     dir_handles: ParkingMutex<HashMap<u64, DirHandleState>>,
@@ -550,6 +557,7 @@ impl VerFs {
             write_lock: AsyncRwLock::new(()),
             inode_write_locks: ParkingMutex::new(HashMap::new()),
             inode_data_versions: ParkingMutex::new(HashMap::new()),
+            pending_atimes: ParkingMutex::new(HashMap::new()),
             gc_lock: Mutex::new(()),
             file_locks: ParkingMutex::new(HashMap::new()),
             dir_handles: ParkingMutex::new(HashMap::new()),
@@ -1809,6 +1817,80 @@ impl FsCore {
             self.meta.flush_wal(true)
         })
     }
+
+    /// Takes up to `max_inodes` recorded access times out of the pending map.
+    fn take_pending_atimes(&self, max_inodes: usize) -> HashMap<u64, (i64, u32)> {
+        let mut pending = self.pending_atimes.lock();
+        if pending.len() <= max_inodes {
+            return std::mem::take(&mut *pending);
+        }
+        let inos: Vec<u64> = pending.keys().take(max_inodes).copied().collect();
+        let mut taken = HashMap::with_capacity(inos.len());
+        for ino in inos {
+            if let Some(access) = pending.remove(&ino) {
+                taken.insert(ino, access);
+            }
+        }
+        taken
+    }
+
+    /// Commits up to `max_inodes` pending access times in one metadata
+    /// transaction.
+    ///
+    /// Each inode is loaded inside the transaction, so the relatime rule is
+    /// re-checked against the current mtime/ctime: a file written since the
+    /// read keeps its new times and still gets the recorded access time, and
+    /// an inode modified into a state where relatime is no longer due is left
+    /// alone. Only the access time is written; size, mtime and ctime are not
+    /// touched. Vanished inodes are skipped, entries are put back on commit
+    /// failure for the next cycle, and the error is returned so the caller
+    /// logs it instead of dropping the update silently.
+    async fn flush_pending_atimes(&self, max_inodes: usize) -> Result<()> {
+        let pending = self.take_pending_atimes(max_inodes);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut updated_inodes = Vec::with_capacity(pending.len());
+        let commit = self
+            .meta
+            .write_txn(|txn| {
+                updated_inodes.clear();
+                for (ino, (access_sec, access_nsec)) in &pending {
+                    let Some(raw) = txn.get(inode_key(*ino))? else {
+                        debug!(
+                            ino,
+                            "atime update skipped: inode vanished before the sync cycle"
+                        );
+                        continue;
+                    };
+                    let mut inode: InodeRecord = decode_rkyv(&raw)?;
+                    if !FsCore::relatime_atime_due(&inode, *access_sec) {
+                        continue;
+                    }
+                    inode.atime_sec = *access_sec;
+                    inode.atime_nsec = *access_nsec;
+                    txn.set(inode_key(*ino), encode_rkyv(&inode)?)?;
+                    updated_inodes.push(*ino);
+                }
+                Ok(())
+            })
+            .await;
+        match commit {
+            Ok(()) => {
+                for ino in &updated_inodes {
+                    self.invalidate_inode_cache(*ino);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let mut pending_atimes = self.pending_atimes.lock();
+                for (ino, access) in pending {
+                    pending_atimes.entry(ino).or_insert(access);
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1817,6 +1899,23 @@ impl SyncTarget for FsCore {
         self.persist_active_pack_id_if_needed().await?;
         self.persist_pack_crc32_read_error_count_if_needed().await?;
         self.persist_corrupt_chunk_marks().await?;
+        // Reads record access times in memory (see FsCore::note_atime); they
+        // reach metadata here, at most one bounded transaction per cycle
+        // instead of one commit per read. They run before the durability
+        // steps so the same cycle hands them to the OS, and a full sync
+        // (shutdown) drains every remaining entry.
+        let mut atime_flush = self.flush_pending_atimes(ATIME_FLUSH_MAX_INODES).await;
+        if full {
+            while atime_flush.is_ok() && !self.pending_atimes.lock().is_empty() {
+                atime_flush = self.flush_pending_atimes(ATIME_FLUSH_MAX_INODES).await;
+            }
+        }
+        if let Err(err) = atime_flush {
+            error!(
+                error = %format!("{err:#}"),
+                "pending atime update flush failed; the entries stay queued for the next sync cycle"
+            );
+        }
         // Both block on the disk. The periodic cycle syncs the packs only
         // when something was appended since the last pack sync, and hands
         // off only WAL records whose pack data is durable: flushing the whole

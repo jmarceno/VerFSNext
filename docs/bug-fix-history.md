@@ -2492,6 +2492,78 @@ syncs and detaches the mount itself.
 `crates/verfsnext-async-fusex/src/session.rs`, `src/lib.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
 
+## B060 - statx Returned No Birth Time and the FUSE ABI Stopped at 7.31 - Oct 29 2026
+
+### Symptom
+
+`stat -c %W` returned 0 for every file: `FUSE_STATX` (opcode 52) was unknown to
+the daemon, which answered `ENOSYS`, so the kernel disabled statx for the mount
+and filled birth time with zero. The daemon also logged `ERROR Unknown
+operation code found: 52` once per mount. The kernel already sends newer
+opcodes regardless of the negotiated minor version, so the vendored protocol
+layer had fallen behind the kernel it runs on.
+
+### Root Cause
+
+The vendored `crates/verfsnext-async-fusex` protocol only knew FUSE ABI up to
+7.31. `FUSE_STATX` is part of ABI 7.39 and the reply is a distinct 288-byte
+`struct fuse_statx_out`, not a `fuse_attr`, so there was no way to answer it.
+Birth time also had no storage: `InodeRecord` had no `btime` field, so even a
+correct statx reply could not have reported a creation time.
+
+### Fix
+
+- The vendored crate now supports ABI 7.39 (`abi-7-32` ... `abi-7-39`
+  features, default `abi-7-39`). `fuse_attr` gained the real `flags` field
+  where older code kept padding (same size, so replies stay byte-compatible),
+  and the statx request/response structures were added with compile-time size
+  assertions (16/24/256/288 bytes) matching the kernel ABI.
+- `FUSE_STATX` is parsed in `fuse_request.rs`, dispatched by `session.rs`
+  (only `FUSE_GETATTR_FH` is honoured) and answered from a new
+  `VirtualFs::statx` implementation in `src/fs/fuse.rs`. The reply carries
+  `STATX_BASIC_STATS | STATX_BTIME`.
+- `InodeRecord` now stores `btime_sec`, `btime_nsec` and `rdev` (the device id
+  used by the block/character device work). New inodes get birth time at
+  creation; the value never changes afterwards.
+- A one-time migration (`src/migration/inode_schema_v2.rs`, marker
+  `SYS:inode_schema_v2_migration_v1`) rewrites every stored inode record to
+  the new layout, including snapshot inodes. Existing inodes get
+  `btime = ctime` (the best available approximation, as other filesystems did
+  when they gained birth time) and `rdev = 0`. The migration is batched,
+  crash-resumable (schema v1 and v2 records are told apart by their exact
+  archived length and the inode key is validated) and runs before any inode is
+  read on every path that opens a data directory (daemon, offline snapshot and
+  pack-size commands). It also performs the `.snapshots` read-only repair that
+  used to run in `MetaStore::bootstrap`, which can no longer decode an inode
+  before the upgrade.
+
+### Data integrity
+
+The record layout change is the risky part: `MetaStore::bootstrap` used to
+decode the `.snapshots` inode on every open, which would have failed (or, worse,
+silently misread) before the migration. That decode was removed and the repair
+moved into the migration. The migration reads each record once, rewrites it in
+the same transaction, validates the inode number against the key, aborts on any
+unexpected record length instead of guessing, and writes its marker only after
+every record was visited. File data, extents, chunk refcounts and directory
+entries are untouched.
+
+### Validation
+
+- Fresh data directory: mount negotiates ABI 7.39; `stat -c %W` returns the
+  creation time; a file modified 1.2 s later keeps `btime` while `ctime`/`mtime`
+  move; directories and symlinks report birth time too; `upgraded_inodes=0` on
+  the first open (the new records are already v2).
+- Migration from a data directory written by the previous binary (files, hard
+  link, symlink, FIFO, nested directories, an existing snapshot): mount
+  succeeds, every sha256 matches the pre-upgrade values, hard links keep one
+  inode, `.snapshots/snap1` still lists the tree, every inode reports
+  `btime` = `ctime`, and a second mount is a no-op (`upgraded_inodes` is not
+  logged again) with the same content.
+- Mount regression probe: lookup/getattr/readdir/create/write/read/hardlink/
+  symlink/xattr/statfs and a 1 MiB random file round-trip all behave as before.
+- `cargo remote -h -- test` and a release build pass.
+
 ## B061 - st_blocks Reported the Logical Size Instead of Allocated Data - Oct 29 2026
 
 ### Symptom
@@ -2668,3 +2740,70 @@ container (headless build, direct FUSE mount). `mknod` of `c 1 3`, `c 1 5`,
 node with the same type and major:minor; the nodes survive a daemon
 restart/remount with the same `rdev`; link and unlink work; the daemon log and
 the records check are clean.
+
+## B064 - Reads Never Updated atime, and a Per-Read Commit Would Have Been Write Amplification - Oct 29 2026
+
+### Symptom
+
+`st_atime` never moved when a file was read: `stat -c %X` kept showing the
+creation (or last explicit `touch -a`) time no matter how much the file was
+read, on every mount. `relatime` semantics were entirely missing, so access
+times were useless to backup, mail and indexing tools and looked frozen.
+Simply committing an access time inside each read would have replaced a data
+read with a metadata transaction per request, the write amplification the
+card item warned about, on a workload that is supposed to stay read-only.
+
+### Root Cause
+
+The FUSE read handler loaded the inode, read the extents and returned data, but
+no code path ever wrote `atime_sec`/`atime_nsec`. The inode record and the
+attribute reply already carried the field, and `setattr` updated it when the
+user asked explicitly; reads just did not.
+
+### Fix
+
+- `FsCore::note_atime` (`src/fs/inode.rs`) evaluates POSIX relatime against the
+  inode the read handler already loaded: update when atime is not newer than
+  both mtime and ctime, or when it is at least 24 hours old. When due, it
+  stores the access time in `FsCore::pending_atimes`
+  (`parking_lot::Mutex<HashMap<u64, (i64, u32)>>`) and returns. Reads take one
+  short mutex and do not commit metadata or take the inode lock.
+- `FsCore::sync_cycle` drains that map: up to `ATIME_FLUSH_MAX_INODES` (4096)
+  entries per periodic cycle, all remaining entries in further chunks for a
+  full sync (shutdown). One bounded metadata transaction per drain: each inode
+  is loaded inside it and the relatime rule is re-checked against the inode as
+  committed, so a file written after the read keeps its fresh mtime/ctime and
+  still gets the recorded access time, and a later explicit `touch -a` is not
+  overwritten. Only `atime_sec`/`atime_nsec` are written; size, mtime and ctime
+  are untouched. The inode cache is invalidated after the commit so the next
+  relatime check sees the new value. Vanished inodes are skipped (debug log);
+  a commit failure puts the entries back for the next cycle and is logged as
+  an error instead of being dropped. No kernel attribute invalidation is sent
+  per read, as agreed: the attr TTL bounds staleness.
+- Read-only inodes (the `.snapshots` tree and its cloned inodes) never record
+  an access time, matching a read-only mount and keeping snapshot metadata
+  static.
+- The behavior is in-memory batching only: no metadata layout changed and no
+  migration is needed. A crash can lose the last cycle's access times, which
+  is the same best-effort guarantee a relatime kernel makes.
+
+### Validation
+
+Clippy over all targets passed. On scratch mounts sharing one data directory
+(attribute and entry TTLs zero), with reads made after a remount so the page
+cache could not serve them: create-then-read updated atime after one 300 ms
+sync cycle while mtime and ctime stayed byte-identical; an atime explicitly
+set a year in the future survived a read unchanged; an atime set two days old
+was updated by one read; six files read in one interval were all updated; on a
+mount with `sync_interval_ms = 5000` a read left atime at its old value and a
+later cycle updated it, proving reads do not commit metadata; a read followed
+by an immediate unmount was persisted by the shutdown full sync and showed the
+read time after remount; another file's updated atime survived unmount/remount
+unchanged; a file read and unlinked before the cycle was skipped without an
+error; all 11 files kept identical sha256 sums and the daemon logs had no
+errors or warnings.
+
+### Affected Files
+
+`src/fs/fuse.rs`, `src/fs/inode.rs`, `src/fs/mod.rs`,
+`docs/bug-fix-history.md`, `docs/technical_deep_dive.md`

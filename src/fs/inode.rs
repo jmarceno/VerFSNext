@@ -6,6 +6,9 @@ use crate::types::{
     PERM_BIT_USER_EXEC, PERM_BIT_WRITE, PERM_TRIPLET_MASK,
 };
 
+/// Longest access time age POSIX relatime tolerates before updating it again.
+const RELATIME_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+
 impl FsCore {
     pub(crate) fn validate_name_length(name: &str, context: &'static str) -> Result<()> {
         if name.len() > NAME_MAX {
@@ -78,6 +81,38 @@ impl FsCore {
             return Ok(blocks);
         }
     }
+
+    /// Records an access time for the next sync cycle when POSIX relatime
+    /// says the inode's access time is due, so a read never commits metadata:
+    /// it takes this short mutex and returns. The sync cycle applies the
+    /// recorded times in one transaction (see
+    /// `FsCore::flush_pending_atimes`) and re-checks the rule there against
+    /// the inode as committed.
+    ///
+    /// Read-only inodes (the snapshot trees) never update times, like a
+    /// read-only mount.
+    pub(crate) fn note_atime(&self, inode: &InodeRecord) {
+        if (inode.flags & INODE_FLAG_READONLY) != 0 {
+            return;
+        }
+        let (sec, nsec) = system_time_to_parts(SystemTime::now());
+        if !FsCore::relatime_atime_due(inode, sec) {
+            return;
+        }
+        self.pending_atimes.lock().insert(inode.ino, (sec, nsec));
+    }
+
+    /// POSIX relatime: the access time is due when it is not newer than both
+    /// the modification and the change time, or when it is older than a day.
+    /// `now_sec` is the second of the access being recorded.
+    pub(crate) fn relatime_atime_due(inode: &InodeRecord, now_sec: i64) -> bool {
+        let atime = (inode.atime_sec, inode.atime_nsec);
+        let newer_than_mtime = atime > (inode.mtime_sec, inode.mtime_nsec);
+        let newer_than_ctime = atime > (inode.ctime_sec, inode.ctime_nsec);
+        let younger_than_day = now_sec.saturating_sub(inode.atime_sec) < RELATIME_MAX_AGE_SECS;
+        !(newer_than_mtime && newer_than_ctime && younger_than_day)
+    }
+
     pub(crate) fn load_inode_or_errno(
         &self,
         ino: u64,

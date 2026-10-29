@@ -117,6 +117,31 @@ Old extents a region can reach are loaded through the batch transaction once per
 
 Cost: each FUSE write that extends a file re-reads (usually from the chunk cache) and re-stores the file's tail chunk. A random write re-chunks the extent before it, the extents it overwrites and normally one or two more until resynchronization.
 
+### Access times (relatime)
+
+File `st_atime` follows POSIX relatime: a read updates it only when it is not
+newer than both `st_mtime` and `st_ctime`, or when it is more than 24 hours
+old. The read path does not commit that update itself: `FsCore::note_atime`
+evaluates the rule against the inode it already loaded and, when due, records
+`(access_sec, access_nsec)` in `FsCore::pending_atimes`, a `parking_lot` map,
+under one short mutex. Reads therefore take no metadata transaction and no
+inode lock, which keeps a read-heavy workload from turning every read into a
+metadata write.
+
+`FsCore::sync_cycle` drains the map: it takes at most
+`ATIME_FLUSH_MAX_INODES` (4096) entries, loads each inode inside one metadata
+transaction, re-checks the relatime rule against the inode as committed (so a
+file written after the read keeps its new mtime/ctime and still gets the
+recorded access time), writes only `atime_sec`/`atime_nsec`, and invalidates
+the inode cache after the commit so the next relatime check sees the new
+value. Inodes that vanished since the read are skipped (logged at debug
+level); a failed commit puts the entries back for the next cycle and is
+logged at error level. A full sync (shutdown) loops until the map is empty, so
+a clean stop persists every recorded access time. Read-only inodes (the
+snapshot trees) never record one, like a read-only mount. No kernel attribute
+invalidation is sent per read: the configured attr TTL bounds attribute
+staleness.
+
 ### POSIX ACLs and creation modes
 
 The mount always passes `default_permissions` and additionally negotiates
@@ -205,6 +230,7 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - sequential readers are read ahead (see "Readahead")
   - read path verifies every stored copy before using it: payload CRC32 from `.idx`, vault AEAD, decompressed length and the plaintext's content hash; a damaged copy is rejected (logged and counted), the next indexed copy of the hash is tried, and when none is intact the read fails with EIO, never returning damaged bytes
   - a chunk with no intact copy is marked corrupt (in memory at once, persisted as `CHUNK_FLAG_CORRUPT` on its record by the next sync cycle); the next write of the same content stores a fresh copy instead of deduplicating against it and repoints the record, keeping its refcount, which repairs every file that references the chunk
+  - reads record relatime-due access times in a short-mutex map; the sync cycle commits them in one bounded metadata transaction per cycle (4096 inodes per periodic cycle, all remaining on shutdown) and re-checks relatime inside that transaction, so reads never commit metadata themselves (see "Access times (relatime)")
   - bounded chunk metadata and chunk payload caches
   - committed metadata read caches (bounded `moka`, wrapped in `FillCache`) for inode, dirent and chunk-record lookups with post-commit invalidation on mutation paths. A fill takes a ticket (its key stripe's epoch) before reading the store and inserts only if no invalidation of that stripe happened meanwhile, under the stripe lock that invalidation also takes, so a reader racing a commit can never cache the pre-commit value
   - dedup hit/miss counters emitted in write-path debug logs
