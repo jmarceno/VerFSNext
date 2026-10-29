@@ -2890,3 +2890,121 @@ intact after the source was unlinked.
 `crates/verfsnext-async-fusex/src/fuse_fs.rs`, `src/fs/fuse.rs`,
 `src/fs/write.rs`, `docs/bug-fix-history.md`,
 `docs/technical_deep_dive.md`
+## B066 - File Attribute ioctls Returned ENOTTY and Immutable/Append/Nodump Were Not Enforced - Oct 29 2026
+
+### Symptom
+
+`lsattr` and `chattr` failed: `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS` and
+`FS_IOC_FSGETXATTR` returned `ENOTTY` on every inode, so no file could be
+marked immutable (`+i`), append-only (`+a`) or nodump (`+d`). The `d` attribute
+is what backup tools (`rsync --dry-run`, dump utilities) use to skip files,
+and `i`/`a` are used for security hardening and append-only logs. In addition,
+nothing in the daemon enforced the attributes even if they had been stored.
+
+### Root Cause
+
+1. `Session::handle_request` answered every `Operation::IoCtl` with `ENOTTY`
+   without forwarding it to the filesystem; the vendored
+   `verfsnext-async-fusex` crate had no restricted-ioctl plumbing at all.
+2. `InodeRecord::flags` only had the internal `READONLY`/`VAULT` bits; the
+   `chattr` bits were neither stored nor reported.
+3. No mutation path checked immutable/append-only state.
+
+### Fix: Restricted FUSE_IOCTL Forwarding
+
+- `session.rs` now builds a `ReplyIoCtl` and calls the new
+  `FileSystem::ioctl(req, fh, flags, cmd, in_data, out_size, reply)`.
+- `fuse_reply.rs` gained `ReplyIoCtl`, which sends the 16-byte
+  `fuse_ioctl_out` (`result`, `flags`, `in_iovs`, `out_iovs`) followed by
+  exactly `out_size` bytes of output data for the commands that return data.
+  The kernel rejects a payload larger than the request's `out_size`, and a
+  short payload would leave caller memory uninitialized.
+- `virtual_fs.rs`/`fuse_fs.rs` forward to the new
+  `VirtualFs::ioctl(ino, fh, cmd, in_data, out_size)`.
+- `VerFs::ioctl` implements `FS_IOC_GETFLAGS` (0x80086601),
+  `FS_IOC_SETFLAGS` (0x40086602) and `FS_IOC_FSGETXATTR` (0x801c581f) for
+  regular files and directories. Every other command still answers `ENOTTY`
+  (the previous behaviour), now explicitly from the fs layer.
+- Input/output sizes follow both kernel paths: the 64-bit ioctl command
+  decodes to an 8-byte `long` (`GETFLAGS`/`SETFLAGS`), while the kernel's
+  fileattr path (`fuse_fileattr_get/set`) sends a 4-byte `int`. `FSGETXATTR`
+  is the 28-byte `struct fsxattr` with xflags mapped to
+  `FS_XFLAG_IMMUTABLE|APPEND|NODUMP`.
+- `SETFLAGS` accepts only `FS_IMMUTABLE_FL|FS_APPEND_FL|FS_NODUMP_FL`, rejects
+  every other requested bit with `EOPNOTSUPP` before touching metadata, and
+  persists the new state in one metadata transaction with a ctime bump.
+- The three attributes are stored in `InodeRecord::flags` bits `1<<3`, `1<<4`
+  and `1<<5`; the `InodeRecord` layout is unchanged, so no migration is
+  needed.
+
+### Fix: Enforcement
+
+`ensure_inode_writable` now also rejects immutable inodes with `EPERM`;
+`create_inode_in_txn` uses it for the parent so an immutable directory cannot
+gain entries. `ensure_inode_not_append_only` is called from unlink, rmdir,
+rename (source and replacement target) and link.
+
+- Immutable regular file: writes, truncate, setattr (size/mode/uid/gid/times),
+  setxattr/removexattr, fallocate, unlink, rename and link all answer `EPERM`.
+- Append-only regular file: only writes that extend the file contiguously from
+  its current end are accepted, `O_TRUNC`, write opens without `O_APPEND`,
+  shrinking truncate/setattr-size, fallocate and unlink/rename/link answer
+  `EPERM`. Growing ftruncate through an `O_APPEND` descriptor is allowed.
+- Append-only inodes are opened with `FOPEN_DIRECT_IO`. With the writeback
+  cache the kernel flushes dirty page-cache ranges whose offsets start at a
+  page boundary before EOF (a 12-byte append to a 6-byte file arrives as
+  `offset=0, len=12`), which is indistinguishable from a rewrite of the
+  existing bytes and would either defeat the check or corrupt data. Direct
+  I/O delivers each write at the requested end-of-file offset, and also makes
+  `MAP_SHARED` mmap fail, which would otherwise bypass the check.
+- Nodump is only stored and reported; the daemon takes no action on it.
+- The unprivileged caller capability gate lives in the kernel (see the
+  validation note below), not in VerFSNext.
+
+### Data integrity
+
+Enforcement runs inside the metadata transactions that make the change, so a
+rejected operation leaves both the inode and its extents untouched: immutable
+writes fail before a write group is staged, and append checks run against the
+size read from the same transaction snapshot that the write commits against.
+Rejections are explicit `EPERM`s logged by the write path, never silent
+partial writes. The writeback-page problem was found and fixed during
+validation: without direct I/O the daemon saw a legitimate append as an
+overwrite of bytes below EOF.
+
+### Validation
+
+- `cargo remote -h -- test` and
+  `cargo remote -h -- clippy --all-targets -- -D warnings` pass.
+- On a scratch mount with attr/entry TTL 0: a C helper calling
+  `FS_IOC_GETFLAGS`/`FS_IOC_FSGETXATTR` returned the expected bits, and an
+  unknown ioctl still returned `ENOTTY`.
+- `chattr +d`, `lsattr`, `GETFLAGS`/`FSGETXATTR` readback and `chattr -d`
+  work end to end and persist across a daemon restart.
+- The host kernel gates `FS_IMMUTABLE_FL`/`FS_APPEND_FL` behind
+  `CAP_LINUX_IMMUTABLE` in the generic fileattr code: as an unprivileged user,
+  `chattr +i/+a` (and even clearing them) returns `EPERM` before any FUSE
+  request is sent, while `+d` (no capability needed) works. To exercise the
+  daemon paths, the flags were seeded through the internal API with temporary
+  startup scaffolding (removed before the commit; no test or code was
+  committed). On a real mount the frozen binary then showed: `lsattr` reports
+  `i`/`a`/`iad`, `GETFLAGS` 0x10/0x20/0x70 and `FSGETXATTR` 0x8/0x10/0x98;
+  immutable files rejected overwrite, append, truncate, utimes, chmod, chgrp,
+  setxattr, removexattr, fallocate, rm, mv and ln with `EPERM` and their
+  content stayed byte-identical; append files accepted `>>` at EOF and
+  rejected overwrite, `O_TRUNC`, `r+`, shrinking truncate, fallocate, rm, mv
+  and ln; immutable directories rejected create, mkdir, unlink, rename, rmdir
+  and chmod; a combined `iad` inode reported all three bits; clearing the
+  flags through the internal SETFLAGS path made the files fully mutable
+  again; plain files behaved exactly as before; the daemon log had no new
+  errors. All flags and data survived remounts.
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/fuse_reply.rs`,
+`crates/verfsnext-async-fusex/src/file_system.rs`,
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`, `src/fs/fuse.rs`,
+`src/fs/inode.rs`, `src/fs/write.rs`, `src/fs/mod.rs`, `src/types/mod.rs`,
+`docs/bug-fix-history.md`, `docs/technical_deep_dive.md`

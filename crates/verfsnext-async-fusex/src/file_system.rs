@@ -7,6 +7,8 @@ use async_trait::async_trait;
 use super::fuse_reply::ReplyDirectoryPlus;
 #[cfg(feature = "abi-7-39")]
 use super::fuse_reply::ReplyStatX;
+#[cfg(feature = "abi-7-11")]
+use super::fuse_reply::ReplyIoCtl;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -359,5 +361,21 @@ pub trait FileSystem {
         _blocksize: u32,
         _idx: u64,
         reply: ReplyBMap<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Handle a restricted ioctl: the kernel decoded the command and hands
+    /// over exactly the input data of the request; the reply payload must be
+    /// the requested output data (at most `out_size` bytes).
+    #[cfg(feature = "abi-7-11")]
+    #[allow(clippy::too_many_arguments)]
+    async fn ioctl(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: ReplyIoCtl<'_>,
     ) -> nix::Result<usize>;
 }

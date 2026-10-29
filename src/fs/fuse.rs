@@ -2,6 +2,7 @@ use super::*;
 use crate::fs::acl::{PosixAcl, ACL_XATTR_ACCESS, ACL_XATTR_DEFAULT};
 use async_trait::async_trait;
 use tracing::{error, info, warn};
+use verfsnext_async_fusex::protocol::FOPEN_DIRECT_IO;
 #[async_trait]
 impl VirtualFs for VerFs {
     async fn init(&self) -> AsyncFusexResult<()> {
@@ -384,6 +385,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut inode: InodeRecord = decode_rkyv(&inode_raw)?;
                 FsCore::ensure_inode_writable(&inode, "unlink")?;
+                FsCore::ensure_inode_not_append_only(&inode, "unlink")?;
                 FsCore::ensure_entry_removable(parent, name, &inode, "unlink")?;
 
                 if inode.kind == INODE_KIND_DIR {
@@ -441,6 +443,7 @@ impl VirtualFs for VerFs {
                 };
                 let target_inode: InodeRecord = decode_rkyv(&raw)?;
                 FsCore::ensure_inode_writable(&target_inode, "rmdir")?;
+                FsCore::ensure_inode_not_append_only(&target_inode, "rmdir")?;
                 FsCore::ensure_entry_removable(parent, dir_name, &target_inode, "rmdir")?;
                 if target_inode.kind != INODE_KIND_DIR {
                     return Err(anyhow_errno(
@@ -620,6 +623,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut source_inode: InodeRecord = decode_rkyv(&source_inode_raw)?;
                 FsCore::ensure_inode_writable(&source_inode, "rename")?;
+                FsCore::ensure_inode_not_append_only(&source_inode, "rename")?;
                 FsCore::ensure_entry_removable(
                     param.old_parent,
                     &param.old_name,
@@ -658,6 +662,7 @@ impl VirtualFs for VerFs {
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
+                    FsCore::ensure_inode_not_append_only(&target_inode, "rename")?;
                     FsCore::ensure_entry_removable(
                         param.new_parent,
                         &param.new_name,
@@ -733,6 +738,7 @@ impl VirtualFs for VerFs {
                     };
                     let mut target_inode: InodeRecord = decode_rkyv(&target_inode_raw)?;
                     FsCore::ensure_inode_writable(&target_inode, "rename")?;
+                    FsCore::ensure_inode_not_append_only(&target_inode, "rename")?;
                     FsCore::ensure_entry_removable(
                         param.new_parent,
                         &param.new_name,
@@ -826,7 +832,13 @@ impl VirtualFs for VerFs {
         Ok(())
     }
 
-    async fn open(&self, _uid: u32, _gid: u32, ino: u64, flags: u32) -> AsyncFusexResult<u64> {
+    async fn open(
+        &self,
+        _uid: u32,
+        _gid: u32,
+        ino: u64,
+        flags: u32,
+    ) -> AsyncFusexResult<(u64, u32)> {
         let inode = self
             .core
             .load_inode_with_vault_access(ino, "open")
@@ -839,6 +851,27 @@ impl VirtualFs for VerFs {
         }
 
         let oflags = OFlag::from_bits_truncate(flags as i32);
+        let write_open = oflags.contains(OFlag::O_WRONLY) || oflags.contains(OFlag::O_RDWR);
+        if (inode.flags & INODE_FLAG_IMMUTABLE) != 0
+            && (write_open || oflags.contains(OFlag::O_TRUNC))
+        {
+            return build_error_result_from_errno(
+                Errno::EPERM,
+                format!("open: immutable inode {} cannot be opened for writing", ino),
+            );
+        }
+        if (inode.flags & INODE_FLAG_APPEND) != 0
+            && (oflags.contains(OFlag::O_TRUNC)
+                || (write_open && !oflags.contains(OFlag::O_APPEND)))
+        {
+            return build_error_result_from_errno(
+                Errno::EPERM,
+                format!(
+                    "open: append-only inode {} can only be opened for appending",
+                    ino
+                ),
+            );
+        }
         if oflags.contains(OFlag::O_TRUNC) {
             let _mutation_guard = self.core.write_lock.read().await;
             let inode_lock = self.core.inode_write_lock(ino);
@@ -857,7 +890,17 @@ impl VirtualFs for VerFs {
         let inode_data_version = self.core.inode_data_version(ino);
         self.core
             .register_file_handle(fh, ino, inode_data_version);
-        Ok(fh)
+        // Append-only files are opened with direct I/O so the kernel sends
+        // each write at the requested end-of-file offset instead of flushing
+        // page-cache ranges that start at a page boundary before EOF. Direct
+        // I/O also makes MAP_SHARED mmap fail, which would otherwise bypass
+        // the append-only write checks.
+        let open_flags = if (inode.flags & INODE_FLAG_APPEND) != 0 {
+            FOPEN_DIRECT_IO
+        } else {
+            0
+        };
+        Ok((fh, open_flags))
     }
 
     async fn read(
@@ -1463,6 +1506,7 @@ impl VirtualFs for VerFs {
                 };
                 let mut target_inode: InodeRecord = decode_rkyv(&target_raw)?;
                 FsCore::ensure_inode_writable(&target_inode, "link")?;
+                FsCore::ensure_inode_not_append_only(&target_inode, "link")?;
                 if target_inode.kind == INODE_KIND_DIR {
                     return Err(anyhow_errno(
                         Errno::EPERM,
@@ -1909,5 +1953,79 @@ impl VirtualFs for VerFs {
             );
         }
         Ok(())
+    }
+
+    async fn ioctl(
+        &self,
+        ino: u64,
+        _fh: u64,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+    ) -> AsyncFusexResult<(i32, Vec<u8>)> {
+        let inode = self
+            .core
+            .load_inode_with_vault_access(ino, "ioctl")
+            .map_err(map_anyhow_to_fuse)?;
+
+        match cmd {
+            FS_IOC_GETFLAGS => {
+                FsCore::ensure_fileattr_target(&inode, "FS_IOC_GETFLAGS")
+                    .map_err(map_anyhow_to_fuse)?;
+                let out = FsCore::encode_getflags_reply(&inode, out_size)
+                    .map_err(map_anyhow_to_fuse)?;
+                debug!(
+                    ino,
+                    flags = format!("{:#x}", FsCore::fs_flags_from_inode(&inode)),
+                    "FS_IOC_GETFLAGS answered"
+                );
+                Ok((0, out))
+            }
+            FS_IOC_SETFLAGS => {
+                FsCore::ensure_fileattr_target(&inode, "FS_IOC_SETFLAGS")
+                    .map_err(map_anyhow_to_fuse)?;
+                let requested =
+                    FsCore::decode_setflags_request(in_data).map_err(map_anyhow_to_fuse)?;
+                let _mutation_guard = self.core.write_lock.read().await;
+                let updated = self
+                    .core
+                    .set_fileattr_flags(ino, requested)
+                    .await
+                    .map_err(map_anyhow_to_fuse)?;
+                debug!(
+                    ino,
+                    requested = format!("{requested:#x}"),
+                    flags = format!("{:#x}", updated.flags),
+                    "FS_IOC_SETFLAGS persisted"
+                );
+                Ok((0, Vec::new()))
+            }
+            FS_IOC_FSGETXATTR => {
+                FsCore::ensure_fileattr_target(&inode, "FS_IOC_FSGETXATTR")
+                    .map_err(map_anyhow_to_fuse)?;
+                let out = FsCore::encode_fsxattr_reply(&inode, out_size)
+                    .map_err(map_anyhow_to_fuse)?;
+                let mut xflags_bytes = [0_u8; 4];
+                xflags_bytes.copy_from_slice(&out[..4]);
+                debug!(
+                    ino,
+                    xflags = format!("{:#x}", u32::from_le_bytes(xflags_bytes)),
+                    "FS_IOC_FSGETXATTR answered"
+                );
+                Ok((0, out))
+            }
+            unsupported => {
+                warn!(
+                    ino,
+                    cmd = format!("{unsupported:#x}"),
+                    in_data_len = in_data.len(),
+                    out_size,
+                    "unsupported ioctl answered with ENOTTY"
+                );
+                Err(AsyncFusexError::Unimplemented {
+                    context: vec![format!("ioctl cmd {unsupported:#x}")],
+                })
+            }
+        }
     }
 }

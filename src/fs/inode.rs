@@ -246,12 +246,7 @@ impl FsCore {
                 format!("create: parent inode {} is not a directory", parent),
             ));
         }
-        if (parent_inode.flags & INODE_FLAG_READONLY) != 0 {
-            return Err(anyhow_errno(
-                Errno::EROFS,
-                format!("create: parent inode {} is read-only", parent),
-            ));
-        }
+        FsCore::ensure_inode_writable(&parent_inode, "create")?;
         if parent == ROOT_INODE && name == Some(VAULT_DIR_NAME) {
             return Err(anyhow_errno(
                 Errno::EPERM,
@@ -388,7 +383,185 @@ impl FsCore {
                 format!("{context}: read-only inode {}", inode.ino),
             ));
         }
+        if (inode.flags & INODE_FLAG_IMMUTABLE) != 0 {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                format!("{context}: immutable inode {}", inode.ino),
+            ));
+        }
         Ok(())
+    }
+    /// Denies the operations an append-only regular file forbids outright:
+    /// removing or renaming it and linking it to a new name.
+    pub(crate) fn ensure_inode_not_append_only(
+        inode: &InodeRecord,
+        context: &'static str,
+    ) -> Result<()> {
+        if (inode.flags & INODE_FLAG_APPEND) != 0 {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                format!("{context}: append-only inode {}", inode.ino),
+            ));
+        }
+        Ok(())
+    }
+    /// Only regular files and directories carry Linux file attributes; the
+    /// kernel answers ENOTTY for every other inode kind before forwarding an
+    /// ioctl, so reaching this on a symlink or special file is an unsupported
+    /// request.
+    pub(crate) fn ensure_fileattr_target(
+        inode: &InodeRecord,
+        context: &'static str,
+    ) -> Result<()> {
+        if inode.kind != INODE_KIND_FILE && inode.kind != INODE_KIND_DIR {
+            return Err(anyhow_errno(
+                Errno::ENOTTY,
+                format!(
+                    "{context}: inode {} kind {} does not support file attributes",
+                    inode.ino, inode.kind
+                ),
+            ));
+        }
+        Ok(())
+    }
+    /// The FS_* flags reported by `FS_IOC_GETFLAGS`.
+    pub(crate) fn fs_flags_from_inode(inode: &InodeRecord) -> u32 {
+        let mut flags = 0;
+        if (inode.flags & INODE_FLAG_IMMUTABLE) != 0 {
+            flags |= FS_IMMUTABLE_FL;
+        }
+        if (inode.flags & INODE_FLAG_APPEND) != 0 {
+            flags |= FS_APPEND_FL;
+        }
+        if (inode.flags & INODE_FLAG_NODUMP) != 0 {
+            flags |= FS_NODUMP_FL;
+        }
+        flags
+    }
+    /// The FS_XFLAG_* xflags reported by `FS_IOC_FSGETXATTR`.
+    fn fs_xflags_from_inode(inode: &InodeRecord) -> u32 {
+        let mut xflags = 0;
+        if (inode.flags & INODE_FLAG_IMMUTABLE) != 0 {
+            xflags |= FS_XFLAG_IMMUTABLE;
+        }
+        if (inode.flags & INODE_FLAG_APPEND) != 0 {
+            xflags |= FS_XFLAG_APPEND;
+        }
+        if (inode.flags & INODE_FLAG_NODUMP) != 0 {
+            xflags |= FS_XFLAG_NODUMP;
+        }
+        xflags
+    }
+    /// Persisted inode bits for the FS_* flags of a `FS_IOC_SETFLAGS` request.
+    fn inode_flags_from_fs_flags(flags: u32) -> u32 {
+        let mut inode_flags = 0;
+        if (flags & FS_IMMUTABLE_FL) != 0 {
+            inode_flags |= INODE_FLAG_IMMUTABLE;
+        }
+        if (flags & FS_APPEND_FL) != 0 {
+            inode_flags |= INODE_FLAG_APPEND;
+        }
+        if (flags & FS_NODUMP_FL) != 0 {
+            inode_flags |= INODE_FLAG_NODUMP;
+        }
+        inode_flags
+    }
+    /// Encodes the `FS_IOC_GETFLAGS` reply. The kernel requests 8 bytes for a
+    /// 64-bit `long` command, or 4 bytes through its fileattr path.
+    pub(crate) fn encode_getflags_reply(inode: &InodeRecord, out_size: u32) -> Result<Vec<u8>> {
+        if out_size != FS_IOC_GETFLAGS_OUT_SIZE && out_size != FS_IOC_FILEATTR_INT_SIZE {
+            return Err(anyhow_errno(
+                Errno::EINVAL,
+                format!("FS_IOC_GETFLAGS: unsupported output size {out_size}"),
+            ));
+        }
+        let mut out = vec![0_u8; out_size as usize];
+        out[..FS_IOC_FILEATTR_INT_SIZE as usize]
+            .copy_from_slice(&FsCore::fs_flags_from_inode(inode).to_le_bytes());
+        Ok(out)
+    }
+    /// Decodes the `FS_IOC_SETFLAGS` input: `long` (8 bytes) for the 64-bit
+    /// ioctl command, or `int` (4 bytes) through the kernel fileattr path.
+    pub(crate) fn decode_setflags_request(in_data: &[u8]) -> Result<u32> {
+        match in_data.len() as u32 {
+            FS_IOC_FILEATTR_INT_SIZE => {
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(&in_data[..4]);
+                Ok(u32::from_le_bytes(bytes))
+            }
+            FS_IOC_SETFLAGS_IN_SIZE => {
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(&in_data[..8]);
+                let value = u64::from_le_bytes(bytes);
+                u32::try_from(value).map_err(|_| {
+                    anyhow_errno(
+                        Errno::EOPNOTSUPP,
+                        format!("FS_IOC_SETFLAGS: unsupported flags {value:#x}"),
+                    )
+                })
+            }
+            len => Err(anyhow_errno(
+                Errno::EINVAL,
+                format!("FS_IOC_SETFLAGS: unsupported input size {len}"),
+            )),
+        }
+    }
+    /// Encodes the 28-byte `struct fsxattr` returned by `FS_IOC_FSGETXATTR`.
+    /// VerFSNext stores no extent-size or project-id hints, so only the
+    /// xflags field is meaningful.
+    pub(crate) fn encode_fsxattr_reply(inode: &InodeRecord, out_size: u32) -> Result<Vec<u8>> {
+        if out_size != FSXATTR_SIZE {
+            return Err(anyhow_errno(
+                Errno::EINVAL,
+                format!("FS_IOC_FSGETXATTR: unsupported output size {out_size}"),
+            ));
+        }
+        let mut out = vec![0_u8; FSXATTR_SIZE as usize];
+        out[..4].copy_from_slice(&FsCore::fs_xflags_from_inode(inode).to_le_bytes());
+        Ok(out)
+    }
+    /// Applies a `FS_IOC_SETFLAGS` request to one live inode. Every requested
+    /// bit outside the supported `a`, `i` and `d` flags is rejected before
+    /// anything is written.
+    pub(crate) async fn set_fileattr_flags(
+        &self,
+        ino: u64,
+        requested: u32,
+    ) -> Result<InodeRecord> {
+        if (requested & !FS_FL_SUPPORTED_SETTABLE) != 0 {
+            return Err(anyhow_errno(
+                Errno::EOPNOTSUPP,
+                format!(
+                    "FS_IOC_SETFLAGS: unsupported flags {:#x} for inode {ino}",
+                    requested & !FS_FL_SUPPORTED_SETTABLE
+                ),
+            ));
+        }
+
+        let mut updated: Option<InodeRecord> = None;
+        self.meta
+            .write_txn(|txn| {
+                let mut inode = FsCore::load_inode_in_txn(txn, ino, "setflags")?;
+                if (inode.flags & INODE_FLAG_READONLY) != 0 {
+                    return Err(anyhow_errno(
+                        Errno::EROFS,
+                        format!("setflags: read-only inode {ino}"),
+                    ));
+                }
+                inode.flags = (inode.flags & !INODE_FLAG_FILEATTR_MASK)
+                    | FsCore::inode_flags_from_fs_flags(requested);
+                let (sec, nsec) = system_time_to_parts(SystemTime::now());
+                inode.ctime_sec = sec;
+                inode.ctime_nsec = nsec;
+                txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
+                updated = Some(inode);
+                Ok(())
+            })
+            .await?;
+        self.invalidate_inode_cache(ino);
+        self.mark_mutation();
+        self.invalidate_inode_attr_best_effort(ino);
+        updated.ok_or_else(|| anyhow!("setflags: metadata transaction returned no inode"))
     }
     pub(crate) fn remove_inode_payload_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,

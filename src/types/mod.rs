@@ -47,6 +47,49 @@ pub const VAULT_DOMAIN_BYTE: u8 = 0xA7;
 pub const INODE_FLAG_READONLY: u32 = 1 << 0;
 pub const INODE_FLAG_VAULT: u32 = 1 << 1;
 pub const INODE_FLAG_VAULT_ROOT: u32 = 1 << 2;
+/// Linux immutable inode attribute (`chattr +i`). Enforced for every mutation
+/// path; persisted in `InodeRecord::flags` and exposed through
+/// `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`.
+pub const INODE_FLAG_IMMUTABLE: u32 = 1 << 3;
+/// Linux append-only inode attribute (`chattr +a`): data may only be appended
+/// at the current end of file.
+pub const INODE_FLAG_APPEND: u32 = 1 << 4;
+/// Linux nodump inode attribute (`chattr +d`): backup tools skip the file. It
+/// is reported to callers, VerFSNext itself never acts on it.
+pub const INODE_FLAG_NODUMP: u32 = 1 << 5;
+/// The inode flag bits owned by `chattr`/`lsattr`.
+pub const INODE_FLAG_FILEATTR_MASK: u32 =
+    INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND | INODE_FLAG_NODUMP;
+
+/// `FS_IOC_GETFLAGS` (`include/uapi/linux/fs.h`, `_IOR('f', 1, long)`).
+pub const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+/// `FS_IOC_SETFLAGS` (`_IOW('f', 2, long)`).
+pub const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+/// `FS_IOC_FSGETXATTR` (`_IOR('X', 31, struct fsxattr)`).
+pub const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+/// User-visible inode flags a `chattr`/`lsattr` caller can request.
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
+pub const FS_NODUMP_FL: u32 = 0x0000_0040;
+/// The `a`, `i` and `d` bits are the only user-modifiable flags VerFSNext
+/// supports; every other requested bit is answered with EOPNOTSUPP instead of
+/// being silently dropped.
+pub const FS_FL_SUPPORTED_SETTABLE: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL;
+/// `struct fsxattr` xflags that correspond to the supported inode flags.
+pub const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
+pub const FS_XFLAG_APPEND: u32 = 0x0000_0010;
+pub const FS_XFLAG_NODUMP: u32 = 0x0000_0080;
+/// Size of `struct fsxattr`, including its 8 padding bytes.
+pub const FSXATTR_SIZE: u32 = 28;
+/// Size of the output payload of a 64-bit `FS_IOC_GETFLAGS` request: the
+/// kernel decodes the command as `_IOR('f', 1, long)`.
+pub const FS_IOC_GETFLAGS_OUT_SIZE: u32 = 8;
+/// Size of a `long` input payload for a 64-bit `FS_IOC_SETFLAGS` request.
+pub const FS_IOC_SETFLAGS_IN_SIZE: u32 = 8;
+/// Size of the `int` payload the kernel's fileattr path sends for
+/// `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` (4 bytes, independent of the command
+/// size field).
+pub const FS_IOC_FILEATTR_INT_SIZE: u32 = 4;
 
 /// World-writable with the sticky bit (like /tmp): with `fuse_allow_other`
 /// every user can create entries at the top level, but only the owner of an

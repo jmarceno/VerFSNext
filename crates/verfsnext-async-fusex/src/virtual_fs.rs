@@ -244,8 +244,15 @@ pub trait VirtualFs: Sync + Send {
         })
     }
 
-    /// Open a file
-    async fn open(&self, uid: u32, gid: u32, ino: u64, flags: u32) -> AsyncFusexResult<u64>;
+    /// Open a file. Returns the file handle and the `FOPEN_*` flags the kernel
+    /// must use for this handle.
+    async fn open(
+        &self,
+        uid: u32,
+        gid: u32,
+        ino: u64,
+        flags: u32,
+    ) -> AsyncFusexResult<(u64, u32)>;
 
     /// Read data with the given buffer, return current offset and the number of bytes read
     async fn read(
@@ -469,6 +476,24 @@ pub trait VirtualFs: Sync + Send {
     ) -> AsyncFusexResult<()> {
         Err(AsyncFusexError::Unimplemented {
             context: vec!["bmap unimplemented".to_owned()],
+        })
+    }
+
+    /// Handle a restricted ioctl for one inode and return its result code
+    /// together with the output data of exactly `out_size` bytes. Commands the
+    /// filesystem does not implement must return `Unimplemented` so the FUSE
+    /// layer answers ENOTTY.
+    #[allow(unused_variables)]
+    async fn ioctl(
+        &self,
+        ino: u64,
+        fh: u64,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+    ) -> AsyncFusexResult<(i32, Vec<u8>)> {
+        Err(AsyncFusexError::Unimplemented {
+            context: vec!["ioctl unimplemented".to_owned()],
         })
     }
 }

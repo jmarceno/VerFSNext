@@ -30,6 +30,8 @@ use super::file_system::FileSystem;
 use super::fuse_reply::ReplyDirectoryPlus;
 #[cfg(feature = "abi-7-39")]
 use super::fuse_reply::ReplyStatX;
+#[cfg(feature = "abi-7-11")]
+use super::fuse_reply::ReplyIoCtl;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyInit, ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -1114,8 +1116,17 @@ async fn dispatch<'a>(
 
         #[cfg(feature = "abi-7-11")]
         Operation::IoCtl { arg, data } => {
-            warn!("IoCtl unsupported, arg={:?}, data={:?}", arg, data);
-            reply_errno(req, file, Errno::ENOTTY).await
+            let reply = ReplyIoCtl::new(req.unique(), file);
+            fs.ioctl(
+                req,
+                arg.fh,
+                arg.flags,
+                arg.cmd,
+                data,
+                arg.out_size,
+                reply,
+            )
+            .await
         }
         #[cfg(feature = "abi-7-11")]
         Operation::Poll { arg } => {
@@ -1229,7 +1240,3 @@ async fn not_implement_helper(req: &Request<'_>, file: &mut File) -> nix::Result
     reply.error_code(Errno::ENOSYS).await
 }
 
-async fn reply_errno(req: &Request<'_>, file: &mut File, errno: Errno) -> nix::Result<usize> {
-    let reply = ReplyEmpty::new(req.unique(), file);
-    reply.error_code(errno).await
-}

@@ -850,3 +850,64 @@ The GUI reads rates from its existing two-second status poll, retaining the
 30-second full metadata refresh. CLI stats displays the latest completed sample
 and its exact interval. Cumulative I/O and uptime remain separately labeled;
 the old traffic/uptime lifetime average is removed. No storage migration.
+
+## File Attribute ioctls and immutable/append/nodump enforcement
+
+`lsattr`, `chattr`, backup tools (`nodump`) and security hardening (`immutable`,
+`append-only`) reach VerFSNext through `FS_IOC_GETFLAGS`, `FS_IOC_SETFLAGS`
+and `FS_IOC_FSGETXATTR`. These are regular `FUSE_IOCTL` requests (ABI 7.11, no
+init flag required): the kernel sends a 32-byte `fuse_ioctl_in` followed by
+exactly `in_size` bytes of input data and expects a 16-byte `fuse_ioctl_out`
+followed by at most `out_size` bytes of output data. The session used to answer
+every `FUSE_IOCTL` with `ENOTTY`; it now parses the request, forwards it and
+`ReplyIoCtl` writes the out structure plus a payload of exactly `out_size`
+bytes for data-returning commands. In/out data sizes follow both kernel paths:
+the 64-bit command decodes as an 8-byte `long`, while the kernel's fileattr
+path (`fuse_fileattr_get/set` → `fuse_priv_ioctl`) sends a 4-byte `int`.
+`FS_IOC_FSGETXATTR` uses the 28-byte `struct fsxattr`. Unknown commands still
+return `ENOTTY` explicitly.
+
+The flags live in the existing `InodeRecord::flags` word (bits 3, 4 and 5;
+no layout or migration change) and map to the Linux flag values as follows:
+
+| chattr | inode bit | `FS_IOC_GETFLAGS` | `FS_IOC_FSGETXATTR` |
+| --- | --- | --- | --- |
+| `+i` immutable | `1<<3` | `FS_IMMUTABLE_FL` 0x10 | `FS_XFLAG_IMMUTABLE` 0x8 |
+| `+a` append | `1<<4` | `FS_APPEND_FL` 0x20 | `FS_XFLAG_APPEND` 0x10 |
+| `+d` nodump | `1<<5` | `FS_NODUMP_FL` 0x40 | `FS_XFLAG_NODUMP` 0x80 |
+
+`SETFLAGS` replaces only those three bits, rejects any other requested bit with
+`EOPNOTSUPP` before touching metadata, and persists the change in one metadata
+transaction with a ctime bump. `GETFLAGS` reports only those three bits, so
+`lsattr` shows clean attributes for ordinary files. `nodump` is stored and
+reported only; VerFSNext never acts on it.
+
+Enforcement is wired into the central mutation helpers so no path can bypass
+it. `ensure_inode_writable` (used by write staging, truncate, setattr,
+setxattr/removexattr, unlink, rmdir, rename, link and fallocate) rejects
+immutable inodes with `EPERM`, and `create_inode_in_txn` applies the same check
+to the parent so an immutable directory cannot gain entries. Append-only
+regular files additionally require each staged write to extend the file
+contiguously from its current end (checked in the same transaction snapshot
+that the write commits against), reject `O_TRUNC` and write opens without
+`O_APPEND`, reject shrinking truncate/setattr-size and fallocate, and refuse
+unlink/rename/link with `EPERM`. Growing `ftruncate` through an `O_APPEND`
+descriptor is allowed.
+
+Append-only inodes are opened with `FOPEN_DIRECT_IO`. This is required for
+correctness, not performance: with the writeback cache the kernel flushes dirty
+page-cache ranges starting at a page boundary, so appending 6 bytes to a
+6-byte file arrives as `offset=0, len=12` instead of `offset=6`. At the FUSE
+protocol level that is indistinguishable from rewriting the existing bytes, so
+a writeback-cache append would either be rejected or would have to accept a
+rewrite of data below EOF. Direct I/O delivers every write at the requested
+end-of-file offset, and it also makes `MAP_SHARED` mmap fail
+(`ENODEV` without `FUSE_DIRECT_IO_ALLOW_MMAP`), closing a second bypass.
+
+The generic VFS fileattr code gates `FS_IMMUTABLE_FL`/`FS_APPEND_FL` behind
+`CAP_LINUX_IMMUTABLE` before the request reaches the filesystem, so an
+unprivileged `chattr +i/+a` fails with `EPERM` on this host (and so does
+clearing them); `+d` needs no capability and works end to end. VerFSNext still
+enforces and persists the flags correctly when they arrive, which is what a
+privileged caller or a future kernel without that gate sees; see B060 for the
+validation method.

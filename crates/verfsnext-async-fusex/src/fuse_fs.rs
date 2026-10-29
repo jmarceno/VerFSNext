@@ -5,6 +5,8 @@ use crate::fs_util::*;
 use crate::fuse_reply::ReplyDirectoryPlus;
 #[cfg(feature = "abi-7-39")]
 use crate::fuse_reply::ReplyStatX;
+#[cfg(feature = "abi-7-11")]
+use crate::fuse_reply::ReplyIoCtl;
 use crate::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -157,12 +159,11 @@ impl FileSystem for FuseFs {
         let open_res = self.virtual_fs.open(req.uid(), req.gid(), ino, flags).await;
 
         match open_res {
-            Ok(fd) => {
+            Ok((fd, mut reply_flags)) => {
                 debug!(
-                    "fusefilesystem call open() successfully opened ino={} with flags={:?}, the fd={}",
-                    ino, flags, fd,
+                    "fusefilesystem call open() successfully opened ino={} with flags={:?}, the fd={}, reply flags={}",
+                    ino, flags, fd, reply_flags,
                 );
-                let mut reply_flags = 0;
                 if self.direct_io {
                     reply_flags |= crate::protocol::FOPEN_DIRECT_IO;
                 }
@@ -1639,6 +1640,62 @@ impl FileSystem for FuseFs {
                 debug!(
                     "fusefilesystem call bmap() failed to map the block index of ino={} to block index of device, the error is: {:?}",
                     ino, e,
+                );
+                reply.error(e).await
+            }
+        }
+    }
+
+    /// Handle a restricted ioctl.
+    #[cfg(feature = "abi-7-11")]
+    #[allow(clippy::too_many_arguments)]
+    async fn ioctl(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: ReplyIoCtl<'_>,
+    ) -> nix::Result<usize> {
+        let ino = req.nodeid();
+        debug!(
+            "ioctl(ino={}, fh={}, flags={:#x}, cmd={:#x}, in_size={}, out_size={}, req={:?})",
+            ino,
+            fh,
+            flags,
+            cmd,
+            in_data.len(),
+            out_size,
+            req,
+        );
+
+        match self
+            .virtual_fs
+            .ioctl(ino, fh, cmd, in_data, out_size)
+            .await
+        {
+            Ok((result, out)) => {
+                debug!(
+                    "fusefilesystem call ioctl() returned result={} with {} output bytes for ino={}",
+                    result,
+                    out.len(),
+                    ino,
+                );
+                reply.ioctl(result, out).await
+            }
+            Err(AsyncFusexError::Unimplemented { context }) => {
+                debug!(
+                    "fusefilesystem call ioctl() does not implement cmd={:#x} for ino={}: {:?}",
+                    cmd, ino, context,
+                );
+                reply.error_code(Errno::ENOTTY).await
+            }
+            Err(e) => {
+                debug!(
+                    "fusefilesystem call ioctl() failed for ino={} cmd={:#x}, the error is: {:?}",
+                    ino, cmd, e,
                 );
                 reply.error(e).await
             }

@@ -22,6 +22,8 @@ use tracing::debug;
 use super::abi_marker;
 #[cfg(feature = "abi-7-21")]
 use super::protocol::FuseDirEntPlus;
+#[cfg(feature = "abi-7-11")]
+use super::protocol::FuseIoCtlOut;
 use super::protocol::{
     FuseAttr, FuseAttrOut, FuseBMapOut, FuseDirEnt, FuseEntryOut, FuseFileLock, FuseGetXAttrOut,
     FuseInitOut, FuseKStatFs, FuseLockOut, FuseLSeekOut, FuseOpenOut, FuseOutHeader,
@@ -376,6 +378,10 @@ impl_as_ioslice_for! {
 impl_as_ioslice_for! {
     FuseNotifyDeleteOut,
 }
+#[cfg(feature = "abi-7-11")]
+impl_as_ioslice_for! {
+    FuseIoCtlOut,
+}
 #[cfg(feature = "abi-7-39")]
 impl_as_ioslice_for! {
     FuseStatxOut,
@@ -617,6 +623,52 @@ impl ReplyBMap<'_> {
     #[allow(dead_code)]
     pub async fn bmap(self, block: u64) -> nix::Result<usize> {
         self.reply.send(FuseBMapOut { block }).await
+    }
+}
+
+/// FUSE ioctl response
+#[cfg(feature = "abi-7-11")]
+#[derive(Debug)]
+pub struct ReplyIoCtl<'a> {
+    /// The inner raw reply
+    reply: ReplyRaw<'a>,
+}
+
+#[cfg(feature = "abi-7-11")]
+impl<'a> ReplyIoCtl<'a> {
+    /// New fuse ioctl reply
+    #[must_use]
+    pub fn new(unique: u64, file: &'a mut File) -> Self {
+        Self {
+            reply: ReplyRaw::new(unique, file),
+        }
+    }
+
+    /// Reply with the ioctl result and the output payload. The kernel rejects
+    /// a payload longer than the `out_size` of the request, so `out` must be
+    /// exactly `out_size` bytes for the commands that return data.
+    pub async fn ioctl(self, result: i32, out: Vec<u8>) -> nix::Result<usize> {
+        self.reply
+            .send((
+                FuseIoCtlOut {
+                    result,
+                    flags: 0,
+                    in_iovs: 0,
+                    out_iovs: 0,
+                },
+                out,
+            ))
+            .await
+    }
+
+    /// Reply with an error code
+    pub async fn error_code(self, error_code: Errno) -> nix::Result<usize> {
+        self.reply.send_error_code(error_code).await
+    }
+
+    /// Reply with an error
+    pub async fn error(self, err: AsyncFusexError) -> nix::Result<usize> {
+        self.reply.send_error(err).await
     }
 }
 

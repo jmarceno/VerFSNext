@@ -166,6 +166,32 @@ impl FsCore {
         }
         FsCore::ensure_inode_writable(inode, "write")
     }
+    /// Append-only files accept writes only when they extend the file
+    /// contiguously from its current end.
+    fn ensure_append_only_write_offsets(
+        inode: &InodeRecord,
+        segments: &[WriteOp],
+    ) -> Result<()> {
+        if (inode.flags & INODE_FLAG_APPEND) == 0 {
+            return Ok(());
+        }
+        let mut expected = inode.size;
+        for segment in segments {
+            if segment.offset != expected {
+                return Err(anyhow_errno(
+                    Errno::EPERM,
+                    format!(
+                        "append-only inode {}: write at offset {} is not the end of file {}",
+                        inode.ino, segment.offset, expected
+                    ),
+                ));
+            }
+            expected = expected
+                .checked_add(segment.data.len() as u64)
+                .ok_or_else(|| anyhow_errno(Errno::EFBIG, "append write offset overflows"))?;
+        }
+        Ok(())
+    }
 
     /// Plans the extents of one inode after its batched writes.
     ///
@@ -482,6 +508,15 @@ impl FsCore {
             ));
         }
         FsCore::ensure_inode_writable(&inode, "truncate")?;
+        if (inode.flags & INODE_FLAG_APPEND) != 0 && new_size < inode.size {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                format!(
+                    "truncate: append-only inode {} cannot shrink from {} to {}",
+                    inode.ino, inode.size, new_size
+                ),
+            ));
+        }
 
         if new_size == inode.size {
             return Ok((inode, None));
@@ -624,6 +659,7 @@ impl FsCore {
             ));
         }
         FsCore::ensure_inode_writable(&inode, "fallocate")?;
+        FsCore::ensure_inode_not_append_only(&inode, "fallocate")?;
 
         let end = offset
             .checked_add(length)
@@ -778,6 +814,14 @@ impl FsCore {
             ));
         }
         FsCore::ensure_inode_writable(&dest, "copy_file_range")?;
+        // Cloning extents into an append-only file would write below EOF
+        // without passing the append-only check the write path applies.
+        if (dest.flags & INODE_FLAG_APPEND) != 0 {
+            return Err(anyhow_errno(
+                Errno::EPERM,
+                "copy_file_range cannot write into an append-only file",
+            ));
+        }
         if FsCore::inode_is_vault(&source) != FsCore::inode_is_vault(&dest) {
             return Err(anyhow_errno(
                 Errno::EXDEV,
@@ -1051,6 +1095,7 @@ impl FsCore {
         if group.segments.is_empty() {
             return Ok(HashMap::new());
         }
+        FsCore::ensure_append_only_write_offsets(&inode, &group.segments)?;
         let plan = self.prepare_write_plan(group, &inode, txn).await?;
 
         let inode_lock = self.inode_write_lock(group.ino);
