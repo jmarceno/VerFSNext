@@ -96,6 +96,13 @@ pub struct InodeRecord {
     pub ctime_nsec: u32,
     pub generation: u64,
     pub flags: u32,
+    /// Birth (creation) time of the inode, reported by statx. Added in storage
+    /// schema v2; older metadata is upgraded by `migration::inode_schema_v2`.
+    pub btime_sec: i64,
+    pub btime_nsec: u32,
+    /// Device ID (`new_encode_dev` encoding) of a block/character device node.
+    /// Zero for every other inode kind. Added in storage schema v2.
+    pub rdev: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]

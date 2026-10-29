@@ -78,6 +78,30 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
 /// FUSE minor version number 7.31
 #[cfg(all(feature = "abi-7-31", not(feature = "abi-7-32")))]
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
+/// FUSE minor version number 7.32
+#[cfg(all(feature = "abi-7-32", not(feature = "abi-7-33")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 32;
+/// FUSE minor version number 7.33
+#[cfg(all(feature = "abi-7-33", not(feature = "abi-7-34")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 33;
+/// FUSE minor version number 7.34
+#[cfg(all(feature = "abi-7-34", not(feature = "abi-7-35")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 34;
+/// FUSE minor version number 7.35
+#[cfg(all(feature = "abi-7-35", not(feature = "abi-7-36")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 35;
+/// FUSE minor version number 7.36
+#[cfg(all(feature = "abi-7-36", not(feature = "abi-7-37")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
+/// FUSE minor version number 7.37
+#[cfg(all(feature = "abi-7-37", not(feature = "abi-7-38")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 37;
+/// FUSE minor version number 7.38
+#[cfg(all(feature = "abi-7-38", not(feature = "abi-7-39")))]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 38;
+/// FUSE minor version number 7.39
+#[cfg(feature = "abi-7-39")]
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 39;
 
 /// FUSE attribute `fuse_attr`
 #[repr(C)]
@@ -113,8 +137,13 @@ pub struct FuseAttr {
     /// Block size
     #[cfg(feature = "abi-7-9")]
     pub blksize: u32,
-    /// Alignment padding
-    #[cfg(feature = "abi-7-9")]
+    /// Per-inode attribute flags (`FUSE_ATTR_*`), added in FUSE ABI 7.32. Older
+    /// kernels see the same bytes as reserved padding, so the field keeps the
+    /// historical size on every supported ABI.
+    #[cfg(feature = "abi-7-32")]
+    pub flags: u32,
+    /// Alignment padding for kernels before ABI 7.32
+    #[cfg(all(feature = "abi-7-9", not(feature = "abi-7-32")))]
     pub padding: u32,
 }
 
@@ -138,7 +167,10 @@ impl std::fmt::Debug for FuseAttr {
             self.uid,
             self.gid,
             self.rdev,
-        )
+        )?;
+        #[cfg(feature = "abi-7-32")]
+        write!(f, ",flags={:#x}", self.flags)?;
+        Ok(())
     }
 }
 
@@ -537,6 +569,9 @@ pub enum FuseOpCode {
     /// Copy a range of data from an opened file to another
     // #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
+    /// Answer a statx request with full attributes including birth time
+    #[cfg(feature = "abi-7-39")]
+    FUSE_STATX = 52,
     /// CUSE specific operations
     #[cfg(feature = "abi-7-11")]
     CUSE_INIT = 4096,
@@ -683,6 +718,138 @@ pub struct FuseAttrOut {
     pub dummy: u32,
     /// FUSE file attribute
     pub attr: FuseAttr,
+}
+
+/// FUSE statx timestamp `fuse_sx_time`
+#[cfg(feature = "abi-7-39")]
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct FuseStatxTime {
+    /// Seconds since the epoch
+    pub sec: i64,
+    /// Nano-seconds within the second
+    pub nsec: u32,
+    /// Reserved for future use
+    pub reserved: i32,
+}
+
+/// FUSE statx attribute payload `fuse_statx`
+///
+/// This is the statx body of the `fuse_statx_out` reply. The spare tail is
+/// part of the ABI: the kernel requires the reply to be exactly the size of
+/// this struct, so the reserved space must stay.
+#[cfg(feature = "abi-7-39")]
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct FuseStatx {
+    /// Requested/reported attribute mask (`STATX_*`)
+    pub mask: u32,
+    /// Preferred I/O block size
+    pub blksize: u32,
+    /// Inode attribute flags (`STATX_ATTR_*`)
+    pub attributes: u64,
+    /// Number of hard links
+    pub nlink: u32,
+    /// Owner user ID
+    pub uid: u32,
+    /// Owner group ID
+    pub gid: u32,
+    /// File mode (type and permission bits)
+    pub mode: u16,
+    /// Reserved for future use
+    pub spare0: u16,
+    /// Inode number
+    pub ino: u64,
+    /// File size in bytes
+    pub size: u64,
+    /// Number of 512-byte blocks allocated
+    pub blocks: u64,
+    /// Mask of supported attribute flags in `attributes`
+    pub attributes_mask: u64,
+    /// Last access time
+    pub atime: FuseStatxTime,
+    /// Creation (birth) time
+    pub btime: FuseStatxTime,
+    /// Last status change time
+    pub ctime: FuseStatxTime,
+    /// Last data modification time
+    pub mtime: FuseStatxTime,
+    /// Device ID of the file if it is a special file (major)
+    pub rdev_major: u32,
+    /// Device ID of the file if it is a special file (minor)
+    pub rdev_minor: u32,
+    /// Device ID of the filesystem holding the file (major)
+    pub dev_major: u32,
+    /// Device ID of the filesystem holding the file (minor)
+    pub dev_minor: u32,
+    /// Reserved for future use
+    pub spare2: [u64; 14],
+}
+
+/// FUSE statx request input `fuse_statx_in`
+#[cfg(feature = "abi-7-39")]
+#[derive(Debug)]
+#[repr(C)]
+pub struct FuseStatxIn {
+    /// Getattr flags (`FUSE_GETATTR_FH`)
+    pub getattr_flags: u32,
+    /// Reserved for future use
+    pub reserved: u32,
+    /// File handler, valid when `getattr_flags` has `FUSE_GETATTR_FH`
+    pub fh: u64,
+    /// Sync flags (`AT_STATX_SYNC_*`)
+    pub sx_flags: u32,
+    /// Requested attribute mask (`STATX_*`)
+    pub sx_mask: u32,
+}
+
+/// FUSE statx response `fuse_statx_out`
+#[cfg(feature = "abi-7-39")]
+#[derive(Debug)]
+#[repr(C)]
+pub struct FuseStatxOut {
+    /// Cache timeout seconds for the attributes
+    pub attr_valid: u64,
+    /// Cache timeout nano-seconds for the attributes
+    pub attr_valid_nsec: u32,
+    /// Future extension flags
+    pub flags: u32,
+    /// Spare space for future extensions
+    pub spare: [u64; 2],
+    /// The statx attributes
+    pub statx: FuseStatx,
+}
+
+/// `STATX_*` attribute mask bits reported by statx
+pub mod statx_masks {
+    /// File type is reported
+    pub const STATX_TYPE: u32 = 0x0000_0001;
+    /// File mode permission bits are reported
+    pub const STATX_MODE: u32 = 0x0000_0002;
+    /// Number of hard links is reported
+    pub const STATX_NLINK: u32 = 0x0000_0004;
+    /// Owner user ID is reported
+    pub const STATX_UID: u32 = 0x0000_0008;
+    /// Owner group ID is reported
+    pub const STATX_GID: u32 = 0x0000_0010;
+    /// Last access time is reported
+    pub const STATX_ATIME: u32 = 0x0000_0020;
+    /// Last data modification time is reported
+    pub const STATX_MTIME: u32 = 0x0000_0040;
+    /// Last status change time is reported
+    pub const STATX_CTIME: u32 = 0x0000_0080;
+    /// Inode number is reported
+    pub const STATX_INO: u32 = 0x0000_0100;
+    /// File size is reported
+    pub const STATX_SIZE: u32 = 0x0000_0200;
+    /// Number of allocated blocks is reported
+    pub const STATX_BLOCKS: u32 = 0x0000_0400;
+    /// Creation (birth) time is reported
+    pub const STATX_BTIME: u32 = 0x0000_0800;
+    /// Every basic attribute of `struct statx` is reported
+    pub const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+    /// Every attribute of `struct statx` is reported
+    pub const STATX_ALL: u32 = 0x0000_0fff;
 }
 
 /// FUSE make node request input `fuse_mknod_in`

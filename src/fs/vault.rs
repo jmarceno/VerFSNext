@@ -226,6 +226,9 @@ impl FsCore {
                     ctime_nsec: nsec,
                     generation: 1,
                     flags: INODE_FLAG_VAULT | INODE_FLAG_VAULT_ROOT,
+                    btime_sec: sec,
+                    btime_nsec: nsec,
+                    rdev: 0,
                 };
                 txn.set(inode_key(vault_ino), encode_rkyv(&vault_inode)?)?;
                 txn.set(

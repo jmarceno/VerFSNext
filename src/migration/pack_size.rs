@@ -11,6 +11,7 @@ use crate::data::pack::PackStore;
 use crate::fs::utils::scan_range_pairs;
 use crate::meta::MetaStore;
 use crate::migration::pack_index_crc32::ensure_pack_index_crc32_compat;
+use crate::migration::inode_schema_v2::ensure_inode_schema_v2_migrated;
 use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::{ensure_dir, set_file_mode};
 use crate::types::{
@@ -89,6 +90,7 @@ pub async fn run_pack_size_migration(config: &Config) -> Result<()> {
 async fn run_pack_size_migration_inner(config: &Config, meta: &MetaStore) -> Result<()> {
     ensure_pack_index_crc32_compat(config, meta).await?;
     ensure_vault_chunk_keys_migrated(meta).await?;
+    ensure_inode_schema_v2_migrated(meta).await?;
     let target_pack_size_mb = config.pack_max_size_mb;
     let Some(current_pack_size_mb) = read_stored_pack_size_mb(meta)? else {
         meta.write_txn(|txn| {

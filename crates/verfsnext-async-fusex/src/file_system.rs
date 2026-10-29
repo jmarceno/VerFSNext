@@ -5,6 +5,8 @@ use async_trait::async_trait;
 
 #[cfg(feature = "abi-7-21")]
 use super::fuse_reply::ReplyDirectoryPlus;
+#[cfg(feature = "abi-7-39")]
+use super::fuse_reply::ReplyStatX;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -45,6 +47,15 @@ pub trait FileSystem {
 
     /// Get file attributes.
     async fn getattr(&self, req: &Request<'_>, reply: ReplyAttr<'_>) -> nix::Result<usize>;
+
+    /// Get file attributes including the birth time (FUSE_STATX).
+    #[cfg(feature = "abi-7-39")]
+    async fn statx(
+        &self,
+        req: &Request<'_>,
+        fh: Option<u64>,
+        reply: ReplyStatX<'_>,
+    ) -> nix::Result<usize>;
 
     /// Set file attributes.
     async fn setattr(

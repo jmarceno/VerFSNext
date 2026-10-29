@@ -37,6 +37,48 @@ accepted.
 | `pack_index_crc32_migration_v1` | marker missing | Rewrites every `.idx` with the fixed-size record that carries `payload_crc32`. |
 | `pack_max_size_mb` | key missing | Stores the configured pack size on first mount (legacy upgrade path). |
 | `vault_chunk_keys_migration_v1` | marker missing | Moves vault chunk records (and inline payloads) from the shared chunk key to the domain-tagged vault key. |
+| `inode_schema_v2_migration_v1` | marker missing | Rewrites every inode record to storage schema v2, which adds birth time (`btime`) and the device id (`rdev`). |
+
+## Inode schema v2 migration (`inode_schema_v2_migration_v1`)
+
+### Why
+
+`statx(2)` needs a birth (creation) time, and block/character device nodes need
+a device id. `InodeRecord` had neither, so the statx and `mknod` work added
+`btime_sec`, `btime_nsec` and `rdev` to the record. Adding fields changes the
+rkyv archive, and the current binary cannot decode an inode written by an older
+version (and an older binary cannot decode the new layout: downgrade is not
+supported after this migration).
+
+### What it does
+
+Every inode record under the `I` key space is rewritten in place, including
+the inodes owned by snapshots (they share the same key space). For each record:
+
+- `btime_sec`/`btime_nsec` are set to the inode's current ctime. The original
+  creation time was never recorded, so ctime is the best available
+  approximation, matching what other filesystems report for files created
+  before they gained birth time.
+- `rdev` is set to 0. Device nodes could not be created before schema v2.
+
+The rewrite runs in metadata transactions of up to 10,000 inodes, and the
+marker is committed only after every record was upgraded. A crash in the
+middle of the scan resumes cleanly: schema v1 and v2 records have different
+archived lengths, records already in the v2 layout are skipped, and the inode
+number of each decoded record is checked against its key. A record with an
+unexpected length, or one whose inode number does not match the key, aborts the
+mount with an explicit error instead of being rewritten.
+
+The migration also re-applies the `.snapshots` read-only inode flag. That repair
+used to run in `MetaStore::bootstrap` on every open, but bootstrap cannot decode
+an inode before this migration has run, so the one-time repair moved here.
+
+### What it cannot fix
+
+The real creation time of files that existed before the upgrade is gone; they
+report their ctime as birth time. Files created after the upgrade record their
+real birth time. Downgrading to a binary that predates schema v2 will not open
+the migrated data directory.
 
 ## Vault chunk key migration (`vault_chunk_keys_migration_v1`)
 

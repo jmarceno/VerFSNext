@@ -127,6 +127,9 @@ impl MetaStore {
             ctime_nsec: nsec,
             generation: 1,
             flags: 0,
+            btime_sec: sec,
+            btime_nsec: nsec,
+            rdev: 0,
         };
 
         self.write_txn(|txn| {
@@ -235,6 +238,9 @@ impl MetaStore {
                     ctime_nsec: nsec,
                     generation: 1,
                     flags: INODE_FLAG_READONLY,
+                    btime_sec: sec,
+                    btime_nsec: nsec,
+                    rdev: 0,
                 };
 
                 root_inode.nlink = root_inode.nlink.saturating_add(1);
@@ -253,15 +259,6 @@ impl MetaStore {
                     })?,
                 )?;
                 txn.set(next_inode_key, next_inode.to_le_bytes().to_vec())?;
-            } else if let Some(raw_dirent) = snapshots_dirent_raw {
-                let dirent: DirentRecord = decode_rkyv(&raw_dirent)?;
-                if let Some(raw_inode) = txn.get(inode_key(dirent.ino))? {
-                    let mut inode: InodeRecord = decode_rkyv(&raw_inode)?;
-                    if (inode.flags & INODE_FLAG_READONLY) == 0 {
-                        inode.flags |= INODE_FLAG_READONLY;
-                        txn.set(inode_key(inode.ino), encode_rkyv(&inode)?)?;
-                    }
-                }
             }
             Ok(())
         })

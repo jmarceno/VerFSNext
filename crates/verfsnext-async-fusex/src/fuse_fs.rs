@@ -3,6 +3,8 @@ use crate::file_system::FileSystem;
 use crate::fs_util::*;
 #[cfg(feature = "abi-7-21")]
 use crate::fuse_reply::ReplyDirectoryPlus;
+#[cfg(feature = "abi-7-39")]
+use crate::fuse_reply::ReplyStatX;
 use crate::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -104,6 +106,31 @@ impl FileSystem for FuseFs {
             Err(err) => {
                 // In the previous version ,this panic will never happen.
                 debug!("getattr() failed to get the attr of ino={ino}, the error is: {err}",);
+                reply.error(err).await
+            }
+        }
+    }
+
+    /// Get file attributes including the birth time.
+    #[cfg(feature = "abi-7-39")]
+    async fn statx(
+        &self,
+        req: &Request<'_>,
+        fh: Option<u64>,
+        reply: ReplyStatX<'_>,
+    ) -> nix::Result<usize> {
+        let ino = req.nodeid();
+        debug!("statx(ino={}, fh={:?}, req={:?})", ino, fh, req);
+
+        match self.virtual_fs.statx(ino, fh).await {
+            Ok((ttl, param)) => {
+                debug!("statx() got the attributes of ino={}: {:?}", ino, param);
+                reply
+                    .statx(ttl, fs_util::convert_to_fuse_statx(param))
+                    .await
+            }
+            Err(err) => {
+                debug!("statx() failed for ino={ino}, the error is: {err}");
                 reply.error(err).await
             }
         }

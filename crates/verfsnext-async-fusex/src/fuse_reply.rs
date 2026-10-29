@@ -27,6 +27,8 @@ use super::protocol::{
     FuseInitOut, FuseKStatFs, FuseLockOut, FuseLSeekOut, FuseOpenOut, FuseOutHeader,
     FuseStatFsOut, FuseWriteOut,
 };
+#[cfg(feature = "abi-7-39")]
+use super::protocol::{FuseStatx, FuseStatxOut};
 #[cfg(feature = "abi-7-18")]
 use super::protocol::{FuseNotifyCode::FUSE_NOTIFY_DELETE, FuseNotifyDeleteOut};
 
@@ -374,6 +376,10 @@ impl_as_ioslice_for! {
 impl_as_ioslice_for! {
     FuseNotifyDeleteOut,
 }
+#[cfg(feature = "abi-7-39")]
+impl_as_ioslice_for! {
+    FuseStatxOut,
+}
 
 /// FUSE init response
 #[derive(Debug)]
@@ -625,6 +631,51 @@ impl ReplyLSeek<'_> {
     /// Reply with the resulting offset.
     pub async fn lseek(self, offset: u64) -> nix::Result<usize> {
         self.reply.send(FuseLSeekOut { offset }).await
+    }
+}
+
+/// FUSE statx response
+#[cfg(feature = "abi-7-39")]
+#[derive(Debug)]
+pub struct ReplyStatX<'a> {
+    /// The inner raw reply
+    reply: ReplyRaw<'a>,
+}
+
+#[cfg(feature = "abi-7-39")]
+impl<'a> ReplyStatX<'a> {
+    /// Create a statx reply
+    #[must_use]
+    pub fn new(unique: u64, file: &'a mut File) -> Self {
+        Self {
+            reply: ReplyRaw::new(unique, file),
+        }
+    }
+}
+
+#[cfg(feature = "abi-7-39")]
+impl ReplyStatX<'_> {
+    /// Reply with the statx attributes.
+    pub async fn statx(self, ttl: Duration, statx: FuseStatx) -> nix::Result<usize> {
+        self.reply
+            .send(FuseStatxOut {
+                attr_valid: ttl.as_secs(),
+                attr_valid_nsec: ttl.subsec_nanos(),
+                flags: 0,
+                spare: [0_u64; 2],
+                statx,
+            })
+            .await
+    }
+
+    /// Reply with an error code.
+    pub async fn error_code(self, error_code: Errno) -> nix::Result<usize> {
+        self.reply.send_error_code(error_code).await
+    }
+
+    /// Reply with an error.
+    pub async fn error(self, err: crate::error::AsyncFusexError) -> nix::Result<usize> {
+        self.reply.send_error(err).await
     }
 }
 

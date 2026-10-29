@@ -164,6 +164,16 @@ pub trait VirtualFs: Sync + Send {
     /// Get file attributes.
     async fn getattr(&self, ino: u64) -> AsyncFusexResult<(Duration, FileAttr)>;
 
+    /// Get the full statx attributes of an inode, including its birth time.
+    ///
+    /// `fh` is the open file handle when the kernel sent one
+    /// (`FUSE_GETATTR_FH`), so the answer can use the opened file identity.
+    async fn statx(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+    ) -> AsyncFusexResult<(Duration, StatxParam)>;
+
     /// Set file attributes.
     async fn setattr(
         &self,

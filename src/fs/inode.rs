@@ -33,7 +33,7 @@ impl FsCore {
             nlink: inode.nlink,
             uid: inode.uid,
             gid: inode.gid,
-            rdev: 0,
+            rdev: inode.rdev,
             version: inode.generation,
         }
     }
@@ -253,6 +253,9 @@ impl FsCore {
             ctime_nsec: nsec,
             generation: 1,
             flags: inherited_flags,
+            btime_sec: sec,
+            btime_nsec: nsec,
+            rdev: 0,
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;

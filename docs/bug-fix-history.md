@@ -2491,3 +2491,75 @@ syncs and detaches the mount itself.
 
 `crates/verfsnext-async-fusex/src/session.rs`, `src/lib.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B060 - statx Returned No Birth Time and the FUSE ABI Stopped at 7.31 - Oct 29 2026
+
+### Symptom
+
+`stat -c %W` returned 0 for every file: `FUSE_STATX` (opcode 52) was unknown to
+the daemon, which answered `ENOSYS`, so the kernel disabled statx for the mount
+and filled birth time with zero. The daemon also logged `ERROR Unknown
+operation code found: 52` once per mount. The kernel already sends newer
+opcodes regardless of the negotiated minor version, so the vendored protocol
+layer had fallen behind the kernel it runs on.
+
+### Root Cause
+
+The vendored `crates/verfsnext-async-fusex` protocol only knew FUSE ABI up to
+7.31. `FUSE_STATX` is part of ABI 7.39 and the reply is a distinct 288-byte
+`struct fuse_statx_out`, not a `fuse_attr`, so there was no way to answer it.
+Birth time also had no storage: `InodeRecord` had no `btime` field, so even a
+correct statx reply could not have reported a creation time.
+
+### Fix
+
+- The vendored crate now supports ABI 7.39 (`abi-7-32` ... `abi-7-39`
+  features, default `abi-7-39`). `fuse_attr` gained the real `flags` field
+  where older code kept padding (same size, so replies stay byte-compatible),
+  and the statx request/response structures were added with compile-time size
+  assertions (16/24/256/288 bytes) matching the kernel ABI.
+- `FUSE_STATX` is parsed in `fuse_request.rs`, dispatched by `session.rs`
+  (only `FUSE_GETATTR_FH` is honoured) and answered from a new
+  `VirtualFs::statx` implementation in `src/fs/fuse.rs`. The reply carries
+  `STATX_BASIC_STATS | STATX_BTIME`.
+- `InodeRecord` now stores `btime_sec`, `btime_nsec` and `rdev` (the device id
+  used by the block/character device work). New inodes get birth time at
+  creation; the value never changes afterwards.
+- A one-time migration (`src/migration/inode_schema_v2.rs`, marker
+  `SYS:inode_schema_v2_migration_v1`) rewrites every stored inode record to
+  the new layout, including snapshot inodes. Existing inodes get
+  `btime = ctime` (the best available approximation, as other filesystems did
+  when they gained birth time) and `rdev = 0`. The migration is batched,
+  crash-resumable (schema v1 and v2 records are told apart by their exact
+  archived length and the inode key is validated) and runs before any inode is
+  read on every path that opens a data directory (daemon, offline snapshot and
+  pack-size commands). It also performs the `.snapshots` read-only repair that
+  used to run in `MetaStore::bootstrap`, which can no longer decode an inode
+  before the upgrade.
+
+### Data integrity
+
+The record layout change is the risky part: `MetaStore::bootstrap` used to
+decode the `.snapshots` inode on every open, which would have failed (or, worse,
+silently misread) before the migration. That decode was removed and the repair
+moved into the migration. The migration reads each record once, rewrites it in
+the same transaction, validates the inode number against the key, aborts on any
+unexpected record length instead of guessing, and writes its marker only after
+every record was visited. File data, extents, chunk refcounts and directory
+entries are untouched.
+
+### Validation
+
+- Fresh data directory: mount negotiates ABI 7.39; `stat -c %W` returns the
+  creation time; a file modified 1.2 s later keeps `btime` while `ctime`/`mtime`
+  move; directories and symlinks report birth time too; `upgraded_inodes=0` on
+  the first open (the new records are already v2).
+- Migration from a data directory written by the previous binary (files, hard
+  link, symlink, FIFO, nested directories, an existing snapshot): mount
+  succeeds, every sha256 matches the pre-upgrade values, hard links keep one
+  inode, `.snapshots/snap1` still lists the tree, every inode reports
+  `btime = ctime`, and a second mount is a no-op (`upgraded_inodes` is not
+  logged again) with the same content.
+- Mount regression probe: lookup/getattr/readdir/create/write/read/hardlink/
+  symlink/xattr/statfs and a 1 MiB random file round-trip all behave as before.
+- `cargo remote -h -- test` and a release build pass.

@@ -51,6 +51,110 @@ pub struct StatFsParam {
     pub frsize: u32,
 }
 
+/// Full `struct statx` view of an inode, including the birth time.
+///
+/// The statx reply is not a `fuse_attr`: it has its own mask, attribute flags,
+/// device ids and timestamps (the kernel requires a fixed 288 byte reply and
+/// the kernel caches attributes from it).
+#[derive(Debug, Clone, Copy)]
+pub struct StatxParam {
+    /// Attribute mask (`STATX_*`) the filesystem reports
+    pub mask: u32,
+    /// Preferred I/O block size
+    pub blksize: u32,
+    /// Inode attribute flags (`STATX_ATTR_*`)
+    pub attributes: u64,
+    /// Mask of the bits in `attributes` the filesystem supports
+    pub attributes_mask: u64,
+    /// Number of hard links
+    pub nlink: u32,
+    /// Owner user ID
+    pub uid: u32,
+    /// Owner group ID
+    pub gid: u32,
+    /// File mode, type and permission bits
+    pub mode: u32,
+    /// Inode number
+    pub ino: u64,
+    /// File size in bytes
+    pub size: u64,
+    /// Number of 512-byte blocks allocated
+    pub blocks: u64,
+    /// Last access time
+    pub atime: SystemTime,
+    /// Creation (birth) time
+    pub btime: SystemTime,
+    /// Last status change time
+    pub ctime: SystemTime,
+    /// Last data modification time
+    pub mtime: SystemTime,
+    /// Device ID of a device node (major), zero otherwise
+    pub rdev_major: u32,
+    /// Device ID of a device node (minor), zero otherwise
+    pub rdev_minor: u32,
+    /// Device ID of the filesystem holding the file (major)
+    pub dev_major: u32,
+    /// Device ID of the filesystem holding the file (minor)
+    pub dev_minor: u32,
+}
+
+/// Splits a `new_encode_dev` device id into its major and minor numbers.
+#[must_use]
+pub fn split_dev(rdev: u32) -> (u32, u32) {
+    let major = (rdev & 0x000f_ff00) >> 8;
+    let minor = (rdev & 0x0000_00ff) | ((rdev >> 12) & 0x000f_ff00);
+    (major, minor)
+}
+
+/// Converts a [`StatxParam`] to the FUSE statx reply body.
+#[cfg(feature = "abi-7-39")]
+#[must_use]
+pub fn convert_to_fuse_statx(param: StatxParam) -> crate::protocol::FuseStatx {
+    let (a_time_secs, a_time_nanos) = time_from_system_time(&param.atime);
+    let (b_time_secs, b_time_nanos) = time_from_system_time(&param.btime);
+    let (c_time_secs, c_time_nanos) = time_from_system_time(&param.ctime);
+    let (m_time_secs, m_time_nanos) = time_from_system_time(&param.mtime);
+    crate::protocol::FuseStatx {
+        mask: param.mask,
+        blksize: param.blksize,
+        attributes: param.attributes,
+        nlink: param.nlink,
+        uid: param.uid,
+        gid: param.gid,
+        mode: param.mode as u16,
+        spare0: 0,
+        ino: param.ino,
+        size: param.size,
+        blocks: param.blocks,
+        attributes_mask: param.attributes_mask,
+        atime: crate::protocol::FuseStatxTime {
+            sec: i64::try_from(a_time_secs).unwrap_or(i64::MAX),
+            nsec: a_time_nanos,
+            reserved: 0,
+        },
+        btime: crate::protocol::FuseStatxTime {
+            sec: i64::try_from(b_time_secs).unwrap_or(i64::MAX),
+            nsec: b_time_nanos,
+            reserved: 0,
+        },
+        ctime: crate::protocol::FuseStatxTime {
+            sec: i64::try_from(c_time_secs).unwrap_or(i64::MAX),
+            nsec: c_time_nanos,
+            reserved: 0,
+        },
+        mtime: crate::protocol::FuseStatxTime {
+            sec: i64::try_from(m_time_secs).unwrap_or(i64::MAX),
+            nsec: m_time_nanos,
+            reserved: 0,
+        },
+        rdev_major: param.rdev_major,
+        rdev_minor: param.rdev_minor,
+        dev_major: param.dev_major,
+        dev_minor: param.dev_minor,
+        spare2: [0_u64; 14],
+    }
+}
+
 /// Set attribute parameters
 #[derive(Debug)]
 pub struct SetAttrParam {
@@ -472,7 +576,9 @@ pub fn convert_to_fuse_attr(attr: FileAttr) -> FuseAttr {
         rdev: attr.rdev,
         #[cfg(feature = "abi-7-9")]
         blksize: 0, // TODO: find a proper way to set block size
-        #[cfg(feature = "abi-7-9")]
+        #[cfg(feature = "abi-7-32")]
+        flags: 0,
+        #[cfg(all(feature = "abi-7-9", not(feature = "abi-7-32")))]
         padding: 0,
     }
 }

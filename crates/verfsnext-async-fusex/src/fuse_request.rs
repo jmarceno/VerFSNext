@@ -9,6 +9,8 @@ use super::context::ProtoVersion;
 use super::de::{DeserializeError, Deserializer};
 #[cfg(feature = "abi-7-19")]
 use super::protocol::FuseFAllocateIn;
+#[cfg(feature = "abi-7-39")]
+use super::protocol::FuseStatxIn;
 #[cfg(feature = "abi-7-23")]
 use super::protocol::FuseRename2In;
 use super::protocol::{
@@ -283,6 +285,12 @@ pub enum Operation<'a> {
         /// The FUSE copy file range request
         arg: &'a FuseCopyFileRangeIn,
     },
+    /// FUSE_STATX = 52
+    #[cfg(feature = "abi-7-39")]
+    StatX {
+        /// The FUSE statx request
+        arg: &'a FuseStatxIn,
+    },
     /// CUSE_INIT = 4096
     #[cfg(feature = "abi-7-11")]
     CuseInit {
@@ -354,6 +362,8 @@ impl<'a> Operation<'a> {
             46 => FuseOpCode::FUSE_LSEEK,
             // #[cfg(feature = "abi-7-28")]
             47 => FuseOpCode::FUSE_COPY_FILE_RANGE,
+            #[cfg(feature = "abi-7-39")]
+            52 => FuseOpCode::FUSE_STATX,
             #[cfg(feature = "abi-7-11")]
             4096 => FuseOpCode::CUSE_INIT,
 
@@ -510,6 +520,10 @@ impl<'a> Operation<'a> {
             },
             // #[cfg(feature = "abi-7-28")]
             FuseOpCode::FUSE_COPY_FILE_RANGE => Operation::CopyFileRange {
+                arg: data.fetch_ref()?,
+            },
+            #[cfg(feature = "abi-7-39")]
+            FuseOpCode::FUSE_STATX => Operation::StatX {
                 arg: data.fetch_ref()?,
             },
             #[cfg(feature = "abi-7-11")]
@@ -680,6 +694,8 @@ impl fmt::Display for Operation<'_> {
                 "COPYFILERANGE src fh={}, dst fh={}, flags={:#?}",
                 arg.fh_in, arg.fh_out, arg.flags,
             ),
+            #[cfg(feature = "abi-7-39")]
+            Operation::StatX { arg } => write!(f, "STATX arg={arg:?}"),
             #[cfg(feature = "abi-7-11")]
             Operation::CuseInit { arg } => write!(
                 f,

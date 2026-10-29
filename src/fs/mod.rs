@@ -9,9 +9,10 @@ use anyhow::{anyhow, Context, Result};
 use verfsnext_async_fusex::error::{AsyncFusexError, AsyncFusexResult};
 use verfsnext_async_fusex::session::SessionNotifier;
 use verfsnext_async_fusex::fs_util::{
-    build_error_result_from_errno, CreateParam, FileAttr, FileLockParam, INum, RenameParam,
-    SetAttrParam, StatFsParam,
+    build_error_result_from_errno, split_dev, CreateParam, FileAttr, FileLockParam, INum,
+    RenameParam, SetAttrParam, StatFsParam, StatxParam,
 };
+use verfsnext_async_fusex::protocol::statx_masks::{STATX_BASIC_STATS, STATX_BTIME};
 use verfsnext_async_fusex::{DirEntry, FileType, VirtualFs};
 use async_trait::async_trait;
 use moka::sync::Cache;
@@ -40,6 +41,7 @@ use crate::migration::pack_index_crc32::{
     ensure_pack_index_crc32_compat, SYS_PACK_CRC32_READ_ERRORS,
 };
 use crate::migration::pack_size::ensure_pack_size_metadata_compat;
+use crate::migration::inode_schema_v2::ensure_inode_schema_v2_migrated;
 use crate::migration::vault_chunk_keys::ensure_vault_chunk_keys_migrated;
 use crate::permissions::normalize_data_tree;
 use crate::snapshot::{records_in_txn, SnapshotManager, SnapshotUsage};
@@ -452,6 +454,7 @@ impl VerFs {
             return Err(err);
         }
         ensure_vault_chunk_keys_migrated(&meta).await?;
+        ensure_inode_schema_v2_migrated(&meta).await?;
         let configured_active_pack_id = meta.get_u64_sys("active_pack_id")?;
         let persisted_pack_crc32_read_error_count =
             meta.get_u64_sys(SYS_PACK_CRC32_READ_ERRORS).unwrap_or(0);

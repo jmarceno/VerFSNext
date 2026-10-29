@@ -194,3 +194,19 @@ mark_sized_types! {@kernel size_check: check_abi_7_24,
 mark_sized_types! {@kernel size_check: check_abi_7_28,
     FuseCopyFileRangeIn,
 }
+
+// `fuse_statx_out` is larger than the 256-byte sanity bound of
+// `mark_sized_types!` (the kernel requires exactly 288 bytes), so the statx
+// types are marked directly and their ABI size is asserted at compile time.
+#[cfg(feature = "abi-7-39")]
+mark_abi_type!(super::protocol::FuseStatxIn);
+#[cfg(feature = "abi-7-39")]
+mark_abi_type!(super::protocol::FuseStatxOut);
+
+#[cfg(feature = "abi-7-39")]
+const _: () = {
+    assert!(mem::size_of::<super::protocol::FuseStatxTime>() == 16);
+    assert!(mem::size_of::<super::protocol::FuseStatxIn>() == 24);
+    assert!(mem::size_of::<super::protocol::FuseStatx>() == 256);
+    assert!(mem::size_of::<super::protocol::FuseStatxOut>() == 288);
+};

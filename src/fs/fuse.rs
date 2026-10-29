@@ -69,6 +69,45 @@ impl VirtualFs for VerFs {
         Ok((self.core.attr_ttl(), self.core.file_attr_from_inode(&inode)))
     }
 
+    async fn statx(
+        &self,
+        ino: u64,
+        _fh: Option<u64>,
+    ) -> AsyncFusexResult<(Duration, StatxParam)> {
+        let inode = self
+            .core
+            .load_inode_with_vault_access(ino, "statx")
+            .map_err(map_anyhow_to_fuse)?;
+        let attr = self.core.file_attr_from_inode(&inode);
+        let (rdev_major, rdev_minor) = split_dev(inode.rdev);
+        Ok((
+            self.core.attr_ttl(),
+            StatxParam {
+                mask: STATX_BASIC_STATS | STATX_BTIME,
+                // Let the kernel keep its default block size; the regular
+                // getattr path reports the same (no blksize).
+                blksize: 0,
+                attributes: 0,
+                attributes_mask: 0,
+                nlink: attr.nlink,
+                uid: attr.uid,
+                gid: attr.gid,
+                mode: sflag_for_kind(inode.kind).bits() | u32::from(attr.perm),
+                ino: attr.ino,
+                size: attr.size,
+                blocks: attr.blocks,
+                atime: attr.atime,
+                btime: parts_to_system_time(inode.btime_sec, inode.btime_nsec),
+                ctime: attr.ctime,
+                mtime: attr.mtime,
+                rdev_major,
+                rdev_minor,
+                dev_major: 0,
+                dev_minor: 0,
+            },
+        ))
+    }
+
     async fn setattr(
         &self,
         _uid: u32,

@@ -5,6 +5,7 @@
 The repository now includes a Phase 5 implementation on top of the existing full FUSE surface and prior data-plane/snapshot/GC work:
 
 - FUSE runtime via `crates/verfsnext-async-fusex`
+  - negotiates FUSE ABI 7.39, which lets the kernel use `FUSE_STATX`; `statx(2)` answers the full basic attribute set plus birth time (B060)
 - Metadata runtime via `crates/verfsnext-surrealkv`
   - WAL batches, SSTable table metadata, and partitioned top-level index payloads are archived with `rkyv` and validated at decode boundaries
 - Two-stage write batching pipeline:
@@ -500,6 +501,14 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 3. No payload is decrypted, so the migration runs while the vault is locked. The plain key space is untouched, so plain chunks need no migration.
 4. Each batch is atomic and already-tagged records are skipped, so a crash or a failed startup resumes safely on the next run. The marker is written only after the scan completes.
 5. Files whose bytes were lost to the old cross-domain alias cannot be recovered by the migration; `verfsnext check` reports them as missing pieces after the upgrade. See `docs/migration-guide.md`.
+
+## Inode Schema v2 Compatibility Migration
+
+1. On startup (and in every offline command that opens the metadata store), VerFS checks `SYS:inode_schema_v2_migration_v1`.
+2. If the marker is missing, it scans every inode record (`I` + inode number, including the inodes owned by snapshots) in batches of 10,000 records, one metadata transaction per batch, and rewrites each record to schema v2: `btime_sec`/`btime_nsec` are set from the inode's ctime (the creation time was never recorded before this schema) and `rdev` is set to 0.
+3. Schema v1 and v2 archives have different lengths. Records already in the v2 layout are skipped, and the inode number decoded from each record is checked against its key, so a crash in the middle of the scan resumes safely. An unexpected record length or a key/inode mismatch aborts the mount with an explicit error instead of guessing.
+4. The migration also re-applies the `.snapshots` read-only inode flag. That repair used to run in `MetaStore::bootstrap` on every open, but bootstrap runs before the migration and cannot decode a pre-v2 inode any more, so the one-time repair moved here.
+5. New inodes record their real creation time at creation; the value is reported by `FUSE_STATX` and never changes afterwards. See `docs/migration-guide.md` for the operator-facing description.
 
 ## Benchmark: ComfyUI Profile (`bench_comfyui_profile`)
 

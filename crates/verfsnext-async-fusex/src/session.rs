@@ -28,6 +28,8 @@ use super::context::ProtoVersion;
 use super::file_system::FileSystem;
 #[cfg(feature = "abi-7-21")]
 use super::fuse_reply::ReplyDirectoryPlus;
+#[cfg(feature = "abi-7-39")]
+use super::fuse_reply::ReplyStatX;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyInit, ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
@@ -37,6 +39,8 @@ use super::fuse_request::{Operation, Request};
 use super::protocol::FATTR_CTIME;
 #[cfg(feature = "abi-7-9")]
 use super::protocol::FATTR_LOCKOWNER; // {FATTR_ATIME_NOW, FATTR_MTIME_NOW};
+#[cfg(all(feature = "abi-7-9", feature = "abi-7-39"))]
+use super::protocol::FUSE_GETATTR_FH;
 #[cfg(feature = "abi-7-9")]
 use super::protocol::FUSE_BIG_WRITES;
 #[cfg(feature = "abi-7-12")]
@@ -1153,6 +1157,16 @@ async fn dispatch<'a>(
         Operation::LSeek { arg } => {
             let reply = ReplyLSeek::new(req.unique(), file);
             fs.lseek(req, arg.fh, arg.offset, arg.whence, reply).await
+        }
+        #[cfg(feature = "abi-7-39")]
+        Operation::StatX { arg } => {
+            let fh = if (arg.getattr_flags & FUSE_GETATTR_FH) != 0 {
+                Some(arg.fh)
+            } else {
+                None
+            };
+            let reply = ReplyStatX::new(req.unique(), file);
+            fs.statx(req, fh, reply).await
         }
         // #[cfg(feature = "abi-7-28")]
         Operation::CopyFileRange { arg } => {
