@@ -3105,3 +3105,105 @@ and no CRC32 errors.
 
 `src/fs/write.rs`, `docs/bug-fix-history.md`,
 `docs/technical_deep_dive.md`
+## B068 - INIT Never Advertised READDIRPLUS (and Related Flags) - Oct 29 2026
+
+### Symptom
+
+`readdirplus()` in `crates/verfsnext-async-fusex/src/fuse_fs.rs` was implemented
+but the kernel never called it: `ls -l`, `find` and `rsync` scans paid one
+`LOOKUP` per directory entry. The INIT reply advertised only
+`FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_DONT_MASK | FUSE_WRITEBACK_CACHE |
+FUSE_POSIX_ACL | FUSE_MAX_PAGES`, so `FUSE_DO_READDIRPLUS`,
+`FUSE_READDIRPLUS_AUTO`, `FUSE_PARALLEL_DIROPS`, `FUSE_CACHE_SYMLINKS` and
+`FUSE_ATOMIC_O_TRUNC` were never negotiated.
+
+### Root Cause
+
+`supported_init_flags()` in `session.rs` never named them, and the generic
+readdirplus path had protocol-level accounting bugs that only mattered once the
+kernel started using it:
+
+1. `.` and `..` were resolved with `virtual_fs.lookup`, which takes a kernel
+   lookup reference. The kernel skips dot entries in a READDIRPLUS reply
+   (`fuse_direntplus_link`) before taking any reference, so those references
+   were never forgotten (unbounded `kernel_lookups` growth).
+2. Every entry was resolved with a lookup *before* checking whether the reply
+   buffer had room. The entry that overflowed the buffer leaked one kernel
+   reference because the kernel never saw it and never sent a FORGET.
+3. An entry that vanished between the directory snapshot and the lookup was
+   answered from `getattr`; the kernel took a lookup reference for that reply
+   that the daemon had not counted, and the daemon could free the inode early.
+
+### Fix
+
+`supported_init_flags()` now advertises, ABI-gated exactly like the existing
+flags:
+
+| flag | minimum ABI | why it is safe here |
+| --- | --- | --- |
+| `FUSE_ATOMIC_O_TRUNC` | 7.9 | `VerFs::open` already truncates under the inode lock before opening, which is exactly what the kernel expects; probed with `O_TRUNC` open + rewrite and concurrent writers |
+| `FUSE_DO_READDIRPLUS` / `FUSE_READDIRPLUS_AUTO` | 7.21 | the generic readdirplus implementation resolves entries through `lookup`, which takes exactly the reference the kernel takes for every non-dot entry it links; dot and vanished entries are now replied name-only |
+| `FUSE_PARALLEL_DIROPS` | 7.25 | the daemon is already fully concurrent and lock-checked; probed with 8 parallel create/rename/unlink/lookup workers |
+| `FUSE_CACHE_SYMLINKS` | 7.28 | symlink targets are immutable inode payloads and entry invalidation on unlink/rename already runs; probed by replacing symlinks under concurrent `readlink` |
+
+`ReplyDirectoryPlus` gained `fits()` and `add_dirent_only()`.
+`add_dirent_only` writes a `fuse_direntplus` with a zeroed `entry_out`
+(`nodeid == 0`); the kernel emits the dirent name/type to userspace and skips
+the entry without taking a reference. `readdirplus()` now:
+
+- checks `fits()` *before* resolving an entry, so no reference is taken for an
+  entry the reply cannot carry;
+- replies `.` and `..` name-only, matching the kernel's skip;
+- replies a vanished entry name-only instead of fabricating attributes from
+  `getattr`, so kernel and daemon reference counts stay in step and a
+  concurrent delete does not fail the whole listing.
+
+No ABI minor version or protocol struct size was changed.
+
+### Data integrity
+
+These are protocol/reference-counting changes, not data-path changes. The
+kernel takes one lookup reference per non-dot entry it links from a
+READDIRPLUS reply, and each such reply is backed by exactly one
+`virtual_fs.lookup`, which registers the same count in the daemon; name-only
+entries take no reference on either side. Concurrent deletions during a
+listing surface as `ENOENT` races only, never as `EIO`, and unlinked inodes
+with outstanding kernel references remain in the orphan index until the
+matching FORGET arrives, as before.
+
+### Validation
+
+- `cargo remote -h -- test` and
+  `cargo remote -h -- clippy --all-targets -- -D warnings` pass.
+- On a scratch mount (attr/entry TTL 0) the negotiated INIT flags were
+  `0xd56069`: the five new flags plus every previously advertised one, ABI
+  still 7.31.
+- Request logs showed 334 `readdirplus()` and 184 plain `readdir()` calls while
+  scanning a 1000-file directory (READDIRPLUS_AUTO mixes both); 46 acceptance
+  checks passed: `ls -l` (1025 entries), `ls -la`, `find -printf` over 1035
+  entries with exact names/types/sizes/modes, an `rsync -an` scan listing every
+  expected path, 10 concurrent `ls -la` runs while deleting 250 of 500 entries
+  (only `ENOENT` races, no `EIO`, consistent final listing), 8 parallel
+  dirops workers, symlink replacement under concurrent `readlink` with no stale
+  target, `O_TRUNC` open leaving size 0 and 20 truncate+rewrite cycles with
+  exact data, concurrent `O_TRUNC` writers and readers with a complete final
+  payload, and 300 concurrent `O_APPEND` records all durable and unmixed.
+- Forget accounting: after creating/listing/deleting the 1000-entry directory
+  tree, the mount was unmounted and remounted; the startup orphan sweep
+  reclaimed nothing (zero leaked inodes). `verfsnext check` reported a
+  consistent record set and zero orphan records.
+- Negative control for the lookup-accounting guard: with the new
+  `fits()` pre-lookup check removed, the same scenario left exactly 1 orphaned
+  inode that the next startup reclaimed (`reclaimed_orphans=1`); with the fix
+  in place the count is 0.
+- Note: `src/lib.rs` resets the log filter to `error` once the mount is
+  established, so request-level debug logs (and the INIT debug line) are only
+  visible with a temporary local filter change during validation or when
+  `RUST_LOG` is honoured at runtime. No logging change is part of this commit.
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/fuse_reply.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`,
+`docs/bug-fix-history.md`, `docs/technical_deep_dive.md`

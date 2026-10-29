@@ -21,7 +21,6 @@ use nix::errno::Errno;
 use nix::sys::stat::SFlag;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, instrument};
 
 pub struct FuseFs {
@@ -927,52 +926,57 @@ impl FileSystem for FuseFs {
         match readdir_res {
             Ok(dir_entries) => {
                 for (i, dir_entry) in dir_entries.iter().enumerate().skip(offset.cast()) {
-                    let resolved = match self
-                        .virtual_fs
-                        .lookup(req.uid(), req.gid(), ino, dir_entry.name())
-                        .await
-                    {
+                    let name = dir_entry.name();
+                    let next_offset = i.cast::<i64>().overflow_add(1);
+                    // A lookup takes a kernel reference the kernel only sends
+                    // a FORGET for when the entry reached it, so never resolve
+                    // an entry the reply buffer cannot carry.
+                    if !reply.fits(name.len()) {
+                        break;
+                    }
+                    if name == "." || name == ".." {
+                        // The kernel skips dot entries in a READDIRPLUS reply
+                        // before taking a reference, so it must not count one.
+                        reply.add_dirent_only(
+                            dir_entry.ino(),
+                            next_offset,
+                            dir_entry.file_type().into(),
+                            name,
+                        );
+                        continue;
+                    }
+                    match self.virtual_fs.lookup(req.uid(), req.gid(), ino, name).await {
                         Ok((entry_ttl, attr_ttl, file_attr, generation)) => {
-                            Ok((
+                            let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
+                            let full = reply.add(
+                                dir_entry.ino(),
+                                next_offset,
+                                dir_entry.file_type().into(),
+                                name,
                                 entry_ttl,
                                 attr_ttl,
-                                fs_util::convert_to_fuse_attr(file_attr),
+                                fuse_attr,
                                 generation,
-                            ))
+                            );
+                            if full {
+                                break;
+                            }
                         }
                         Err(lookup_err) => {
+                            // The entry vanished between the directory snapshot
+                            // and the lookup. Reply the name without attributes
+                            // so the kernel emits the dirent and takes no
+                            // reference, instead of failing the whole readdir.
                             debug!(
-                                "readdirplus lookup fallback for ino={} name={:?}, error={:?}",
-                                ino,
-                                dir_entry.name(),
-                                lookup_err,
+                                "readdirplus entry for ino={} name={:?} vanished, replying the name only, error={:?}",
+                                ino, name, lookup_err,
                             );
-                            self.virtual_fs.getattr(dir_entry.ino()).await.map(
-                                |(attr_ttl, file_attr)| {
-                                    (
-                                        Duration::ZERO,
-                                        attr_ttl,
-                                        fs_util::convert_to_fuse_attr(file_attr),
-                                        0,
-                                    )
-                                },
-                            )
-                        }
-                    };
-
-                    if let Ok((entry_ttl, attr_ttl, fuse_attr, generation)) = resolved {
-                        let full = reply.add(
-                            dir_entry.ino(),
-                            i.cast::<i64>().overflow_add(1),
-                            dir_entry.file_type().into(),
-                            dir_entry.name(),
-                            entry_ttl,
-                            attr_ttl,
-                            fuse_attr,
-                            generation,
-                        );
-                        if full {
-                            break;
+                            reply.add_dirent_only(
+                                dir_entry.ino(),
+                                next_offset,
+                                dir_entry.file_type().into(),
+                                name,
+                            );
                         }
                     }
                 }

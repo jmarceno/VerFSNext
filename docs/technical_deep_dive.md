@@ -539,8 +539,11 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
 - Unlinked-inode lifetime follows the FUSE contract: an inode stays valid until the
   kernel forgets it, not only until its last handle closes.
   - `FsCore` counts kernel lookup references per inode: entry replies from `lookup`,
-    `create`, `mknod`, `mkdir`, `symlink` and `link` add one, and `FORGET`/`BATCH_FORGET`
-    subtract `nlookup`. READDIRPLUS is not negotiated, so it adds no references.
+    `create`, `mknod`, `mkdir`, `symlink`, `link` and every READDIRPLUS entry that carries
+    an attribute (and therefore a kernel reference) add one, and `FORGET`/`BATCH_FORGET`
+    subtract `nlookup`. READDIRPLUS replies that carry only a name (`.`/`..` and entries
+    whose lookup raced a delete) add no reference, so the counts match what the kernel
+    holds (B068).
   - Removing the last name of a regular file (unlink or rename-over) deletes it at once
     only if no open handle and no kernel reference remains. Otherwise the inode is kept
     with `nlink = 0`, and an orphan index key `O<ino>` is written in the same transaction.
@@ -949,3 +952,75 @@ clearing them); `+d` needs no capability and works end to end. VerFSNext still
 enforces and persists the flags correctly when they arrive, which is what a
 privileged caller or a future kernel without that gate sees; see B060 for the
 validation method.
+
+## READDIRPLUS, parallel dirops and the other INIT flags
+
+The INIT reply now negotiates the following flags on top of the existing
+`ASYNC_READ | BIG_WRITES | DONT_MASK | WRITEBACK_CACHE | POSIX_ACL |
+MAX_PAGES` set (all ABI-gated in `supported_init_flags()` in
+`crates/verfsnext-async-fusex/src/session.rs`):
+
+| flag | ABI gate | effect |
+| --- | --- | --- |
+| `FUSE_DO_READDIRPLUS` | 7.21 | kernel may answer directory reads with READDIRPLUS, returning attributes in the same reply |
+| `FUSE_READDIRPLUS_AUTO` | 7.21 | kernel decides per read whether to use READDIRPLUS (at offset 0, or after a lookup miss) instead of always |
+| `FUSE_PARALLEL_DIROPS` | 7.25 | kernel allows concurrent lookup/readdir instead of serialising them per directory |
+| `FUSE_CACHE_SYMLINKS` | 7.28 | kernel caches READLINK results until the inode/entry is invalidated |
+| `FUSE_ATOMIC_O_TRUNC` | 7.9 | kernel passes `O_TRUNC` in OPEN; the daemon truncates as part of the open instead of a separate SETATTR |
+
+With `READDIRPLUS_AUTO` the kernel calls READDIRPLUS at offset 0 of a listing
+and plain READDIR for continuation pages once it has not been advised to keep
+using the plus variant, so both ops share the same per-directory-handle
+snapshot in `VerFs::readdir` and their offsets stay consistent.
+
+### Lookup-reference accounting in READDIRPLUS
+
+READDIRPLUS replies carry a full `fuse_entry_out` per entry, which the kernel
+turns into a dentry/inode reference without sending a separate LOOKUP. The
+kernel's rules (fs/fuse/readdir.c, `fuse_direntplus_link`/`parse_dirplusfile`)
+drive the daemon side:
+
+- an entry with `nodeid != 0` is linked and takes exactly one lookup reference;
+- an entry with `nodeid == 0` is only emitted to userspace (the dirent part is
+  used, the entry part is ignored) and takes no reference;
+- `.` and `..` are skipped by the kernel before any reference is taken;
+- entries the kernel could not link are explicitly forgotten with a FORGET.
+
+`ReplyDirectoryPlus` therefore exposes `fits(name_len)` and
+`add_dirent_only(ino, offset, kind, name)`. `add_dirent_only` writes a
+`fuse_direntplus` with a zeroed `entry_out`; the kernel emits the name and type
+and takes no reference. `FuseFs::readdirplus` applies the following rules:
+
+1. Check `fits()` *before* resolving an entry with `VirtualFs::lookup`. A
+   lookup registers a kernel reference in `FsCore::kernel_lookups`; if the
+   entry then does not fit in the reply buffer the kernel never learns about it
+   and never sends the FORGET, leaking the reference forever.
+2. Reply `.` and `..` name-only. The kernel skips them, so a lookup for them
+   would be a reference the kernel never takes.
+3. If `lookup` fails because the entry vanished between the directory snapshot
+   and the reply, emit the name-only dirent. The name still belongs to the
+   listing (readdir races may show deleted names), the kernel takes no
+   reference, and the daemon does not fabricate attributes from `getattr` that
+   would make the kernel take a reference the daemon never counted.
+
+Every non-dot entry that reaches the reply therefore has exactly one
+`kernel_lookups` count on the daemon side and one kernel reference, and every
+FORGET the kernel sends has a matching count. Unlinked inodes with outstanding
+references stay in the orphan index; when the last reference is forgotten the
+inode is deleted (or reclaimed by the startup sweep if the daemon stopped in
+between).
+
+### Why these flags are safe
+
+- `ATOMIC_O_TRUNC`: `VerFs::open` already performs the truncate under the
+  global write gate and the per-inode write lock before opening, which is what
+  the flag promises; with the writeback cache the kernel additionally takes
+  its truncate lock (`is_wb_truncate`), so dirty pages cannot race the
+  truncation.
+- `PARALLEL_DIROPS`: all directory operations already run as concurrent async
+  requests guarded by the metadata transaction and cache locks; the flag only
+  lifts the kernel's per-directory serialisation for lookups/readdir.
+- `CACHE_SYMLINKS`: symlink targets are immutable payload records created with
+  the inode and never rewritten (replacing a symlink is unlink + create of a
+  new inode); entry invalidation on unlink/rename/rmdir already runs, so the
+  kernel cannot return a stale target for a name it revalidates.

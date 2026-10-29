@@ -761,6 +761,88 @@ impl<'a> ReplyDirectoryPlus<'a> {
         }
     }
 
+    /// The number of bytes an entry with a `name_len`-byte name occupies in
+    /// the reply buffer, including the 8-byte alignment padding.
+    fn entry_size(name_len: usize) -> usize {
+        let entlen = mem::size_of::<FuseDirEntPlus>().overflow_add(name_len);
+        crate::util::round_up(entlen, mem::size_of::<u64>())
+    }
+
+    /// True when an entry with a `name_len`-byte name still fits in the reply
+    /// buffer. Callers that resolve an entry (and thereby take a kernel
+    /// lookup reference) must check this first so they never take a reference
+    /// for an entry the reply cannot carry.
+    #[must_use]
+    pub fn fits(&self, name_len: usize) -> bool {
+        self.data
+            .len()
+            .overflow_add(Self::entry_size(name_len))
+            <= self.data.capacity()
+    }
+
+    /// Add an entry without attributes. The kernel still emits the dirent
+    /// (name, inode number, type) to userspace but takes no lookup reference
+    /// for it and never uses the zeroed attributes. Returns true if the
+    /// buffer is full.
+    pub fn add_dirent_only<T: AsRef<OsStr>>(
+        &mut self,
+        ino: u64,
+        offset: i64,
+        kind: SFlag,
+        name: T,
+    ) -> bool {
+        let name_bytes = name.as_ref().as_bytes();
+        if !self.fits(name_bytes.len()) {
+            return true;
+        }
+        let direntplus = FuseDirEntPlus {
+            entry_out: FuseEntryOut {
+                nodeid: 0,
+                generation: 0,
+                entry_valid: 0,
+                attr_valid: 0,
+                entry_valid_nsec: 0,
+                attr_valid_nsec: 0,
+                attr: FuseAttr {
+                    ino: 0,
+                    size: 0,
+                    blocks: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    atimensec: 0,
+                    mtimensec: 0,
+                    ctimensec: 0,
+                    mode: 0,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    #[cfg(feature = "abi-7-9")]
+                    blksize: 0,
+                    #[cfg(feature = "abi-7-32")]
+                    flags: 0,
+                    #[cfg(all(feature = "abi-7-9", not(feature = "abi-7-32")))]
+                    padding: 0,
+                },
+            },
+            dirent: FuseDirEnt {
+                ino,
+                off: offset.cast(),
+                namelen: name_bytes.len().cast(),
+                typ: crate::util::mode_from_kind_and_perm(kind, 0).overflow_shr(12),
+            },
+        };
+        let entlen = mem::size_of::<FuseDirEntPlus>() + name_bytes.len();
+        let entsize = Self::entry_size(name_bytes.len());
+        let padlen = entsize.overflow_sub(entlen);
+        let direntplus_bytes = unsafe { fuse_dir_ent_plus_in_raw(&direntplus) };
+        self.data.extend_from_slice(direntplus_bytes);
+        self.data.extend_from_slice(name_bytes);
+        self.data.extend(std::iter::repeat_n(0, padlen));
+        false
+    }
+
     /// Add an entry to the directory plus reply buffer. Returns true if the
     /// buffer is full.
     #[allow(clippy::too_many_arguments)]
@@ -793,12 +875,11 @@ impl<'a> ReplyDirectoryPlus<'a> {
                 typ: crate::util::mode_from_kind_and_perm(kind, 0).overflow_shr(12),
             },
         };
-        let entlen = direntplus.size_with_name();
-        let entsize = crate::util::round_up(entlen, mem::size_of::<u64>());
-        let padlen = entsize.overflow_sub(entlen);
-        if self.data.len().overflow_add(entsize) > self.data.capacity() {
+        if !self.fits(name_bytes.len()) {
             return true;
         }
+        let entlen = direntplus.size_with_name();
+        let padlen = Self::entry_size(name_bytes.len()).overflow_sub(entlen);
 
         let direntplus_bytes = unsafe { fuse_dir_ent_plus_in_raw(&direntplus) };
         self.data.extend_from_slice(direntplus_bytes);

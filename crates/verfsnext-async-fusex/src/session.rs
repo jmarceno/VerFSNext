@@ -44,11 +44,17 @@ use super::protocol::FATTR_LOCKOWNER; // {FATTR_ATIME_NOW, FATTR_MTIME_NOW};
 #[cfg(all(feature = "abi-7-9", feature = "abi-7-39"))]
 use super::protocol::FUSE_GETATTR_FH;
 #[cfg(feature = "abi-7-9")]
+use super::protocol::FUSE_ATOMIC_O_TRUNC;
+#[cfg(feature = "abi-7-9")]
 use super::protocol::FUSE_BIG_WRITES;
+#[cfg(feature = "abi-7-21")]
+use super::protocol::{FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO};
 #[cfg(feature = "abi-7-12")]
 use super::protocol::FUSE_DONT_MASK;
 #[cfg(feature = "abi-7-28")]
-use super::protocol::FUSE_MAX_PAGES;
+use super::protocol::{FUSE_CACHE_SYMLINKS, FUSE_MAX_PAGES};
+#[cfg(feature = "abi-7-25")]
+use super::protocol::FUSE_PARALLEL_DIROPS;
 #[cfg(feature = "abi-7-23")]
 use super::protocol::FUSE_WRITEBACK_CACHE;
 #[cfg(feature = "abi-7-26")]
@@ -109,15 +115,27 @@ fn supported_init_flags() -> u32 {
     let mut flags = FUSE_ASYNC_READ;
     #[cfg(feature = "abi-7-9")]
     {
+        flags |= FUSE_ATOMIC_O_TRUNC;
+    }
+    #[cfg(feature = "abi-7-9")]
+    {
         flags |= FUSE_BIG_WRITES;
     }
     #[cfg(feature = "abi-7-12")]
     {
         flags |= FUSE_DONT_MASK;
     }
+    #[cfg(feature = "abi-7-21")]
+    {
+        flags |= FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO;
+    }
     #[cfg(feature = "abi-7-23")]
     {
         flags |= FUSE_WRITEBACK_CACHE;
+    }
+    #[cfg(feature = "abi-7-25")]
+    {
+        flags |= FUSE_PARALLEL_DIROPS;
     }
     #[cfg(feature = "abi-7-26")]
     {
@@ -125,7 +143,7 @@ fn supported_init_flags() -> u32 {
     }
     #[cfg(feature = "abi-7-28")]
     {
-        flags |= FUSE_MAX_PAGES;
+        flags |= FUSE_CACHE_SYMLINKS | FUSE_MAX_PAGES;
     }
     flags
 }
