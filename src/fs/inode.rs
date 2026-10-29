@@ -196,6 +196,7 @@ impl FsCore {
         umask: u32,
         uid: u32,
         gid: u32,
+        rdev: u32,
     ) -> Result<InodeRecord> {
         let Some(parent_raw) = txn.get(inode_key(parent))? else {
             return Err(anyhow_errno(
@@ -310,7 +311,7 @@ impl FsCore {
             flags: inherited_flags,
             btime_sec: sec,
             btime_nsec: nsec,
-            rdev: 0,
+            rdev,
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
@@ -614,6 +615,8 @@ impl FsCore {
             INODE_KIND_FILE => FileType::File,
             INODE_KIND_FIFO => FileType::Fifo,
             INODE_KIND_SOCKET => FileType::Socket,
+            INODE_KIND_CHR => FileType::CharDevice,
+            INODE_KIND_BLK => FileType::BlockDevice,
             INODE_KIND_SYMLINK => FileType::Symlink,
             _ => FileType::File,
         }

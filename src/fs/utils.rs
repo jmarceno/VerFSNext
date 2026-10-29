@@ -13,6 +13,8 @@ pub(crate) fn sflag_for_kind(kind: u8) -> SFlag {
         INODE_KIND_FILE => SFlag::S_IFREG,
         INODE_KIND_FIFO => SFlag::S_IFIFO,
         INODE_KIND_SOCKET => SFlag::S_IFSOCK,
+        INODE_KIND_CHR => SFlag::S_IFCHR,
+        INODE_KIND_BLK => SFlag::S_IFBLK,
         INODE_KIND_SYMLINK => SFlag::S_IFLNK,
         _ => SFlag::S_IFREG,
     }

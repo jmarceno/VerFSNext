@@ -2617,3 +2617,54 @@ linked file can be reopened by name; closing an unlinked 1 MiB temporary file
 leaks nothing; and `O_TMPFILE` in a missing directory still fails cleanly. The
 records check after the crash test reports no missing data, damaged copies,
 reference-count mismatches or orphan extent records.
+
+## B063 - mknod Could Not Create Block or Character Device Nodes - Oct 29 2026
+
+### Symptom
+
+`mknod(path, S_IFCHR | 0600, makedev(1, 3))` and `mknod(path, S_IFBLK | 0600, ...)`
+failed on a VerFSNext mount (the filesystem answered `EOPNOTSUPP`). Root-run
+`rsync -a --specials` of a `/dev` tree, container rootfs restores and backups
+with device nodes could not reproduce those nodes.
+
+### Root Cause
+
+`VerFs::mknod` only knew regular files, directories, FIFOs and sockets; the
+`S_IFCHR`/`S_IFBLK` cases were rejected, `InodeRecord` had nowhere to store the
+device id, and `FileType` (the readdir entry type handed to the kernel) had no
+device variants. The statx work added the `rdev` field to the inode schema, so
+the remaining gap was the inode kinds and the wiring.
+
+### Fix
+
+- New inode kinds `INODE_KIND_CHR` and `INODE_KIND_BLK`, mapped to
+  `S_IFCHR`/`S_IFBLK` for attribute replies and to
+  `FileType::CharDevice`/`FileType::BlockDevice` for directory listings.
+- `mknod` accepts both kinds and stores the `rdev` value the kernel sends. The
+  kernel sends it in `new_encode_dev` form and decodes the same form from the
+  attribute reply, so the device id is stored and returned verbatim; the statx
+  path splits it into major/minor for its own reply.
+- `create_inode_in_txn` takes the device id as a parameter (zero for every
+  other kind) and fills the schema-v2 `rdev` field.
+- No new migration is needed: device nodes could not exist before this change,
+  and the schema-v2 migration already backfills `rdev = 0` for old inodes.
+
+### Data integrity
+
+Device nodes carry no file data or chunk references, so the data plane is
+untouched. They are ordinary named inodes for the namespace logic: link,
+unlink, rename, snapshots, readdir and the read-only flag all use the generic
+paths. `rdev` is part of the inode record and therefore survives remounts and
+snapshot restores.
+
+### Validation
+
+Device creation needs `CAP_MKNOD`, so the probe ran as root in a privileged
+container (headless build, direct FUSE mount). `mknod` of `c 1 3`, `c 1 5`,
+`c 10 229` and `b 7 0` succeeds; `stat -c '%F %t:%T'` reports
+`character special file`/`block special file` with the exact major:minor
+(`1:3`, `1:5`, `10:229`, `7:0`); `ls -l` shows the `c`/`b` entry types; a
+`rsync -a --specials` copy of a directory tree of device nodes reproduces every
+node with the same type and major:minor; the nodes survive a daemon
+restart/remount with the same `rdev`; link and unlink work; the daemon log and
+the records check are clean.

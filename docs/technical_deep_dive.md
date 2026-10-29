@@ -419,6 +419,12 @@ Built with the default `gui` feature (Qt 6 Quick via cxx-qt 0.10, tray via `ksni
   - `SYS:vault.policy`
 - Inodes now carry `flags` with a read-only bit used for snapshot immutability.
   - Additional inode flags mark vault namespace and descendants.
+- Inode kinds cover regular files, directories, symlinks, FIFOs, sockets and
+  block/character device nodes. A device node stores the kernel's
+  `new_encode_dev` device id in the schema-v2 `rdev` field, reports its
+  `S_IFCHR`/`S_IFBLK` mode and `c`/`b` directory entry type, and holds no
+  extents or chunk references (B063). Creating one requires `CAP_MKNOD`, so it
+  is only reachable by root (root rsync, container rootfs and `/dev` backups).
 - Unlinked-inode lifetime follows the FUSE contract: an inode stays valid until the
   kernel forgets it, not only until its last handle closes.
   - `FsCore` counts kernel lookup references per inode: entry replies from `lookup`,

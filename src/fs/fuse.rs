@@ -243,10 +243,12 @@ impl VirtualFs for VerFs {
             SFlag::S_IFIFO => INODE_KIND_FIFO,
             SFlag::S_IFSOCK => INODE_KIND_SOCKET,
             SFlag::S_IFDIR => INODE_KIND_DIR,
-            SFlag::S_IFCHR | SFlag::S_IFBLK | SFlag::S_IFLNK => {
+            SFlag::S_IFCHR => INODE_KIND_CHR,
+            SFlag::S_IFBLK => INODE_KIND_BLK,
+            SFlag::S_IFLNK => {
                 return build_error_result_from_errno(
                     Errno::EOPNOTSUPP,
-                    format!("mknod does not support node type {:?}", param.node_type),
+                    "mknod cannot create a symbolic link".to_owned(),
                 );
             }
             _ => {
@@ -255,6 +257,12 @@ impl VirtualFs for VerFs {
                     format!("mknod received invalid node type {:?}", param.node_type),
                 );
             }
+        };
+        // The kernel sends the device id in new_encode_dev form; it is stored
+        // verbatim and reported back in the same form.
+        let rdev = match create_kind {
+            INODE_KIND_CHR | INODE_KIND_BLK => param.rdev,
+            _ => 0,
         };
         let _guard = self.core.write_lock.write().await;
 
@@ -271,6 +279,7 @@ impl VirtualFs for VerFs {
                     param.umask,
                     param.uid,
                     param.gid,
+                    rdev,
                 )?;
                 created = Some(inode);
                 Ok(())
@@ -322,6 +331,7 @@ impl VirtualFs for VerFs {
                     param.umask,
                     param.uid,
                     param.gid,
+                    0,
                 )?;
                 created = Some(inode);
                 Ok(())
@@ -506,6 +516,7 @@ impl VirtualFs for VerFs {
                     0,
                     uid,
                     gid,
+                    0,
                 )?;
                 inode.size = target_bytes.len() as u64;
                 txn.set(inode_key(inode.ino), encode_rkyv(&inode)?)?;
@@ -1272,6 +1283,7 @@ impl VirtualFs for VerFs {
                     umask,
                     uid,
                     gid,
+                    0,
                 )?;
                 created = Some(inode);
                 Ok(())
@@ -1328,6 +1340,7 @@ impl VirtualFs for VerFs {
                     param.umask,
                     param.uid,
                     param.gid,
+                    0,
                 )?;
                 created = Some(inode);
                 Ok(())

@@ -32,6 +32,10 @@ pub enum FileType {
     Fifo,
     /// A UNIX-domain socket.
     Socket,
+    /// A character device.
+    CharDevice,
+    /// A block device.
+    BlockDevice,
 }
 
 impl TryFrom<SFlag> for FileType {
@@ -55,6 +59,8 @@ impl TryFrom<SFlag> for FileType {
             SFlag::S_IFREG => Ok(Self::File),
             SFlag::S_IFLNK => Ok(Self::Symlink),
             SFlag::S_IFSOCK => Ok(Self::Socket),
+            SFlag::S_IFCHR => Ok(Self::CharDevice),
+            SFlag::S_IFBLK => Ok(Self::BlockDevice),
             _ => {
                 error!("Try convert {:?} to FileType failed.", value);
                 Err(AsyncFusexError::ArgumentInvalid { context: vec![] })
@@ -80,6 +86,8 @@ impl From<FileType> for SFlag {
             FileType::File => SFlag::S_IFREG,
             FileType::Socket => SFlag::S_IFSOCK,
             FileType::Symlink => SFlag::S_IFLNK,
+            FileType::CharDevice => SFlag::S_IFCHR,
+            FileType::BlockDevice => SFlag::S_IFBLK,
         }
     }
 }
