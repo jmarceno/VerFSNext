@@ -233,6 +233,15 @@ pub trait VirtualFs: Sync + Send {
         buf: &mut Vec<u8>,
     ) -> AsyncFusexResult<usize>;
 
+    /// Resolve SEEK_DATA/SEEK_HOLE against the file's allocated extents.
+    async fn lseek(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        whence: u32,
+    ) -> AsyncFusexResult<u64>;
+
     /// Write data
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()>;
 

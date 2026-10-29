@@ -2144,3 +2144,52 @@ and the failed operations left no entries behind.
 
 `src/types/mod.rs`, `src/fs/mod.rs`, `src/fs/inode.rs`, `src/fs/fuse.rs`,
 `docs/bug-fix-history.md`
+
+## B054 - FUSE_LSEEK Returned EOPNOTSUPP for SEEK_DATA/SEEK_HOLE - Oct 29 2026
+
+### Symptom
+
+`lseek(fd, offset, SEEK_DATA)` and `SEEK_HOLE` failed with `EOPNOTSUPP`.
+Sparse-aware tools including `cp`, `rsync --sparse`, `tar --sparse` and
+`qemu-img` could not discover holes and either copied allocated zeroes or
+reported an error.
+
+### Root Cause
+
+The FUSE session dispatched `FUSE_LSEEK` to an error helper that replied
+`EOPNOTSUPP`. The async filesystem interface had no lseek operation, no reply
+type and no implementation that consulted the extent map. `EOPNOTSUPP` is
+also the wrong fallback signal: the kernel turns `ENOSYS` into generic
+seekability, but forwards every other errno to userspace.
+
+### Fix
+
+`FUSE_LSEEK` now has a `ReplyLSeek` response and an end-to-end path through
+`FileSystem` and `VirtualFs`. `VerFs::lseek` validates the file handle and the
+regular-file type, returns `ENXIO` at or past EOF, and resolves the request
+against the file's sorted extents:
+
+- `SEEK_DATA` returns the offset when it lies inside an extent, otherwise the
+  start of the next extent, and `ENXIO` when no allocated data follows.
+- `SEEK_HOLE` returns the current offset when it lies in a gap, otherwise the
+  end of the covering extent; a data run that reaches EOF resolves to EOF.
+
+Bytes absent from the extent map are holes and read as zeroes, which is the
+representation the existing read and sparse-write paths already use.
+
+### Validation
+
+Release build passed. On a scratch mount with a 1,000,000-byte file containing
+two allocated ranges separated by holes, every reported `SEEK_DATA` range was
+non-empty, all unreported bytes read as zero, `SEEK_DATA` and `SEEK_HOLE` at
+and past EOF returned `ENXIO`, and `cp --sparse=always` copied the exact file
+contents.
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/fuse_reply.rs`,
+`crates/verfsnext-async-fusex/src/file_system.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`,
+`crates/verfsnext-async-fusex/src/session.rs`,
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`, `src/fs/fuse.rs`,
+`docs/bug-fix-history.md`

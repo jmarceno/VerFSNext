@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+    ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use super::fuse_request::Request;
 #[cfg(feature = "abi-7-16")]
@@ -131,6 +131,16 @@ pub trait FileSystem {
         offset: i64,
         size: u32,
         reply: ReplyData<'_>,
+    ) -> nix::Result<usize>;
+
+    /// Reposition the file offset for SEEK_DATA/SEEK_HOLE.
+    async fn lseek(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: u64,
+        whence: u32,
+        reply: ReplyLSeek<'_>,
     ) -> nix::Result<usize>;
 
     /// Write data

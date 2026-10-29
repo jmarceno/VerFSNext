@@ -29,7 +29,7 @@ use super::file_system::FileSystem;
 use super::fuse_reply::ReplyDirectoryPlus;
 use super::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyInit, ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+    ReplyInit, ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use super::fuse_request::{Operation, Request};
 #[cfg(feature = "abi-7-23")]
@@ -1075,8 +1075,8 @@ async fn dispatch<'a>(
         }
         // #[cfg(feature = "abi-7-24")]
         Operation::LSeek { arg } => {
-            error!("LSeek unsupported, arg={:?}", arg);
-            reply_errno(req, file, Errno::EOPNOTSUPP).await
+            let reply = ReplyLSeek::new(req.unique(), file);
+            fs.lseek(req, arg.fh, arg.offset, arg.whence, reply).await
         }
         // #[cfg(feature = "abi-7-28")]
         Operation::CopyFileRange { arg } => {

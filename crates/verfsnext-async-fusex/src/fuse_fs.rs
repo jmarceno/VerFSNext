@@ -5,7 +5,7 @@ use crate::fs_util::*;
 use crate::fuse_reply::ReplyDirectoryPlus;
 use crate::fuse_reply::{
     ReplyAttr, ReplyBMap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+    ReplyLock, ReplyLSeek, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use crate::fuse_request::Request;
 #[cfg(feature = "abi-7-16")]
@@ -454,6 +454,37 @@ impl FileSystem for FuseFs {
                 debug!(
                     "fusefilesystem call read() failed to read the content of ino={}, the error is: {:?}",
                     ino, e,
+                );
+                reply.error(e).await
+            }
+        }
+    }
+
+    /// Reposition the file offset for SEEK_DATA/SEEK_HOLE.
+    async fn lseek(
+        &self,
+        req: &Request<'_>,
+        fh: u64,
+        offset: u64,
+        whence: u32,
+        reply: ReplyLSeek<'_>,
+    ) -> nix::Result<usize> {
+        let ino = req.nodeid();
+        debug!(
+            "lseek(ino={}, fh={}, offset={}, whence={}, req={:?})",
+            ino, fh, offset, whence, req,
+        );
+
+        match self
+            .virtual_fs
+            .lseek(ino, fh, offset, whence)
+            .await
+        {
+            Ok(resolved) => reply.lseek(resolved).await,
+            Err(e) => {
+                debug!(
+                    "fusefilesystem call lseek() failed for ino={} fh={} offset={} whence={}, the error is: {:?}",
+                    ino, fh, offset, whence, e,
                 );
                 reply.error(e).await
             }

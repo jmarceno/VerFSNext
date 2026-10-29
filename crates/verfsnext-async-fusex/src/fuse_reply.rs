@@ -24,7 +24,8 @@ use super::abi_marker;
 use super::protocol::FuseDirEntPlus;
 use super::protocol::{
     FuseAttr, FuseAttrOut, FuseBMapOut, FuseDirEnt, FuseEntryOut, FuseFileLock, FuseGetXAttrOut,
-    FuseInitOut, FuseKStatFs, FuseLockOut, FuseOpenOut, FuseOutHeader, FuseStatFsOut, FuseWriteOut,
+    FuseInitOut, FuseKStatFs, FuseLockOut, FuseLSeekOut, FuseOpenOut, FuseOutHeader,
+    FuseStatFsOut, FuseWriteOut,
 };
 #[cfg(feature = "abi-7-18")]
 use super::protocol::{FuseNotifyCode::FUSE_NOTIFY_DELETE, FuseNotifyDeleteOut};
@@ -280,6 +281,7 @@ impl_fuse_reply_new_for! {
     ReplyEntry,
     ReplyInit,
     ReplyLock,
+    ReplyLSeek,
     ReplyOpen,
     ReplyStatFs,
     ReplyWrite,
@@ -319,6 +321,7 @@ impl_fuse_reply_error_for! {
     ReplyEntry,
     ReplyInit,
     ReplyLock,
+    ReplyLSeek,
     ReplyOpen,
     ReplyStatFs,
     ReplyWrite,
@@ -361,6 +364,7 @@ impl_as_ioslice_for! {
     FuseEntryOut,
     FuseInitOut,
     FuseLockOut,
+    FuseLSeekOut,
     FuseOpenOut,
     FuseStatFsOut,
     FuseWriteOut,
@@ -607,6 +611,20 @@ impl ReplyBMap<'_> {
     #[allow(dead_code)]
     pub async fn bmap(self, block: u64) -> nix::Result<usize> {
         self.reply.send(FuseBMapOut { block }).await
+    }
+}
+
+/// FUSE lseek response
+#[derive(Debug)]
+pub struct ReplyLSeek<'a> {
+    /// The inner raw reply
+    reply: ReplyRaw<'a>,
+}
+
+impl ReplyLSeek<'_> {
+    /// Reply with the resulting offset.
+    pub async fn lseek(self, offset: u64) -> nix::Result<usize> {
+        self.reply.send(FuseLSeekOut { offset }).await
     }
 }
 

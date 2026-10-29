@@ -876,6 +876,86 @@ impl VirtualFs for VerFs {
         Ok(read_len)
     }
 
+    async fn lseek(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        whence: u32,
+    ) -> AsyncFusexResult<u64> {
+        self.core.mark_activity();
+        self.core
+            .validate_file_handle(fh, ino)
+            .map_err(map_anyhow_to_fuse)?;
+        let inode = self
+            .core
+            .load_inode_with_vault_access(ino, "lseek")
+            .map_err(map_anyhow_to_fuse)?;
+        if inode.kind != INODE_KIND_FILE {
+            return build_error_result_from_errno(
+                Errno::EINVAL,
+                "lseek SEEK_DATA/SEEK_HOLE requires a regular file".to_owned(),
+            );
+        }
+        if offset >= inode.size {
+            return build_error_result_from_errno(
+                Errno::ENXIO,
+                format!(
+                    "lseek offset {} is at or past file size {}",
+                    offset, inode.size
+                ),
+            );
+        }
+
+        let extents = self
+            .core
+            .meta
+            .read_txn(|txn| FsCore::load_all_extents_in_txn(txn, ino))
+            .map_err(map_anyhow_to_fuse)?;
+        match whence {
+            value if value == libc::SEEK_DATA as u32 => {
+                for extent in &extents {
+                    if extent.start >= inode.size {
+                        break;
+                    }
+                    let extent_end = extent.end().min(inode.size);
+                    if extent_end <= offset {
+                        continue;
+                    }
+                    return Ok(extent.start.max(offset));
+                }
+                build_error_result_from_errno(
+                    Errno::ENXIO,
+                    format!("no data at or after offset {}", offset),
+                )
+            }
+            value if value == libc::SEEK_HOLE as u32 => {
+                let mut cursor = offset;
+                for extent in &extents {
+                    if extent.start >= inode.size {
+                        break;
+                    }
+                    let extent_end = extent.end().min(inode.size);
+                    if extent_end <= cursor {
+                        continue;
+                    }
+                    if extent.start > cursor {
+                        return Ok(cursor);
+                    }
+                    cursor = extent_end;
+                    if cursor >= inode.size {
+                        return Ok(inode.size);
+                    }
+                }
+                Ok(cursor)
+            }
+            _ => build_error_result_from_errno(
+                Errno::EINVAL,
+                format!("unsupported lseek whence {}", whence),
+            ),
+        }
+    }
+
     async fn write(&self, ino: u64, offset: i64, data: &[u8], flags: u32) -> AsyncFusexResult<()> {
         self.core.mark_activity();
         // Kernel writeback discards WRITE errors apart from a per-file error flag,
