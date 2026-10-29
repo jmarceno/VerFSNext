@@ -49,7 +49,8 @@ use crate::sync::{SyncService, SyncTarget};
 use crate::types::{
     chunk_key, decode_chunk_key, decode_dirent_name, decode_inline_chunk_key, decode_rkyv,
     decode_xattr_name, dirent_key, dirent_prefix, encode_rkyv, extent_key, extent_prefix,
-    inode_key, inline_chunk_key, parts_to_system_time, prefix_end, symlink_target_key, sys_key,
+    inode_key, inline_chunk_key, orphan_key, parts_to_system_time, prefix_end, symlink_target_key,
+    sys_key,
     system_time_to_parts, xattr_key, xattr_prefix, ChunkId, ChunkRecord, DirentRecord,
     ExtentRecord, InodeRecord, INODE_FLAG_READONLY, INODE_FLAG_VAULT, INODE_FLAG_VAULT_ROOT,
     INODE_KIND_DIR, INODE_KIND_FIFO, INODE_KIND_FILE, INODE_KIND_SOCKET, INODE_KIND_SYMLINK,

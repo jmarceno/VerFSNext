@@ -569,6 +569,9 @@ pub enum FuseOpCode {
     /// Copy a range of data from an opened file to another
     // #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
+    /// Create an unnamed temporary file (O_TMPFILE)
+    #[cfg(feature = "abi-7-37")]
+    FUSE_TMPFILE = 51,
     /// Answer a statx request with full attributes including birth time
     #[cfg(feature = "abi-7-39")]
     FUSE_STATX = 52,

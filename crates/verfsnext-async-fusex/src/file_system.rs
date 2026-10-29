@@ -68,6 +68,15 @@ pub trait FileSystem {
     /// Read symbolic link.
     async fn readlink(&self, req: &Request<'_>, reply: ReplyData<'_>) -> nix::Result<usize>;
 
+    /// Create an unnamed temporary file (`O_TMPFILE`).
+    #[cfg(feature = "abi-7-37")]
+    async fn tmpfile(
+        &self,
+        req: &Request<'_>,
+        param: CreateParam,
+        reply: ReplyCreate<'_>,
+    ) -> nix::Result<usize>;
+
     /// Create file node.
     async fn mknod(
         &self,

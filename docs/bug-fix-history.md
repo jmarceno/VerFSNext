@@ -2557,3 +2557,63 @@ warnings.
 
 `src/fs/inode.rs`, `src/fs/mod.rs`, `src/fs/fuse.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B062 - O_TMPFILE Returned EOPNOTSUPP - Oct 29 2026
+
+### Symptom
+
+`open(dir, O_TMPFILE | O_RDWR, 0600)` on a VerFSNext mount returned
+`EOPNOTSUPP`. Programs that prefer anonymous temporary files (systemd, glibc
+`tmpfile()` in some configurations, editors and build tools) silently fell back
+to create/unlink, or failed when they also need `linkat(2)` to give the
+temporary file a name.
+
+### Root Cause
+
+The vendored protocol knew ABI 7.39 after the statx work, but `FUSE_TMPFILE`
+(opcode 51) was still an unknown opcode: the session answered `ENOSYS`, which
+the kernel translates to `EOPNOTSUPP` for `O_TMPFILE`. Even if it had been
+parsed, the filesystem had no way to create an inode without a directory entry:
+`create_inode_in_txn` always wrote a dirent and `nlink = 1`.
+
+### Fix
+
+- The protocol parses `FUSE_TMPFILE` (ABI 7.37) with the `fuse_create_in` body
+  and the kernel's anonymous name, dispatches it through the session and the
+  fuse filesystem layer, and replies with `fuse_entry_out` + `fuse_open_out`
+  like `FUSE_CREATE`.
+- `create_inode_in_txn` takes an optional name. With `None` it creates a
+  regular inode with `nlink = 0`, inherits the parent's setgid group, vault
+  domain and default ACLs as usual, skips the dirent and leaves the parent
+  directory times alone, and writes the inode into the orphan index in the same
+  transaction. The orphan index is what makes a daemon crash (or a lazy unmount
+  while the kernel still holds the file) reclaim the inode and its chunks on
+  the next start instead of leaking them.
+- `link(2)` of an unnamed inode (the `linkat(/proc/self/fd/N)` and
+  `linkat(fd, "", ..., AT_EMPTY_PATH)` forms) now removes the orphan index entry
+  in the same transaction that adds the name and bumps `nlink`, so the startup
+  sweep cannot later refuse to mount because an orphan names a linked inode.
+- The normal unlinked-file teardown already covers the release/forget path:
+  when the kernel drops the last reference the inode, extents and chunk
+  references are deleted.
+
+### Data integrity
+
+An `O_TMPFILE` inode has no name: if the daemon dies while one is open, nothing
+in the namespace points at its extents. The orphan index is written at creation
+time, before the open handle is returned to the kernel, so the next mount
+reclaims it (verified by killing the daemon with SIGKILL while a 2 MiB
+temporary file was open: the next start logged `reclaimed_orphans=1`, the mount
+was healthy and the records check reported no reference-count mismatches).
+Linking the file removes the orphan entry atomically with adding its name.
+
+### Validation
+
+A C probe on a scratch mount passes every step: create with `O_TMPFILE|O_RDWR`,
+write and read back, `fstat` reports a regular file with `nlink == 0` and the
+written size; `linkat(/proc/self/fd/N)` and `linkat(fd, "", AT_EMPTY_PATH)`
+both create a named file whose `nlink` is 1 and whose content matches; the
+linked file can be reopened by name; closing an unlinked 1 MiB temporary file
+leaks nothing; and `O_TMPFILE` in a missing directory still fails cleanly. The
+records check after the crash test reports no missing data, damaged copies,
+reference-count mismatches or orphan extent records.

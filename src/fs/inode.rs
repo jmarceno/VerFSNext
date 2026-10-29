@@ -180,11 +180,17 @@ impl FsCore {
         FsCore::ensure_inode_writable(&parent_inode, context)?;
         Ok(parent_inode)
     }
+    /// Creates an inode under `parent`.
+    ///
+    /// `name` is the directory entry to create. `None` creates an unnamed
+    /// (unlinked, `nlink == 0`) inode for `O_TMPFILE`: it gets an orphan index
+    /// entry so a crash reclaims it, and it must be `link(2)`-ed before the
+    /// kernel drops it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_inode_in_txn(
         txn: &mut verfsnext_surrealkv::Transaction,
         parent: INum,
-        name: &str,
+        name: Option<&str>,
         kind: u8,
         mode: u32,
         umask: u32,
@@ -210,24 +216,26 @@ impl FsCore {
                 format!("create: parent inode {} is read-only", parent),
             ));
         }
-        if parent == ROOT_INODE && name == VAULT_DIR_NAME {
+        if parent == ROOT_INODE && name == Some(VAULT_DIR_NAME) {
             return Err(anyhow_errno(
                 Errno::EPERM,
                 "top-level .vault is managed only by crypt control commands",
             ));
         }
 
-        let dirent_key_bytes = dirent_key(parent, name.as_bytes());
-        if let Some(existing_dirent_raw) = txn.get(dirent_key_bytes.clone())? {
-            let existing_dirent: DirentRecord = decode_rkyv(&existing_dirent_raw)?;
-            if txn.get(inode_key(existing_dirent.ino))?.is_none() {
-                // Self-heal stale directory entry left behind by an earlier failed/mixed version.
-                txn.delete(dirent_key_bytes.clone())?;
-            } else {
-                return Err(anyhow_errno(
-                    Errno::EEXIST,
-                    format!("create: {} already exists", name),
-                ));
+        if let Some(name) = name {
+            let existing_dirent_key = dirent_key(parent, name.as_bytes());
+            if let Some(existing_dirent_raw) = txn.get(existing_dirent_key.clone())? {
+                let existing_dirent: DirentRecord = decode_rkyv(&existing_dirent_raw)?;
+                if txn.get(inode_key(existing_dirent.ino))?.is_none() {
+                    // Self-heal stale directory entry left behind by an earlier failed/mixed version.
+                    txn.delete(existing_dirent_key)?;
+                } else {
+                    return Err(anyhow_errno(
+                        Errno::EEXIST,
+                        format!("create: {} already exists", name),
+                    ));
+                }
             }
         }
 
@@ -284,7 +292,13 @@ impl FsCore {
             perm: child_perm,
             uid,
             gid: inherited_gid,
-            nlink: if kind == INODE_KIND_DIR { 2 } else { 1 },
+            nlink: if kind == INODE_KIND_DIR {
+                2
+            } else if name.is_some() {
+                1
+            } else {
+                0
+            },
             size: 0,
             atime_sec: sec,
             atime_nsec: nsec,
@@ -300,7 +314,16 @@ impl FsCore {
         };
 
         txn.set(inode_key(ino), encode_rkyv(&inode)?)?;
-        txn.set(dirent_key_bytes, encode_rkyv(&DirentRecord { ino, kind })?)?;
+        if let Some(name) = name {
+            txn.set(
+                dirent_key(parent, name.as_bytes()),
+                encode_rkyv(&DirentRecord { ino, kind })?,
+            )?;
+        } else {
+            // Unnamed (O_TMPFILE) inode: indexed so a crash reclaims it, and
+            // removed from the index by link(2).
+            txn.set(orphan_key(ino), Vec::new())?;
+        }
         txn.set(next_inode_key, (ino + 1).to_le_bytes().to_vec())?;
         if let Some(access_acl) = inherited_access_acl {
             txn.set(xattr_key(ino, ACL_XATTR_ACCESS.as_bytes()), access_acl)?;
@@ -309,14 +332,16 @@ impl FsCore {
             txn.set(xattr_key(ino, ACL_XATTR_DEFAULT.as_bytes()), default_acl)?;
         }
 
-        if kind == INODE_KIND_DIR {
-            parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+        if name.is_some() {
+            if kind == INODE_KIND_DIR {
+                parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+            }
+            parent_inode.mtime_sec = sec;
+            parent_inode.mtime_nsec = nsec;
+            parent_inode.ctime_sec = sec;
+            parent_inode.ctime_nsec = nsec;
+            txn.set(inode_key(parent), encode_rkyv(&parent_inode)?)?;
         }
-        parent_inode.mtime_sec = sec;
-        parent_inode.mtime_nsec = nsec;
-        parent_inode.ctime_sec = sec;
-        parent_inode.ctime_nsec = nsec;
-        txn.set(inode_key(parent), encode_rkyv(&parent_inode)?)?;
 
         Ok(inode)
     }

@@ -265,7 +265,7 @@ impl VirtualFs for VerFs {
                 let inode = FsCore::create_inode_in_txn(
                     txn,
                     param.parent,
-                    &param.name,
+                    Some(&param.name),
                     create_kind,
                     param.mode,
                     param.umask,
@@ -316,7 +316,7 @@ impl VirtualFs for VerFs {
                 let inode = FsCore::create_inode_in_txn(
                     txn,
                     param.parent,
-                    &param.name,
+                    Some(&param.name),
                     INODE_KIND_DIR,
                     param.mode,
                     param.umask,
@@ -500,7 +500,7 @@ impl VirtualFs for VerFs {
                 let mut inode = FsCore::create_inode_in_txn(
                     txn,
                     parent,
-                    name,
+                    Some(name),
                     INODE_KIND_SYMLINK,
                     PERM_SYMLINK_DEFAULT as u32,
                     0,
@@ -1266,7 +1266,7 @@ impl VirtualFs for VerFs {
                 let inode = FsCore::create_inode_in_txn(
                     txn,
                     parent,
-                    name,
+                    Some(name),
                     INODE_KIND_FILE,
                     mode,
                     umask,
@@ -1286,6 +1286,62 @@ impl VirtualFs for VerFs {
             AsyncFusexError::from(anyhow_errno(Errno::EIO, "missing created file inode"))
         })?;
         self.core.invalidate_inode_attr_best_effort(inode.ino);
+        self.core.increment_open_file_count(inode.ino);
+        let fh = self.core.new_handle();
+        let inode_data_version = self.core.inode_data_version(inode.ino);
+        self.core
+            .register_file_handle(fh, inode.ino, inode_data_version);
+        self.core.add_kernel_lookup(inode.ino);
+        Ok((
+            self.core.entry_ttl(),
+            self.core.attr_ttl(),
+            self.core
+                .file_attr_from_inode(&inode)
+                .map_err(map_anyhow_to_fuse)?,
+            inode.generation,
+            fh,
+            0,
+        ))
+    }
+
+    async fn tmpfile(
+        &self,
+        param: CreateParam,
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)> {
+        FsCore::validate_name_length(&param.name, "tmpfile").map_err(map_anyhow_to_fuse)?;
+        let _parent_inode = self
+            .core
+            .load_inode_with_vault_access(param.parent, "tmpfile")
+            .map_err(map_anyhow_to_fuse)?;
+        let _guard = self.core.write_lock.write().await;
+
+        let mut created: Option<InodeRecord> = None;
+        self.core
+            .meta
+            .write_txn(|txn| {
+                let inode = FsCore::create_inode_in_txn(
+                    txn,
+                    param.parent,
+                    None,
+                    INODE_KIND_FILE,
+                    param.mode,
+                    param.umask,
+                    param.uid,
+                    param.gid,
+                )?;
+                created = Some(inode);
+                Ok(())
+            })
+            .await
+            .map_err(map_anyhow_to_fuse)?;
+        self.core.mark_mutation();
+
+        let inode = created.ok_or_else(|| {
+            AsyncFusexError::from(anyhow_errno(
+                Errno::EIO,
+                "missing created temporary file inode",
+            ))
+        })?;
         self.core.increment_open_file_count(inode.ino);
         let fh = self.core.new_handle();
         let inode_data_version = self.core.inode_data_version(inode.ino);
@@ -1381,6 +1437,12 @@ impl VirtualFs for VerFs {
                     })?,
                 )?;
 
+                // Linking an unnamed inode (O_TMPFILE) gives it its first
+                // name: it is no longer an orphan and the startup sweep must
+                // not reclaim it.
+                if target_inode.nlink == 0 {
+                    txn.delete(orphan_key(ino))?;
+                }
                 target_inode.nlink = target_inode.nlink.saturating_add(1);
                 let now = SystemTime::now();
                 let (sec, nsec) = system_time_to_parts(now);

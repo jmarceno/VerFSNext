@@ -221,6 +221,7 @@ Effect (direct I/O, unique data, pack bytes per data byte): 1 MiB writes 1.016 -
   - every completed scan is kept as a snapshot (in memory and in `<data_dir>/stats-snapshot.json`), so `stats` requests that can use a kept scan answer instantly, including after a reboot; see "Kept statistics scan"
   - range scans resolve each user key without a per-key point lookup when no range tombstone can exist (see the SurrealKV architecture guide), so whole-tree scans (statistics, records check, namespace walks) no longer repeat a full level search per key
   - read-only inode flag enforcement across mutating FUSE operations
+  - `O_TMPFILE` creates an unnamed inode (`nlink = 0`, no dirent) with an orphan-index entry so a crash reclaims it; `link(2)` of the unnamed inode adds the name and drops the orphan entry in the same transaction (B062)
   - exposes snapshot create/list/delete methods used by control socket server in mounted mode
   - enforces `.vault` lock-state visibility and access policy
   - blocks removal (`unlink`/`rmdir`) and rename of the top-level `/.vault` namespace (`INODE_FLAG_VAULT_ROOT`, `EPERM`) and blocks cross-boundary rename/link between vault and non-vault trees

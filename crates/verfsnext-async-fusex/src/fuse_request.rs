@@ -285,6 +285,14 @@ pub enum Operation<'a> {
         /// The FUSE copy file range request
         arg: &'a FuseCopyFileRangeIn,
     },
+    /// FUSE_TMPFILE = 51
+    #[cfg(feature = "abi-7-37")]
+    TmpFile {
+        /// The FUSE create request shared with FUSE_CREATE
+        arg: &'a FuseCreateIn,
+        /// The anonymous (empty) name the kernel sends for the temporary file
+        name: &'a str,
+    },
     /// FUSE_STATX = 52
     #[cfg(feature = "abi-7-39")]
     StatX {
@@ -362,6 +370,8 @@ impl<'a> Operation<'a> {
             46 => FuseOpCode::FUSE_LSEEK,
             // #[cfg(feature = "abi-7-28")]
             47 => FuseOpCode::FUSE_COPY_FILE_RANGE,
+            #[cfg(feature = "abi-7-37")]
+            51 => FuseOpCode::FUSE_TMPFILE,
             #[cfg(feature = "abi-7-39")]
             52 => FuseOpCode::FUSE_STATX,
             #[cfg(feature = "abi-7-11")]
@@ -521,6 +531,11 @@ impl<'a> Operation<'a> {
             // #[cfg(feature = "abi-7-28")]
             FuseOpCode::FUSE_COPY_FILE_RANGE => Operation::CopyFileRange {
                 arg: data.fetch_ref()?,
+            },
+            #[cfg(feature = "abi-7-37")]
+            FuseOpCode::FUSE_TMPFILE => Operation::TmpFile {
+                arg: data.fetch_ref()?,
+                name: data.fetch_str()?,
             },
             #[cfg(feature = "abi-7-39")]
             FuseOpCode::FUSE_STATX => Operation::StatX {
@@ -693,6 +708,12 @@ impl fmt::Display for Operation<'_> {
                 f,
                 "COPYFILERANGE src fh={}, dst fh={}, flags={:#?}",
                 arg.fh_in, arg.fh_out, arg.flags,
+            ),
+            #[cfg(feature = "abi-7-37")]
+            Operation::TmpFile { arg, name } => write!(
+                f,
+                "TMPFILE name={name:?}, flags={:#x}, mode={:#o}",
+                arg.flags, arg.mode,
             ),
             #[cfg(feature = "abi-7-39")]
             Operation::StatX { arg } => write!(f, "STATX arg={arg:?}"),

@@ -276,6 +276,39 @@ impl FileSystem for FuseFs {
         }
     }
 
+    /// Create an unnamed temporary file (`O_TMPFILE`).
+    #[cfg(feature = "abi-7-37")]
+    async fn tmpfile(
+        &self,
+        req: &Request<'_>,
+        param: CreateParam,
+        reply: ReplyCreate<'_>,
+    ) -> nix::Result<usize> {
+        let ino = req.nodeid();
+        let name = param.name.clone();
+        debug!(
+            "tmpfile(ino={}, name={:?}, mode={}, req={:?})",
+            ino, name, param.mode, req,
+        );
+
+        match self.virtual_fs.tmpfile(param).await {
+            Ok((entry_ttl, attr_ttl, file_attr, generation, fh, flags)) => {
+                debug!(
+                    "fusefilesystem call tmpfile() created ino={:?} with attr={:?}",
+                    file_attr.ino, file_attr,
+                );
+                let fuse_attr = fs_util::convert_to_fuse_attr(file_attr);
+                reply
+                    .created(&entry_ttl, &attr_ttl, fuse_attr, generation, fh, flags)
+                    .await
+            }
+            Err(err) => {
+                debug!("tmpfile() failed to create a temporary file, the error is: {err}",);
+                reply.error(err).await
+            }
+        }
+    }
+
     /// Create a directory.
     async fn mkdir(
         &self,

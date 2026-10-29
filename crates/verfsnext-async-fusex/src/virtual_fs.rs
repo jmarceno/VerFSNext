@@ -189,6 +189,12 @@ pub trait VirtualFs: Sync + Send {
     /// Create file node.
     async fn mknod(&self, param: CreateParam) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 
+    /// Create an unnamed regular file for `O_TMPFILE`.
+    async fn tmpfile(
+        &self,
+        param: CreateParam,
+    ) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64, u64, u32)>;
+
     /// Create a directory
     async fn mkdir(&self, param: CreateParam) -> AsyncFusexResult<(Duration, Duration, FileAttr, u64)>;
 

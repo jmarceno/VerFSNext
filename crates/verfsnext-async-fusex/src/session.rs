@@ -1038,6 +1038,22 @@ async fn dispatch<'a>(
             let reply = ReplyEmpty::new(req.unique(), file);
             fs.access(req, arg.mask, reply).await
         }
+        #[cfg(feature = "abi-7-37")]
+        Operation::TmpFile { arg, name } => {
+            let param = CreateParam {
+                parent: req.nodeid(),
+                name: name.to_owned(),
+                mode: arg.mode,
+                umask: arg.umask,
+                rdev: 0,
+                uid: req.uid(),
+                gid: req.gid(),
+                node_type: SFlag::S_IFREG,
+                link: None,
+            };
+            let reply = ReplyCreate::new(req.unique(), file);
+            fs.tmpfile(req, param, reply).await
+        }
         Operation::Create { arg, name } => {
             let reply = ReplyCreate::new(req.unique(), file);
             fs.create(
