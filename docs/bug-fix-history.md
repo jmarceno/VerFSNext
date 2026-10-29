@@ -2807,3 +2807,86 @@ errors or warnings.
 
 `src/fs/fuse.rs`, `src/fs/inode.rs`, `src/fs/mod.rs`,
 `docs/bug-fix-history.md`, `docs/technical_deep_dive.md`
+
+## B065 - copy_file_range Copied Through 128 KiB Reads and Writes - Oct 29 2026
+
+### Symptom
+
+`cp`, `rsync` and `copy_file_range(2)` copied whole files byte by byte through
+a userspace read/write loop in the vendored FUSE layer: every copied byte was
+read (unpacked, decompressed and verified) and written back through the
+content-defined chunker. A large copy therefore cost as much CPU and I/O as
+writing the data from scratch even though the destination data already existed
+in the store, deduplicated, and could have been shared by reference.
+
+### Root Cause
+
+`FuseFs::copy_file_range` in
+`crates/verfsnext-async-fusex/src/fuse_fs.rs` implemented the request as 128 KiB
+`VirtualFs::read` + `VirtualFs::write` iterations. The filesystem side had no
+copy operation at all, so the generic FUSE layer owned the data movement and
+could not share the source's chunk records with the destination.
+
+### Fix
+
+`copy_file_range` is now a real filesystem operation. The generic loop is gone;
+`FuseFs::copy_file_range` forwards to a new `VirtualFs::copy_file_range`, which
+`VerFs` implements with `FsCore::copy_file_range_locked` in `src/fs/write.rs`.
+The staging routine, modeled on `stage_truncate_in_txn` and
+`remove_extent_range_in_txn`, is metadata-only for the copied data:
+
+- The destination range is trimmed/removed first with
+  `remove_extent_range_in_txn`, so overwritten destination chunks are
+  decremented exactly once and its boundary extents are split.
+- Every source extent the copied range fully covers is cloned by reference: the
+  same `ExtentRecord` is inserted at the mapped destination offset and its chunk
+  gets exactly one reference, with no payload read.
+- The at most two boundary extents the range only partially covers are sliced
+  from their verified payload, stored as new chunks with
+  `stage_chunk_if_missing`, and referenced once.
+
+Validations: both inodes are read through the transaction, must be regular
+files with vault access, and the destination must be writable; `flags != 0` and
+same-inode overlapping ranges are `EINVAL`; copying between the vault and the
+plain namespace is `EXDEV`; `n = min(len, source_size - offset_in)`. The
+destination size becomes `max(size, offset_out + n)`, mtime/ctime are updated,
+the destination cache and data version are invalidated after the commit, and
+conflicts are retried with the same commit-retry loop as truncate and
+fallocate. Both inodes are write-locked in inode-number order under the
+mutation gate so opposite-direction copies cannot deadlock.
+
+The session keeps replying `ENOSYS` to `FUSE_COPY_FILE_RANGE_64` (opcode 53);
+the kernel then retries the same request as legacy `FUSE_COPY_FILE_RANGE`
+(opcode 47), which is the implemented path. When the daemon answers `EXDEV` or
+`EOPNOTSUPP`, the kernel falls back to `splice_copy_file_range`, so a
+cross-domain `copy_file_range(2)` still succeeds by byte copy while the
+filesystem itself refuses to clone across the vault boundary.
+
+### Validation
+
+Release build, clippy and the test suite passed. On a scratch mount with random
+data, 71 checks passed:
+`python3 os.copy_file_range` full-file, mid-file (unaligned source and
+destination offsets), copy into an existing destination, copy at and past
+source EOF, zero length, sparse sources, same-file non-overlapping forward and
+backward copies, overlapping same-file rejected with `EINVAL`, 40 randomized
+source/destination offset/size cases against a Python byte-level mirror, and
+the direct `copy_file_range` syscall with `flags=0` and `flags=1`. Copied files
+kept their sha256 after the source was overwritten and after it was unlinked;
+`sha256sum` of every file was unchanged after a remount of the same data
+directory. A 64 MiB `cp` took 0.026 s against 0.209 s for a 128 KiB read/write
+loop through the same mount. `verfsnext check` (on the mounted daemon, before
+and after the remount) reported no missing data, no refcount mismatches, no
+orphan extents and no CRC32 errors. A temporary probe line confirmed the
+daemon receives opcode 47 after the kernel's opcode 53 probe, that same-domain
+copies commit through the clone path (`Ok(bytes)`) and that cross-domain copies
+return `EXDEV`; the line was removed before the commit. A vault mount copied
+files inside `.vault` (full, partial and same-file) and kept the destination
+intact after the source was unlinked.
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/virtual_fs.rs`,
+`crates/verfsnext-async-fusex/src/fuse_fs.rs`, `src/fs/fuse.rs`,
+`src/fs/write.rs`, `docs/bug-fix-history.md`,
+`docs/technical_deep_dive.md`

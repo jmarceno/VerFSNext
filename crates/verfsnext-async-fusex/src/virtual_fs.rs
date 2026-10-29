@@ -279,6 +279,23 @@ pub trait VirtualFs: Sync + Send {
         mode: u32,
     ) -> AsyncFusexResult<()>;
 
+    /// Copy a range of bytes between two open files.
+    ///
+    /// At most `min(len, source_size - offset_in)` bytes are copied; the
+    /// number actually copied is returned.
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> AsyncFusexResult<u64>;
+
     /// Flush method
     async fn flush(&self, ino: u64, lock_owner: u64) -> AsyncFusexResult<()>;
 

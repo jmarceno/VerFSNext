@@ -1085,6 +1085,53 @@ impl VirtualFs for VerFs {
         Ok(())
     }
 
+    async fn copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> AsyncFusexResult<u64> {
+        self.core.mark_activity();
+        if flags != 0 {
+            return build_error_result_from_errno(
+                Errno::EINVAL,
+                format!("copy_file_range flags {flags:#x} are not supported"),
+            );
+        }
+        self.core
+            .validate_file_handle(fh_in, ino_in)
+            .map_err(map_anyhow_to_fuse)?;
+        self.core
+            .validate_file_handle(fh_out, ino_out)
+            .map_err(map_anyhow_to_fuse)?;
+
+        let _mutation_guard = self.core.write_lock.read().await;
+        // Both inodes are write-locked in inode-number order so two copies in
+        // opposite directions cannot deadlock.
+        let first = ino_in.min(ino_out);
+        let second = ino_in.max(ino_out);
+        let first_lock = self.core.inode_write_lock(first);
+        let _first_guard = first_lock.lock().await;
+        let second_lock = if second == first {
+            None
+        } else {
+            Some(self.core.inode_write_lock(second))
+        };
+        let _second_guard = match second_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        self.core
+            .copy_file_range_locked(ino_in, ino_out, offset_in, offset_out, len)
+            .await
+            .map_err(map_anyhow_to_fuse)
+    }
+
     async fn flush(&self, _ino: u64, _lock_owner: u64) -> AsyncFusexResult<()> {
         self.core.mark_activity();
         if let Ok(inode) = self.core.load_inode_or_errno(_ino, "flush") {

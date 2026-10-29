@@ -203,6 +203,53 @@ the new transaction snapshot.
 `SEEK_DATA`/`SEEK_HOLE` scan extents forward from the one covering the offset
 and stop at the first answer, so a seek never loads a file's whole extent list.
 
+### Copy file range
+
+`copy_file_range` is a filesystem operation, not a byte loop:
+`FuseFs::copy_file_range` forwards to `VirtualFs::copy_file_range`, implemented
+by `VerFs` with `FsCore::copy_file_range_locked`.
+
+- The session replies `ENOSYS` to `FUSE_COPY_FILE_RANGE_64` (opcode 53); the
+  kernel then retries the same request as legacy `FUSE_COPY_FILE_RANGE`
+  (opcode 47), which is the implemented path. This costs one logged unknown
+  opcode per mount.
+- `VerFs::copy_file_range` rejects nonzero flags with `EINVAL`, validates both
+  file handles, takes the mutation gate read side and write-locks both inodes
+  in inode-number order (so opposite-direction copies cannot deadlock).
+- `stage_copy_file_range_in_txn` loads both inodes through the transaction: both
+  must be regular files with vault access, the destination must be writable,
+  the vault/plain domains must match (`EXDEV`), and same-inode overlapping
+  ranges are `EINVAL`. The copied length is `min(len, source_size - offset_in)`.
+- The destination range is trimmed/removed first with
+  `remove_extent_range_in_txn`, so overwritten destination chunks lose exactly
+  one reference and destination boundary extents are split.
+- Source extents overlapping the copied range are cloned: a fully covered
+  extent inserts the same `ExtentRecord` at the mapped destination offset and
+  adds one reference to its chunk, with no payload read. The at most two
+  boundary extents are sliced from their verified payload and stored as new
+  chunks (one reference each). Holes stay holes, so a copy that starts past the
+  destination's old EOF leaves a hole.
+- The destination size becomes `max(size, offset_out + n)` and its mtime/ctime
+  are updated in the same transaction; the inode cache is invalidated, the data
+  version bumped and the attribute invalidation sent only after the commit.
+  Retryable commit conflicts rerun the complete plan from the new transaction
+  snapshot.
+- Source extents are read from the transaction snapshot while all deletes and
+  extent sets are still staged in memory, so a same-inode copy with
+  non-overlapping ranges clones exactly the bytes the committed state holds,
+  even when the destination trim splits an extent the source range also uses.
+
+The kernel treats `EXDEV` and `EOPNOTSUPP` from the request as "filesystem
+cannot copy this", so a cross-domain `copy_file_range(2)` silently falls back
+to `splice_copy_file_range` (a generic read/write copy) and succeeds while the
+filesystem itself refuses to clone across the vault boundary. A same-file
+overlapping range is rejected by the VFS before the request reaches the daemon.
+
+Cost: copying a file N bytes long costs one metadata transaction over its
+extents plus, at most, two payload reads for the boundary chunks. `cp` of a
+64 MiB file took 0.026 s against 0.209 s for a 128 KiB read/write loop on the
+same mount.
+
 ### Inline end-of-file chunks
 
 The chunk that ends a region at the end of the file is not a content-defined cut: the next append re-chunks it. Such a chunk, when new, is stored inline in metadata instead of a pack (`CHUNK_FLAG_INLINE`, `pack_id = INLINE_PACK_ID`, payload under `T` + hash; raw bytes, vault payloads encrypted with the record's nonce). Truncating down stores the kept prefix of the last extent the same way.

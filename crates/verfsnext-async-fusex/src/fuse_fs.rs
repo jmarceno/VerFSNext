@@ -605,67 +605,43 @@ impl FileSystem for FuseFs {
         fh_in: u64,
         offset_in: i64,
         nodeid_out: u64,
-        _fh_out: u64,
+        fh_out: u64,
         offset_out: i64,
         len: u64,
         flags: u64,
         reply: ReplyWrite<'_>,
     ) -> nix::Result<usize> {
         let nodeid_in = req.nodeid();
+        let offset_in: u64 = offset_in.cast();
+        let offset_out: u64 = offset_out.cast();
         debug!(
-            "copy_file_range(nodeid_in={}, nodeid_out={}, offset_in={}, offset_out={}, len={}, flags={:#x}, req={:?})",
-            nodeid_in, nodeid_out, offset_in, offset_out, len, flags, req,
+            "copy_file_range(nodeid_in={}, fh_in={}, offset_in={}, nodeid_out={}, fh_out={}, offset_out={}, len={}, flags={:#x}, req={:?})",
+            nodeid_in, fh_in, offset_in, nodeid_out, fh_out, offset_out, len, flags, req,
         );
 
-        if flags != 0 {
-            return reply.error_code(Errno::EINVAL).await;
-        }
-
-        if len == 0 {
-            return reply.written(0).await;
-        }
-
-        let mut copied: u64 = 0;
-        while copied < len {
-            let remaining = len.overflow_sub(copied);
-            let chunk_size = remaining.min(128 * 1024).cast::<u32>();
-            let mut buf = Vec::new();
-            let in_offset = offset_in.overflow_add(copied.cast::<i64>()).cast::<u64>();
-            let out_offset = offset_out.overflow_add(copied.cast::<i64>());
-
-            let read_size = match self
-                .virtual_fs
-                .read(nodeid_in, fh_in, in_offset, chunk_size, &mut buf)
-                .await
-            {
-                Ok(read_size) => read_size,
-                Err(e) => return reply.error(e).await,
-            };
-
-            if read_size == 0 {
-                break;
+        match self
+            .virtual_fs
+            .copy_file_range(
+                nodeid_in, fh_in, offset_in, nodeid_out, fh_out, offset_out, len, flags,
+            )
+            .await
+        {
+            Ok(copied) => {
+                if copied > u32::MAX.cast::<u64>() {
+                    return reply.error_code(Errno::EOVERFLOW).await;
+                }
+                debug!(
+                    "fusefilesystem call copy_file_range() copied {copied} bytes from ino={nodeid_in} to ino={nodeid_out}",
+                );
+                reply.written(copied.cast()).await
             }
-
-            let payload = &buf[..read_size.min(buf.len())];
-            if let Err(e) = self
-                .virtual_fs
-                .write(nodeid_out, out_offset, payload, 0)
-                .await
-            {
-                return reply.error(e).await;
-            }
-
-            copied = copied.overflow_add(payload.len().cast());
-            if payload.len() < chunk_size.cast::<usize>() {
-                break;
+            Err(e) => {
+                debug!(
+                    "fusefilesystem call copy_file_range() failed from ino={nodeid_in} to ino={nodeid_out}, the error is: {e:?}",
+                );
+                reply.error(e).await
             }
         }
-
-        if copied > u32::MAX.cast::<u64>() {
-            return reply.error_code(Errno::EOVERFLOW).await;
-        }
-
-        reply.written(copied.cast()).await
     }
 
     /// Allocate, deallocate or zero a byte range in an open file.

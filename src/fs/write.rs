@@ -690,6 +690,197 @@ impl FsCore {
         Ok((inode, Some(new_chunks)))
     }
 
+    /// Applies FUSE_COPY_FILE_RANGE between two regular files. The caller
+    /// holds the global mutation gate read side and the write locks of both
+    /// inodes.
+    pub(crate) async fn copy_file_range_locked(
+        &self,
+        source_ino: u64,
+        dest_ino: u64,
+        offset_in: u64,
+        offset_out: u64,
+        len: u64,
+    ) -> Result<u64> {
+        let mut attempt = 1;
+        loop {
+            let mut txn = self.meta.begin_write()?;
+            let (copied, staged) = self
+                .stage_copy_file_range_in_txn(
+                    source_ino, dest_ino, offset_in, offset_out, len, &mut txn,
+                )
+                .await?;
+            let Some(new_chunks) = staged else {
+                return Ok(copied);
+            };
+            match self.meta.commit_write_txn(&mut txn).await {
+                Ok(()) => {
+                    self.publish_committed_chunk_records(&new_chunks);
+                    self.invalidate_inode_cache(dest_ino);
+                    self.mark_mutation();
+                    self.bump_inode_data_version(dest_ino);
+                    self.invalidate_inode_attr_best_effort(dest_ino);
+                    return Ok(copied);
+                }
+                Err(err) if attempt < MAX_COMMIT_ATTEMPTS && is_retryable_commit_error(&err) => {
+                    tracing::warn!(
+                        source_ino,
+                        dest_ino,
+                        offset_in,
+                        offset_out,
+                        len,
+                        attempt,
+                        error = %format!("{err:#}"),
+                        "retrying copy_file_range after metadata conflict"
+                    );
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Stages a copy of `min(len, source_size - offset_in)` bytes of
+    /// `source_ino` to `dest_ino` into `txn` and returns how many bytes the
+    /// copy covers plus the chunk records it created.
+    ///
+    /// The destination range is trimmed/removed first. Every source extent the
+    /// copied range fully covers is then cloned by reference: the same
+    /// `ExtentRecord` at the mapped destination offset and one reference for
+    /// its chunk, with no payload read. The at most two extents the range only
+    /// partially covers are re-encoded from their payload so only the copied
+    /// bytes become a new chunk. The destination keeps its bytes past the
+    /// copied range; a copy that starts past the old end of file leaves a
+    /// hole.
+    async fn stage_copy_file_range_in_txn(
+        &self,
+        source_ino: u64,
+        dest_ino: u64,
+        offset_in: u64,
+        offset_out: u64,
+        len: u64,
+        txn: &mut verfsnext_surrealkv::Transaction,
+    ) -> Result<(u64, Option<HashMap<ChunkId, NewChunk>>)> {
+        let source = FsCore::load_inode_in_txn(txn, source_ino, "copy_file_range")?;
+        self.ensure_inode_vault_access(&source, "copy_file_range")?;
+        if source.kind != INODE_KIND_FILE {
+            return Err(anyhow_errno(
+                Errno::EISDIR,
+                format!("copy_file_range source inode {source_ino} is not a regular file"),
+            ));
+        }
+        let mut dest = FsCore::load_inode_in_txn(txn, dest_ino, "copy_file_range")?;
+        self.ensure_inode_vault_access(&dest, "copy_file_range")?;
+        if dest.kind != INODE_KIND_FILE {
+            return Err(anyhow_errno(
+                Errno::EISDIR,
+                format!("copy_file_range destination inode {dest_ino} is not a regular file"),
+            ));
+        }
+        FsCore::ensure_inode_writable(&dest, "copy_file_range")?;
+        if FsCore::inode_is_vault(&source) != FsCore::inode_is_vault(&dest) {
+            return Err(anyhow_errno(
+                Errno::EXDEV,
+                "copy_file_range cannot copy between the vault and the plain namespace",
+            ));
+        }
+
+        let copied = len.min(source.size.saturating_sub(offset_in));
+        if copied == 0 {
+            return Ok((0, None));
+        }
+        let source_end = offset_in + copied;
+        let copy_end = offset_out.checked_add(copied).ok_or_else(|| {
+            anyhow_errno(
+                Errno::EOVERFLOW,
+                "copy_file_range destination range overflows file offsets",
+            )
+        })?;
+        if source_ino == dest_ino && offset_in < copy_end && offset_out < source_end {
+            return Err(anyhow_errno(
+                Errno::EINVAL,
+                "copy_file_range source and destination ranges overlap in the same file",
+            ));
+        }
+
+        let vault = FsCore::inode_is_vault(&source);
+        let mut extent_updates = Vec::<FileExtent>::new();
+        let mut extent_deletes = Vec::<u64>::new();
+        let mut ref_deltas = HashMap::<ChunkId, i64>::new();
+        let mut pending_chunks = HashMap::<ChunkId, StagedChunk>::new();
+        let mut checked_ids = HashSet::<ChunkId>::new();
+
+        self.remove_extent_range_in_txn(
+            txn,
+            dest_ino,
+            &dest,
+            vault,
+            offset_out,
+            copy_end,
+            &mut extent_updates,
+            &mut extent_deletes,
+            &mut ref_deltas,
+            &mut checked_ids,
+            &mut pending_chunks,
+        )?;
+
+        for extent in self.load_extents_in_txn(txn, source_ino, offset_in, source_end)? {
+            let keep_start = extent.start.max(offset_in);
+            let keep_end = extent.end().min(source_end);
+            let mapped_start = offset_out + (keep_start - offset_in);
+            if keep_start == extent.start && keep_end == extent.end() {
+                let id = ChunkId {
+                    vault,
+                    hash: extent.record.chunk_hash,
+                };
+                *ref_deltas.entry(id).or_insert(0) += 1;
+                extent_updates.push(FileExtent {
+                    start: mapped_start,
+                    record: extent.record,
+                });
+                continue;
+            }
+            let payload = self.load_extent_payload(&extent, vault)?;
+            let data = Arc::new(
+                payload[(keep_start - extent.start) as usize..(keep_end - extent.start) as usize]
+                    .to_vec(),
+            );
+            self.stage_replacement_extent(
+                txn,
+                &source,
+                vault,
+                mapped_start,
+                data,
+                &mut extent_updates,
+                &mut ref_deltas,
+                &mut checked_ids,
+                &mut pending_chunks,
+            )?;
+        }
+
+        let new_chunks = self.materialize_pending_chunks(pending_chunks).await?;
+        let now = SystemTime::now();
+        let (sec, nsec) = system_time_to_parts(now);
+        dest.size = dest.size.max(copy_end);
+        dest.mtime_sec = sec;
+        dest.mtime_nsec = nsec;
+        dest.ctime_sec = sec;
+        dest.ctime_nsec = nsec;
+
+        for start in extent_deletes {
+            txn.delete(extent_key(dest_ino, start))?;
+        }
+        for extent in extent_updates {
+            txn.set(
+                extent_key(dest_ino, extent.start),
+                encode_rkyv(&extent.record)?,
+            )?;
+        }
+        FsCore::apply_ref_deltas_in_txn(txn, &ref_deltas, &new_chunks)?;
+        txn.set(inode_key(dest_ino), encode_rkyv(&dest)?)?;
+        Ok((copied, Some(new_chunks)))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn remove_extent_range_in_txn(
         &self,
@@ -767,7 +958,7 @@ impl FsCore {
         pending_chunks: &mut HashMap<ChunkId, StagedChunk>,
     ) -> Result<()> {
         let len = u32::try_from(data.len())
-            .map_err(|_| anyhow_errno(Errno::EIO, "fallocate extent exceeds u32 length"))?;
+            .map_err(|_| anyhow_errno(Errno::EIO, "replacement extent exceeds u32 length"))?;
         let chunk_hash = FsCore::hash_for_inode(inode, &data);
         let id = ChunkId {
             vault,
