@@ -2434,3 +2434,60 @@ chmod mask sync were rechecked.
 `src/fs/write.rs`, `src/fs/chunk.rs`, `src/fs/fuse.rs`,
 `docs/bug-fix-history.md`, `docs/migration-guide.md`,
 `docs/technical_deep_dive.md`
+
+## B059 - Daemon Kept Running After fusermount -u - Oct 29 2026
+
+### Symptom
+
+After `fusermount -u <mountpoint>` the mount disappeared but the daemon kept
+running with the data folder locked, until it got SIGINT or SIGTERM. A new
+daemon for the same folder could not start, and the systemd user service still
+reported active.
+
+### Root Cause
+
+When the kernel closes the FUSE connection, `fuse_device_reader` gets
+`ENODEV` and returns, but nothing told `Session::run`, which only waits on the
+cancellation token cancelled by signals and the control socket. Every reader
+thread exited and the process idled indefinitely.
+
+### Fix
+
+A reader that sees `ENODEV` sets `Session::kernel_unmounted` and cancels the
+run token, which starts the normal graceful shutdown: request drain, write
+batcher drain, full pack sync, metadata close. Two steps change when the
+mount was removed from outside:
+
+- the shutdown `syncfs` is skipped: the kernel already wrote back every dirty
+  page during `umount` before closing the connection, and the mount path now
+  names the underlying directory;
+- `Session::unmount` and its destructor do not run `fusermount -uz`, which
+  would detach a new mount created at the same path in the meantime.
+
+The daemon exits 0, so the systemd user service (`Restart=on-failure`) stays
+stopped. If our own unmount at the end of a signal-driven shutdown triggers
+`ENODEV`, the flag is set after the detach and changes nothing.
+
+### Data integrity
+
+FUSE writes are committed before they are acknowledged, plain `umount` refuses
+with `EBUSY` while files are open, and a lazy unmount closes the connection
+only after the last reference is gone, so no acknowledged or kernel-cached
+data is outstanding when the shutdown starts. It is the same
+drain-then-full-sync path as SIGINT. The metadata store's exclusive lock keeps
+a second daemon out until the shutdown has finished.
+
+### Validation
+
+Clippy over all targets passed. On a scratch mount: a 200 MB file copied in
+and then `fusermount -u` without a sync made the daemon exit cleanly within
+2 s, and the file hashed identically after a remount. With a writer holding a
+file open, `fusermount -u` failed with `EBUSY` and the daemon kept serving;
+`fusermount -uz` left it running until the writer closed the file, after which
+it shut down and the 8 MiB file was complete after a remount. SIGINT still
+syncs and detaches the mount itself.
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/session.rs`, `src/lib.rs`,
+`docs/bug-fix-history.md`, `docs/technical_deep_dive.md`

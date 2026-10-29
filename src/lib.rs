@@ -234,6 +234,10 @@ async fn run_mount(log_handle: LogHandle, config_path: PathBuf) -> Result<()> {
 
     let run_result = session.run(cancel.clone()).await;
     cancel.cancel();
+    if session.unmounted_by_kernel() {
+        info!("mount point was unmounted outside the daemon, starting graceful shutdown");
+        eprintln!("mount point was unmounted outside the daemon, starting graceful shutdown");
+    }
     let signal_result = signal_task
         .await
         .context("signal task join failed")

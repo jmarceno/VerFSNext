@@ -563,6 +563,16 @@ mount through `EBUSY`. Failures in signal handling, control-task completion, fin
 sync or unmount propagate to the daemon's exit status. An explicitly attempted
 unmount relinquishes session ownership and is never retried in its destructor.
 
+An unmount from outside the daemon (`fusermount -u`, `umount`, or a lazy
+`fusermount -uz` once its last open descriptor closes) starts the same graceful
+shutdown. The kernel closes the connection only after `umount` has written back
+every dirty page through FUSE writes, each committed before its reply, so the
+reader that gets `ENODEV` marks the session as unmounted by the kernel and
+cancels the run token. The shutdown then skips the `syncfs` (the path no longer
+names this mount) and the final detach (the mount point may already hold a new
+mount), and the daemon exits 0, so the user service's `Restart=on-failure`
+leaves it stopped. A busy plain `umount` fails with `EBUSY` and changes nothing.
+
 The reliability oracle uses strict filesystem traversal and records connection
 errors separately from complete content mismatches. Every recovered mount is
 verified against its external durable checkpoint before fault observations are

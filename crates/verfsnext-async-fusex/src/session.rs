@@ -7,6 +7,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
@@ -308,6 +309,7 @@ impl Drop for Admission {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fuse_device_reader(
     buffer_tx: Sender<(File, AlignedBytes)>,
     buffer_rx: Receiver<(File, AlignedBytes)>,
@@ -315,6 +317,8 @@ fn fuse_device_reader(
     proto_version: ProtoVersion,
     fs: Arc<dyn FileSystem + Send + Sync>,
     gate: Arc<RequestGate>,
+    kernel_unmounted: Arc<AtomicBool>,
+    token: CancellationToken,
 ) {
     loop {
         let Ok((mut file, mut buffer)) = buffer_rx.recv() else {
@@ -354,9 +358,15 @@ fn fuse_device_reader(
                         });
                         continue;
                     }
-                    // Filesystem was unmounted, quit the loop
+                    // The kernel closed the connection: the mount is gone,
+                    // either detached by an outside `fusermount -u`/`umount`
+                    // or by our own unmount at the end of shutdown. An outside
+                    // unmount starts the same graceful shutdown as SIGINT.
                     Some(Errno::ENODEV) => {
-                        info!("filesystem destroyed, quit the run loop");
+                        if !kernel_unmounted.swap(true, Ordering::SeqCst) {
+                            info!("FUSE connection closed by the kernel, shutting down");
+                        }
+                        token.cancel();
                         return;
                     }
                     // Unhandled error
@@ -456,6 +466,9 @@ pub struct Session<F: FileSystem + Send + Sync + 'static> {
     session_config: SessionConfig,
     /// Stops request dispatch before the filesystem's final sync
     gate: Arc<RequestGate>,
+    /// Set once the kernel closed the connection, which happens only after
+    /// the mount was detached
+    kernel_unmounted: Arc<AtomicBool>,
 }
 pub async fn new_session(
     mount_path: &Path,
@@ -473,6 +486,7 @@ pub async fn new_session(
         filesystem: Arc::new(fs),
         session_config,
         gate: Arc::default(),
+        kernel_unmounted: Arc::default(),
     })
 }
 
@@ -491,6 +505,9 @@ impl Drop for FuseFd {
 impl<F: FileSystem + Send + Sync + 'static> Drop for Session<F> {
     fn drop(&mut self) {
         if let Some(mount_path) = self.mount_path.take() {
+            if self.unmounted_by_kernel() {
+                return;
+            }
             // A session abandoned before explicit shutdown still owns its mount.
             let result = futures::executor::block_on(mount::umount(&mount_path));
             if let Err(err) = result {
@@ -505,9 +522,21 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
     /// Detach the mount after the filesystem has completed its final sync.
     pub async fn unmount(mut self) -> anyhow::Result<()> {
         let mount_path = self.mount_path.take().expect("session owns its mount");
+        if self.unmounted_by_kernel() {
+            // The mount point may already hold a new mount; a lazy unmount
+            // here would detach it.
+            info!(path = %mount_path.display(), "FUSE mount already detached outside the daemon");
+            return Ok(());
+        }
         mount::umount(&mount_path).await?;
         info!(path = %mount_path.display(), "FUSE mount detached");
         Ok(())
+    }
+
+    /// Whether the kernel closed the connection because the mount was
+    /// detached outside the daemon.
+    pub fn unmounted_by_kernel(&self) -> bool {
+        self.kernel_unmounted.load(Ordering::SeqCst)
     }
 
     /// Get FUSE device fd
@@ -545,17 +574,34 @@ impl<F: FileSystem + Send + Sync + 'static> Session<F> {
             let fs = Arc::clone(&self.filesystem);
             let protocol_version = self.proto_version.load();
             let gate = Arc::clone(&self.gate);
+            let kernel_unmounted = Arc::clone(&self.kernel_unmounted);
+            let reader_token = token.clone();
             // Readers stop at the request gate; their `JoinHandle`s are not needed.
             thread::spawn(move || {
-                fuse_device_reader(pool_tx, pool_rx, handle, protocol_version, fs, gate);
+                fuse_device_reader(
+                    pool_tx,
+                    pool_rx,
+                    handle,
+                    protocol_version,
+                    fs,
+                    gate,
+                    kernel_unmounted,
+                    reader_token,
+                );
             });
         }
 
         token.cancelled().await;
         // Pages held by the kernel writeback cache reach the filesystem only while
         // requests are still served. A sync failure is returned after draining so the
-        // caller still performs its final filesystem sync.
-        let sync_result = self.sync_mount().await;
+        // caller still performs its final filesystem sync. After an outside unmount
+        // the kernel has already written back every dirty page before closing the
+        // connection, and the mount path no longer names this filesystem.
+        let sync_result = if self.unmounted_by_kernel() {
+            Ok(())
+        } else {
+            self.sync_mount().await
+        };
         let gate = Arc::clone(&self.gate);
         tokio::task::spawn_blocking(move || gate.close_and_drain())
             .await
