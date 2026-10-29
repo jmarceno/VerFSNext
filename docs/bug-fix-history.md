@@ -1996,3 +1996,35 @@ missing printed the wait notice and mounted once the folders were created.
 ### Affected Files
 
 `src/lib.rs`, `src/gui/daemon.rs`, `src/gui/controller.rs`, `docs/technical_deep_dive.md`
+
+## B050 - poll() on Any File Returned POLLERR and Flooded the Daemon Log - Oct 29 2026
+
+### Symptom
+
+An integrity audit of the live desktop mount found a 790 MB `daemon.log` after two
+weeks: 4,483,410 of its 4,484,258 lines were `ERROR ... Poll unsupported`. On the live
+mount, `poll()` with `POLLIN` on a regular file returned `POLLERR` (revents 8), where
+ext4 returns `POLLIN`.
+
+### Root Cause
+
+`verfsnext-async-fusex` answered `FUSE_POLL` with `EOPNOTSUPP`. The kernel
+(`fuse_file_poll`) only sets `fc->no_poll` and reports the default "always ready"
+mask when the reply is `ENOSYS`; for any other errno it returns `EPOLLERR` and asks
+the daemon again on the next poll. Every app that polled or epolled a file on the
+mount saw an error, and every call logged an error line.
+
+### Fix
+
+`Operation::Poll` replies `ENOSYS` (through `not_implement_helper`) and logs at warn
+level. The kernel then stops sending `FUSE_POLL` for the rest of the mount, so the
+line appears at most once per mount.
+
+### Validation
+
+Headless build on a scratch mount: three `poll(POLLIN)` calls on a file returned
+`POLLIN` (revents 1).
+
+### Affected Files
+
+`crates/verfsnext-async-fusex/src/session.rs`

@@ -1031,8 +1031,11 @@ async fn dispatch<'a>(
         }
         #[cfg(feature = "abi-7-11")]
         Operation::Poll { arg } => {
-            error!("Poll unsupported, arg={:?}", arg);
-            reply_errno(req, file, Errno::EOPNOTSUPP).await
+            // ENOSYS is the only answer that makes the kernel set `no_poll` and
+            // report files as always ready; any other errno turns every poll()
+            // on the mount into EPOLLERR and sends the next one here again.
+            warn!("Poll unsupported, arg={:?}", arg);
+            not_implement_helper(req, file).await
         }
         #[cfg(feature = "abi-7-15")]
         Operation::NotifyReply { data } => {
