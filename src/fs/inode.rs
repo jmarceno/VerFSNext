@@ -217,12 +217,12 @@ impl FsCore {
 
         if kind == INODE_KIND_DIR {
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
-            parent_inode.mtime_sec = sec;
-            parent_inode.mtime_nsec = nsec;
-            parent_inode.ctime_sec = sec;
-            parent_inode.ctime_nsec = nsec;
-            txn.set(inode_key(parent), encode_rkyv(&parent_inode)?)?;
         }
+        parent_inode.mtime_sec = sec;
+        parent_inode.mtime_nsec = nsec;
+        parent_inode.ctime_sec = sec;
+        parent_inode.ctime_nsec = nsec;
+        txn.set(inode_key(parent), encode_rkyv(&parent_inode)?)?;
 
         Ok(inode)
     }

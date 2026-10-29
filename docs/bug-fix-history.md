@@ -2071,3 +2071,40 @@ socket (`c1fd`).
 `src/fs/fuse.rs`, `crates/verfsnext-async-fusex/src/session.rs`,
 `crates/verfsnext-async-fusex/src/virtual_fs.rs`,
 `docs/bug-fix-history.md`, `docs/migration-guide.md`
+
+## B052 - Namespace Changes Did Not Advance Directory mtime/ctime - Oct 29 2026
+
+### Symptom
+
+Creating a file, symlink, FIFO, hard link or directory left the parent
+directory's mtime and ctime unchanged. `unlink()` also left both timestamps
+unchanged. Backup tools, `make`, rsync change detection and file managers use
+directory timestamps to notice that a directory changed.
+
+### Root Cause
+
+`create_inode_in_txn` updated and rewrote the parent inode only when the new
+inode was a directory, which was intended to maintain the parent `nlink`. File,
+symlink and special-node creation therefore skipped the timestamp update. The
+normal `unlink` path deleted the dirent and decremented the removed inode's
+link count but never touched the parent. `link` likewise added its dirent
+without touching the destination directory.
+
+### Fix
+
+Every inode creation now writes the parent's mtime and ctime, with `nlink`
+still incremented only for a subdirectory. The normal unlink path and the hard
+link path call `touch_parent_inode_in_txn`, so all namespace-changing
+operations now update the affected parent directories. Existing rename and
+rmdir paths already did this and were verified alongside the changed paths.
+
+### Validation
+
+Release build passed. On a scratch mount, each of create, mkdir, mkfifo,
+symlink, hard link, unlink, rmdir and rename (both source and destination
+parents) was run after resetting the parent mtime. Every operation advanced
+both the parent's mtime and ctime.
+
+### Affected Files
+
+`src/fs/inode.rs`, `src/fs/fuse.rs`, `docs/bug-fix-history.md`

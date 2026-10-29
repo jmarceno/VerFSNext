@@ -316,6 +316,7 @@ impl VirtualFs for VerFs {
                 let defer_final_delete = inode.nlink <= 1 && self.core.inode_referenced(inode.ino);
                 let _removed_inode =
                     FsCore::remove_name_from_inode_in_txn(txn, &mut inode, defer_final_delete)?;
+                FsCore::touch_parent_inode_in_txn(txn, parent, 0, sec, nsec)?;
                 Ok(())
             })
             .await
@@ -1219,6 +1220,7 @@ impl VirtualFs for VerFs {
                 target_inode.ctime_sec = sec;
                 target_inode.ctime_nsec = nsec;
                 txn.set(inode_key(ino), encode_rkyv(&target_inode)?)?;
+                FsCore::touch_parent_inode_in_txn(txn, newparent, 0, sec, nsec)?;
                 linked = Some(target_inode);
                 Ok(())
             })
