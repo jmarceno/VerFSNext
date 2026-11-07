@@ -3412,3 +3412,52 @@ and, while writing, the write batch (`batch_max_size_mb`).
 `src/alloc.rs`, `src/lib.rs`, `src/fs/mod.rs`, `src/gui/daemon.rs`,
 `src/gui/controller.rs`, `docs/bug-fix-history.md`,
 `docs/technical_deep_dive.md`
+
+## B071 - Tray Icon Vanished for Good After a Session-Bus Hiccup - Nov 07 2026
+
+### Root Cause
+
+`ksni` 0.2.2 runs its own D-Bus connection inside `TrayService::run()`.
+When the session bus drops that connection (a `dbus-broker` peer reset, or
+the watcher restarting), `run()` returns `Err` and `service_loop` gives up:
+`Err(error::Error::Dbus(r)) => return Err(r)`
+(`ksni-0.2.2/src/service.rs:71`). The tray thread logged the error and
+exited, so the process kept running with no tray icon and no way to get it
+back short of a restart.
+
+`TrayHandle` only ever built one `TrayService`, so nothing reconnected, and
+`update()` kept pushing state into a `Handle` whose service was gone.
+
+### Fixed
+
+`TrayHandle::start` now runs a reconnect loop on the tray thread: every
+`run()` error builds a fresh `TrayService` (and therefore a fresh session-bus
+connection) after `RECONNECT_INTERVAL`, and swaps the new `Handle` into the
+shared `Arc<Mutex<Handle<VerfsTray>>>` so `update()` always reaches the
+service that is actually running. A clean `Ok(())` return still ends the
+loop, so an explicit shutdown is not mistaken for a reconnect.
+
+The live tray state moved into an `Arc<Mutex<TrayState>>` that each new
+`TrayService` reads, so a reconnected icon does not revert to its startup
+defaults. Icons are shared as `Arc<Vec<Icon>>` instead of being re-rendered
+per reconnect.
+
+`watcher_offine` also had its log level corrected: losing the watcher is
+recoverable, so it is a warning, not an error.
+
+### Validation
+
+Ran the release build, restarted the service, then restarted
+`com.system76.CosmicStatusNotifierWatcher.service` while the app was running.
+Before the fix the `verfsnext-tray` thread was gone from
+`/proc/<pid>/task/*/comm` and the item disappeared from
+`RegisteredStatusNotifierItems`. After the fix the thread stays alive and
+`org.kde.StatusNotifierItem-<pid>-1` is present in the list after the
+watcher restart, alongside the other tray items.
+
+`cargo remote -h -- clippy --all-targets` emits no warnings and
+`cargo remote -h -- test` passes (42 + 11 tests).
+
+### Affected Files
+
+`src/gui/tray.rs`, `docs/bug-fix-history.md`

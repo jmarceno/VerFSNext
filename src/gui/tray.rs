@@ -1,5 +1,8 @@
 //! StatusNotifier tray icon via ksni (no GTK).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,11 @@ use ksni::{Handle, Tray, TrayService};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/verfsnext.svg");
 const ICON_SIZE: u32 = 64;
+
+/// How long the first registration gets to fail before the tray is declared up.
+const FIRST_ATTEMPT_WINDOW: Duration = Duration::from_millis(800);
+/// Pause between attempts when the session bus dropped the tray connection.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
@@ -45,12 +53,24 @@ impl Default for TrayState {
 
 struct VerfsTray {
     tx: Sender<TrayEvent>,
-    state: TrayState,
-    icon_running: Vec<ksni::Icon>,
-    icon_stopped: Vec<ksni::Icon>,
+    /// Shared with `TrayHandle`: a reconnected `TrayService` reads the current
+    /// state from here instead of the values it was built with, so the menu and
+    /// icon never revert to their startup defaults after a bus hiccup.
+    shared: Arc<Mutex<TrayState>>,
+    icon_running: Arc<Vec<ksni::Icon>>,
+    icon_stopped: Arc<Vec<ksni::Icon>>,
 }
 
 impl VerfsTray {
+    fn state(&self) -> TrayState {
+        // A poisoned lock still holds the last known state; a tray must never
+        // panic on the D-Bus thread just because a UI thread died holding it.
+        self.shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn send(&self, ev: TrayEvent) {
         if self.tx.send(ev).is_err() {
             tracing::error!(?ev, "tray event dropped: the app stopped listening");
@@ -76,16 +96,16 @@ impl Tray for VerfsTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        if self.state.running {
-            self.icon_running.clone()
+        if self.state().running {
+            self.icon_running.as_ref().clone()
         } else {
-            self.icon_stopped.clone()
+            self.icon_stopped.as_ref().clone()
         }
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: self.state.status_line.clone(),
+            title: self.state().status_line,
             description: String::new(),
             icon_name: String::new(),
             icon_pixmap: self.icon_pixmap(),
@@ -97,9 +117,10 @@ impl Tray for VerfsTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
+        let state = self.state();
         vec![
             StandardItem {
-                label: self.state.status_line.clone(),
+                label: state.status_line.clone(),
                 enabled: false,
                 ..Default::default()
             }
@@ -107,28 +128,28 @@ impl Tray for VerfsTray {
             MenuItem::Separator,
             StandardItem {
                 label: "Open VerFSNext Folder".into(),
-                enabled: self.state.running,
+                enabled: state.running,
                 activate: Box::new(|t: &mut Self| t.send(TrayEvent::OpenFolder)),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "Take a Snapshot Now".into(),
-                enabled: self.state.running,
+                enabled: state.running,
                 activate: Box::new(|t: &mut Self| t.send(TrayEvent::TakeSnapshot)),
                 ..Default::default()
             }
             .into(),
             StandardItem {
-                label: self.state.toggle_label.clone(),
-                enabled: self.state.toggle_enabled,
+                label: state.toggle_label.clone(),
+                enabled: state.toggle_enabled,
                 activate: Box::new(|t: &mut Self| t.send(TrayEvent::ToggleRunning)),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: if self.state.configured {
+                label: if state.configured {
                     "Open Control Center…".into()
                 } else {
                     "Set Up VerFSNext…".into()
@@ -138,7 +159,7 @@ impl Tray for VerfsTray {
             }
             .into(),
             StandardItem {
-                label: self.state.quit_label.clone(),
+                label: state.quit_label.clone(),
                 activate: Box::new(|t: &mut Self| t.send(TrayEvent::Quit)),
                 ..Default::default()
             }
@@ -146,21 +167,32 @@ impl Tray for VerfsTray {
         ]
     }
 
+    /// The watcher only blips (a restart, or a session-bus reconnect). Returning
+    /// `false` here makes ksni shut the service down for good, so keep it alive:
+    /// ksni re-registers by itself when the watcher name comes back.
     fn watcher_offine(&self) -> bool {
-        tracing::error!("system tray host went away; the VerFSNext icon is gone until it returns");
+        tracing::warn!("system tray host went away; waiting for it to come back");
         true
     }
 }
 
 pub struct TrayHandle {
     pub rx: Receiver<TrayEvent>,
-    handle: Handle<VerfsTray>,
+    /// Swapped for a new handle every time the service reconnects, so
+    /// `update()` always reaches the `TrayService` that is actually running.
+    handle: Arc<Mutex<Handle<VerfsTray>>>,
+    /// The live state, read by whichever service instance is running.
+    shared: Arc<Mutex<TrayState>>,
+    stop: Arc<AtomicBool>,
     last: TrayState,
 }
 
 impl Drop for TrayHandle {
     fn drop(&mut self) {
-        self.handle.shutdown();
+        self.stop.store(true, Ordering::Release);
+        if let Ok(handle) = self.handle.lock() {
+            handle.shutdown();
+        }
     }
 }
 
@@ -183,37 +215,74 @@ impl TrayHandle {
         }
 
         let (tx, rx) = unbounded();
-        let service = TrayService::new(VerfsTray {
-            tx,
-            state: TrayState::default(),
-            icon_running: vec![render_icon(1.0)?],
-            icon_stopped: vec![render_icon(0.4)?],
-        });
-        let handle = service.handle();
-        let (err_tx, err_rx) = std::sync::mpsc::channel();
-        thread::Builder::new()
-            .name("verfsnext-tray".into())
-            .spawn(move || {
-                if let Err(e) = service.run() {
-                    tracing::error!(error = %e, "tray service stopped");
-                    if err_tx.send(e.to_string()).is_err() {
-                        tracing::error!("tray startup error could not be reported");
-                    }
-                }
-            })
-            .context("failed to start tray thread")?;
+        let icon_running = Arc::new(vec![render_icon(1.0)?]);
+        let icon_stopped = Arc::new(vec![render_icon(0.4)?]);
+        let shared = Arc::new(Mutex::new(TrayState::default()));
+        let service = build_service(tx.clone(), shared.clone(), icon_running.clone(), icon_stopped.clone());
+        let handle = Arc::new(Mutex::new(service.handle()));
+        let stop = Arc::new(AtomicBool::new(false));
 
-        match err_rx.recv_timeout(Duration::from_millis(800)) {
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        {
+            let thread_handle = handle.clone();
+            let thread_shared = shared.clone();
+            let thread_stop = stop.clone();
+            thread::Builder::new()
+                .name("verfsnext-tray".into())
+                .spawn(move || {
+                    // One service per session-bus connection. ksni returns an
+                    // error when the connection dies and never retries, so a
+                    // new connection comes from a new `TrayService`.
+                    let mut next = Some(service);
+                    let mut reported = false;
+                    while !thread_stop.load(Ordering::Acquire) {
+                        let Some(service) = next.take() else {
+                            break;
+                        };
+                        match service.run() {
+                            // A clean stop is a real shutdown, not a reconnect.
+                            Ok(()) => break,
+                            Err(e) => {
+                                if !reported {
+                                    reported = true;
+                                    let _ = err_tx.send(e.to_string());
+                                }
+                                tracing::warn!(error = %e, "tray connection lost; reconnecting");
+                            }
+                        }
+                        if thread_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(RECONNECT_INTERVAL);
+                        let rebuilt = build_service(
+                            tx.clone(),
+                            thread_shared.clone(),
+                            icon_running.clone(),
+                            icon_stopped.clone(),
+                        );
+                        *thread_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rebuilt.handle();
+                        next = Some(rebuilt);
+                    }
+                })
+                .context("failed to start tray thread")?;
+        }
+
+        match err_rx.recv_timeout(FIRST_ATTEMPT_WINDOW) {
             Ok(e) => bail!("could not create the tray icon: {e}"),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 bail!("tray thread exited before registering")
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // Still running: the first registration succeeded.
+            Err(RecvTimeoutError::Timeout) => {}
         }
 
         Ok(Self {
             rx,
             handle,
+            shared,
+            stop,
             last: TrayState::default(),
         })
     }
@@ -223,8 +292,34 @@ impl TrayHandle {
             return;
         }
         self.last = state.clone();
-        self.handle.update(move |tray| tray.state = state);
+        *self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.clone();
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .update(move |tray| {
+                *tray
+                    .shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+            });
     }
+}
+
+fn build_service(
+    tx: Sender<TrayEvent>,
+    shared: Arc<Mutex<TrayState>>,
+    icon_running: Arc<Vec<ksni::Icon>>,
+    icon_stopped: Arc<Vec<ksni::Icon>>,
+) -> TrayService<VerfsTray> {
+    TrayService::new(VerfsTray {
+        tx,
+        shared,
+        icon_running,
+        icon_stopped,
+    })
 }
 
 fn watcher_present() -> Result<bool> {
